@@ -27,7 +27,7 @@ describe("fused loop ledger publication", () => {
   });
 
   test("a previously resolved Stop archives human history but not its live control evidence", async () => {
-    const host = fixture(); host.setLimit(2);
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(2);
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.agent === "pitako.worker" && request.key.includes(".l1.")) return closedInterruptedProducer(result, "stopped");
@@ -52,7 +52,7 @@ describe("fused loop ledger publication", () => {
   });
 
   test("a changed observation after a published crash is a human-needed conflict, not another close", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(1);
     let crashed = false;
     host.setRespond((request, normal) => {
       const result = normal();

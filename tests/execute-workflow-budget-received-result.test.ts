@@ -41,7 +41,7 @@ function exhaustAfterWorker(host: ControllerHost, shape?: (result: Result) => Re
 }
 
 test("a complete worker result received before gate budget exhaustion is reviewed, sealed and admitted on relaunch, not restored", async () => {
-  const host = fixture(undefined, { taskCount: 1 });
+  const host = fixture(undefined, { realCheckout: true, taskCount: 1 });
   const denied = exhaustAfterWorker(host);
   const first = await host.execute();
   expect(first.status, first.reason).toBe("budget-exhausted");
@@ -67,7 +67,7 @@ test("a complete worker result received before gate budget exhaustion is reviewe
 });
 
 test("a pause result received before budget exhaustion continues from its seal on relaunch, not a rollback", async () => {
-  const host = fixture(undefined, { taskCount: 1 });
+  const host = fixture(undefined, { realCheckout: true, taskCount: 1 });
   exhaustAfterWorker(host, result => {
     const value = copy(result);
     Object.assign(value.structuredOutput, { status: "continue", remaining: ["Finish src/change1.ts"],
@@ -89,7 +89,7 @@ test("a pause result received before budget exhaustion continues from its seal o
 });
 
 test("without a retained worker result, relaunch keeps the checkpoint-first fallback", async () => {
-  const host = fixture(undefined, { taskCount: 1 });
+  const host = fixture(undefined, { realCheckout: true, taskCount: 1 });
   exhaustAfterWorker(host);
   expect((await host.execute()).status).toBe("budget-exhausted");
   // State written before retention existed has only the launch reference.

@@ -218,7 +218,7 @@ test("a sealed rejection replays as pause and repairs with the frozen model over
 });
 
 test("reviewer candidate mutation fails the saved gate candidate check", async () => {
-  const host = fixture(); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.key.endsWith(".task-reviewer")) host.changeCheckout();
@@ -234,7 +234,7 @@ test("reviewer candidate mutation fails the saved gate candidate check", async (
 });
 
 test("a settled sealer cannot admit a checkout changed before replay", async () => {
-  const host = fixture(); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
   host.setFailSave(value => value.loop?.attempt?.stage === "result");
   expect((await host.execute()).status).toBe("partial");
   host.setFailSave(); host.changeCheckout();

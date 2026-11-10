@@ -3,6 +3,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import { processBudget, expectProcessBudget, type Processes } from "./process-budget.ts";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
 import { canonicalDigest, canonicalJSON as canonicalViewJSON } from "../../extensions/canonical.mjs";
 import { captureBaseline, captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
@@ -56,29 +57,45 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
   dependsOn: [] as { taskId: string; reason: string }[],
   checks: [{ id: `${id}-check`, requirement: "spec:criterion-1", command: `bun test ${id}`, cwd: config.root }] });
 type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
-  controlledCheckpoints?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
-type OwnedResources = { roots: string[]; settlements: Promise<unknown>[] };
+  realCheckout?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
+type OwnedResources = { roots: string[]; settlements: Promise<unknown>[]; disposers: (() => void)[]; controlledProcesses: (() => Processes)[] };
 export function executeControllerFixture() {
-  const owned: OwnedResources = { roots: [], settlements: [] };
+  const owned: OwnedResources = { roots: [], settlements: [], disposers: [], controlledProcesses: [] };
   afterEach(async () => {
     await Promise.all(owned.settlements.splice(0));
-    for (const root of owned.roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    try {
+      const total: Processes = { git: 0, sealer: 0, loopIO: 0, gates: 0, other: 0 };
+      for (const processes of owned.controlledProcesses.splice(0))
+        for (const [key, count] of Object.entries(processes())) total[key as keyof Processes] += count;
+      // All controlled fixtures in this test measured zero processes; allow +2.
+      expectProcessBudget(total, 2);
+    } finally {
+      for (const dispose of owned.disposers.splice(0)) dispose();
+      for (const root of owned.roots.splice(0)) rmSync(root, { recursive: true, force: true });
+    }
   });
   return { fixture: (content?: string, options?: FixtureOptions) => ownedFixture(owned, content, options) };
 }
 export type ControllerHost = ReturnType<typeof ownedFixture>;
-function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLETE IMMUTABLE SPECS", options: FixtureOptions = {}) {
-  // Controller fixtures own real preimages/seals, even when the controlled worker
-  // is a no-op. Candidate-drift cases change actual WIP, never seal invented hashes.
+function ownedFixture({ roots, settlements, disposers, controlledProcesses }: OwnedResources, content = "COMPLETE IMMUTABLE SPECS", options: FixtureOptions = {}) {
+  // Controller protocol tests use controlled candidates/checkpoints. Opt into
+  // realCheckout for byte, drift, restoration or command-execution assertions.
   const root = mkdtempSync(path.join(tmpdir(), "pitako-execute-controller-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "ignore" });
-  git("init", "-q");
-  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
+  const budget = processBudget(root);
+  disposers.push(budget.dispose);
+  const git = (...args: string[]) => { budget.counts.git++; return execFileSync("git", args, { cwd: root, stdio: "ignore" }); };
+  if (options.realCheckout) {
+    git("init", "-q");
+    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
+  }
   const config = { ...globalConfig, root, preliminary: undefined as any };
   const observedCandidate = (): Candidate => {
+    if (!options.realCheckout) return copy(checkout);
     const { head, fingerprint } = checkoutEvidence(root); return { head, fingerprint };
   };
-  let checkout = observedCandidate(), clock = 1000;
+  let checkout = candidate(), clock = 1000;
+  if (options.realCheckout) checkout = observedCandidate();
+  if (!options.realCheckout) controlledProcesses.push(budget.processes);
   // calls observes logical operation boundaries for fault injection; launches is
   // the actual native dispatch inventory, including grouped launches only once.
   const calls: Request[] = [], launches: Request[] = [], hostCalls: string[] = [], statusCalls: string[] = [], emits: any[] = [];
@@ -138,7 +155,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       : JSON.parse(request.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!);
     if (selectedTask.kind === "implementation" && descriptor.checkpoint?.progress) {
       captures.set(descriptor.key, copy(descriptor.checkpoint));
-      if (!options.controlledCheckpoints && !existsSync(path.join(root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json")))
+      if (options.realCheckout && !existsSync(path.join(root, ".pi/subagents/checkpoints", descriptor.key, "manifest.json")))
         captureCheckpoint(descriptor.checkpoint, ["src/" + descriptor.taskId + ".ts"]);
     }
     return { status: "complete", work: `Implemented ${selectedTask.goal}`,
@@ -200,10 +217,11 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       const input = JSON.parse(request.task);
       if (input.operation === "taskDelta") {
         let delta;
-        if (options.controlledCheckpoints) delta = {
+        if (!options.realCheckout) delta = {
           touched: captures.has(input.intents.at(-1).key) ? ["src/change1.ts"] : [], netChanged: [], overflow: null,
         };
         else {
+          budget.counts.loopIO++;
           const response = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")],
             { cwd: root, input: request.task, encoding: "utf8" });
           if (response.status !== 0) throw new Error(response.stdout + response.stderr);
@@ -217,7 +235,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
       if (input.operation !== "gate") {
         try {
           const current = readBacklog(root, "spec");
-          const value = input.operation === "baseline" ? { ...captureBaseline(input), backlog: undefined } : input.operation === "reviewOriginals" ? { ...reviewOriginals(input), backlog: undefined } : input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
+          const value = input.operation === "baseline" ? { ...(options.realCheckout ? captureBaseline(input) : { candidate: copy(checkout) }), backlog: undefined } : input.operation === "reviewOriginals" ? { ...reviewOriginals(input), backlog: undefined } : input.operation === "prepare" ? { ...current, cancelledScope: current.backlog ? cancelledScope(current.backlog) : [], view, lastConfirmedUnit: null }
             : { ...apply({ ...input, currentHumanIds: view.posts.filter(post => post.type === "HUMAN").map(post => post.id) }), view };
           const { backlog, ...receipt } = value;
           if (input.operation === "prepare" || input.operation === "apply") Object.assign(receipt, {
@@ -236,7 +254,9 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
         mkdirSync(directory, { recursive: true });
         const reused = input.reuse && input.reuse.candidate.head === before.head && input.reuse.candidate.fingerprint === before.fingerprint;
         const gates = reused ? copy(input.reuse.results) : input.task.gates.map((gate: any, index: number) => {
+          if (!options.realCheckout) return { id: gate.id, status: "pass", exit: 0, ms: 1, tail: "Controlled gate passed", logRef: `/native/gates/${request.key}/${gate.id}.log` };
           const start = Date.now();
+          budget.counts.gates++;
           const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd),
             encoding: "utf8", timeout: gate.timeoutMs });
           const output = (command.stdout ?? "") + (command.stderr ?? "");
@@ -270,12 +290,13 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     if (request.agent === "pitako.checkpoint-sealer") {
       const input = JSON.parse(request.task), intent = input.intent;
       let observed;
-      if (options.controlledCheckpoints) {
+      if (!options.realCheckout) {
         observed = { v: 1, outcome: captures.has(intent.key) && input.kind ? "sealed" : "observed",
           kind: input.kind, candidate: copy(checkout),
           ...(captures.has(intent.key) && input.kind ? { checkpointRef: path.join(root, ".pi/subagents/checkpoints", intent.key, `${input.kind}.json`),
             digest: digest(intent.key), position: { loop: intent.loop, cursor: intent.cursor + (input.kind === "unit" ? 1 : 0), phase: intent.phase } } : {}) };
       } else {
+        budget.counts.sealer++;
         // A private process preserves the sealer's cwd boundary without reloading Node's TS hook.
         const response = spawnSync(process.execPath, ["--eval", `
           import { sealCheckpointRequest } from ${JSON.stringify(path.resolve("extensions/execute-checkpoint.ts"))};
@@ -536,7 +557,8 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
   const controlledDate = { now: () => clock };
-  return { root, observedCandidate, verifications, calls, launches, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
+  return { root, processes: budget.processes, expectProcessBudget: (maximum: number) => expectProcessBudget(budget.processes(), maximum),
+    observedCandidate, verifications, calls, launches, hostCalls, statusCalls, emits, storage, snapshots, native, plan, worker, result, state,
     setSaveObserver: (observer: typeof saveObserver) => { saveObserver = observer; },
     setLimit: (value: number) => { admittedLimit = value; },
     setAdmission: (value?: typeof admission) => { admission = value; },
@@ -546,6 +568,7 @@ function ownedFixture({ roots, settlements }: OwnedResources, content = "COMPLET
     setObservationResponse: (value?: typeof observationResponse) => { observationResponse = value; },
     setHostResponse: (value?: typeof hostResponse) => { hostResponse = value; }, setFailSave: (value?: typeof failSave) => { failSave = value; },
     changeCheckout: (version = 1) => {
+      if (!options.realCheckout) throw new Error("changeCheckout requires realCheckout: true");
       writeFileSync(path.join(root, "candidate-drift"), String(version)); checkout = observedCandidate();
     }, advance: (ms: number) => { clock += ms; },
     records: () => {

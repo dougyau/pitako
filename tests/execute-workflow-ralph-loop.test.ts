@@ -4,10 +4,20 @@ import { createHash } from "node:crypto";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { TASK_UPDATE_KEYS, readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture, copy, type Result } from "./fixtures/execute-workflow.ts";
+import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
+import { expectProcessBudget } from "./fixtures/process-budget.ts";
 
 const { fixture } = executeControllerFixture();
+const acceptanceComposition = realCheckoutCompositionFixture();
+const acceptanceScripts = acceptanceComposition.scripts;
+function acceptanceCheckout(host: ReturnType<typeof fixture>, request: { agent?: string; key: string; task: string }) {
+  if (request.agent === "pitako.checkpoint-sealer" ||
+      request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+    return acceptanceScripts.runDeterministic(request.key, request,
+      { ...acceptanceScripts, root: host.root, inlineSealer: true }, undefined);
+}
 const isGate = (call: { agent?: string; task: string }) => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate";
-const taskFixture = () => { const host = fixture(); host.setLimit(1); return host; };
+const taskFixture = (realCheckout = false) => { const host = fixture(undefined, { realCheckout }); host.setLimit(1); return host; };
 const checkOrigin = (ref: string) => {
   expect(Buffer.byteLength(ref)).toBeLessThanOrEqual(512);
   const output = JSON.parse(ref);
@@ -177,7 +187,7 @@ test("a retained native barrier with an admitted result does not block task sett
 });
 
 test("the sealer cannot admit a candidate changed after gates", async () => {
-  const host = taskFixture(); let changed = false;
+  const host = taskFixture(true); let changed = false;
   host.setRespond((request, normal) => {
     if (request.agent === "pitako.checkpoint-sealer" && !changed) { changed = true; host.changeCheckout(); }
     return normal();
@@ -408,15 +418,19 @@ test("relaunch adopts a human backlog after a digest conflict without reusing it
 
 
 test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates before completion", async mode => {
-  const host = fixture(); host.setLimit(3);
+  const host = fixture(undefined, { realCheckout: true }); host.setLimit(3);
   let acceptanceRan = false, driftVersion = 0;
   let persistedRepairs: NonNullable<ReturnType<typeof readBacklog>["backlog"]>["tasks"] = [];
   let selectedRepair = null as string | null;
   host.setRespond((request, normal) => {
+    const checkout = acceptanceCheckout(host, request);
+    if (checkout) return checkout;
+    if (request.agent === "pitako.worker")
+      return host.result(request, { status: "complete", work: "No product changes", remaining: [] });
     const result = normal();
     if (request.agent === "pitako.execution-director" && request.key.includes(".l1."))
       result.structuredOutput.acceptance = [{ id: "acceptance", command: mode === "fail"
-        ? 'node -e "process.exit(1)"' : "node -e 0", cwd: "." }];
+        ? "false" : "true", cwd: "." }];
     if (isGate(request) && JSON.parse(request.task).task.id === "final-acceptance") {
       acceptanceRan = true;
       if (mode === "stale") host.changeCheckout(++driftVersion);
@@ -453,6 +467,8 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
     const gapWrite = host.calls.findIndex(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).recordGaps);
     expect(gapWrite).toBeLessThan(host.calls.indexOf(director));
   } else expect(repairs).toEqual([]);
+  // Measured 73 including IPC Git and one shared runtime, plus eight.
+  if (mode === "fail") expectProcessBudget([host.processes(), acceptanceComposition.processes()], 81);
 });
 
 
@@ -500,7 +516,7 @@ test.each(["timeout", "error"])("final acceptance %s blocks as environment with 
 
 test.each(["review", "compliance"])("final-phase %s findings become durable tasks for the next director", async phase => {
   // The live save observer measures every mission write; historical copies are unused here.
-  const host = fixture(undefined, { taskCount: 0, findings: true, retainSnapshots: false, controlledCheckpoints: true }); host.setLimit(3);
+  const host = fixture(undefined, { taskCount: 0, findings: true, retainSnapshots: false }); host.setLimit(3);
   let peakBytes = 0, consumed = false;
   host.setSaveObserver((value, bytes, serialized) => {
     peakBytes = Math.max(peakBytes, bytes);
@@ -596,7 +612,7 @@ test("final review receives done and obsolete reasons, current DECISIONs, and fo
 test.each(["pass", "fail", "timeout", "error", "superseded", "blocking-failure"])("final verdict honors only current HUMAN exceptions: %s", async mode => {
   const human = { id: 42, type: "HUMAN", content: "Loader may fail", author: "root", createdAt: "2026-11-08",
     metadata: { quote: "Loader may fail", saidAt: "2026-11-08" } };
-  const host = fixture(undefined, { taskCount: 0, humanPosts: [human] }); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0, humanPosts: [human] }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.execution-director") result.structuredOutput.acceptance = [
@@ -651,9 +667,14 @@ test.each(["pass", "fail", "timeout", "error", "superseded", "blocking-failure"]
 const finalGates = (host: ReturnType<typeof fixture>) => host.calls.filter(call => isGate(call) && JSON.parse(call.task).task.id === "final-acceptance");
 function repeatedAcceptanceFixture() {
   const humanPosts: any[] = [];
-  const host = fixture(undefined, { taskCount: 0, humanPosts }); host.setLimit(5);
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0, humanPosts }); host.setLimit(5);
   let allowException = false;
   host.setRespond((request, normal) => {
+    const checkout = acceptanceCheckout(host, request);
+    if (checkout) return checkout;
+    // This fixture asserts real acceptance commands/log reuse, not product edits.
+    if (request.agent === "pitako.worker")
+      return host.result(request, { status: "complete", work: "No product changes", remaining: [] });
     const result = normal();
     if (request.agent === "pitako.execution-director" && (request.key.includes(".l1.") || allowException))
       result.structuredOutput.acceptance = [
@@ -767,6 +788,8 @@ test.each(["before-launch", "after-receipt"])("one-shot fresh acceptance survive
   expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
   expect(finalGates(host).filter(call => call.key.includes(".fresh.gate"))).toHaveLength(1);
   expect(host.current().freshAcceptanceAuthorized).toBe(false);
+  // Measured 106 including IPC Git and one shared runtime, plus eleven.
+  expectProcessBudget([host.processes(), acceptanceComposition.processes()], 117);
 });
 
 test("a new invocation has no reusable final acceptance record", async () => {

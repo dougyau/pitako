@@ -1,19 +1,27 @@
-import { afterEach, expect, test } from "bun:test";
+import { beforeAll, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beginHookEffect, captureBaseline, checkpointDirectory, checkpointTaskDelta, closeHookEffect, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { canonicalDigest, sha256 } from "../extensions/canonical.mjs";
+import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
+import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
-const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+const composition = realCheckoutCompositionFixture();
+const { roots, disposers } = composition;
+const runtime = nativeCheckpointFixture(composition);
+beforeAll(() => runtime.startNativeCheckpoint());
 const entry = path.resolve("skills/execute/loop-io.mjs");
 
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-task-delta-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, encoding: "utf8",
-    env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
+  const budget = processBudget(root); disposers.push(budget.dispose);
+  const git = (...args: string[]) => {
+    budget.counts.git++;
+    return execFileSync("git", args, { cwd: root, encoding: "utf8",
+      env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
+  };
   git("init", "-q");
   writeFileSync(path.join(root, "product"), "original");
   git("add", ".");
@@ -35,14 +43,24 @@ function fixture() {
     effect();
     closeHookEffect(intent, seq);
   }
-  function delta() {
+  function deltaCLI() {
+    budget.counts.loopIO++;
     return JSON.parse(execFileSync("node", [entry], { cwd: root, encoding: "utf8",
       input: JSON.stringify({ operation: "taskDelta", invocation: "delta", intents }) }));
   }
-  return { root, intents, attempt, edit, delta };
+  async function delta() {
+    const observed = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(), root,
+      missionPath: path.join(root, ".pi/mission.json"), intents,
+      loopIO: new URL("../skills/execute/loop-io.mjs", import.meta.url).href },
+    `async input => (await import(input.loopIO)).taskDelta({ root: input.root, invocation: "delta", intents: input.intents })`);
+    expect(observed?.[0], observed?.[2]).toBe(0);
+    return JSON.parse(observed![1]);
+  }
+  return { root, intents, attempt, edit, delta, deltaCLI,
+    processes: () => [budget.processes(), composition.processes()] };
 }
 
-test("slot delta retains touched paths across attempts but excludes reverted content", () => {
+test("slot delta retains touched paths across attempts but excludes reverted content", async () => {
   const f = fixture(), first = f.attempt();
   f.edit(first, ["product", "zeta"], () => {
     writeFileSync(path.join(f.root, "product"), "changed");
@@ -53,16 +71,18 @@ test("slot delta retains touched paths across attempts but excludes reverted con
     writeFileSync(path.join(f.root, "product"), "original");
     writeFileSync(path.join(f.root, "alpha"), "new");
   });
-  expect(f.delta()).toEqual({ touched: ["alpha", "product", "zeta"], netChanged: ["alpha", "zeta"], overflow: null });
-  expect(f.delta()).toEqual(f.delta());
+  expect(await f.delta()).toEqual({ touched: ["alpha", "product", "zeta"], netChanged: ["alpha", "zeta"], overflow: null });
+  expect(await f.delta()).toEqual(await f.delta());
+  // Measured 87: 47 parent Git + 39 IPC Git + one shared runtime; plus nine.
+  expectProcessBudget(f.processes(), 96);
 });
 
-test("unwritten and write-then-revert attempts have distinct touched evidence", () => {
+test("unwritten and write-then-revert attempts have distinct touched evidence", async () => {
   const f = fixture(), first = f.attempt();
-  expect(f.delta()).toEqual({ touched: [], netChanged: [], overflow: null });
+  expect(await f.delta()).toEqual({ touched: [], netChanged: [], overflow: null });
   f.edit(first, ["product"], () => writeFileSync(path.join(f.root, "product"), "temporary"));
   f.edit(first, ["product"], () => writeFileSync(path.join(f.root, "product"), "original"));
-  expect(f.delta()).toEqual({ touched: ["product"], netChanged: [], overflow: null });
+  expect(await f.delta()).toEqual({ touched: ["product"], netChanged: [], overflow: null });
 });
 
 test("net delta includes deletions and mode-only changes relative to dispatch WIP", () => {
@@ -73,16 +93,17 @@ test("net delta includes deletions and mode-only changes relative to dispatch WI
     rmSync(path.join(f.root, "prior-wip"));
     chmodSync(path.join(f.root, "product"), 0o755);
   });
-  expect(f.delta().netChanged).toEqual(["prior-wip", "product"]);
+  // This case retains real stdin/stdout CLI transport; repeated cases reuse IPC.
+  expect(f.deltaCLI().netChanged).toEqual(["prior-wip", "product"]);
 });
 
-test("more than 200 net changes publish a deterministic digest-verified overflow reference", () => {
+test("more than 200 net changes publish a deterministic digest-verified overflow reference", async () => {
   const f = fixture(), first = f.attempt();
   const files = Array.from({ length: 205 }, (_, index) => `new-${String(index).padStart(3, "0")}`);
   f.edit(first, [...files].reverse(), () => {
     for (const file of files) writeFileSync(path.join(f.root, file), file);
   });
-  const delta = f.delta();
+  const delta = await f.delta();
   expect(delta.touched).toEqual(files);
   expect(delta.netChanged).toEqual(files.slice(0, 200));
   expect(Object.keys(delta.overflow).sort()).toEqual(["digest", "path"]);
@@ -90,7 +111,7 @@ test("more than 200 net changes publish a deterministic digest-verified overflow
   expect(sha256(bytes)).toBe(delta.overflow.digest);
   expect(overflow.result).toEqual(files.slice(200));
   expect(overflow.resultDigest).toBe(canonicalDigest(overflow.result));
-  expect(f.delta()).toEqual(delta);
+  expect(await f.delta()).toEqual(delta);
 });
 
 test("slot delta fails closed on missing, mismatched or corrupt baseline and open journal effects", () => {

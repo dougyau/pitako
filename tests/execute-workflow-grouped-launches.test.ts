@@ -1,11 +1,12 @@
 import { expect, test } from "bun:test";
+import { expectProcessBudget } from "./fixtures/process-budget.ts";
 import path from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
-import { compositionFixture } from "./fixtures/plan-execute-composition.ts";
+import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 
-const composition = compositionFixture();
+const composition = realCheckoutCompositionFixture();
 const scripts = composition.scripts;
 const { fixture } = executeControllerFixture();
 
@@ -61,6 +62,8 @@ test("an observed no-journal pause keeps the previous unit in its next baseline"
   expect(second!.loop.attempt.checkpoint.progress.admitted.change2).toEqual(["continue"]);
   expect(second!.loop.attempt.checkpoint.progress.previous).toMatchObject({ taskId: "change1", attempt: 1 });
   expect(host.launches).toHaveLength(23);
+  // Measured zero controller processes + one shared runtime, plus two.
+  expectProcessBudget([host.processes(), composition.processes()], 3);
 });
 
 test.each(["step-order", "seal-kind", "after-candidate", "baseline-variant", "request-count", "native-artifacts"])("workflow rejects damaged %s close evidence before admission", async damage => {
@@ -115,7 +118,7 @@ test("capacity and positive activity prevent grouped redispatch", async () => {
 });
 
 test.each([false, true])("workflow admits actual grouped CLI projections and drains linked intentions (continuation: %s)", async continuation => {
-  const host = fixture();
+  const host = fixture(undefined, { realCheckout: true });
   host.setLimit(1);
   let workers = 0;
   host.setRespond((request, normal) => {

@@ -10,8 +10,12 @@ import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflo
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, removeCache, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
+import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
+import { expectProcessBudget } from "./fixtures/process-budget.ts";
 
 const { fixture } = executeControllerFixture();
+const recoveryComposition = realCheckoutCompositionFixture();
+const recoveryScripts = recoveryComposition.scripts;
 
 // Association/access witnesses belong to the in-progress manifest, not compact references.
 function observeInlineReviewOriginals(host: ReturnType<typeof fixture>) {
@@ -70,8 +74,12 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["gaps", "continue"])("a closed loop's %s pause cannot block the next loop's checkpoint recovery", async status => {
-    const host = fixture(); host.setLimit(2);
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(2);
     host.setRespond((request, normal) => {
+      if (request.agent === "pitako.checkpoint-sealer" ||
+          request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+        return recoveryScripts.runDeterministic(request.key, request,
+          { ...recoveryScripts, root: host.root, inlineSealer: true }, undefined);
       if (request.agent === "pitako.worker" && request.key.includes(".l1.t1."))
         return host.result(request, { ...host.worker(request, "pause"), status,
           remaining: ["Same pending defect"], diagnosis: "Still pending",
@@ -101,6 +109,8 @@ describe("workflow-owned execute controller", () => {
     expect(output.status, output.reason).toBe("partial");
     expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a2")).toHaveLength(1);
     expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 2, cursor: 1 } });
+    // Measured 194 including IPC Git and one shared runtime, plus twenty.
+    expectProcessBudget([host.processes(), recoveryComposition.processes()], 214);
   });
 
   test.each(["spawn", "nonzero", "stdout", "published-crash", "state-save"])(
@@ -184,7 +194,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["unit", "pause"].flatMap(kind => ["none", "resolution-cut"].map(cut => [kind, cut])))(
     "v6 stale %s seal Stop requires fresh human input before any archiver dispatch (%s)", async (kind, cut) => {
-    const host = fixture(); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
     host.setLaunchRespond((request, normal) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain"
       ? { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "" } : normal());
     host.setRespond((request, normal) => {
@@ -228,7 +238,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("v6 a post-publication persistence cut resumes identical bytes before moving the cursor", async () => {
-    const host = fixture(); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
     host.setFailSave(value => value.ledger?.count === 3 && !value.intentions?.length);
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
@@ -244,7 +254,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("v6 admission-to-archive halt cannot enter frozen record bytes", async () => {
-    const host = fixture(); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
     let cut = false;
     const set = host.state.set;
     host.state.set = async (key, value: any) => {
@@ -456,7 +466,7 @@ describe("workflow-owned execute controller", () => {
 
   // Missing preimages cannot be repaired by replanning or accepting a report.
   test("changed implementation without a pre-capture manifest blocks without admitting the unit", async () => {
-    const host = fixture("FULL SPECS");
+    const host = fixture("FULL SPECS", { realCheckout: true });
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.key === "invoke-human-1.l1.t1.a1") {
@@ -960,7 +970,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["settled", "unknown", "permission", "current-stop"])(
     "historical worker %s uses checkpoint-first recovery without redispatch", async mode => {
-      const host = fixture(); host.setLimit(1);
+      const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
       const target = "invoke-human-1.l1.t1.a1";
       host.setRespond((request, normal) => request.key !== target ? normal() : mode === "unknown"
         ? { ...normal(), ok: false, stopped: true }
@@ -2291,7 +2301,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["compliance", "adversarial", "candidate-drift"])("three %s gaps report exhaustion on every emission and replay without renewing slots", async mode => {
-    const host = fixture("FULL SPECS", { findings: true, taskCount: 0 });
+    const host = fixture("FULL SPECS", { realCheckout: mode === "candidate-drift", findings: true, taskCount: 0 });
     host.setRespond((request, normal) => {
       const result = normal();
       if (mode === "compliance" && request.key.endsWith(".compliance")) return gaps(result);
@@ -2335,7 +2345,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["compliance", "adversarial", "candidate-drift"])("third-loop %s closing persistence suspension reports recovery before exhaustion without repeating work", async mode => {
-    const host = fixture("FULL SPECS", { findings: true, taskCount: 0 });
+    const host = fixture("FULL SPECS", { realCheckout: mode === "candidate-drift", findings: true, taskCount: 0 });
     host.setRespond((request, normal) => {
       const result = normal();
       if (mode === "compliance" && request.key.endsWith(".compliance")) return gaps(result);
@@ -2407,7 +2417,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("candidate drift at the single closing comparison invalidates checks/review/compliance and goes to next director", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); host.setObservationResponse((key, value) => {
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setObservationResponse((key, value) => {
       if (key === "invoke-human-1.l1.checkout") { host.changeCheckout(); return { ...value, checkout: { ...host.observedCandidate() } }; } return value;
     });
     expect((await host.execute()).status).toBe("complete");
@@ -2517,7 +2527,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("missing writer inventory continues only through checkpoint-first restoration of the selected task", async () => {
-    const host = fixture(undefined, { readOnly: true }); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true, readOnly: true }); host.setLimit(1);
     cutAt(host, value => !!value.loop?.attempt?.launch);
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     host.setStatus(ref => ref.includes(".t1.a1") ? { ok: true, results: [] } : copy(host.native.get(ref)!));
@@ -2602,7 +2612,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["none", "before-intent", "before-launch", "before-result", "before-cursor", "after-cursor"])(
     "a missing worker report uses checkpoint-first continuation across %s without an inspector or repeated writer", async cut => {
-      const host = fixture(undefined, { readOnly: true });
+      const host = fixture(undefined, { realCheckout: true, readOnly: true });
       host.setRespond((request, normal) => {
         if (request.key === "invoke-human-1.l1.t1.a1") {
           const result = normal(); // The original captured real preimages before losing its report.
@@ -2766,7 +2776,7 @@ describe("workflow-owned execute controller", () => {
     ["unrelated body run", "State: running", false],
     ["unrelated output", "State: complete\nOutput: /native/running-stopped-recovery.txt", false],
   ])("installed wrapped status distinguishes %s from actual writer activity", async (mode, body, active) => {
-    const host = fixture(undefined, { readOnly: true });
+    const host = fixture(undefined, { realCheckout: true, readOnly: true });
     cutAt(host, value => !!value.loop?.attempt?.launch);
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
         host.setRespond((request, normal) => {
@@ -2795,7 +2805,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each([["plan", "stopped"], ["writer", "stopped"], ["plan", "interrupted"], ["writer", "interrupted"]])("observed %s recovery %s preserves barriers without repeating work", async (phase, signal) => {
-    const host = fixture(undefined, { readOnly: true });
+    const host = fixture(undefined, { realCheckout: true, readOnly: true });
     cutAt(host, value => phase === "plan" ? value.loop?.plan?.stage === "published" : !!value.loop?.attempt?.launch);
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     if (phase === "plan") removeCache(host);
@@ -2851,7 +2861,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["stopped", "interrupted", "remembered-stop", "remembered-interruption", "permission"])("exact native status %s is classified without reattachment", async mode => {
-    const host = fixture(undefined, { readOnly: true });
+    const host = fixture(undefined, { realCheckout: true, readOnly: true });
     cutAt(host, value => !!value.loop?.attempt?.launch);
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     host.setRespond((request, normal) => {
@@ -2880,7 +2890,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("model reason cannot impersonate an observed native cancellation", async () => {
-    const host = fixture(undefined, { readOnly: true });
+    const host = fixture(undefined, { realCheckout: true, readOnly: true });
     cutAt(host, value => !!value.loop?.attempt?.launch);
     expect((await host.execute()).status).toBe("partial"); host.setFailSave();
     host.setRespond((request, normal) => {
@@ -2916,7 +2926,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["same", "changed"])("reused result is phase/candidate aware for %s candidate, not an automatic veto or success", async mode => {
-    const host = fixture(); host.setRespond((request, normal) => ({ ...normal(), reused: true }));
+    const host = fixture(undefined, { realCheckout: true }); host.setRespond((request, normal) => ({ ...normal(), reused: true }));
     expect((await host.execute()).status).toBe("complete");
     const count = host.calls.length, tokens = (await host.execute()).tokens;
     expect(host.calls).toHaveLength(count);
@@ -2936,7 +2946,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("candidate changed after closing persistence cut invalidates cached gates without a second close in that loop", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); cutAt(host, value => value.loop?.phase === "finished");
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); cutAt(host, value => value.loop?.phase === "finished");
     expect((await host.execute()).status).toBe("partial"); host.setFailSave(); host.changeCheckout();
     expect((await host.execute()).status).toBe("complete");
     expect(host.history()).toHaveLength(2);
@@ -3075,7 +3085,7 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["worker-stop", "review-stop", "permission", "timeout"])("native %s is not green or an inferred invocation timeout cancellation", async mode => {
-    const host = fixture(undefined, { readOnly: true, taskCount: mode === "review-stop" ? 0 : 1 }); host.setRespond((request, normal) => {
+    const host = fixture(undefined, { realCheckout: true, readOnly: true, taskCount: mode === "review-stop" ? 0 : 1 }); host.setRespond((request, normal) => {
       if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
         const saved = host.current(), restore = saved.loop.attempt.restore;
         restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
@@ -3234,7 +3244,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
   };
 
   test("an interrupted task restores before a fresh same-task worker and reaches final verification", async () => {
-    const fx = fixture(undefined, { readOnly: true });
+    const fx = fixture(undefined, { realCheckout: true, readOnly: true });
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return {
         ...normal(), ok: false, structuredOutput: undefined, state: "interrupted", results: [],
@@ -3257,7 +3267,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
   });
 
   test.each(["before-restoration-launch", "before-result-save", "after-result-save"])("reconciles %s without repeating the interrupted or restored writer", async cut => {
-    const fx = fixture(undefined, { readOnly: true }); fx.setLimit(1);
+    const fx = fixture(undefined, { realCheckout: true, readOnly: true }); fx.setLimit(1);
     cutAt(fx, value => cut === "after-result-save" ? value.loop?.cursor === 1
       : value.loop?.attempt?.key.endsWith(".a2") && (cut === "before-restoration-launch"
         ? value.loop.attempt.restore?.undispatched === true : value.loop.attempt.stage === "result"));
@@ -3280,7 +3290,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
   });
 
   test("a pending restoration successor is observed, never replaced by another key", async () => {
-    const fx = fixture(undefined, { readOnly: true }); fx.setLimit(1);
+    const fx = fixture(undefined, { realCheckout: true, readOnly: true }); fx.setLimit(1);
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
       if (request.key.endsWith(".t1.a2")) {
@@ -3300,7 +3310,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
   });
 
   test("a previously pending restoration successor is admitted when its exact result settles", async () => {
-    const fx = fixture(undefined, { readOnly: true }); fx.setLimit(1);
+    const fx = fixture(undefined, { realCheckout: true, readOnly: true }); fx.setLimit(1);
     let successor: Result | undefined;
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
@@ -3411,7 +3421,7 @@ describe("compact admission", () => {
 describe("native closing observations", () => {
   test("four host-free final closes interleaved with repair tasks preserve singleton implicit waiting and distinct evidence", async () => {
     // Closing evidence is the subject; real checkpoint sealing is covered by the sealer and recovery suites.
-    const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true }); host.setLimit(10);
+    const host = fixture(undefined, { readOnly: true }); host.setLimit(10);
     host.setRespond((request, normal) => {
       const result = normal();
       // Each of the first two loops stalls a distinct task, not the same task twice.
@@ -3480,7 +3490,7 @@ describe("native closing observations", () => {
   });
 
   test.each(["validated", "recovered"])("%s closing evidence after a save cut cannot certify a changed checkout", async mode => {
-    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(1);
     cutAt(host, value => mode === "validated" ? !!value.loop?.closing :
       value.loop?.observation?.stage === "receipt");
     expect((await host.execute()).status).toBe("partial");

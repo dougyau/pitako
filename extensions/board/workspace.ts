@@ -3,6 +3,7 @@ import { lstatSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { canonicalPath } from "./paths.ts";
 import { PitakoConfigError } from "../errors.ts";
+import { gitProcessStarted } from "../git-process-observer.ts";
 
 /** Physical Git worktree root, or the canonical cwd when this directory is not a repository. */
 export function currentWorkspace(cwd = process.cwd()): string {
@@ -60,6 +61,7 @@ function gitPaths(cwd: string): { worktreeRoot: string; commonDir: string } | un
 }
 
 function revParse(cwd: string, args: string[]): string {
+  gitProcessStarted(cwd);
   const output = execFileSync("git", ["rev-parse", ...args], {
     cwd,
     encoding: "utf8",
@@ -126,6 +128,7 @@ interface WorktreeEntry {
 export function registeredWorktrees(root: string, commonDir: string, strict = false): string[] {
   let output: string;
   try {
+    gitProcessStarted(root);
     output = execFileSync("git", ["worktree", "list", "--porcelain", "-z"], {
       cwd: root,
       encoding: "utf8",

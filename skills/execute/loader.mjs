@@ -12,6 +12,7 @@ const sources = new Set([
   "./inspect.ts",
   "./observe.ts",
   "../../extensions/spec-plans.ts",
+  "../../extensions/git-process-observer.ts",
   "../../extensions/execute-retained.ts",
   "../../extensions/execute-checkpoint.ts",
   "../../extensions/execute-state.ts",
@@ -32,4 +33,3 @@ registerHooks({
         : stripTypeScriptTypes(readFileSync(new URL(url), "utf8"), { sourceUrl: url }) };
   },
 });
-

@@ -60,7 +60,7 @@ test("inherited-only findings remain notes and do not block", async () => {
 });
 
 test("actual write then revert remains review-eligible with empty netChanged", async () => {
-  const host = fixture(); host.setLimit(1);
+  const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.worker") {
