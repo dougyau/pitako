@@ -3410,7 +3410,8 @@ describe("compact admission", () => {
 
 describe("native closing observations", () => {
   test("four host-free final closes interleaved with repair tasks preserve singleton implicit waiting and distinct evidence", async () => {
-    const host = fixture(undefined, { readOnly: true }); host.setLimit(10);
+    // Closing evidence is the subject; real checkpoint sealing is covered by the sealer and recovery suites.
+    const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true }); host.setLimit(10);
     host.setRespond((request, normal) => {
       const result = normal();
       // Each of the first two loops stalls a distinct task, not the same task twice.
