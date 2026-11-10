@@ -116,14 +116,16 @@ narrative outside findings remain recoverable; every finding gets a disposition.
 Essential-original references explain why the exact original is needed. Before
 each consuming phase (critique, defense, synthesis) the workflow dispatches the
 model-free `pitako.access-verifier` once over the phase's required originals. It
-compares each published file with the admitted value in canonical form and
-writes a no-clobber receipt under the mission directory
-(`<mission>/receipts/review/<gate>.json`). A contradictory or unavailable
-original blocks the whole phase before dispatch with an explanation naming the
-original, key, path, differing JSON pointers and the action to take; a verifier
-failure is reported as "verification did not run". No model creates, chooses or
-copies receipts, IDs, paths or digests; reviewers receive the verified originals
-inline. Receipts follow mission retention; check them later with the
+compares the canonical JSON digest of each published file with the digest saved
+in review state (state keeps references, not values) and writes a no-clobber
+receipt under the mission directory (`<mission>/receipts/review/<gate>.json`).
+A contradictory or unavailable original blocks the whole phase before dispatch
+with an explanation naming the original, key, path, expected and observed
+digests and the action to take; a verifier failure is reported as
+"verification did not run". No model creates, chooses or copies receipts, IDs,
+paths or digests; reviewers read each verified original in full by its
+`savedOutputPath`. Review state keeps a value inline only for a failed,
+unpublished original with no path. Receipts follow mission retention; check them later with the
 `access_receipt_verify` tool or `node <pitako>/extensions/access-receipts.mjs check <receipt>`.
 
 Retain actual `results[].savedOutputPath`, returned reference objects and text

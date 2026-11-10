@@ -64,7 +64,7 @@ test("a later failing designated check turns the notice unfulfilled without chan
 
 test("specs without a criteria anchor keep the director prompt and view unchanged", async () => {
   for (const anchor of [undefined, null, { spec: "fix-spec" }]) {
-    const host = fixture(undefined, { readOnly: true });
+    const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true });
     const prompts = marking(host, { "full": [1] });
     const outcome = await host.execute(anchor === undefined ? {} : { originalProblem: anchor });
     expect(outcome.status).toBe("complete");

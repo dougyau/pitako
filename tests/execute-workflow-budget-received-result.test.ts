@@ -29,23 +29,23 @@ function relaunchStatus(host: ControllerHost) {
       : { ok: true, output: "", results: [] };
   });
 }
-// Requests, gates and sealing share one native close admission.
+// Complete results gate before review; incomplete results retain grouped close.
 function exhaustAfterWorker(host: ControllerHost, shape?: (result: Result) => Result) {
   let denied: string | undefined;
   host.setRespond((request, normal) => request.key === worker && shape ? shape(normal()) : normal());
   host.setLaunchRespond((request, normal) => {
-    if (!denied && request.key === `${worker}.close`) { denied = request.key; return receipt(request.key); }
+    if (!denied && request.key === `${worker}.${shape ? "close" : "gate"}`) { denied = request.key; return receipt(request.key); }
     return normal();
   });
   return () => denied;
 }
 
-test("a complete worker result received before grouped close budget exhaustion is sealed and admitted on relaunch, not restored", async () => {
+test("a complete worker result received before gate budget exhaustion is reviewed, sealed and admitted on relaunch, not restored", async () => {
   const host = fixture(undefined, { taskCount: 1 });
   const denied = exhaustAfterWorker(host);
   const first = await host.execute();
   expect(first.status, first.reason).toBe("budget-exhausted");
-  expect(denied()).toBe(`${worker}.close`);
+  expect(denied()).toBe(`${worker}.gate`);
   expect(host.current().loop.attempt).toMatchObject({ key: worker, stage: "launched" });
   expect(checkpoint(host, worker, "manifest.json")).toBe(true);
   expect(checkpoint(host, worker, "unit.json")).toBe(false);
@@ -57,7 +57,7 @@ test("a complete worker result received before grouped close budget exhaustion i
   expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(false);
   expect(host.calls.filter(call => call.key === worker)).toHaveLength(1);
   expect(host.calls.filter(call => call.key === `${worker}.seal`)).toHaveLength(1);
-  expect(host.launches.filter(call => call.key === `${worker}.close`)).toHaveLength(2);
+  expect(host.launches.filter(call => call.key === `${worker}.gate`)).toHaveLength(2);
   expect(checkpoint(host, worker, "unit.json")).toBe(true);
   expect(checkpoint(host, worker, "restore.json")).toBe(false);
   expect(host.calls.filter(call => call.key === `${worker}.gate`)).toHaveLength(1);

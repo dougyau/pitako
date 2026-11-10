@@ -2,7 +2,10 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
+import { createRequire } from "node:module";
 import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
+import { canonicalDigest } from "./canonical.mjs";
+const { safePath } = createRequire(import.meta.url)("./hash-ledger.mjs") as { safePath(file: string): string };
 
 const record = (value: unknown): value is Record<string, unknown> =>
 	!!value && typeof value === "object" && !Array.isArray(value);
@@ -60,6 +63,39 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		if (record(call) && call.key === `invoke-${context.invocation}.l${loop.number}.demand-observation` &&
 			(loop.phase !== "director" || loop.plan || !record(call.ref) || typeof call.ref.runId !== "string")) continue;
 		const reference = record(call) ? call.ref : undefined;
+		// Settled task reviews grow during this very resource's replay, not at admission.
+		if (bound && record(reference) && typeof call.key === "string" &&
+			call.key.startsWith(`invoke-${context.invocation}.l${loop.number}.`) &&
+			/\.t\d+\.a\d+\.task-(reviewer|synthesis)$/.test(call.key)) {
+			const taskResults = record(invocation.tasks) ? Object.values(invocation.tasks).filter(record)
+				.flatMap(task => [task.last, task.completed]) : [];
+			const attempts = [loop.attempt, ...(Array.isArray(loop.results) ? loop.results : []), ...taskResults].filter(record);
+			const saved = attempts.flatMap(attempt => record(attempt.taskReview) ? Object.values(attempt.taskReview) : [])
+				.find(value => record(value) && value.key === call.key);
+			if (record(saved) && saved.key === reference.key && saved.runId === reference.runId &&
+				typeof saved.key === "string" && typeof saved.runId === "string" &&
+				typeof saved.path === "string" && typeof saved.digest === "string") {
+				if (!path.isAbsolute(saved.path) || !/^[a-f0-9]{64}$/.test(saved.digest))
+					throw new Error("Invalid retained task review publication reference.");
+				let bytes: string;
+				try { bytes = readFileSync(safePath(saved.path), "utf8"); }
+				catch { throw new Error(`Retained review original ${saved.key} missing at ${saved.path}.`); }
+				if (canonicalDigest(JSON.parse(bytes)) !== saved.digest)
+					throw new Error(`Published review original integrity conflict with admitted digest: ${saved.key} at ${saved.path}.`);
+				const native = typeof reference.asyncDir === "string" ? readJson(path.join(reference.asyncDir, "status.json")) : undefined;
+				if (native !== undefined && (!record(native) || native.runId !== saved.runId ||
+					native.workflowKey !== undefined && native.workflowKey !== saved.key ||
+					native.cwd !== undefined && native.cwd !== root ||
+					native.state !== "complete" || (Array.isArray(native.steps) && native.steps.some(step =>
+						record(step) && (step.stopped || step.interrupted || step.detached || step.exitCode !== undefined && step.exitCode !== 0 ||
+							step.structuredOutput !== undefined && canonicalDigest(step.structuredOutput) !== saved.digest)))))
+					throw new Error("Retained task review native producer conflicts with its settled reference.");
+				if ([reference, ...(Array.isArray(reference.results) ? reference.results : [])].some(value =>
+					record(value) && (value.stopped || value.interrupted || value.detached)))
+					throw new Error("Retained task review has a native barrier.");
+				continue;
+			}
+		}
 		if (record(reference) && !refs.some(ref => record(ref) && ref.key === reference.key))
 			refs.push(reference);
 	}
@@ -82,6 +118,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 			const prefix = `invoke-${context.invocation}.l${loop.number}.`;
 			if (typeof ref.key !== "string" ||
 				!(ref.key.startsWith(`${prefix}review.`) || ref.key === `${prefix}compliance` ||
+					ref.key.startsWith(prefix) && /^t\d+\.a\d+\.task-(reviewer|synthesis)$/.test(ref.key.slice(prefix.length)) ||
 				ref.key === `${prefix}demand-observation` && loop.phase === "director" && !loop.plan ||
 				ref.key.startsWith(`${prefix}recover`) && recoveries.some(item => record(item.ref) &&
 					item.ref.key === ref.key && isDeepStrictEqual(item.ref, ref))) ||

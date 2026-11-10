@@ -10,6 +10,7 @@ import { resolveWorkflowResource } from "../node_modules/pi-subagents/src/workfl
 import { consumeWorkflowResourcePermit } from "../node_modules/pi-subagents/src/shared/workflow-child-permit.js";
 import { runWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { executionResource } from "../extensions/plan-execute.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { digest, preliminarySpec, SPEC_SECTIONS, checkoutEvidence, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { planExecute, checkout, missionFiles, childResponse, registeredCheckpoint, compositionFixture, nativeCheckpointFixture, assignmentSpec, resourceWithAgentDir } from "./fixtures/plan-execute-composition.ts";
 import { prepare, apply, readBacklog, updateProgress, reviewOriginals } from "../skills/execute/loop.ts";
@@ -50,7 +51,7 @@ describe("plan/execute packaged composition", () => {
       if (!resource.ok) throw Error(resource.error);
       const permit = consumeWorkflowResourcePermit(resource.resource.permit, resource.resource.script);
       if (typeof permit === "string") throw Error(permit);
-      const metadata = { ...deterministicScripts, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } };
+      const metadata = { ...deterministicScripts, inlineLoopIO: true, inlineSealer: true, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } };
       const script = resource.resource.script;
       const input = { mode, root, nativeRoot, missionPath, statePath, metadata, script,
         loopLoader: new URL("../skills/execute/loader.mjs", import.meta.url).href,
@@ -95,8 +96,19 @@ describe("plan/execute packaged composition", () => {
             }
           } },
           host: async (key: string, request: any) => {
-            const stdout = key === "fixture-closing" ? JSON.stringify({ ...input.metadata, checkout: candidate() })
-              : io.execFileSync("sh", ["-c", request.command], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+            let stdout;
+            if (key === "fixture-closing") stdout = JSON.stringify({ ...input.metadata, checkout: candidate() });
+            // Keep the real shell/Node transport in one case; recovery variants
+            // reuse the inspector loaded in this file-owned Node process.
+            else if (input.mode === "restored") stdout = io.execFileSync("sh", ["-c", request.command], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
+            else {
+              const argv = [...request.command.matchAll(/'((?:[^']|'\\'')*)'/g)].map(match => match[1].replaceAll("'\\''", "'"));
+              const entry = new URL("./inspect.mjs", input.loopLoader);
+              if (argv[0] !== "node" || argv[1] !== require("node:url").fileURLToPath(entry) ||
+                  argv.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ") !== request.command)
+                throw Error("Unexpected inspection command: " + request.command);
+              stdout = await (await import(new URL("./inspect.ts", input.loopLoader).href)).inspect(argv.slice(2));
+            }
             const value = JSON.parse(stdout); if (value.admission) value.admission.maxCycles = 1; if (value.checkpoint) observations.push(value.checkpoint);
             if (value.checkpointObservation) witnesses.push(value.checkpointObservation);
             return { key, kind: "command", state: "passed", ok: true, exitCode: 0, stdout: JSON.stringify(value), stderr: "", durationMs: 0, outputPath: input.nativeRoot + "/" + key + ".log" };
@@ -132,12 +144,13 @@ describe("plan/execute packaged composition", () => {
             calls.push(key);
             if (request.agent === "pitako.loop-io") {
               const { operation, ...data } = JSON.parse(request.task);
-              if (["advance", "selection", "close", "drain"].includes(operation)) {
+              if (["advance", "selection", "close", "drain", "taskDelta"].includes(operation)) {
                 input.metadata.groupedHooks = { afterStep: (step: string) => {
                   const intention = data.intentions?.find((entry: any) => entry.key === step && entry.operation === "ledger");
                   if (intention) archives.push(structuredClone(intention.input.record));
                 } };
-                return await response(key, request, input.metadata, candidate());
+                // Real grouped/delta operations observe their own checkout.
+                return await response(key, request, input.metadata, undefined);
               }
               const value = operation === "baseline" ? io.captureBaseline(data) : await loopIo[operation](data);
               if (operation === "apply") value.view = (await loopIo.prepare({ ...data, taskId: value.selected?.id, previousConfirmedUnit: null })).view;
@@ -150,7 +163,7 @@ describe("plan/execute packaged composition", () => {
             if (request.agent === "pitako.execution-inspector") throw Error("Checkpoint recovery must not require an inspector chain");
             // Only final checks/compliance consume the candidate; restored unit
             // results get their actual post-write identity below.
-            const needsCandidate = request.agent === "pitako.checkpoint-sealer" || request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
+            const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
             const result = await response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
             if (request.agent === "pitako.worker" && key.endsWith(".t1.a1")) {
               const intent = storage.get("invoke-human-1").loop.attempt.checkpoint;
@@ -337,7 +350,7 @@ describe("plan/execute packaged composition", () => {
         calls.push(key);
         if (request.agent === "pitako.loop-io") {
           const { operation, ...data } = JSON.parse(request.task);
-          if (["advance", "selection", "close", "drain"].includes(operation)) {
+          if (["advance", "selection", "close", "drain", "taskDelta"].includes(operation)) {
             return await childResponse(key, request, metadata, checkout);
           }
           const input = { ...data, dbPath: path.join(root, ".pi/test-board.db") };
@@ -428,7 +441,7 @@ describe("plan/execute packaged composition", () => {
         calls.push(key);
         if (request.agent === "pitako.loop-io") {
           const { operation, ...data } = JSON.parse(request.task);
-          if (["advance", "selection", "close", "drain"].includes(operation)) {
+          if (["advance", "selection", "close", "drain", "taskDelta"].includes(operation)) {
             metadata.groupedHooks = { afterStep: (step: string) => {
               const intention = data.intentions?.find((entry: any) => entry.key === step && entry.operation === "ledger");
               if (intention?.input.record.body.frame) archivedFrame = structuredClone(intention.input.record.body.frame);
@@ -582,7 +595,7 @@ describe("plan/execute packaged composition", () => {
           if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(String(request.task)));
           if (request.agent === "pitako.loop-io") {
             const input = JSON.parse(String(request.task));
-            if (["advance", "selection", "close", "drain"].includes(input.operation)) {
+            if (["advance", "selection", "close", "drain", "taskDelta"].includes(input.operation)) {
               const response = input.operation === "advance" && mode === "decision-overflow"
                 ? { key, agent: request.agent, runId: `native-${key}`, ok: false, output: JSON.stringify({
                   error: "loop-io", reason: "Current DECISIONs exceed 8 KiB; ask the human to consolidate them.", viewOverflow: true }), results: [{ exitCode: 1 }] }
@@ -709,9 +722,9 @@ describe("plan/execute packaged composition", () => {
       expect(expected.value).toMatchObject({ status: ["complete", "recovered", "rejected-plan", "mismatched-association"].includes(mode) || recoveredHost ? "complete" : mode === "stopped" || mode.endsWith("-stop") ? "cancelled" : "blocked",
         ...hostTarget && !recoveredHost ? { status: "blocked" } : {},
         loopsConsumed: recoveredHost ? 2 : hostTarget && hostTarget !== "inspect-loop-1" ? 0 : ["complete", "recovered", "mismatched-association"].includes(mode) || analysisTarget ? 2 : mode === "rejected-plan" ? 3 : 1 });
-      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate|baseline)(?:\.d1)?(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 9 : mode.includes("-later-") ? 11 : 14
-        : recoveredHost ? 16 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
-        : mode === "decision-overflow" ? 1 : ["complete", "mismatched-association"].includes(mode) ? 16 : mode === "recovered" ? 17 : mode === "rejected-plan" ? 21 : ["stopped", "permission"].includes(mode) ? 4 : mode === "unresolved-plan" ? 3 : 1);
+      expect(calls.filter(key => !key.includes(".requests-") && !/\.(prepare|selection|settlement|gate|baseline)(?:\.d1)?(?:\.r\d+)?$/.test(key) && !key.includes(".review.verify-") && !/\.seal(?:\.r\d+)?$/.test(key))).toHaveLength(analysisTarget ? mode.includes("-prepare-") ? 11 : mode.includes("-later-") ? 13 : 16
+        : recoveredHost ? 18 : hostTarget ? hostTarget === "inspect-loop-1" ? 7 : 0
+        : mode === "decision-overflow" ? 1 : ["complete", "mismatched-association"].includes(mode) ? 18 : mode === "recovered" ? 19 : mode === "rejected-plan" ? 23 : ["stopped", "permission"].includes(mode) ? 4 : mode === "unresolved-plan" ? 3 : 1);
       if (mode === "decision-overflow") {
         expect((expected.value as any).reason).toContain("human to consolidate");
         expect(calls).toEqual(["invoke-human-1.l1.advance"]);
@@ -735,7 +748,7 @@ describe("plan/execute packaged composition", () => {
       }
       if (mode === "recovered") {
         expect(readBacklog(root, "assignment").backlog!.tasks.find(task => task.id === "final")!.status).toBe("done");
-        expect(calls).toContain("invoke-human-1.l1.t1.a2.close");
+        expect(calls).toContain("invoke-human-1.l1.t1.a2.gate");
         expect(calls.filter(key => /\.t1\.a\d+$/.test(key))).toHaveLength(2);
         expect(calls.filter(key => key.includes(".recover"))).toHaveLength(0);
       }
@@ -941,10 +954,10 @@ describe("plan/execute packaged composition", () => {
       const resource = resourceWithAgentDir(global).resolve({ root, id: "assignment", invocation: "human-1",
         missionId: "native.mission-1", missionPath });
       const association = { root, missionId: "native.mission-1", missionPath, invocation: "human-1", maxCycles: 5, sourceRefs: [] };
-      const retained = { version: mode === "v4" ? 4 : 6, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
+      const retained = { version: mode === "v4" ? 4 : EXECUTE_STATE_VERSION, ...(mode === "partial-without-association" ? { snapshot: { content: "partial" } } :
         { association: mode === "partial-association" ? {} : { ...association, ...(mode === "foreign" ? { missionId: "other" } : {}) } }) };
       const state: Record<string, any> = { "invoke-human-1": retained,
-        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: 6, association: { ...association, invocation: "other" } } } : {}) };
+        ...(mode === "legacy-conflict" ? { "pitako-execution": { version: EXECUTE_STATE_VERSION, association: { ...association, invocation: "other" } } } : {}) };
       const original = JSON.stringify(state); writeFileSync(statePath, original);
       const command = resource.hostCommands.find(grant => grant.key === "inspect-initial")!.command;
       // The inspector itself must not hide the conflict behind invalid settings.
@@ -1010,7 +1023,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
             let result;
             if (request.agent === "pitako.loop-io") {
               const {operation,...payload} = JSON.parse(request.task);
-              if (["advance","selection","close","drain"].includes(operation)) {
+              if (["advance","selection","close","drain","taskDelta"].includes(operation)) {
                 result = await response(key, request, {...input.metadata, loopIO:input.packageRoot+"/skills/execute/loop-io.mjs"}, input.checkout);
               } else {
                 const value = operation === "baseline" ? captureBaseline(payload) : await loopIo[operation](payload);
@@ -1081,7 +1094,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
     expect(observed.calls.some((call: any) => call.resume)).toBe(false);
     expect(observed.invocation.consumedLoops).toBe(1);
     expect(readFileSync(path.join(root, "owned"), "utf8")).toBe("Existing interrupted-unit WIP");
-    const gates = observed.calls.filter((call: any) => call.key.endsWith(".close"));
+    const gates = observed.calls.filter((call: any) => call.key === "invoke-human-1.l1.t1.a2.gate");
     if (mode === "pending") {
       expect(observed.second.status).not.toBe("complete");
       expect(observed.backlog.tasks[0].status).toBe("pending");
@@ -1156,7 +1169,7 @@ test("registered Node public root resume consumes durable results and closes the
           let result;
           if (request.agent === "pitako.loop-io") {
             const {operation,...payload} = JSON.parse(request.task);
-            if (["advance","selection","close","drain"].includes(operation)) {
+            if (["advance","selection","close","drain","taskDelta"].includes(operation)) {
               result = await response(key, request, {...metadata, loopIO:input.packageRoot+"/skills/execute/loop-io.mjs"}, input.checkout);
             } else {
               const value = operation === "baseline" ? captureBaseline(payload) : await loopIo[operation](payload);
@@ -1247,7 +1260,9 @@ test("registered Node public root resume consumes durable results and closes the
     expect(observed.successor.workflow.resumeOrigin).toMatchObject({sourceRunId:observed.sourceId,attempt:1});
     expect(observed.successor.workflow.value.status).toBe("partial");
     expect(observed.backlog.tasks[0]).toMatchObject({id:"unit",status:"done"});
-    expect(observed.calls.filter((key:string)=>key.endsWith(".close"))).toHaveLength(1);
+    expect(observed.calls.filter((key:string)=>key === "invoke-human-1.l1.t1.a1.gate")).toHaveLength(1);
+    expect(observed.calls.filter((key:string)=>/\.task-(reviewer|synthesis)$/.test(key))).toEqual([
+      "invoke-human-1.l1.t1.a1.task-reviewer", "invoke-human-1.l1.t1.a1.task-synthesis"]);
     expect(observed.again.isError).toBe(true);
     expect(JSON.stringify(observed.again.content)).toContain(observed.claim.newRunId);
   });

@@ -119,8 +119,11 @@ Return `{work, status, remaining, knowledge:{findings, handoff}}`, with status
 complete, continue, gaps or blocked, instead of the generic prose shape above.
 No per-check evidence or candidate identities are required. The workflow runs
 the metric and focused gates after you settle, then chooses unit only for a
-complete result with passing gates and no mutation; otherwise it seals pause
-and continues this same task. Do not run the full acceptance suite in task loops.
+complete result with passing gates and no mutation; a complete file-writing
+result also needs admission by a read-only task review. Otherwise it seals
+pause and continues this same task. A review rejection allows one same-slot
+repair; a rejected or incomplete repair, or failed repair gates, leaves gaps.
+The workflow chooses the seal; you do not. Do not run the full acceptance suite in task loops.
 Knowledge defects never reject an otherwise valid result. Keep handoff at most
 2 KB: describe current repository state (locations, seams, metric value), not
 agent narrative or next steps. Pending work belongs in remaining/the backlog;

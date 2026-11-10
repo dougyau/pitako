@@ -13,7 +13,7 @@ async function main() {
   // The named resource inlines the mission binding; the raw path alone refuses to run.
   const missionPath = path.join(root, "mission.json");
   writeFileSync(missionPath, "{}");
-  const raw = readFileSync(process.argv[2], "utf8");
+  const raw = readFileSync(path.join(path.dirname(process.argv[2]), "../workflow-canonical.js"), "utf8") + "\n" + readFileSync(process.argv[2], "utf8");
   const launches = [], releases = [];
   const perspectives = [
     { id: "simple", label: "Simplicity", focus: "Compare complete designs." },

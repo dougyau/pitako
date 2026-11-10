@@ -9,7 +9,7 @@ const retry = first + ".d1";
 const selection = "invoke-human-1.l1.selection";
 
 test("first validation rejection retries in-loop without changing backlog bytes or progress", async () => {
-  const host = fixture(undefined, { taskCount: 2 });
+  const host = fixture(undefined, { taskCount: 2, controlledCheckpoints: true });
   const backlog = path.join(host.root, ".pitako/backlog/spec.json");
   let before: string | undefined;
   host.setRespond((request, normal) => {

@@ -2,7 +2,9 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { readReviewOriginal, readBacklog } from "../skills/execute/loop.ts";
+import { canonicalDigest } from "../extensions/canonical.mjs";
 import { restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
@@ -17,7 +19,7 @@ function observeInlineReviewOriginals(host: ReturnType<typeof fixture>) {
   host.setSaveObserver(() => {
     const manifest = host.storage.get("review-invoke-human-1");
     for (const original of manifest?.originals ?? [])
-      if (Object.hasOwn(original, "value"))
+      if (Object.hasOwn(original, "digest"))
         originals.set(original.key, copy({ ...manifest.originalDefaults, ...original }));
   });
   return originals;
@@ -126,7 +128,7 @@ describe("workflow-owned execute controller", () => {
       const outcome = await host.execute();
       expect(injected).toBe(true);
       expect(outcome.status, outcome.reason).toBe("partial");
-      expect(host.current()).toMatchObject({ version: 6, consumedLoops: 1, sealPending: null, taskFrame: null,
+      expect(host.current()).toMatchObject({ version: EXECUTE_STATE_VERSION, consumedLoops: 1, sealPending: null, taskFrame: null,
         ledger: { count: 3 }, loop: { cursor: 1 } });
       expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
         .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"]);
@@ -1558,7 +1560,7 @@ describe("workflow-owned execute controller", () => {
     expect(next.storage.get("prior-invocation-history")).toEqual(oldStore);
   });
 
-  test.each([2, 3, 4, 5])("non-v6 retained state v%s fails before any resume or dispatch with the actionable message", async version => {
+  test.each([2, 3, 4, 5, 6])("prior retained state v%s fails before any resume or dispatch with the actionable message", async version => {
     const host = fixture();
     host.setRespond((request, normal) => request.key.endsWith(".compliance") ? gaps(normal()) : normal());
     await host.execute();
@@ -1571,7 +1573,7 @@ describe("workflow-owned execute controller", () => {
       expect(output.reason).toContain(`created by an incompatible Pitako contract v${version}; start a new mission`);
       expect([...host.storage.entries()]).toEqual(before);
       expect(host.calls).toHaveLength(calls); expect(host.hostCalls).toHaveLength(reads);
-      old.version = 6; host.storage.set(field, old);
+      old.version = EXECUTE_STATE_VERSION; host.storage.set(field, old);
     }
   });
 
@@ -1854,7 +1856,7 @@ describe("workflow-owned execute controller", () => {
       const retained = manifest.originals.find((entry: any) => entry.key === request.key);
       expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
       const original = inlineOriginals.get(request.key);
-      expect(readReviewOriginal(retained)).toEqual(original.value);
+      expect(canonicalDigest(readReviewOriginal(retained))).toBe(original.digest);
       expect(ref.runId).toBe(original.runId);
       expect(ref.outputReference).toBe(`/native/output/${request.key}.json`);
       expect(original.results).toBeUndefined(); // canonical witnesses belong to execute, not a second manifest copy
@@ -1868,7 +1870,7 @@ describe("workflow-owned execute controller", () => {
         expect(request.outputSchema.properties).not.toHaveProperty(field);
       expect(original.association).toMatchObject({ key: request.key, namespace: manifest.namespace,
         query: manifest.query, revision: manifest.revision, attempt: 1 });
-      expect(original.value).toEqual(recovered);
+      expect(original.digest).toBe(canonicalDigest(recovered));
       expect(original).toMatchObject({ terminal: "succeeded", publication: "published", sufficient: true });
       expect(original.failedOriginal).toBeUndefined();
     }
@@ -1933,7 +1935,7 @@ describe("workflow-owned execute controller", () => {
       expect(witness.outputReference).toEqual(actual.outputReference);
       const original = host.storage.get("review-invoke-human-1").originals.find((entry: any) => entry.key === ref.key);
       expect(inlineOriginals.get(ref.key).association.key).toBe(ref.key);
-      expect(readReviewOriginal(original)).toEqual(inlineOriginals.get(ref.key).value);
+      expect(canonicalDigest(readReviewOriginal(original))).toBe(inlineOriginals.get(ref.key).digest);
       expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8"))).toEqual(readReviewOriginal(original));
     }
   });
@@ -1944,7 +1946,7 @@ describe("workflow-owned execute controller", () => {
       let observed: Result | undefined;
       host.setRespond((request, normal) => {
         const result = normal();
-        if (mode === "inaccessible-essential" ? request.phase === "review-independent" : request.key.endsWith("review.director-prepare")) {
+        if (mode === "inaccessible-essential" ? request.phase === "review-independent" && !observed : request.key.endsWith("review.director-prepare")) {
           if (mode === "optional-artifact") result.metadataSaveError = "Optional debug artifact unavailable";
           if (["mandatory-publication", "partial-failed", "inaccessible-essential"].includes(mode)) {
             delete result.results![0]!.savedOutputPath;
@@ -1969,8 +1971,8 @@ describe("workflow-owned execute controller", () => {
       let optionalOriginal: any;
       host.setSaveObserver(() => {
         const manifest = host.storage.get("review-invoke-human-1");
-        const inline = manifest?.originals.find((entry: any) => entry.runId === observed?.runId && Object.hasOwn(entry, "value"));
-        if (inline) optionalOriginal = copy({ ...manifest.originalDefaults, ...inline });
+        const original = manifest?.originals.find((entry: any) => entry.runId === observed?.runId);
+        if (original?.digest) optionalOriginal = copy({ ...manifest.originalDefaults, ...original });
         if (!observed?.structuredOutput) return;
         const merged = JSON.stringify(Object.fromEntries(host.storage));
         bodyCopies.push(merged.split(JSON.stringify(observed.structuredOutput.reason).slice(1, -1)).length - 1);
@@ -2003,7 +2005,9 @@ describe("workflow-owned execute controller", () => {
       }
       if (mode === "optional-artifact") {
         expect(optionalOriginal).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
-        expect(readReviewOriginal(retainedOriginal)).toEqual(optionalOriginal.value);
+        expect(optionalOriginal).not.toHaveProperty("value");
+        expect(optionalOriginal.digest).toBe(canonicalDigest(observed!.structuredOutput));
+        expect(readReviewOriginal(retainedOriginal)).toEqual(observed!.structuredOutput);
       }
       if (mode === "partial-failed") {
         host.setStatus(ref => ({ ...copy(host.native.get(ref)!), ok: true,
@@ -2996,7 +3000,10 @@ describe("workflow-owned execute controller", () => {
     const calls = host.calls.length, replay = await host.execute();
     expect(replay.reason).toBe(output.reason); expect(replay.status).toBe("blocked");
     expect(replay.phase).toBe(output.phase); expect(replay.loopsConsumed).toBe(1);
-    expect(host.calls).toHaveLength(calls); expect(host.history()[0].halt).toEqual(halt);
+    // Reference-only synthesis revalidates its required originals on disk.
+    expect(host.calls.slice(calls).map(call => ({ agent: call.agent, key: call.key }))).toEqual(
+      phase === "director-synthesis" ? [{ agent: "pitako.access-verifier", key: "invoke-human-1.l1.review.verify-synthesis.r1" }] : []);
+    expect(host.history()[0].halt).toEqual(halt);
   });
 
   test.each(["director", "worker", "review", "compliance"])("returned native capacity receipt at %s retains its actual run reference", async phase => {
@@ -3139,7 +3146,7 @@ describe("workflow-owned execute controller", () => {
       for (const retained of manifest.originals) {
         expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
         const original = inlineOriginals.get(retained.key);
-        expect(readReviewOriginal(retained)).toEqual(original.value);
+        expect(canonicalDigest(readReviewOriginal(retained))).toBe(original.digest);
         expect(original).toMatchObject({ attempt: 1, terminal: "succeeded", publication: "published",
           delivery: "complete", essentialAccess: "accessible", sufficient: true, diagnostic: "" });
         const ref = loop.review.references.find((entry: any) => entry.key === original.key);
@@ -3150,7 +3157,7 @@ describe("workflow-owned execute controller", () => {
           phase: host.calls.find(call => call.key === original.key)!.phase!.replace("review-", ""),
           producer: original.key.includes(".director-") ? "director" : original.key.split("-").at(-1),
           key: original.key, attempt: original.attempt });
-        expect(original.value).toEqual(exact);
+        expect(original.digest).toBe(canonicalDigest(exact));
         expect(original.id).toBe(`${original.association.key}.v1.a1`);
         expect(ref.outputReference).toBe(witness.savedOutputPath);
         expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
@@ -3403,7 +3410,8 @@ describe("compact admission", () => {
 
 describe("native closing observations", () => {
   test("four host-free final closes interleaved with repair tasks preserve singleton implicit waiting and distinct evidence", async () => {
-    const host = fixture(undefined, { readOnly: true }); host.setLimit(10);
+    // Closing evidence is the subject; real checkpoint sealing is covered by the sealer and recovery suites.
+    const host = fixture(undefined, { readOnly: true, controlledCheckpoints: true }); host.setLimit(10);
     host.setRespond((request, normal) => {
       const result = normal();
       // Each of the first two loops stalls a distinct task, not the same task twice.

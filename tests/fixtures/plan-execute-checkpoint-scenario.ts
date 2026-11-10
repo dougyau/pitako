@@ -102,6 +102,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           return input.mode === "pause-input-cut" && l?.resolutions?.at(-1)?.stage === "intention";
         };
         const candidate = () => { const { head, fingerprint } = io.checkoutEvidence(input.root); return { head, fingerprint }; };
+        let gateCandidate: any;
         const state = { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
           const checkpoint = value.lastConfirmed;
           const admission = checkpoint?.taskId === "second";
@@ -208,10 +209,13 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             if (!unitMode && !pauseMode && input.mode !== "abrupt-continue" && request.task?.includes("CHECKPOINT FALLBACK (same pending task"))
               return { key, ok: false, output: "", artifactPaths: [], error: "Blocked by pi-subagents permission rule: restoration denied in lifecycle fixture" };
             // Grouped operations observe their own checkout; do not duplicate it for every launch.
+            if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate")
+              gateCandidate = candidate();
+            // Controlled review children write only excluded metadata after the final gate.
             const needsCandidate = key.endsWith(".compliance") || request.agent === "pitako.checkout-observer" ||
               request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate";
-            const result = await response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
-            if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && !result.ok) {
+            const result = await response(key, request, input.metadata, needsCandidate ? gateCandidate : undefined);
+            if (request.agent === "pitako.loop-io" && ["close", "taskDelta"].includes(JSON.parse(request.task).operation) && !result.ok) {
               const failure = JSON.parse(result.output);
               if (input.mode === "corrupt") sealError = failure.reason;
             }
@@ -328,13 +332,10 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (second && input.mode === "corrupt") io.writeFileSync(manifestPath, "{broken");
               if (second && input.mode === "incomplete") io.prepareCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from("not yet written").toString("base64"), mode: 420 } }]);
               const paused = second && (input.mode === "pause" || pauseMode) && (!continuing || input.mode === "pause-twice" && intent.attempt === 2);
-              const current = candidate();
               Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
                 status: paused ? (input.mode.includes("status-continue") ? "continue" : input.mode.includes("status-gaps") ? "gaps" : "blocked") : "complete", remaining: paused && input.mode !== "pause-empty" ? ["Pending second unit"] : [],
                 continuation: { mode: "fresh", reason: paused ? "Resume pending second unit from its exact pause" : "Unit complete" },
-                git: { wip: "Real owned WIP" },
-                checks: [{ id: intent.taskId + "-check", command: "bun test affected", cwd: input.root,
-                  output: "Observed controlled unit", logPaths: [], result: "passed", before: current, after: current }] });
+                git: { wip: "Real owned WIP" } });
               if (second && input.mode === "missing-receipt") delete result.structuredOutput.checkpointReceipt;
               if (second && input.mode === "wrong-progress") result.structuredOutput.checkpointReceipt = {
                 progress: { consumedLoops: 2 } };
@@ -753,7 +754,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(actual.sealError).not.toBe(""); expect(actual.points).toHaveLength(1);
         }
         if (mode === "incomplete") {
-          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity", ref: { agent: "pitako.loop-io" } });
+          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity",
+            ref: { agent: "pitako.checkpoint-sealer", key: "invoke-human-1.l2.t1.a1.seal" } });
           expect(loop.halt.reason).toContain("last step partially applied: true");
           expect(loop.results.some((entry: any) => entry.taskId === "second")).toBe(false);
           expect(actual.points).toHaveLength(1);

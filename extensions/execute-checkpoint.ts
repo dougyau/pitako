@@ -242,6 +242,47 @@ function manifestDigest(directory: string) {
   const files = ["manifest.json", ...readdirSync(directory).filter(file => /^capture-\d{6}\.json$/.test(file)).sort()];
   return hash(files.map(file => readFileSync(path.join(directory, file), "utf8")).join(""));
 }
+// The caller supplies the complete, ordered slot history, including unwritten attempts.
+export const checkpointTaskDelta = operation((intents: CheckpointIntent[]) => {
+  const first = intents[0];
+  if (!first || first.attempt !== 1) throw new Error("Task delta requires the first slot attempt.");
+  const touched = new Set<string>();
+  let baseline: Baseline | undefined;
+  for (const [offset, intent] of intents.entries()) {
+    if (intent.attempt !== offset + 1 || intent.taskId !== first.taskId ||
+        intent.loop !== first.loop || intent.cursor !== first.cursor ||
+        !equal(intent.association, first.association) || !equal(intent.planRef, first.planRef))
+      throw new Error("Task delta slot association mismatch.");
+    const directory = checkpointDirectory(intent);
+    const retained = read<Baseline>(path.join(directory, "baseline.json"));
+    if (!intent.baseline || !equal(retained.intent, intent) || !equal(retained.candidate, intent.baseline))
+      throw new Error("Dispatch baseline association mismatch.");
+    baseline ??= retained;
+    if (index(intent.association.root) !== retained.index ||
+        checkoutEvidence(intent.association.root).head !== retained.candidate.head)
+      throw new Error("Dispatch baseline HEAD/index changed.");
+    if (existsSync(path.join(directory, "manifest.json"))) {
+      const { manifest, openPaths } = load(intent);
+      if (openPaths.size) {
+        const partialFile = path.join(directory, "restore.json"), restoredFile = path.join(directory, "restored.json");
+        if (!existsSync(restoredFile)) throw new Error("Task delta requires settled checkpoint effects.");
+        const partial = read<{ intent: CheckpointIntent }>(partialFile);
+        const restored = read<{ checkpointRef: string; digest: string; partialRef: string; position: unknown }>(restoredFile);
+        if (!equal(partial.intent, intent) || restored.partialRef !== partialFile ||
+            restored.checkpointRef !== path.join(directory, "manifest.json") || restored.digest !== manifestDigest(directory) ||
+            !equal(restored.position, { loop: intent.loop, cursor: intent.cursor, phase: intent.phase }))
+          throw new Error("Checkpoint restored observation conflicts.");
+      }
+      for (const file of manifest.files) touched.add(file.path);
+    } else if (readdirSync(directory).some(file => /^(capture-|effect-|hook-effect-)/.test(file))) {
+      throw new Error("Task delta journal lacks a manifest.");
+    }
+  }
+  const current = checkoutSnapshot(first.association.root).files;
+  const netChanged = [...new Set([...Object.keys(baseline!.files), ...Object.keys(current)])]
+    .filter(file => !equal(baseline!.files[file] ?? null, current[file] ?? null)).sort();
+  return { touched: [...touched].sort(), netChanged };
+});
 export function captureCheckpoint(intent: CheckpointIntent, paths: string[]) {
   const directory = checkpointDirectory(intent), root = intent.association.root;
   if (!Array.isArray(paths) || !paths.length || new Set(paths).size !== paths.length)

@@ -44,6 +44,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   const agentDir = path.resolve(getAgentDir());
   // Trusted complete sources are loaded at setup, never discovered in resolve.
   const rootScript = readFileSync(path.join(packageRoot(), "skills/execute/workflow.js"), "utf8");
+  const canonicalScript = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8");
   const reviewScript = readFileSync(path.join(packageRoot(), "skills/review/workflow.js"), "utf8");
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
@@ -80,7 +81,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
       originalProblem: validateSpec(preliminary.content, args.id),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"), stateVersion: EXECUTE_STATE_VERSION,
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
-    return { script: `const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
+    return { script: `${canonicalScript}\nconst config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
       hostCommands: inspections };
   } };
 }
@@ -100,7 +101,8 @@ const ANALYSIS_WORKFLOWS = {
  */
 export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS) {
   const workflow = ANALYSIS_WORKFLOWS[name];
-  const source = readFileSync(path.join(packageRoot(), workflow.source), "utf8");
+  const source = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8") + "\n" +
+    readFileSync(path.join(packageRoot(), workflow.source), "utf8");
   return { name, version: 1, resolve(args: Readonly<Record<string, unknown>>) {
     const { missionId, missionPath, ...input } = args;
     if (!isMissionId(missionId)) throw new Error(`${name} requires an existing native missionId from mission.create.`);

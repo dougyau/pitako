@@ -178,7 +178,9 @@ test.each([
       const input = JSON.parse(request.task);
       if (input.intent.taskId === "change1") {
         expect(input.kind).toBe(expected);
-        expect(host.current().loop.attempt).toMatchObject({ stage: "launched", close: { dispatched: true } });
+        expect(host.current().loop.attempt).toMatchObject({ stage: "launched",
+          ...(status === "complete" ? { taskReview: { synthesis: { projection: { admitted: true } } } }
+            : { close: { dispatched: true } }) });
         expect(host.current().loop.attempt).not.toHaveProperty("result");
       }
     }
@@ -224,7 +226,7 @@ test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks bef
   const output = await host.execute();
   expect(output.status).toBe("blocked");
   expect(host.current().loop.halt).toMatchObject({ code: "checkpoint-integrity",
-    ref: { agent: mode === "rejected" ? "pitako.checkpoint-sealer" : "pitako.loop-io" } });
+    ref: { agent: mode === "pause" ? "pitako.loop-io" : "pitako.checkpoint-sealer" } });
   expect(output.reason).toContain("src/change1.ts");
   expect(output.reason).toContain("journaled sha256 absence");
   expect(output.reason).toContain("last step partially applied: false");
@@ -288,7 +290,7 @@ test.each([false, true])("missing implementation result restores before the next
   const output = await host.execute();
   expect(output.status, output.reason).toBe("complete");
   expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
-  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key), output.reason)
     .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
   expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2,
     checks: { current: true }, checkpoint: { confirmation: { kind: "unit" } } });
@@ -298,11 +300,11 @@ test.each([false, true])("missing implementation result restores before the next
   } : null);
 });
 
-test("grouped close retry is restored when native budget rejects dispatch", async () => {
+test("pre-review gate retry is restored when native budget rejects dispatch", async () => {
   const host = controller(undefined, { readOnly: true });
   let rejected = false;
   host.setLaunchRespond((request, normal) => {
-    if (!rejected && request.key.endsWith(".close")) {
+    if (!rejected && request.key.endsWith(".gate")) {
       rejected = true;
       const error = new RunFanoutLimitError({ code: "RUN_FANOUT_LIMIT", path: `workflow[${request.key}]`, used: 64, limit: 64, requested: 1, remaining: 0 }).message;
       return { key: request.key, ok: false, error, output: error, artifactPaths: [] };
@@ -310,7 +312,7 @@ test("grouped close retry is restored when native budget rejects dispatch", asyn
     return normal();
   });
   expect((await host.execute()).status).toBe("budget-exhausted");
-  expect(host.current().loop.attempt.close.retry).toBe(0);
+  expect(host.current().loop.attempt.gate.retry).toBe(0);
   expect(host.current().loop.attempt).not.toHaveProperty("result");
 });
 
@@ -347,22 +349,22 @@ test("a stopped sealer admits nothing; current input reconciles it before a fres
   let stopped = false;
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (!stopped && request.key.endsWith(".close")) { stopped = true; return { ...result, ok: false, stopped: true }; }
+    if (!stopped && request.key.endsWith(".seal")) { stopped = true; return { ...result, ok: false, stopped: true }; }
     return result;
   });
   expect((await host.execute()).status).toBe("cancelled");
-  expect(host.current().loop.halt).toMatchObject({ code: "native-barrier", cause: "stopped", ref: { agent: "pitako.loop-io" } });
+  expect(host.current().loop.halt).toMatchObject({ code: "native-barrier", cause: "stopped", ref: { agent: "pitako.checkpoint-sealer" } });
   expect(host.current().loop.attempt).not.toHaveProperty("result");
   const calls = host.calls.length;
   expect((await host.execute()).status).toBe("cancelled");
   expect(host.calls).toHaveLength(calls);
   const output = await host.execute({ unblock: true, resolution: { loop: 1, text: "Continue after the sealer stop." } });
   expect(output.status, output.reason).toBe("complete");
-  expect(host.statusCalls).toContain("native-invoke-human-1.l1.t1.a1.close");
+  expect(host.statusCalls).toContain("native-invoke-human-1.l1.t1.a1.seal");
   expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
-  expect(host.launches.filter(call => call.key.startsWith("invoke-human-1.l1.t1.a1.close")).map(call => call.key))
-    .toEqual(["invoke-human-1.l1.t1.a1.close", "invoke-human-1.l1.t1.a1.close.r1"]);
-  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer")).toHaveLength(1);
+  expect(host.launches.filter(call => call.key.startsWith("invoke-human-1.l1.t1.a1.seal")).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t1.a1.seal.r1"]);
+  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer")).toHaveLength(2);
   expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual(["complete"]);
 });
 
@@ -371,11 +373,11 @@ test("an active retained sealer blocks fallback and re-seal; unknown status take
   let active = true;
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (request.key === "invoke-human-1.l1.t1.a1.close") return { ...result, ok: false, state: "running" };
+    if (request.key === "invoke-human-1.l1.t1.a1.seal") return { ...result, ok: false, state: "running" };
     return result;
   });
   host.setStatus(ref => {
-    if (["invoke-human-1.l1.t1.a1.close", "native-invoke-human-1.l1.t1.a1.close"].includes(ref)) {
+    if (["invoke-human-1.l1.t1.a1.seal", "native-invoke-human-1.l1.t1.a1.seal"].includes(ref)) {
       if (active) return { ok: false, state: "running", results: [] };
       throw Error("Status unavailable");
     }
@@ -391,9 +393,9 @@ test("an active retained sealer blocks fallback and re-seal; unknown status take
   const output = await host.execute();
   expect(output.status, output.reason).toBe("complete");
   expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
-  expect(host.launches.filter(call => call.key.startsWith("invoke-human-1.l1.t1.a1.close")).map(call => call.key))
-    .toEqual(["invoke-human-1.l1.t1.a1.close", "invoke-human-1.l1.t1.a1.close.r1"]);
-  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer")).toHaveLength(1);
+  expect(host.launches.filter(call => call.key.startsWith("invoke-human-1.l1.t1.a1.seal")).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1.seal", "invoke-human-1.l1.t1.a1.seal.r1"]);
+  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer")).toHaveLength(2);
 });
 
 test("replay with a seal record and a retained worker result re-seals idempotently and admits it once", async () => {
@@ -402,12 +404,16 @@ test("replay with a seal record and a retained worker result re-seals idempotent
   expect((await host.execute()).status).toBe("partial");
   expect(host.current().loop.attempt).toMatchObject({ key: "invoke-human-1.l1.t1.a1", stage: "launched", seal: { retry: 1 } });
   host.setFailSave();
-  host.setStatus(ref => { throw Error(`Status '${ref}' unavailable`); });
+  host.setStatus(ref => {
+    if (/\.task-(reviewer|synthesis)$/.test(ref)) return copy(host.native.get(ref)!);
+    throw Error(`Status '${ref}' unavailable`);
+  });
   const calls = host.calls.length;
   const output = await host.execute();
   expect(output.status, output.reason).toBe("complete");
-  expect(host.statusCalls.slice(0, 1)).toEqual(["native-invoke-human-1.l1.t1.a1.close"]);
-  expect(host.calls.slice(calls).filter(call => call.agent === "pitako.checkpoint-sealer")).toEqual([]);
+  expect(host.statusCalls.slice(0, 1)).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
+  expect(host.calls.slice(calls).filter(call => call.agent === "pitako.checkpoint-sealer").map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a1.seal.r1"]);
   expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(false);
   expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual(["complete"]);
   expect(host.history()[0].results.find((entry: any) => entry.taskId === "change1")).toMatchObject({ attempt: 1, status: "complete" });
@@ -422,14 +428,17 @@ test("replay with a seal record and unknown worker status observes the sealer, f
   // Without a retained received result the worker result is unknown.
   const retained = host.current(); delete retained.loop.attempt.received;
   host.storage.set("invoke-human-1", retained);
-  host.setStatus(ref => { throw Error(`Status '${ref}' unavailable`); });
+  host.setStatus(ref => {
+    if (/\.task-(reviewer|synthesis)$/.test(ref)) return copy(host.native.get(ref)!);
+    throw Error(`Status '${ref}' unavailable`);
+  });
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a2") throw Error("Controlled fallback transport stop");
     return observeGate(host, request, normal);
   });
   const calls = host.calls.length;
   await host.execute();
-  expect(host.statusCalls.slice(0, 1)).toEqual(["native-invoke-human-1.l1.t1.a1.close"]);
+  expect(host.statusCalls.slice(0, 1)).toEqual(["invoke-human-1.l1.t1.a1.seal"]);
   expect(host.calls.slice(calls).some(call => call.agent === "pitako.checkpoint-sealer" && call.key.startsWith("invoke-human-1.l1.t1.a1.seal"))).toBe(false);
   expect(host.history()[0].results.filter((entry: any) => entry.taskId === "change1").map((entry: any) => entry.status)).toEqual([]);
   expect(host.current().lastConfirmed).toBeNull();
@@ -538,9 +547,11 @@ test("controller routes a never-closed effect to a restoring worker before admis
     return observeGate(host, request, normal);
   });
   const output = await host.execute(); expect(output.status, output.reason).toBe("partial");
-  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
+  expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key), output.reason)
     .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
   expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2 });
+  expect(host.calls.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key)).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.t1.a2.task-reviewer", "invoke-human-1.l1.t1.a2.task-synthesis"]);
 });
 
 function dispatchBaseline(f: ReturnType<typeof fixture>) {

@@ -9,20 +9,21 @@ const composition = compositionFixture();
 const scripts = composition.scripts;
 const { fixture } = executeControllerFixture();
 
-test("one task attempt uses five launches and one trailing drain", async () => {
+test("a reviewed task uses standalone gate and seal with one trailing drain", async () => {
   const host = fixture();
   host.setLimit(1);
   const output = await host.execute();
   expect(output.status, output.reason + "\n" + host.launches.map(call => call.key).join("\n")).toBe("partial");
   expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
-    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "close", "drain"]);
+    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "gate", "taskDelta",
+      "pitako.reviewer", "pitako.reviewer", "pitako.request-observer", "pitako.checkpoint-sealer", "drain"]);
   const drain = JSON.parse(host.launches.at(-1)!.task);
   expect(drain.intentions.map((entry: any) => entry.operation === "ledger" ? entry.input.record.kind : "settlement"))
     .toEqual(["unit", "settlement", "loop"]);
   expect(host.current().intentions).toEqual([]);
 });
 
-test("each extra attempt adds only worker and close, including its folded baseline", async () => {
+test("an incomplete attempt keeps grouped close and a folded baseline before reviewed completion", async () => {
   const host = fixture();
   host.setLimit(1);
   let workers = 0;
@@ -37,7 +38,8 @@ test("each extra attempt adds only worker and close, including its folded baseli
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
   expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
-    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "close", "pitako.worker", "close", "drain"]);
+    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "close", "pitako.worker",
+      "gate", "taskDelta", "pitako.reviewer", "pitako.reviewer", "pitako.request-observer", "drain", "pitako.checkpoint-sealer", "drain"]);
   const workersCalls = host.launches.filter(call => call.agent === "pitako.worker");
   expect(workersCalls[1]!.task).toContain('"attempt":2');
   const second = host.snapshots.find(state => state.loop?.attempt?.number === 2 && state.loop.attempt.checkpoint);
@@ -58,12 +60,14 @@ test("an observed no-journal pause keeps the previous unit in its next baseline"
   const second = host.snapshots.find(state => state.loop?.number === 2 && state.loop.attempt?.number === 2 && state.loop.attempt.checkpoint);
   expect(second!.loop.attempt.checkpoint.progress.admitted.change2).toEqual(["continue"]);
   expect(second!.loop.attempt.checkpoint.progress.previous).toMatchObject({ taskId: "change1", attempt: 1 });
-  expect(host.launches).toHaveLength(13);
+  expect(host.launches).toHaveLength(23);
 });
 
 test.each(["step-order", "seal-kind", "after-candidate", "baseline-variant", "request-count", "native-artifacts"])("workflow rejects damaged %s close evidence before admission", async damage => {
   const host = fixture();
   host.setLimit(1);
+  host.setRespond((request, normal) => request.agent === "pitako.worker"
+    ? host.result(request, { status: "complete", work: "Confirmed no file changes", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const response = await normal();
     if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close") {
@@ -96,6 +100,8 @@ test("capacity and positive activity prevent grouped redispatch", async () => {
 
   const host = fixture();
   host.setLimit(1);
+  host.setRespond((request, normal) => request.agent === "pitako.worker"
+    ? host.result(request, { status: "complete", work: "Confirmed no file changes", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const response = await normal();
     if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close")
@@ -124,8 +130,12 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
   });
   const entry = path.resolve("skills/execute/loop-io.mjs");
   host.setLaunchRespond(async (request, normal) => {
+    if (request.agent === "pitako.checkpoint-sealer" ||
+        request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+      return scripts.runDeterministic(request.key, request, { ...scripts, root: host.root, inlineSealer: true }, undefined);
     if (request.agent !== "pitako.loop-io") return normal();
     const input = JSON.parse(request.task), dbPath = path.join(host.root, ".pi/board.db");
+    if (!["advance", "selection", "close", "drain"].includes(input.operation)) return normal();
     for (const name of ["prepare", "apply", "gate"]) if (input[name]) input[name].dbPath = dbPath;
     for (const intention of input.intentions ?? []) if (intention.operation === "apply") intention.input.dbPath = dbPath;
     // Keep stdin/stdout CLI coverage for advance and close, not a cold loader for every drain.
@@ -138,7 +148,7 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
       child.stdin.write(JSON.stringify(input)); child.stdin.end();
       observation = await lifecycle.result;
     } else {
-      const response = await scripts.runLoopIO(request.key, { ...request, task: JSON.stringify(input) },
+      const response = await scripts.runDeterministic(request.key, { ...request, task: JSON.stringify(input) },
         { ...scripts, root: host.root }, undefined);
       observation = [response.results[0].exitCode, response.output + "\n", ""];
     }
@@ -158,7 +168,12 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
   });
   const output = await host.executeNative();
   expect(output.status, output.reason).toBe("partial");
-  expect(host.launches).toHaveLength(continuation ? 8 : 6);
+  expect(output.reason).toContain("1 authorized loops consumed");
+  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
+    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker",
+      ...(continuation ? ["close", "pitako.worker"] : []),
+      "gate", "taskDelta", "pitako.reviewer", "pitako.reviewer", "pitako.request-observer",
+      ...(continuation ? ["drain"] : []), "pitako.checkpoint-sealer", "drain"]);
   expect(host.records().map((record: any) => record.kind)).toEqual(continuation ? ["spec", "unit", "unit", "loop"] : ["spec", "unit", "loop"]);
   expect(host.current().intentions).toEqual([]);
 });

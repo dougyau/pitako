@@ -91,16 +91,21 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     const input = JSON.parse(request.task), path = require("node:path"), fs = require("node:fs");
     const missionPath = path.join(metadata.root, ".pi/subagents/native-missions", path.basename(input.missionPath));
     fs.mkdirSync(path.dirname(missionPath), { recursive: true });
-    const output = require("node:child_process").execFileSync("node", [metadata.verifier ?? path.resolve("extensions/access-receipts.mjs"), "--verify-stdin"], {
-      input: JSON.stringify({ ...input, missionPath }), encoding: "utf8" });
-    return { key, ok: true, agent: request.agent, runId: `native-${key}`, output, results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
+    // The verifier uses absolute paths; no cold process or cwd change is needed.
+    return (async () => {
+      const { verifyGate } = await import(require("node:url").pathToFileURL(metadata.verifier ?? path.resolve("extensions/access-receipts.mjs")).href);
+      return { key, ok: true, agent: request.agent, runId: `native-${key}`,
+        output: JSON.stringify(verifyGate({ ...input, missionPath })), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
+    })();
   }
   if (request.agent === "pitako.loop-io") {
     const input = JSON.parse(request.task);
+    if (input.operation === "taskDelta" && process.cwd() !== metadata.root && metadata.runDeterministic)
+      return metadata.runDeterministic(key, request, metadata, checkout);
     if (["advance", "selection", "close", "drain"].includes(input.operation)) return (async () => {
-      if (process.cwd() !== metadata.root && metadata.runLoopIO)
-        return metadata.runLoopIO(key, request, metadata, checkout);
+      if (process.cwd() !== metadata.root && metadata.runDeterministic)
+        return metadata.runDeterministic(key, request, metadata, checkout);
       const { operation, ...params } = input;
       const dbPath = metadata.boardPath ?? metadata.root + "/.pi/board.db";
       for (const name of ["prepare", "apply", "gate"]) if (params[name]) params[name].dbPath = dbPath;
@@ -128,7 +133,18 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       }
     })();
     // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
-    if (input.operation !== "gate" && metadata.loopOperations && (input.operation !== "baseline" || metadata.loopOperations.baseline)) return (async () => {
+    if (input.operation === "taskDelta" && process.cwd() === metadata.root) return (async () => {
+      const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
+      const { operation, ...params } = input;
+      try {
+        return { key, ok: true, agent: request.agent, runId: `native-${key}`,
+          output: JSON.stringify(runtime.taskDelta(params)), results: [{ exitCode: 0 }] };
+      } catch (error: any) {
+        return { key, ok: false, agent: request.agent, runId: `native-${key}`,
+          output: JSON.stringify({ error: "loop-io", reason: error.message }), results: [{ exitCode: 1 }] };
+      }
+    })();
+    if (input.operation !== "gate" && metadata.loopOperations?.[input.operation]) return (async () => {
       try {
         const { operation, ...params } = input;
         params.dbPath = metadata.boardPath ?? metadata.root + "/.pi/board.db";
@@ -171,6 +187,9 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   if (request.agent === "pitako.checkpoint-sealer") {
     const input = JSON.parse(request.task);
     const manifest = metadata.root + "/.pi/subagents/checkpoints/" + input.intent.key + "/manifest.json";
+    if (process.cwd() !== metadata.root && metadata.runDeterministic &&
+        (require("node:fs").existsSync(manifest) || input.restoreSources))
+      return metadata.runDeterministic(key, request, { ...metadata, inlineSealer: true }, checkout);
     const output = metadata.sealCheckpointRequest ? JSON.stringify(metadata.sealCheckpointRequest(input))
       : require("node:fs").existsSync(manifest) || input.restoreSources ?
       require("node:child_process").execFileSync("node", [metadata.sealer ?? require("node:path").resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"], {
@@ -227,6 +246,11 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   }
   else if (request.agent === "pitako.worker") value = { status: "complete", work: "Scoped behavior implemented",
     remaining: [], knowledge: { findings: [], handoff: "Current scoped source implements the required behavior." } };
+  else if (/\.task-(reviewer|synthesis)$/.test(key)) value = {
+    completeness: { verdict: "Complete", score: 10, findings: [] },
+    correctness: { verdict: "Correct", score: 10, findings: [] },
+    scope: { verdict: "In scope", score: 10, findings: [] }, conflict: false,
+  };
   else if (key.endsWith(".demand-observation")) value = { memo: "Inherited demands remain advisory",
     evidenceLimits: ["Controlled source evidence only"], observations: [] };
   else if (key.endsWith("director-prepare")) value = { status: "ready", reason: "Whole result perspectives", angles: [
@@ -239,15 +263,18 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       reason: "Current source/check evidence", status: loop >= completeLoop ? "fulfilled" : "gap", evidence: ["src/entry.ts:1"], checks: ["/native/check.log"] })) };
   else throw Error(`Unexpected child ${key}`);
   const results: any[] = [];
-  if (request.phase?.startsWith("review-")) {
+  if (request.phase?.startsWith("review-") || /\.task-(reviewer|synthesis)$/.test(key)) {
     // The harness passes its file-owned fs boundary, including in Node children.
     const fs = require("node:fs");
-    const required = JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1].split("\n")[0]);
+    const required = request.phase?.startsWith("review-")
+      ? JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1].split("\n")[0]) : [];
     for (const entry of required) {
       const original = JSON.parse(fs.readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
       if (entry.association.key !== entry.key || entry.delivery !== "complete" || entry.runId !== `native-${entry.key}`)
         throw Error("Wrong exact original envelope");
-      require("node:assert/strict").deepEqual(original, entry.value, "Published original differs from admitted value");
+      const path = require("node:path");
+      const canonical = new Function(fs.readFileSync(path.resolve(path.dirname(metadata.verifier ?? path.resolve("extensions/access-receipts.mjs")), "../skills/workflow-canonical.js"), "utf8") + ";return canonicalDigest;")();
+      require("node:assert/strict").equal(canonical(original), entry.digest, "Published original differs from admitted digest");
     }
     const savedOutputPath = metadata.root + "/.pi/subagents/review-originals/" + key + ".json";
     fs.mkdirSync(metadata.root + "/.pi/subagents/review-originals", { recursive: true });
@@ -360,11 +387,11 @@ export function compositionFixture() {
   let useRuntime = false;
   beforeAll(async () => { if (useRuntime) await runtime.startNativeCheckpoint(); });
   const scripts = { ...deterministicScripts,
-    runLoopIO: async (key: string, request: any, metadata: any, checkout: any) => {
+    runDeterministic: async (key: string, request: any, metadata: any, checkout: any) => {
       const result = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
         root: metadata.root, key, request, metadata, checkout }, `async (input, _, respond) =>
           respond(input.key, input.request, input.metadata, input.checkout)`);
-      if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Grouped fixture cancelled");
+      if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Deterministic fixture cancelled");
       return JSON.parse(result[1]);
     } };
   return { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository,

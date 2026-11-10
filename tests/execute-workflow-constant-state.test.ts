@@ -167,7 +167,8 @@ test("a gaps publisher delivers its verified rejection summary to the very next 
 });
 
 test.each([4, 5])("selection rejection ring remembers three loops, not all history (repeat at %s)", async repeat => {
-  const host = fixture(undefined, { taskCount: 6 }); host.setLimit(6);
+  // This checks the rejection ring, not checkpoint filesystem operations.
+  const host = fixture(undefined, { taskCount: 6, controlledCheckpoints: true }); host.setLimit(6);
   host.setRespond((request, normal) => {
     const number = Number(request.key.match(/\.l(\d+)\./)![1]), result = normal();
     if (request.agent === "pitako.execution-director" && [1, repeat].includes(number))

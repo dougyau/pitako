@@ -8,8 +8,9 @@ launches the named resource `pitako.review` (raw script paths fail). The resourc
 runs `skills/review/workflow.js`, which dispatches the packaged `pitako.reviewer`
 profile for independent angles, cross-critique, one author response, and a final
 synthesis. Before each consuming phase, the model-free `pitako.access-verifier`
-compares the published originals with the admitted values and writes a
-no-clobber receipt in the mission directory; a contradictory or unavailable
+compares the canonical JSON digest of each published original with the digest
+saved in review state and writes a no-clobber receipt in the mission directory.
+Reviewers read the verified originals by path; a contradictory or unavailable
 original blocks that phase with an explanation. Receipts follow mission
 retention; `access_receipt_verify` and `extensions/access-receipts.mjs check`
 recompute them read-only and report drift or a pruned mission.

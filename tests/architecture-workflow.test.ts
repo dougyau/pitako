@@ -9,7 +9,7 @@ const { appendLedger, ledgerPath, verifyLedger } = await import(new URL("../skil
 import { canonicalJSON, canonicalDigest } from "../extensions/canonical.mjs";
 import { verifyGate } from "../extensions/access-receipts.mjs";
 
-const rawSource = readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
+const rawSource = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
 const compactFunctions = rawSource.slice(rawSource.indexOf("function compactConsultation("), rawSource.indexOf("function retainedConsultation("));
 const nativeFlagsSource = rawSource.slice(rawSource.indexOf("const nativeFlags ="), rawSource.indexOf("const retained ="));
 const {compactConsultation, expandConsultation} = new Function("function utf8Bytes(s) {return unescape(encodeURIComponent(s)).length;}" + nativeFlagsSource + compactFunctions + ";return {compactConsultation, expandConsultation};")();
@@ -2422,7 +2422,7 @@ test("prose is uncapped and more than eight factual doubts fails before confirma
   expect(host.calls.filter(call => call.request.phase === "architecture-factual")).toHaveLength(0);
 });
 
-const digestFunctions = rawSource.slice(rawSource.indexOf("function canonicalJSON("), rawSource.indexOf("const pendingReplacement"));
+const digestFunctions = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8");
 const scriptDigest = new Function(digestFunctions + "; return canonicalDigest;")() as (value: unknown) => string;
 const stateBound = new Function(nativeFlagsSource + "function utf8Bytes(value) { return unescape(encodeURIComponent(value)).length; }\n" +
   rawSource.slice(rawSource.indexOf("function architectureStateBound("), rawSource.indexOf("function retainedConsultation(")) +
