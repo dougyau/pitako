@@ -385,17 +385,13 @@ function persistState(stateKey, value, optionalPlan = null) {
   return pending;
 }
 function maxCycles() { return invocation?.association?.maxCycles ?? null; }
+// The native setter measures the whole file as indented JSON (pi-subagents
+// workflow-state.js, 256 KiB). The quarter left covers other keys and later saves.
+const DRAIN_BEFORE_ARCHIVE_BYTES = 192 * 1024;
+function stateBytes() { return utf8Bytes(JSON.stringify({ [key]: { ...invocation, activePlan: null } }, null, 2)); }
 function save() {
   if ((loop?.phase === "closing" && !loop.closing || loop?.outcome === "gaps") && !loop.archivePending && !loop.archived)
-    {
-      loop.archivePending = loopArchive();
-      if (loop.phase === "closing") {
-        const pending = loop.archivePending;
-        pending.bodyIdentity = bodyIdentity(pending.record.body);
-        pending.frozen = { usage: clone(loop.usage), ...(loop.resolutions ? { resolutions: archiveProjection(loop.resolutions) } : {}) };
-        delete pending.record.body;
-      }
-    }
+    loop.archivePending = frozenLoopArchive(loop.phase !== "closing");
   if (loop?.phase === "closing" && loop.archivePending && !loop.archived) closingRecord();
   // The native setter measures the ENTIRE merged file, including unrelated keys.
   // Essential state is committed first. One optional identical active plan cannot
@@ -1021,6 +1017,19 @@ function queueIntention(intention) {
     if (!same(existing, intention)) throw new Error(`Pending loop-io intention changed: ${intention.key}.`);
   } else pending.push(clone(intention));
 }
+// Ledger intentions keep identities for bytes the workflow rebuilds exactly: the
+// admitted spec and a frozen loop archive. A grouped launch transports the full request.
+function transportIntention(intention) {
+  const { archive, ...value } = clone(intention);
+  if (value.operation !== "ledger") return value;
+  if (value.input.spec && value.input.spec.content === undefined) {
+    if (config.preliminary.digest !== value.input.spec.digest)
+      throw Object.assign(new Error("Spec digest mismatch requires reliable admitted source bytes."), { ledgerIntegrity: true });
+    value.input.spec = { content: config.preliminary.content, digest: value.input.spec.digest };
+  }
+  if (archive) value.input.record = frozenLoopRecord(value.input.record.loop, archive);
+  return value;
+}
 function queueApply(slot, input) {
   if (invocation.intentions?.some(entry => entry.key === input.key)) return;
   const previous = invocation.intentions?.findLast(entry => entry.operation === "apply");
@@ -1075,7 +1084,7 @@ function groupedIO(slot, input, owner = loop) {
   pending.input ??= { ...clone(input), root: config.root, invocation: config.invocation, key: pending.key,
     receipts: invocation.receiptReference ? [clone(invocation.receiptReference)] : [],
     ...(input.operation !== "drain" ? { requests: { cursor: 0 } } : {}) };
-  const intentions = clone((invocation.intentions ?? []).slice(0, pending.intentionCount));
+  const intentions = pending.admitted ? [] : (invocation.intentions ?? []).slice(0, pending.intentionCount).map(transportIntention);
   return loopIO(slot, { ...pending.input, intentions }, owner).then(transport => {
     const reference = receiptReference(transport), projection = transport.projection;
     if (!projection || projection.invocation !== config.invocation || !Array.isArray(projection.steps) ||
@@ -2459,7 +2468,11 @@ function archiveProjection(value) {
 function prepareSeal(projected) {
   invocation.sealPending = { expected: clone(invocation.ledger), record: { kind: "unit", loop: loop.number,
     body: archiveProjection({ taskId: projected.taskId, attempt: projected.attempt, result: clone(projected),
-      results: clone(loopResults().filter(item => item.taskId === projected.taskId)),
+      // `result` is this attempt. An earlier result confirmed by its own seal is
+      // already that unit record's result, so it is cited; an unsealed one is archived here.
+      results: clone(loopResults().filter(item => item.taskId === projected.taskId && item.attempt !== projected.attempt)
+        .map(item => item.checkpoint?.confirmation ? { taskId: item.taskId, attempt: item.attempt, status: item.status,
+          sealed: { key: item.ref.key, digest: item.checkpoint.confirmation.digest } } : item)),
       frame: clone(invocation.taskFrame), recoveries: clone(loop.recoveries),
       checkpoint: clone(invocation.lastConfirmed) }) } };
 }
@@ -2488,6 +2501,22 @@ function closingRecord() {
     throw new Error("Closing archive source fields changed before publication.");
   return record;
 }
+// A pending loop archive keeps its identity and the inputs that may still change,
+// not a second copy of the frozen loop; publication rebuilds identical bytes.
+function frozenLoopArchive(freezeScope) {
+  const pending = loopArchive();
+  pending.bodyIdentity = bodyIdentity(pending.record.body);
+  pending.frozen = { usage: clone(loop.usage), ...(loop.resolutions ? { resolutions: archiveProjection(loop.resolutions) } : {}),
+    ...(freezeScope ? { cancelledScope: clone(cancelledScope()) } : {}) };
+  delete pending.record.body;
+  return pending;
+}
+function frozenLoopRecord(number, archive) {
+  const record = loopArchive(archive.frozen).record;
+  if (record.loop !== number || loop.archived || bodyIdentity(record.body) !== archive.bodyIdentity)
+    throw new Error(`Loop ${number} archive source fields changed before publication; inspect the retained loop, no replacement record.`);
+  return record;
+}
 function loopArchive(frozen) {
   const body = {};
   for (const field of ["number", "cursor", "manifest", "plan", "attempt", "results",
@@ -2496,7 +2525,8 @@ function loopArchive(frozen) {
       : frozen && ["usage", "resolutions"].includes(field) ? frozen[field] : loop[field];
     if (value !== undefined) body[field] = archiveProjection(value);
   }
-  if (cancelledScope().length) body.cancelledScope = clone(cancelledScope());
+  const scope = frozen?.cancelledScope ?? cancelledScope();
+  if (scope.length) body.cancelledScope = clone(scope);
   return { expected: clone(invocation.ledger), record: { kind: "loop", loop: loop.number, body } };
 }
 function retainedResolutions() {
@@ -2546,8 +2576,16 @@ function foldLoop(summaries) {
 }
 function archiveGaps() {
   if (loop.archived || loop.archiveQueued) return Promise.resolve();
-  loop.archivePending ??= loopArchive();
-  return archiveSeal(loop.archivePending);
+  const pending = loop.archivePending ??= frozenLoopArchive(true);
+  // Safety margin, decided once: when the frozen loop and pending seal bodies leave
+  // too little native headroom, publish those seals before queueing the loop archive.
+  pending.drainFirst ??= !!invocation.intentions?.length && stateBytes() > DRAIN_BEFORE_ARCHIVE_BYTES;
+  return (pending.drainFirst && invocation.intentions?.length
+    ? groupedIO("finishDrain", { operation: "drain" }, invocation) : Promise.resolve()).then(() => {
+    // A drain moved the anchor after this archive was frozen; the anchor is not body content.
+    if (!invocation.intentions?.some(entry => entry.operation === "ledger")) pending.expected = clone(invocation.ledger);
+    return archiveSeal(pending);
+  });
 }
 function archiveSeal(pending = invocation.sealPending) {
   // Retained legacy publications still use their original recovery route.
@@ -2555,11 +2593,13 @@ function archiveSeal(pending = invocation.sealPending) {
   const closing = pending.record.kind === "loop";
   const previous = invocation.intentions?.findLast(entry => entry.operation === "ledger");
   const sealKey = `${key}.l${pending.record.loop}.${closing ? "gaps" : `seal${Math.max(1, pending.expected.count)}`}`;
+  // The admitted spec is cited by digest; the drain transports its exact content.
   const input = { expected: clone(pending.expected), record: clone(pending.record),
-    ...(pending.expected.count === 0 && !previous ? { spec: { content: config.preliminary.content,
-      digest: invocation.association.digest } } : {}) };
+    ...(pending.expected.count === 0 && !previous ? { spec: { digest: invocation.association.digest } } : {}) };
   if (previous) { input.expectedFrom = previous.key; delete input.expected; }
-  queueIntention({ key: sealKey, operation: "ledger", input });
+  const archive = closing && !pending.record.body ? { bodyIdentity: pending.bodyIdentity, frozen: clone(pending.frozen) } : null;
+  if (archive) frozenLoopRecord(pending.record.loop, archive);
+  queueIntention({ key: sealKey, operation: "ledger", input, ...(archive ? { archive } : {}) });
   if (closing) {
     loop.archiveQueued = true;
     loop.archivePending = { expected: clone(pending.expected),

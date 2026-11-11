@@ -460,7 +460,9 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           ? actual.archives.find((record: any) => record.kind === "loop" && record.loop === 2).body
           : actual.retained.loop;
         const history = (records: any[], retained: any[], tasks: any) => [...new Map(
-          [...records.flatMap(record => record.body.results ?? []), ...retained.flatMap(entry => entry.ref ? [entry] :
+          // A unit record's own attempt is `result`; earlier sealed attempts are cited by their records.
+          [...records.flatMap(record => [...(record.body.results ?? []).filter((result: any) => !result.sealed),
+            ...(record.kind === "unit" ? [record.body.result] : [])]), ...retained.flatMap(entry => entry.ref ? [entry] :
             [tasks[entry.taskId].completed, tasks[entry.taskId].last].filter(result => result?.attempt === entry.attempt))]
             .map(result => [`${result.taskId}:${result.attempt}`, result])).values()]
           .sort((a: any, b: any) => ["first", "second", "final"].indexOf(a.taskId) - ["first", "second", "final"].indexOf(b.taskId) || a.attempt - b.attempt);

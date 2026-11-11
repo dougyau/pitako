@@ -385,6 +385,17 @@ keys. Every grouped launch drains pending intentions in that order before its
 own steps, retaining ledger link/byte comparisons, same-key apply request/content
 digests and Board `postOnce` replay checks.
 
+A pending intention never holds a second copy of state the workflow can rebuild.
+The admitted spec is cited by digest. A loop/gaps intention keeps the frozen
+body identity and frozen usage, resolution and cancelled-scope inputs, and the
+drain rebuilds identical bytes from the retained loop. A changed source field
+fails closed with no replacement record. A unit body keeps its own result. It
+cites an earlier result already sealed by its own unit record by key and
+checkpoint digest, and archives only unsealed earlier results in full. When
+the indented invocation state already exceeds 192 KiB, the workflow drains the
+pending intentions before it queues the loop archive. This decision is saved
+once per loop.
+
 - `advance`: drain → prepare → request observation.
 - `selection`: a separate launch after the director; drain → apply selection →
   request observation → eligible dispatch-baseline capture.
@@ -839,9 +850,9 @@ retained state fails before any resume or dispatch: "created by an incompatible
 Pitako contract vN; start a new mission". Nothing is migrated.
 Keep current task/control progress and usage totals, not a closed-loop array.
 Full completed results live once per task; completed attempts reference them,
-while pending tasks retain the last result for continuation. Closing record
-bytes are rebuilt from immutable source fields, freezing mutable usage and
-resolution inputs. Archive each seal before discarding, and every consumed loop
+while pending tasks retain the last result for continuation. Closing and gaps
+record bytes are rebuilt from immutable source fields, freezing mutable usage and
+resolution inputs (and cancelled scope for gaps). Archive each seal before discarding, and every consumed loop
 including gaps. Seals run inside grouped close with no extra dispatch; fused
 closing adds none and retries unpublished output with `.checkout.r<n>`.
 
