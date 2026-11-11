@@ -5,7 +5,9 @@ import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subage
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
 import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId, validateSpec } from "./spec-plans.ts";
 import { boundRetainedAnalyses } from "./execute-retained.ts";
-import { EXECUTE_STATE_VERSION } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath } from "./execute-state.ts";
+import { isExecuteReviewModel } from "./execute-settings.ts";
+import { reviewModels } from "./review-settings.ts";
 import { packageRoot } from "./stack.ts";
 
 function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
@@ -99,7 +101,7 @@ const ANALYSIS_WORKFLOWS = {
  * receipts need the resolve-time mission record path and a receipt namespace.
  * The trusted source is read at setup; args are inlined as data.
  */
-export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS) {
+export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS, root = process.cwd(), agentDir = path.resolve(getAgentDir())) {
   const workflow = ANALYSIS_WORKFLOWS[name];
   const source = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8") + "\n" +
     readFileSync(path.join(packageRoot(), workflow.source), "utf8");
@@ -110,7 +112,22 @@ export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS) {
         path.basename(missionPath) !== `${missionId}.json`)
       throw new Error(`${name} requires the actual mission record path returned by mission.create or mission.show.`);
     const access = { missionPath, namespace: workflow.namespace(input) };
-    return { script: `const args = ${JSON.stringify(input)};\nconst pitakoAccess = ${JSON.stringify(access)};\n${source}` };
+    let models = "";
+    if (name === "pitako.review") {
+      const file = executionStatePath({ missionId, missionPath });
+      let retained;
+      try { retained = JSON.parse(readFileSync(file, "utf8"))["review-standalone"]; }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+      // Native replay checks script bytes before the workflow can read its state.
+      const selected = retained === undefined ? reviewModels(root, agentDir) : retained.models;
+      for (const slot of ["r1", "r2", "synthesis"] as const)
+        if (selected?.[slot]?.key !== `pitako.review.${slot}` || !isExecuteReviewModel(selected?.[slot]?.model))
+          throw new Error(`${file}: pitako.review.${slot}: invalid frozen model selection.`);
+      models = `const pitakoReviewModels = ${JSON.stringify(selected)};\n`;
+    }
+    return { script: `const args = ${JSON.stringify(input)};\nconst pitakoAccess = ${JSON.stringify(access)};\n${models}${source}` };
   } };
 }
 const NAMED_WORKFLOWS = ["pitako.execute", ...Object.keys(ANALYSIS_WORKFLOWS)];
@@ -187,7 +204,7 @@ export default function planExecute(pi: ExtensionAPI): void {
       const sessionId = ctx.sessionManager.getSessionId();
       registrations.push(registerWorkflowResource({ sessionId, definition: executionResource() }));
       for (const name of Object.keys(ANALYSIS_WORKFLOWS) as (keyof typeof ANALYSIS_WORKFLOWS)[])
-        registrations.push(registerWorkflowResource({ sessionId, definition: analysisResource(name) }));
+        registrations.push(registerWorkflowResource({ sessionId, definition: analysisResource(name, ctx.cwd) }));
     } catch (error) {
       dispose();
       throw new Error(`Deterministic runtime agent or workflow resource registration failed: ${String(error instanceof Error ? error.message : error)}. Inspect the installed pi-subagents registration listener and conflicting agent; reconcile it before preparing execution. No fallback was registered.`);

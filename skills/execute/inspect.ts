@@ -79,7 +79,12 @@ export async function inspect(argv: string[]): Promise<string> {
         const revivalContextPeak = executeRevivalContextPeak(observed.root, agentDir);
         const taskReviewer = executeTaskReviewer(observed.root, agentDir);
         const taskSynthesis = executeTaskSynthesis(observed.root, agentDir);
+        const { reviewModels } = await import("../../extensions/review-settings.ts");
+        const models = reviewModels(observed.root, agentDir);
         admission = { maxCycles,
+          ...(models.r1.model !== "anthropic/claude-opus-5-5:high" ||
+            models.r2.model !== "openai-codex/gpt-6.1-sol:xhigh" ||
+            models.synthesis.model !== "anthropic/claude-opus-5-5:high" ? { reviewModels: models } : {}),
           ...(taskReviewer !== DEFAULT_TASK_REVIEWER ? { taskReviewer } : {}),
           ...(taskSynthesis !== DEFAULT_TASK_SYNTHESIS ? { taskSynthesis } : {}),
           ...(revivalContextPeak !== 120000 ? { revivalContextPeak } : {}) };

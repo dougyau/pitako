@@ -78,7 +78,7 @@ describe("workflow-owned execute controller", () => {
 
   // Reject blind keyed redispatch: the second responder would turn a retained
   // barrier into fulfillment, so absence of new calls is the observable guarantee.
-  test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
+  test.each(["review.director-prepare", "review.independent-angle1-r1", "compliance"].flatMap(phase =>
     ["stop", "permission", "thrown-permission", "thrown-status-stop", "pending", "unknown"].map(mode => ({ phase, mode }))))(
     "retained analysis barrier at $phase ($mode) is observed before replay dispatch", async ({ phase, mode }) => {
       const host = fixture(undefined, { taskCount: 0 });
@@ -110,7 +110,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.statusCalls).toContain(mode === "thrown-permission" ? target : `native-${target}`);
     });
 
-  test.each(["review.director-prepare", "review.independent-angle1", "compliance"].flatMap(phase =>
+  test.each(["review.director-prepare", "review.independent-angle1-r1", "compliance"].flatMap(phase =>
     ["intention", "receipt", "phase"].map(cut => ({ phase, cut }))))("analysis $phase $cut persistence cut never blindly replaces a call", async ({ phase, cut }) => {
     const host = fixture(undefined, { taskCount: 0 }), target = `invoke-human-1.l1.${phase}`;
     cutAt(host, value => {
@@ -226,7 +226,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.history()).toHaveLength(1);
   });
 
-  test.each(["review.director-prepare", "review.independent-angle1", "compliance"])(
+  test.each(["review.director-prepare", "review.independent-angle1-r1", "compliance"])(
     "native status exceptions at %s preserve their current barrier, not the old receipt", async phase => {
       for (const mode of ["stop", "permission"]) {
         const host = fixture(undefined, { taskCount: 0 }), target = `invoke-human-1.l1.${phase}`;

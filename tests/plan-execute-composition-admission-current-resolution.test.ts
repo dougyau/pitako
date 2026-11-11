@@ -33,7 +33,7 @@ const composition = realCheckoutCompositionFixture();
 const { execFileSync } = composition;
 const deterministicScripts = composition.scripts;
 const { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository } = composition;
-const native = nativeCheckpointFixture(composition);
+const native = composition.runtime;
 const nodeNative = nativeCheckpointFixture(composition);
 // Load actual Node/SDK wiring once; case deadlines cover behavior rather than cold imports.
 beforeAll(() => nodeNative.startNativeCheckpoint({ native: true }));
@@ -219,7 +219,7 @@ describe("plan/execute packaged composition", () => {
     const installed = path.join(nativeRoot, "node_modules/pitako");
     for (const file of ["skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
       "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
-      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-settings.ts", "extensions/execute-state.ts",
+      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-settings.ts", "extensions/review-settings.ts", "extensions/execute-state.ts",
       "extensions/canonical.mjs", "extensions/hash-ledger.mjs",
       "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file);
@@ -243,16 +243,15 @@ describe("plan/execute packaged composition", () => {
         const response: any = request.agent === "pitako.execution-inspector" ? { ...base, structuredOutput: {
           status: "recovered", reason: "Read exact complete original plan", original: originalPlan, workerResult: null,
           originalAvailable: true, binding: "absent", comparison: "only-original", provenance: ["/controlled/producer-original.json"],
-        } } : key.includes("critique-") ? { ...base, structuredOutput: { status: "ready", reason: "Checked source", challenges: key.endsWith("-b") ? [{ findingId: "a-1", assessment: "supported", evidence: "Caller inspected" }] : [] } } :
-          key.includes("defense-") ? { ...base, structuredOutput: { status: "ready", reason: "Checked source", responses: [{ findingId: "a-1", disposition: "maintain", reason: "Reachable caller" }] } } :
+        } } :
           await childResponse(key, request, { ...metadata, loopOperations }, observedCandidate());
-        if (!query && key.endsWith("independent-a")) response.structuredOutput.findings = [{
+        if (!query && key.endsWith("independent-a-r1")) response.structuredOutput.findings = [{
           title: "Caller behavior", location: "src/api.ts:1", scenario: "Empty key", evidence: "Caller accepts key",
           impact: "Wrong selection", classification: "scoped-defect", requirement: "spec: preserve caller key",
         }];
         if (!query && key.endsWith("director-synthesis")) Object.assign(response.structuredOutput, {
-          dispositions: [{ findingId: "a-1", decision: "include", classification: "scoped-defect", requirement: "spec: preserve caller key", reason: "Source inspected" }],
-          screening: { verdict, reason: "Current consequence assessed", assessments: [{ findingId: "a-1", requirement: "spec: selection respects caller input", consequence: "Wrong selection", material: verdict === "material-gaps", reason: "Current caller evidence" }] },
+          dispositions: [{ findingId: "a-r1-1", decision: "include", classification: "scoped-defect", requirement: "spec: preserve caller key", reason: "Source inspected" }],
+          screening: { verdict, reason: "Current consequence assessed", assessments: [{ findingId: "a-r1-1", requirement: "spec: selection respects caller input", consequence: "Wrong selection", material: verdict === "material-gaps", reason: "Current caller evidence" }] },
         });
         if (key.endsWith(".director")) {
           if (query) response.structuredOutput.reason = "中😀\"\n'; globalThis.recoveryInjected = true; //".repeat(3000);
@@ -348,8 +347,8 @@ describe("plan/execute packaged composition", () => {
     const compliance = childResponse("invoke-human-1.l1.compliance", { agent: "pitako.reviewer" }, metadata, observedCandidate());
     const next = childResponse("invoke-human-1.l2.director", { agent: "pitako.execution-director" }, metadata, observedCandidate());
     Object.assign(next, { ok: false, stopped: true, structuredOutput: undefined });
-    const queryChildren = query ? Object.fromEntries(["review.director-prepare", "review.independent-a",
-      "review.independent-b", "review.director-synthesis", "compliance"].map(phase => {
+    const queryChildren = query ? Object.fromEntries(["review.director-prepare", "review.independent-evidence-contract-r1", "review.independent-evidence-contract-r2",
+      "review.independent-a-r1", "review.independent-a-r2", "review.director-synthesis", "compliance"].map(phase => {
         const key = `invoke-human-1.l1.${phase}`;
         return [key, childResponse(key, { agent: "pitako.reviewer" }, metadata, observedCandidate())];
       })) : {};
@@ -429,7 +428,7 @@ describe("plan/execute packaged composition", () => {
     }
     expect(recovered.result.value).toMatchObject({ status: verdict === "clear" ? "complete" : "cancelled", loopsConsumed: verdict === "clear" ? 1 : 2, maxLoops: 3 });
     expect(recovered.calls).toEqual([
-      ...["critique", "defense", "synthesis"].map(gate => `invoke-human-1.l1.review.verify-${gate}.r1`),
+      ...["synthesis"].map(gate => `invoke-human-1.l1.review.verify-${gate}.r1`),
       ...(verdict === "clear" ? ["invoke-human-1.l1.reviewOriginals", compliance.key, closing.key, "invoke-human-1.l1.finishDrain"] : ["invoke-human-1.l1.reviewOriginals", "invoke-human-1.l1.closingDrain", closing.key, "invoke-human-1.l2.advance", "invoke-human-1.l2.demandOriginals", observation.key, next.key]),
     ]);
     expect(recovered.statuses).toHaveLength(6);
@@ -602,14 +601,16 @@ describe("plan/execute packaged composition", () => {
     else expect(existsSync(projectFile)).toBe(false);
   });
 
-  test.each(["invalid", "malformed", "read-error", "BOM-invalid", "BOM-malformed", "non-leading-BOM", "double-BOM", "taskReviewer", "taskSynthesis"])(
+  test.each(["invalid", "malformed", "read-error", "BOM-invalid", "BOM-malformed", "non-leading-BOM", "double-BOM", "taskReviewer", "taskSynthesis", "review.r1", "review.r2", "review.synthesis"])(
     "packaged %s settings failure reaches admission with actual file/key and no director", async mode => {
     const root = repository(), global = path.join(root, "private-global"), file = path.join(root, ".pi/settings.json");
     assignmentSpec(root);
     mkdirSync(global); mkdirSync(path.dirname(file));
     if (mode === "read-error") mkdirSync(file);
     else {
-      const invalid = JSON.stringify({ pitako: { execute: { [mode.startsWith("task") ? mode : "maxCycles"]: false } } });
+      const invalid = JSON.stringify({ pitako: mode.startsWith("review.")
+        ? { review: { [mode.slice(7)]: false } }
+        : { execute: { [mode.startsWith("task") ? mode : "maxCycles"]: false } } });
       const content = mode === "malformed" ? "{" : mode === "BOM-malformed" ? "\uFEFF{" :
         mode === "BOM-invalid" ? "\uFEFF" + invalid : mode === "non-leading-BOM" ? " \uFEFF{}" :
         mode === "double-BOM" ? "\uFEFF\uFEFF{}" : invalid;
@@ -640,7 +641,8 @@ describe("plan/execute packaged composition", () => {
       throw Error("Expected an admission diagnostic string");
     }
     expect(observed.value.reason).toContain(file);
-    expect(observed.value.reason).toContain(`pitako.execute.${mode.startsWith("task") ? mode : "maxCycles"}`);
+    expect(observed.value.reason).toContain(mode.startsWith("review.") ? `pitako.${mode}`
+      : `pitako.execute.${mode.startsWith("task") ? mode : "maxCycles"}`);
     if (mode === "BOM-invalid") expect(observed.value.reason).toContain("expected a positive safe integer");
     if (["malformed", "BOM-malformed", "non-leading-BOM", "double-BOM"].includes(mode))
       expect(observed.value.reason).toContain("SyntaxError");
@@ -1462,7 +1464,8 @@ describe("plan/execute packaged composition", () => {
     expect(result.value).toMatchObject({ status: "complete", loopsConsumed: 2, actionRequired: "none" });
     expect(calls.filter(call => call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.loop-io" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
       "invoke-human-1.l1.t1.a1.task-reviewer", "invoke-human-1.l1.t1.a1.task-synthesis", "invoke-human-1.l2.director",
-      "invoke-human-1.l2.review.director-prepare", "invoke-human-1.l2.review.independent-a", "invoke-human-1.l2.review.independent-b",
+      "invoke-human-1.l2.review.director-prepare", "invoke-human-1.l2.review.independent-evidence-contract-r1", "invoke-human-1.l2.review.independent-evidence-contract-r2",
+      "invoke-human-1.l2.review.independent-a-r1", "invoke-human-1.l2.review.independent-a-r2",
       "invoke-human-1.l2.review.director-synthesis", "invoke-human-1.l2.compliance", "invoke-human-1.l2.checkout"]);
     expect(inspections).toEqual(["inspect-initial"]);
     writeFileSync(path.join(root, "package.json"), JSON.stringify({ name: "pitako", pi: { subagents: { agents: [path.resolve("agents")] } } }));
@@ -1972,12 +1975,12 @@ describe("packaged workflow caller examples", () => {
     const store = mkdtempSync(path.join(tmpdir(), "pitako-review-launch-")); roots.push(store);
     const { missionPath } = missionFiles(store);
     // The named resource inlines args and the mission binding; the raw path alone refuses.
-    const resolved = analysisResource("pitako.review").resolve({ ...input.args, missionId: "native.mission-1", missionPath });
+    const resolved = analysisResource("pitako.review", store, store).resolve({ ...input.args, missionId: "native.mission-1", missionPath });
     const result = await runWorkflowScript({ script: resolved.script,
       state: { get: key => persisted.get(key), set: (key, value) => { persisted.set(key, structuredClone(value)); } },
       launch: async (key, request) => { launches.push(request); return { key, ok: false, output: "", artifactPaths: [], error: "Controlled terminal failure, no original delivered" }; },
       status: async () => { throw Error("Status preview is not an original"); } });
-    expect((result.value as any).status).toBe("failed");
+    expect((result.value as any).status).toBe("blocked");
     expect(launches).toHaveLength(1); // Argument admission succeeded, not a fabricated review success.
     expect(launches[0].task.split("\n")[0]).toBe(launches[0].label);
     expect(launches[0].label).toContain(input.args.workDescription);
@@ -2055,6 +2058,17 @@ describe("compact admission and preliminary capture", () => {
     } } }));
     expect(inspect(expanded, root).admission).toEqual({ maxCycles: 3,
       taskReviewer: "custom/project-reviewer:high", taskSynthesis: "custom/global-synthesis" });
+    writeFileSync(path.join(store, "settings.json"), JSON.stringify({ pitako: { review: {
+      r1: "custom/global-first:low", r2: "custom/global-second", synthesis: "custom/global-director",
+    } } }));
+    writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: { review: {
+      r1: "custom/project-first:high",
+    } } }));
+    expect(inspect(expanded, root).admission).toEqual({ maxCycles: 3, reviewModels: {
+      r1: { key: "pitako.review.r1", model: "custom/project-first:high" },
+      r2: { key: "pitako.review.r2", model: "custom/global-second" },
+      synthesis: { key: "pitako.review.synthesis", model: "custom/global-director" },
+    } });
     writeFileSync(source, content.slice(0, -1) + "x");
     expect(inspect(expanded, root).binding).not.toBe(config.preliminary.binding);
   });
@@ -2089,7 +2103,9 @@ describe("compact admission and preliminary capture", () => {
     } }));
     writeFileSync(path.join(store, "settings.json"), "{invalid JSON");
     mkdirSync(path.join(root, ".pi"), { recursive: true });
-    writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: { execute: { taskReviewer: false } } }));
+    writeFileSync(path.join(root, ".pi/settings.json"), JSON.stringify({ pitako: {
+      execute: { taskReviewer: false }, review: { r1: false, r2: false, synthesis: false },
+    } }));
     const replay = inspect(expanded, root);
     expect(replay.error).toBeUndefined();
     expect(replay.binding).toBe(initial.binding);
@@ -2321,7 +2337,7 @@ describe("plan/execute packaged composition", () => {
       const metadata = { ...deterministicScripts, inlineLoopIO: true, root, withTask: historicalChild || mode.startsWith("retained-worker-") || mode === "worker-blocked", commonDir: path.join(root, ".git"), candidates: [],
         selected: { source: `${root}/.pitako/plans/assignment.md`, digest: digest(content), chunks: 1 } };
       const children: Record<string, any> = {};
-      for (const loop of [1, 2]) for (const phase of [...loop > 1 ? ["demand-observation"] : [], "director", "t1.a1", "review.director-prepare", "review.independent-a", "review.independent-b", "review.director-synthesis", "compliance", "checkout"]) {
+      for (const loop of [1, 2]) for (const phase of [...loop > 1 ? ["demand-observation"] : [], "director", "t1.a1", "review.director-prepare", "review.independent-evidence-contract-r1", "review.independent-evidence-contract-r2", "review.independent-a-r1", "review.independent-a-r2", "review.director-synthesis", "compliance", "checkout"]) {
         const key = `invoke-human-1.l${loop}.${phase}`;
         children[key] = childResponse(key, { agent: phase === "director" ? "pitako.execution-director" : phase === "checkout" ? "pitako.checkout-observer" : phase === "t1.a1" ? "pitako.worker" : "pitako.reviewer" }, metadata, checkout);
       }

@@ -1,11 +1,11 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, rmSync } from "node:fs";
 import { checkpointScenarioFixture } from "./fixtures/plan-execute-checkpoint-scenario.ts";
-import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 
 const composition = realCheckoutCompositionFixture();
 const { roots, disposers, checkpointCancellations, settleWorkflows } = composition;
-const native = nativeCheckpointFixture(composition);
+const native = composition.runtime;
 const { nativeCheckpointExits, startNativeCheckpoint, nativeCheckpointCase, nativeCheckpointInput } = native;
 const { checkpointScenario, releasePreparedPause } = checkpointScenarioFixture(composition, native);
 // Fixture settlement cases do not use the SDK; scenario cases below load it.
@@ -46,6 +46,10 @@ test("native checkpoint fixture cancellation after IPC disconnect joins late con
     const keepAlive = setInterval(() => {}, 60000);
     process.disconnect();
     await new Promise(resolve => process.once('SIGTERM', resolve));
+    // Node's IPC reader can report the peer's concurrent disconnect here.
+    process.emit('error', Object.assign(new Error('IPC channel is already disconnected'), {
+      code: 'ERR_IPC_DISCONNECTED',
+    }));
     clearInterval(keepAlive);
     process.stdout.write('settled stdout');
     process.stderr.write('settled stderr');
@@ -59,11 +63,14 @@ test("native checkpoint fixture cancellation after IPC disconnect joins late con
   expect(existsSync(native.nativeCheckpointRoot)).toBe(true);
   const cancel = [...checkpointCancellations][0]!;
   cancel(); cancel();
-  await settleWorkflows();
+  // Re-entry before the old close must join it, not reuse its occupied IPC slot.
+  const successor = nativeCheckpointCase(settlementInput(), "async () => 'fresh case'");
   expect(await continuation).toBeUndefined();
+  expect(await successor).toEqual([0, JSON.stringify("fresh case"), ""]);
+  expect(native.nativeCheckpoint?.spawnfile).toBe(child.spawnfile);
+  await settleWorkflows();
   expect(finished).toBe(true);
-  expect(native.nativeCheckpoint).toBeUndefined();
-  const [exit, output, errors] = await nativeCheckpointExits.at(-1)!.promise;
+  const [exit, output, errors] = await nativeCheckpointExits.at(-2)!.promise;
   expect(exit, errors).toBe(143);
   expect(output).toContain("settled stdout");
   expect(errors).toContain("settled stderr");
@@ -71,7 +78,6 @@ test("native checkpoint fixture cancellation after IPC disconnect joins late con
   expect(checkpointCancellations.size).toBe(0);
   expect(existsSync(native.nativeCheckpointRoot)).toBe(true);
   cancel();
-  await startSettlementChild();
   expect(await nativeCheckpointCase(settlementInput(), "async () => 'fresh case'"))
     .toEqual([0, JSON.stringify("fresh case"), ""]);
 });
@@ -83,6 +89,113 @@ test("native checkpoint fixture preserves genuine failure and subsequent normal 
   expect(failure?.[2]).toContain("controlled case failure");
   expect(await nativeCheckpointCase(settlementInput(), "async () => 'completed'"))
     .toEqual([0, JSON.stringify("completed"), ""]);
+});
+
+test.each(["idle", "pending"])("native checkpoint fixture records non-owner SIGTERM while %s", async mode => {
+  if (!native.nativeCheckpoint) await startSettlementChild();
+  let pending: Promise<[number, string, string] | undefined> | undefined;
+  if (mode === "pending") {
+    pending = nativeCheckpointCase(settlementInput(), "async () => { process.send({ready:true}); return new Promise(() => {}); }");
+    // Observe child entry without a sleep or a case-owned cancellation.
+    await new Promise<void>(resolve => native.nativeCheckpoint!.once("message", () => resolve()));
+  }
+  const operation = nativeCheckpointExits.at(-1)!;
+  expect(operation.cancelled).toBe(false);
+  native.nativeCheckpoint!.kill("SIGTERM");
+  const [exit, , errors] = await operation.promise;
+  expect(exit, errors).toBe(143);
+  expect(operation.cancelled).toBe(true);
+  if (pending) {
+    const result = await pending;
+    expect(result?.[0]).toBe(143);
+    expect(result?.[2]).toContain("closed before replying");
+  }
+  await settleWorkflows();
+  expect(native.nativeCheckpoint).toBeUndefined();
+  expect(checkpointCancellations.size).toBe(0);
+});
+
+test("native checkpoint fixture keeps an asynchronous consumer owned until it settles", async () => {
+  if (!native.nativeCheckpoint) await startSettlementChild();
+  let entered!: () => void, release!: () => void;
+  const consuming = new Promise<void>(resolve => { entered = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const pending = nativeCheckpointCase(settlementInput(), "async () => 'completed'", async () => {
+    entered();
+    await released;
+    return "consumer settled";
+  });
+  try {
+    await consuming;
+    expect(checkpointCancellations.size).toBe(1);
+    let settled = false;
+    const settlement = settleWorkflows().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await settlement;
+    expect(await pending).toBe("consumer settled");
+    expect(checkpointCancellations.size).toBe(0);
+  } finally {
+    release();
+    await settleWorkflows();
+  }
+});
+
+test("composition settlement joins workflow work after the native reply", async () => {
+  const root = composition.repository();
+  let entered!: () => void, release!: () => void;
+  const continued = new Promise<void>(resolve => { entered = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const pending = composition.ownWorkflow(async () => {
+    expect(await nativeCheckpointCase(settlementInput(), "async () => 'completed'"))
+      .toEqual([0, JSON.stringify("completed"), ""]);
+    entered();
+    await released;
+    expect(existsSync(root)).toBe(true);
+  });
+  try {
+    await continued;
+    let settled = false;
+    const settlement = settleWorkflows().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await settlement;
+    await pending;
+  } finally {
+    release();
+    await pending;
+  }
+});
+
+test("checkpoint child lifecycle joins asynchronous assertions before releasing roots", async () => {
+  const root = composition.repository();
+  let entered!: () => void, release!: () => void;
+  const consuming = new Promise<void>(resolve => { entered = resolve; });
+  const released = new Promise<void>(resolve => { release = resolve; });
+  const child = Bun.spawn([process.execPath, "-e", ""], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  child.stdin.end();
+  const lifecycle = composition.checkpointLifecycle(child, async () => {
+    entered();
+    await released;
+    expect(existsSync(root)).toBe(true);
+  });
+  try {
+    await consuming;
+    expect(checkpointCancellations.size).toBe(1);
+    let settled = false;
+    const settlement = settleWorkflows().then(() => { settled = true; });
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    release();
+    await settlement;
+    await lifecycle.result;
+    expect(checkpointCancellations.size).toBe(0);
+  } finally {
+    release();
+    await lifecycle.settled;
+  }
 });
 
 test("native checkpoint fixture close without a reply is not a successful case", async () => {
@@ -123,8 +236,9 @@ describe("plan/execute packaged composition", () => {
     }
     test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`, async () => {
       await checkpointScenario(mode);
-      // Measured 159 (158 Git + one opaque runtime), plus 16.
-      if (mode === "unit-before-capture") composition.expectProcessBudget(175);
+      // Native module loading also observes Git formerly hidden by the jiti module graph.
+      // Measured 177 (176 Git + one opaque runtime), plus 18.
+      if (mode === "unit-before-capture") composition.expectProcessBudget(195);
     });
   }
 });
@@ -145,8 +259,8 @@ describe("native SDK checkpoint wiring", () => {
   beforeAll(async () => {
     if (native.nativeCheckpoint?.connected) native.nativeCheckpoint.disconnect();
     await nativeCheckpointExits.at(-1)?.promise;
-    await startNativeCheckpoint({ native: true });
-    await checkpointScenario("abrupt-continue", false, true);
+    await startNativeCheckpoint({ native: true, extension: false });
   });
+  beforeAll(() => checkpointScenario("abrupt-continue", false, true));
   test("registered loader restores an interrupted unit and completes the workflow", () => checkpointScenario("abrupt-continue"));
 });

@@ -360,9 +360,8 @@ test.each(["cancellation", "finalGaps"])("%s projections discard their unused vi
 });
 
 test("a final review with production-sized originals and native metadata stays inside the native state envelope", async () => {
-  // Magnitudes mirror exec-elee-20261109-2: eleven completed tasks, four angles, ~113 KB of
-  // review values and native reviewer receipts carrying acceptance and debug paths.
-  const host = fixture(undefined, { taskCount: 11, angles: 4, findings: true, retainSnapshots: false });
+  // Eleven completed tasks and four mirrored reviews with large originals and native debug metadata.
+  const host = fixture(undefined, { taskCount: 11, findings: true, retainSnapshots: false });
   host.setLimit(12);
   let peakBytes = 0;
   host.setSaveObserver((_value, bytes) => { peakBytes = Math.max(peakBytes, bytes); });
@@ -372,8 +371,6 @@ test("a final review with production-sized originals and native metadata stays i
     if (request.key === "invoke-human-1.l1.director")
       for (const change of value.changes) change.task.goal = pad(change.task.goal, 1600);
     if (request.key.includes(".review.independent-")) value.coverage = pad(request.key, 12 * 1024);
-    if (request.key.includes(".review.critique-")) value.reason = pad(request.key, 6 * 1024);
-    if (request.key.includes(".review.defense-")) value.reason = pad(request.key, 5 * 1024);
     if (request.key.endsWith(".review.director-synthesis")) value.memo = pad(request.key, 17 * 1024);
     return result;
   });

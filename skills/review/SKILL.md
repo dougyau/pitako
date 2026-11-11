@@ -1,6 +1,6 @@
 ---
 name: review
-description: Review a supplied diff, plan, solution, codebase scope, or issue through independent adversarial angles, cross-critique with one defense, and evidence-based synthesis. Uses one background pi-subagents scripted workflow.
+description: Review a supplied diff, plan, solution, codebase scope, or issue through two independent angles mirrored across two model slots, followed by evidence-based synthesis. Uses one background pi-subagents scripted workflow.
 ---
 
 # Review
@@ -42,8 +42,16 @@ coverage instead of claiming closure.
 
 Launch the registered named resource `pitako.review`, never a script path: raw
 paths fail with "launch by name after mission.create". Each new review pass needs
-its own mission; a retained standalone pass is not implicitly restarted or
-migrated. First create the mission in the project being reviewed:
+its own mission. Every retained standalone `terminalOutcome` refuses relaunch
+before dispatch, with persisted state unchanged. If a host abort (user Stop,
+workflow timeout or runtime crash) leaves no `terminalOutcome`, a same-args
+standalone relaunch starts a new pass only if no child original was saved yet.
+After a child original is saved (for example, after `director-prepare`), the
+relaunch dispatches a fresh `director-prepare`, then ends blocked with
+"Review original integrity conflict" and retains `terminalOutcome: "blocked"`;
+start a new mission. Native replay (`runtime-replaced` or `owner-exited`) still
+reuses frozen models and settled children.
+First create the mission in the project being reviewed:
 
 ```js
 subagent({ action: "mission.create", cwd: "<project being reviewed>",
@@ -77,36 +85,50 @@ subagent({
 Return control after admission. Native completion delivers the final result;
 do not poll, add a watcher, or launch another director.
 
-The script fixes three phases; the director selects two to four angles on the
-same complete target, not files or subtasks:
+The script uses exactly two angles on the same complete target, not files or
+subtasks. The fixed angle is `evidence-contract` for `diff`, `solution`,
+`codebase`, and `issue`, or `decision-fidelity` for `plan` (including specs).
+The director selects exactly one additional risk angle whose id must differ
+from the fixed angle.
 
-1. **Independent review.** Fresh reviewers see no peer conclusions. Each may
+1. **Independent mirrored review.** Each angle is reviewed by both model slots,
+   `r1` and `r2`, giving four fresh read-only `pitako.reviewer` children.
+   Fresh reviewers see no peer conclusions. Each may
    return zero findings. verify-behavior and ponytail-review are common; additional skills are chosen
    from the script's bounded list by risk. Apply ponytail-review to correctness, safety, useful tests and simplicity; require reachable cases and evidence, not speculative guards.
-2. **Cross-critique and defense.** A different reviewer examines every finding.
-   Each author then gets one response: maintain, narrow, or withdraw.
-   Native resumes preserve each child's profile and context. Reviewers without
-   assigned findings skip critique; authors without findings skip defense.
-   When there are no findings, both phases need no child calls. No extra rounds.
-3. **Synthesis.** The director deduplicates and records a reasoned disposition
+2. **Synthesis.** Directly after the four reviews, the director deduplicates and records a reasoned disposition
    for every finding: include, discard, or uncertain. Evidence decides, not votes.
    Each finding and final disposition also has a `classification`:
    `scoped-defect`, `related-improvement`, `out-of-scope`, or `uncertain`.
    `requirement` cites the agreed requirement or existing guarantee and its
    source for a scoped defect; it is `null` when none is established.
-   Cross-critique challenges both factual support and belonging to the scope.
    Unresolved claims stay uncertain rather than becoming defects automatically.
    A disposition classified `uncertain` uses decision `uncertain`, never `include`.
 
-The workflow makes no model overrides. Pi-subagents owns native child model
-selection.
+No critique or defense phases run in standalone `/review` or `/execute` final
+review. No extra rounds. Synthesis rules, schema, and `.director-synthesis` key
+are unchanged. Independent keys are `independent-<angle>-r1` and
+`independent-<angle>-r2`; model ids never enter keys. References record the model,
+and finding ids are `<angle>-<slot>-<n>`.
+
+Pi settings `pitako.review.r1` and `pitako.review.r2` default to
+`anthropic/claude-opus-5-5:high` and `openai-codex/gpt-6.1-sol:xhigh`;
+`pitako.review.synthesis` defaults to `anthropic/claude-opus-5-5:high` and selects
+both the prepare director and synthesis. Each value is one exact
+`provider/id[:thinking]` string sent unchanged as the child `model`.
+Standalone `/review` reads settings through its named analysis resource;
+`/execute` freezes them at admission. Both reuse frozen values on replay.
+Invalid values are rejected; an unknown or failing model stops review with its
+settings key, model, and native error, never a fallback model.
+See [configuration](../../docs/configuration.md#package-and-session-settings)
+for settings precedence and examples.
 
 ## Evidence handoff
 
 Every fresh/resumed request carries the complete current brief and target,
 caller-supplied single-line `workDescription`, readable `label`, explicit `phase`
 and concrete first task line. This includes angle selection, independent review,
-cross-critique, defense and synthesis. Keys and native resume identity remain
+and synthesis. Keys and native resume identity remain
 unchanged; titles do not promise historical session renaming or uniform native views.
 
 Full originals request native persistence and `outputMode: "file-only"`. Finding
@@ -114,7 +136,7 @@ indexes identify each authoritative original/ordinal/ID rather than copying
 finding bodies into a second table. Reasons, coverage, uncertainty and contrary
 narrative outside findings remain recoverable; every finding gets a disposition.
 Essential-original references explain why the exact original is needed. Before
-each consuming phase (critique, defense, synthesis) the workflow dispatches the
+the synthesis phase the workflow dispatches the
 model-free `pitako.access-verifier` once over the phase's required originals. It
 compares the canonical JSON digest of each published file with the digest saved
 in review state (state keeps references, not values) and writes a no-clobber

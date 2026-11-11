@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { beforeAll, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -16,6 +16,7 @@ const { verifyLedger } = await import(path.resolve("skills/execute/ledger.mjs"))
 const composition = realCheckoutCompositionFixture();
 const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
+beforeAll(() => runtime.startNativeCheckpoint({ extension: false }));
 const invocation = "drain-fixture";
 const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
 
@@ -54,7 +55,13 @@ async function fixture() {
   return { root, dbPath, request: { operation: "drain", key: "finish", invocation, intentions } };
 }
 
-async function launch(f: Awaited<ReturnType<typeof fixture>>, request: any = f.request, interruption?: { key: string; phase: string }) {
+function launch(f: Awaited<ReturnType<typeof fixture>>, request: any = f.request, interruption?: { key: string; phase: string }) {
+  const result = launchCase(f, request, interruption);
+  composition.workflowSettlements.push(result.then(() => {}, () => {}));
+  return result;
+}
+
+async function launchCase(f: Awaited<ReturnType<typeof fixture>>, request: any, interruption?: { key: string; phase: string }) {
   // Reuse the file-owned loader, not operation state: every replay re-reads disk.
   // The fixture joins cancelled cases and the child before releasing owned roots.
   // loop-io loads its own Node hooks; these harnesses do not use the Pi SDK.
@@ -109,22 +116,27 @@ async function finalState(f: Awaited<ReturnType<typeof fixture>>, output: string
   return { records, backlog: domainBacklog, contentDigest: lastApplied!.contentDigest };
 }
 
-test("drains in persisted order and returns an immutable receipt by reference, including empty finish drains", async () => {
+test("drains in persisted order and returns an immutable receipt by reference, including empty finish drains", () => {
+  const work = (async () => {
   const f = await fixture();
   // Keep the external CLI boundary once; the interruption matrix owns disk replay.
   const child = Bun.spawn(["node", entry], { cwd: f.root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(JSON.stringify(f.request)); child.stdin.end();
-  const first = (await composition.checkpointLifecycle(child,
-    ([exit, stdout, stderr]) => ({ exit, stdout, stderr })).result)!;
-  expect(first.exit, first.stdout + first.stderr).toBe(0);
-  const state = await finalState(f, first.stdout);
-  const replay = await launch(f);
-  expect(replay.exit, replay.stderr).toBe(0);
-  expect(replay.stdout).toBe(first.stdout);
-  expect(await finalState(f, replay.stdout)).toEqual(state);
-  const empty = await launch(f, { ...f.request, key: "empty-finish", intentions: [] });
-  expect(empty.exit, empty.stderr).toBe(0);
-  expect(receipt(empty.stdout)).toEqual({ invocation, steps: [] });
+  await composition.checkpointLifecycle(child, async ([exit, stdout, stderr]) => {
+    expect(exit, stdout + stderr).toBe(0);
+    const state = await finalState(f, stdout);
+    const replay = await launch(f);
+    expect(replay.exit, replay.stderr).toBe(0);
+    expect(replay.stdout).toBe(stdout);
+    expect(await finalState(f, replay.stdout)).toEqual(state);
+    const empty = await launch(f, { ...f.request, key: "empty-finish", intentions: [] });
+    expect(empty.exit, empty.stderr).toBe(0);
+    expect(receipt(empty.stdout)).toEqual({ invocation, steps: [] });
+  }).result;
+  })();
+  // Own the caller too: a runner timeout abandons its await of the lifecycle.
+  composition.workflowSettlements.push(work.then(() => {}, () => {}));
+  return work;
 });
 
 async function groupedFixture(operation: "advance" | "close") {

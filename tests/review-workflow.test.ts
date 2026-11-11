@@ -1,16 +1,17 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 const originalsRoot = mkdtempSync(join(tmpdir(), "pitako-review-originals-"));
 let originalNumber = 0;
 afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
-import { runWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
+import { runWorkflowScript, workflowRunParamsFingerprint, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { verifyGate } from "../extensions/access-receipts.mjs";
 
 import { readReviewOriginal, reviewOriginals } from "../skills/execute/loop.ts";
 import { createHash } from "node:crypto";
 import { canonicalDigest } from "../extensions/canonical.mjs";
+import { analysisResource } from "../extensions/plan-execute.ts";
 
 const source = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
 interface Request {
@@ -19,6 +20,7 @@ interface Request {
 }
 interface Result {
   ok: boolean; runId?: string; error?: string; structuredOutput?: unknown;
+  reused?: boolean;
   agent?: string; outputReference?: string; outputArtifactPath?: string;
   outputPathMapping?: { requestedPath: string; savedPath: string };
   artifactPaths?: string[]; results?: WorkflowScriptChildResult["results"];
@@ -30,7 +32,7 @@ interface Outcome {
     findingId: string; decision: string; reason: string;
     classification: string; requirement: string | null;
   }[];
-  references: { key: string; runId: string; stopped?: boolean; results?: { structuredOutputPath: string }[] }[];
+  references: { key: string; model: string; runId: string; stopped?: boolean; reused?: boolean; results?: { structuredOutputPath: string }[] }[];
   screening?: { verdict: string; reason: string; assessments: unknown[] };
 }
 const args = {
@@ -40,17 +42,20 @@ const args = {
 };
 const angles = [
   { id: "a", focus: "Correctness and reachable callers", skills: ["blast-radius"] },
-  { id: "b", focus: "Unnecessary complexity", skills: ["ponytail-review"] },
 ];
+function keyModel(phase: string, output: string) {
+  return phase === "review-independent" && output.endsWith("-r2.json")
+    ? "openai-codex/gpt-6.1-sol:xhigh" : "anthropic/claude-opus-5-5:high";
+}
+const reviewKeys = ["director-prepare", "independent-evidence-contract-r1", "independent-evidence-contract-r2",
+  "independent-a-r1", "independent-a-r2", "director-synthesis"];
 const finding = {
   title: "PRIVATE_FINDING", location: "src/api.ts:12", scenario: "Caller passes an empty key",
   evidence: "Guard removed by the supplied patch", impact: "Wrong record selected",
   classification: "scoped-defect", requirement: "README.md: caller keys must select the matching record",
 };
-const challenge = { findingId: "a-1", assessment: "refuted", evidence: "Caller rejects empty keys" };
-const response = { findingId: "a-1", disposition: "withdraw", reason: "Confirmed the caller guard" };
 const disposition = {
-  findingId: "a-1", decision: "discard", reason: "Existing guard prevents the scenario",
+  findingId: "a-r1-1", decision: "discard", reason: "Existing guard prevents the scenario",
   classification: finding.classification, requirement: finding.requirement,
 };
 function child(key: string, properties?: object): Result {
@@ -58,11 +63,7 @@ function child(key: string, properties?: object): Result {
   if (key === "director-prepare") body = { angles };
   else if (key.startsWith("independent-"))
     body = { coverage: "Inspected changed API and callers; no tests executed",
-      findings: key.endsWith("-a") ? [finding] : [] };
-  else if (key.startsWith("critique-"))
-    body = { challenges: key.endsWith("-b") ? [challenge] : [] };
-  else if (key.startsWith("defense-"))
-    body = { responses: key.endsWith("-a") ? [response] : [] };
+      findings: key === "independent-a-r1" ? [finding] : [] };
   else body = { memo: "No supported findings. Existing caller guard refutes the report. Tests unrun.",
     dispositions: [disposition] };
   return { ok: true, runId: `native-${key}`,
@@ -105,32 +106,42 @@ function fixture(
   const calls: { key: string; request: Request }[] = [];
   const persisted = new Map<string, any>();
   const recovered = new Map<string, Result>();
+  const fingerprints = new Map<string, string>();
   let replaying = false;
   let saveCount = 0;
   const missionFile = join(originalsRoot, `mission-${++originalNumber}.json`);
-  writeFileSync(missionFile, JSON.stringify({ other: storage?.other ?? "", workflowState: {} }));
+  writeFileSync(missionFile, "{}");
+  const stateFile = join(missionFile.slice(0, -5), "state.json");
+  mkdirSync(missionFile.slice(0, -5));
+  writeFileSync(stateFile, JSON.stringify({ other: storage?.other ?? "" }));
   const state = { get: async (key: string) => persisted.get(key), set: (key: string, value: any) => {
     saveCount++;
     if (saveCount === storage?.failAt) throw new Error("Essential mission save denied after User Stop");
-    const mission = JSON.parse(readFileSync(missionFile, "utf8"));
-    mission.workflowState[key] = value;
+    const mission = JSON.parse(readFileSync(stateFile, "utf8"));
+    mission[key] = value;
     const bytes = JSON.stringify(mission);
     if (Buffer.byteLength(bytes, "utf8") > 256 * 1024) throw new Error("Whole mission exceeds 256 KiB");
-    writeFileSync(missionFile, bytes);
+    writeFileSync(stateFile, bytes);
     persisted.set(key, JSON.parse(JSON.stringify(value)));
   } };
   const access = { missionPath: missionFile, namespace: "review" };
+  let beforeVerify: (() => void | Result) | undefined;
   const verifications: { key: string; request: any; output: any }[] = [];
   function dispatch(key: string, request: Request): Promise<Result> {
     // The real model-free verifier runs over the actual published temp files.
     if (request.agent === "pitako.access-verifier") return Promise.resolve().then(() => {
+      const failure = beforeVerify?.();
+      if (failure) return failure;
       const output = verifyGate(JSON.parse(request.task));
       verifications.push({ key, request: JSON.parse(request.task), output });
       return { ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(output), results: [{ exitCode: 0 } as any] };
     });
-    if (replaying && recovered.has(key)) return Promise.resolve(recovered.get(key)!);
+    const fingerprint = workflowRunParamsFingerprint({ ...request });
+    if (replaying && recovered.has(key) && fingerprints.get(key) === fingerprint)
+      return Promise.resolve({ ...recovered.get(key)!, reused: true });
     expect(calls.some(call => call.key === key)).toBe(false);
     calls.push({ key, request });
+    fingerprints.set(key, fingerprint);
     if (key === synchronousFailureKey) throw new Error("Synchronous dispatch rejection");
     return Promise.resolve().then(() => respond(key, request)).then(result => {
       const published = nativeOriginal(key, request, result);
@@ -157,9 +168,12 @@ function fixture(
   // Named-resource resolution inlines pitakoAccess; the raw source alone refuses to run.
   const bound = `const pitakoAccess = ${JSON.stringify(access)};\n`;
   return {
-    calls, persisted, missionFile, verifications, recovered, saves: () => saveCount,
+    get beforeVerify() { return beforeVerify; },
+    set beforeVerify(value: (() => void | Result) | undefined) { beforeVerify = value; },
+    calls, persisted, missionFile, stateFile, verifications, recovered, saves: () => saveCount,
     reconcile: () => { replaying = true; },
     execute: (input: unknown = args) => new AsyncFunction("args", "runs", "state", bound + source)(input, runs, state),
+    resolved: (script: string) => new AsyncFunction("unused", "runs", "state", script)(undefined, runs, state),
     raw: (input: unknown = args) => new AsyncFunction("args", "runs", "state", source)(input, runs, state),
     library: <T = Outcome>(input: unknown = args, options: object = {}, tail?: string) =>
       new AsyncFunction("args", "runs", "state", `${bound}const pitakoReviewLibraryMode = true;\n${source}\n${
@@ -169,6 +183,138 @@ function fixture(
 }
 
 describe("review scripted workflow", () => {
+  test("same-args standalone relaunch starts a new pass after host abort leaves no terminalOutcome", async () => {
+    const stateFile = join(originalsRoot, `host-abort-state-${++originalNumber}.json`);
+    writeFileSync(stateFile, "{}");
+    const state = {
+      get: (key: string) => JSON.parse(readFileSync(stateFile, "utf8"))[key],
+      set: (key: string, value: unknown) => {
+        const retained = JSON.parse(readFileSync(stateFile, "utf8"));
+        retained[key] = value;
+        writeFileSync(stateFile, JSON.stringify(retained));
+      },
+    };
+    const script = nativeAccess().prefix + source;
+    const controller = new AbortController();
+    const interruptedCalls: string[] = [];
+    await expect(runWorkflowScript({
+      script, args, state, signal: controller.signal,
+      launch: async key => {
+        interruptedCalls.push(key);
+        controller.abort(new Error("Host user Stop"));
+        return { key, ok: false, error: "Host user Stop", artifactPaths: [] } as any;
+      },
+      status: async () => { throw new Error("Unexpected status query"); },
+    })).rejects.toThrow("Host user Stop");
+    expect(interruptedCalls).toEqual(["director-prepare"]);
+    const retained = state.get("review-standalone");
+    expect(retained).toBeDefined();
+    expect(retained.terminalOutcome).toBeUndefined();
+    expect(retained.originals).toEqual([]);
+
+    const calls: string[] = [];
+    const relaunched = await runWorkflowScript({
+      script, args, state,
+      launch: async (key, request) => {
+        const verified = verifierLaunch(key, request);
+        if (verified) return verified;
+        calls.push(key);
+        return { key, ...nativeOriginal(key, request as unknown as Request, child(key)),
+          output: "", artifactPaths: [] } as any;
+      },
+      status: async () => { throw new Error("Unexpected status query"); },
+    });
+    expect(relaunched.value).toMatchObject({ status: "completed", phase: "synthesis" });
+    expect(calls).toEqual(reviewKeys);
+    expect((relaunched.value as Outcome).references.every(ref => !ref.reused)).toBe(true);
+    expect(state.get("review-standalone").terminalOutcome).toBe("completed");
+  });
+
+  test("same-args standalone relaunch blocks after host abort leaves a saved prepare original", async () => {
+    const stateFile = join(originalsRoot, `host-abort-state-${++originalNumber}.json`);
+    writeFileSync(stateFile, "{}");
+    const state = {
+      get: (key: string) => JSON.parse(readFileSync(stateFile, "utf8"))[key],
+      set: (key: string, value: unknown) => {
+        const retained = JSON.parse(readFileSync(stateFile, "utf8"));
+        retained[key] = value;
+        writeFileSync(stateFile, JSON.stringify(retained));
+      },
+    };
+    const script = nativeAccess().prefix + source;
+    const controller = new AbortController();
+    const interruptedCalls: string[] = [];
+    await expect(runWorkflowScript({
+      script, args, state, signal: controller.signal,
+      launch: async (key, request) => {
+        interruptedCalls.push(key);
+        if (key.startsWith("independent-")) {
+          controller.abort(new Error("Host user Stop"));
+          return { key, ok: false, error: "Host user Stop", artifactPaths: [] } as any;
+        }
+        return { key, ...nativeOriginal(key, request as unknown as Request, child(key)),
+          output: "", artifactPaths: [] } as any;
+      },
+      status: async () => { throw new Error("Unexpected status query"); },
+    })).rejects.toThrow("Host user Stop");
+    expect(interruptedCalls[0]).toBe("director-prepare");
+    expect(interruptedCalls[1]).toBe("independent-evidence-contract-r1");
+    const retained = state.get("review-standalone");
+    expect(retained.terminalOutcome).toBeUndefined();
+    expect(retained.originals).toHaveLength(1);
+    expect(retained.originals[0]).toMatchObject({ key: "director-prepare", runId: "native-director-prepare" });
+
+    const calls: string[] = [];
+    const relaunched = await runWorkflowScript({
+      script, args, state,
+      launch: async (key, request) => {
+        calls.push(key);
+        return { key, ...nativeOriginal(key, request as unknown as Request,
+          { ...child(key), runId: `relaunched-${key}` }), output: "", artifactPaths: [] } as any;
+      },
+      status: async () => { throw new Error("Unexpected status query"); },
+    });
+    expect(calls).toEqual(["director-prepare"]);
+    expect(relaunched.value).toMatchObject({
+      status: "blocked",
+      error: "Review original integrity conflict: producer or canonical digest changed during execute reconciliation.",
+    });
+    expect(state.get("review-standalone").terminalOutcome).toBe("blocked");
+  });
+
+  test("standalone native replay freezes models and synthesis params after save interruption", async () => {
+    const root = mkdtempSync(join(originalsRoot, "settings-"));
+    const agentDir = join(root, "agent");
+    mkdirSync(agentDir);
+    mkdirSync(join(root, ".pi"));
+    const file = join(root, ".pi/settings.json");
+    const configured = { r1: "custom/first:high", r2: "other/second:xhigh", synthesis: "custom/director:low" };
+    writeFileSync(file, JSON.stringify({ pitako: { review: configured } }));
+    const host = fixture(undefined, undefined, { failAt: 5 });
+    const resolve = () => analysisResource("pitako.review", root, agentDir).resolve({
+      ...args, missionId: host.missionFile.split("/").pop()!.slice(0, -5), missionPath: host.missionFile,
+    }).script;
+    const script = resolve();
+    const first = await host.resolved(script);
+    expect(first.status).toBe("failed");
+    expect(host.recovered.has("director-synthesis")).toBe(true);
+    writeFileSync(file, JSON.stringify({ pitako: { review: { r1: "changed/model", r2: "changed/model", synthesis: "changed/model" } } }));
+    for (const { key, request } of host.calls)
+      expect(request.model).toBe(key.startsWith("independent-") ? configured[key.endsWith("-r1") ? "r1" : "r2"] : configured.synthesis);
+    host.reconcile();
+    const replayScript = resolve();
+    // Named-resource resume and reuseFrom reject different script digests.
+    expect(createHash("sha256").update(replayScript).digest("hex"))
+      .toBe(createHash("sha256").update(script).digest("hex"));
+    const replay = await host.resolved(replayScript);
+    expect(replay.status).toBe("completed");
+    expect(replay.references.every(ref => ref.reused)).toBe(true);
+    for (const ref of replay.references)
+      expect(ref.model).toBe(ref.key.startsWith("independent-") ? configured[ref.key.endsWith("-r1") ? "r1" : "r2"] : configured.synthesis);
+    expect(host.calls).toHaveLength(6);
+    expect(host.persisted.get("review-standalone").models.r1.model).toBe(configured.r1);
+  });
+
   test("the unchanged library source is inert until called and validates standalone input inside the function", async () => {
     const host = fixture();
     expect(await host.library<{ status: string; references: never[] }>({ rootExecuteArgument: true }, {}, 'return { status: "root", references: [] };'))
@@ -201,9 +347,32 @@ describe("review scripted workflow", () => {
     },
   );
 
+  test("maximum execute prefix and risk angle keep mirrored keys within the native limit", async () => {
+    const prefix = `invoke-${"x".repeat(64)}.l100.review.`;
+    const risk = { ...angles[0], id: "r".repeat(29) };
+    const host = fixture(key => {
+      const local = key.slice(prefix.length);
+      return child(local, local === "director-prepare" ? { angles: [risk] }
+        : local === "director-synthesis" ? {
+          dispositions: [],
+          screening: { verdict: "clear", reason: "No findings", assessments: [] },
+        } : {});
+    });
+    const result = await host.library(args, { prefix, mode: "execute" });
+    expect(prefix).toHaveLength(84);
+    expect(result.status).toBe("completed");
+    expect(host.calls.map(call => call.key)).toEqual([
+      "director-prepare", "independent-evidence-contract-r1", "independent-evidence-contract-r2",
+      `independent-${risk.id}-r1`, `independent-${risk.id}-r2`, "director-synthesis",
+    ].map(key => prefix + key));
+    expect(host.calls[3]!.key).toHaveLength(128);
+    for (const { key } of [...host.calls, ...host.verifications])
+      expect(key).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
+  });
+
   test.each(["clear", "material-gaps", "blocked"])(
     "execute screening is reasoned independently of protocol completion: %s", async verdict => {
-      const assessment = { findingId: "a-1", requirement: finding.requirement,
+      const assessment = { findingId: "a-r1-1", requirement: finding.requirement,
         material: verdict === "material-gaps", consequence: "Caller may select a wrong record",
         reason: verdict === "material-gaps" ? "Reachable violation remains" : "Existing guard bounds the risk" };
       const screening = { verdict, reason: "Requirement and current caller evidence assessed", assessments: [assessment] };
@@ -212,7 +381,7 @@ describe("review scripted workflow", () => {
       const result = await host.library(args, { prefix: "loop1.", mode: "execute" });
       expect(result.status).toBe("completed");
       expect(result.screening).toEqual(screening);
-      // Includes fresh preparation/angles and resumed critique/defense/synthesis.
+      // Synthesis resumes preparation; all independent reviewers are fresh.
       expect(host.calls.some(call => call.request.resume)).toBe(true);
       for (const { request } of host.calls) {
         expect(request.skill).toContain("scope-discipline");
@@ -230,7 +399,7 @@ describe("review scripted workflow", () => {
   test.each(["clear", "material-gaps"])(
     "execute screening preserves rephrased requirements and its %s verdict", async verdict => {
       const screening = { verdict, reason: "Current requirement and consequence assessed", assessments: [{
-        findingId: "a-1", requirement: "README.md: selecting a record must respect the caller's key",
+        findingId: "a-r1-1", requirement: "README.md: selecting a record must respect the caller's key",
         material: verdict === "material-gaps", consequence: "Caller may select a wrong record",
         reason: verdict === "material-gaps" ? "Reachable violation remains" : "Existing guard bounds the risk",
       }] };
@@ -247,16 +416,16 @@ describe("review scripted workflow", () => {
     undefined,
     { verdict: "clear", reason: "No gaps", assessments: [] },
     { verdict: "clear", reason: "No gaps", assessments: [
-      { findingId: "a-1", material: true, reason: "Violation", requirement: finding.requirement, consequence: "Wrong record" },
+      { findingId: "a-r1-1", material: true, reason: "Violation", requirement: finding.requirement, consequence: "Wrong record" },
     ] },
     { verdict: "material-gaps", reason: "Gaps", assessments: [
-      { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "Wrong record" },
+      { findingId: "a-r1-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "Wrong record" },
     ] },
     { verdict: "material-gaps", reason: "Gaps", assessments: [
-      { findingId: "a-1", material: true, reason: "Violation", requirement: null, consequence: "Wrong record" },
+      { findingId: "a-r1-1", material: true, reason: "Violation", requirement: null, consequence: "Wrong record" },
     ] },
     { verdict: "clear", reason: "No gaps", assessments: [
-      { findingId: "a-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "" },
+      { findingId: "a-r1-1", material: false, reason: "Bounded", requirement: finding.requirement, consequence: "" },
     ] },
   ])("rejects absent, incomplete, or contradictory execute screening: %j", async screening => {
     const host = fixture(key => child(key.slice("loop1.".length),
@@ -277,7 +446,7 @@ describe("review scripted workflow", () => {
       key.endsWith("director-synthesis") ? {
         dispositions: [finalDisposition],
         screening: { verdict: "material-gaps", reason: "Claimed gap", assessments: [{
-          findingId: "a-1", material: true, reason: "Claimed violation",
+          findingId: "a-r1-1", material: true, reason: "Claimed violation",
           requirement: finalDisposition.requirement, consequence: "Wrong record",
         }] },
       } : {}));
@@ -285,7 +454,7 @@ describe("review scripted workflow", () => {
     expect(result.status).toBe("failed");
     expect(result.screening).toBeUndefined();
     if (finalDisposition.decision === "discard" || ["out-of-scope", "related-improvement"].includes(finalDisposition.classification))
-      expect(result.error).toContain("Execute screening contradicts dispositions or lacks consequences. a-1");
+      expect(result.error).toContain("Execute screening contradicts dispositions or lacks consequences. a-r1-1");
     expect(host.calls.find(call => call.key.endsWith("director-synthesis"))!.request.task)
       .toContain("A discarded duplicate, out-of-scope or related-improvement finding is assessed material:false; the kept finding carries its consequence.");
   });
@@ -308,83 +477,43 @@ describe("review scripted workflow", () => {
     expect(JSON.stringify(result)).not.toContain("structuredOutput\":");
   });
 
-  test.each([2, 3, 4])("native sandbox preserves standalone/library parity and all %i-angle phases", async count => {
-    const roster = Array.from({ length: count }, (_, index) => ({ id: `r${index}`, focus: `Risk ${index}`, skills: [] }));
-    const outcomes: unknown[] = [];
+  test.each(["diff", "solution", "codebase", "issue", "plan"])("native sandbox mirrors fixed and risk angles for %s", async kind => {
     for (const library of [false, true]) {
-      const calls: string[] = [];
-      const bound = nativeAccess().prefix;
+      const calls: string[] = [], fixed = kind === "plan" ? "decision-fidelity" : "evidence-contract";
       const result = await runWorkflowScript({
-        script: library ? `${bound}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : bound + source,
-        args,
+        script: library ? `${nativeAccess().prefix}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : nativeAccess().prefix + source,
+        args: { ...args, target: { ...args.target, kind } },
         state: { get: () => undefined, set: () => {} },
         launch: async (key, request) => {
           const verified = verifierLaunch(key, request);
           if (verified) return verified;
           calls.push(key);
-          const id = key.slice(key.indexOf("-") + 1);
-          const index = roster.findIndex(angle => angle.id === id);
-          const body = key === "director-prepare" ? { angles: roster }
-            : key.startsWith("independent-") ? { findings: [finding] }
-              : key.startsWith("critique-") ? { challenges: [{ ...challenge, findingId: `${roster[(index + 1) % count]!.id}-1` }] }
-                : key.startsWith("defense-") ? { responses: [{ ...response, findingId: `${id}-1` }] }
-                  : { dispositions: roster.map(angle => ({ ...disposition, findingId: `${angle.id}-1` })) };
-          if (key.startsWith("independent-")) {
-            expect(request.task).toContain(JSON.stringify(args.target));
-            expect(request.task).toContain(args.brief);
-            expect(request.task).not.toContain(finding.title);
-          }
-          return { key, ...nativeOriginal(key, request as unknown as Request, child(key, body)), output: "", artifactPaths: [] } as any;
+          return { key, ...nativeOriginal(key, request as unknown as Request, child(key)), output: "", artifactPaths: [] } as any;
         },
         status: async () => { throw new Error("Unexpected status query"); },
       });
       expect(result.value).toMatchObject({ status: "completed", phase: "synthesis" });
-      expect(calls).toEqual([
-        "director-prepare", ...roster.map(angle => `independent-${angle.id}`),
-        ...roster.map(angle => `critique-${angle.id}`), ...roster.map(angle => `defense-${angle.id}`),
-        "director-synthesis",
-      ]);
-      expect(calls).toHaveLength(3 * count + 2); // 8 / 11 / 14, including preparation and synthesis.
-      outcomes.push(result.value);
+      expect(calls).toEqual(["director-prepare", `independent-${fixed}-r1`, `independent-${fixed}-r2`,
+        "independent-a-r1", "independent-a-r2", "director-synthesis"]);
     }
-    expect(outcomes[1]).toMatchObject({ status: "completed", phase: "synthesis" });
   });
 
-  test("controlled capacity exhaustion in the native sandbox retains completed phases without replacement", async () => {
-    const calls: string[] = [];
-    const attempted: string[] = [];
-    const result = await runWorkflowScript({
-      script: `${nativeAccess().prefix}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs, { prefix: "loop1." });`,
-      args,
-      state: { get: () => undefined, set: () => {} },
-      launch: async (key, request) => {
-        const verified = verifierLaunch(key, request);
-        if (verified) return verified;
-        attempted.push(key);
-        // The public sandbox delegates runtime admission to its launch boundary.
-        if (calls.length === 3) throw new Error("Native spawn capacity exhausted");
-        calls.push(key);
-        return { key, ...nativeOriginal(key, request as unknown as Request, child(key.slice("loop1.".length))), output: "", artifactPaths: [] } as any;
-      },
-      status: async () => { throw new Error("Unexpected status query"); },
-    });
-    expect(result.value).toMatchObject({ status: "failed", phase: "critique",
-      references: [
-        { key: "loop1.director-prepare", runId: "native-director-prepare" },
-        { key: "loop1.independent-a", runId: "native-independent-a" },
-        { key: "loop1.independent-b", runId: "native-independent-b" },
-        { key: "loop1.critique-b", error: "Native spawn capacity exhausted" },
-      ] });
-    expect(calls).toEqual(["loop1.director-prepare", "loop1.independent-a", "loop1.independent-b"]);
-    expect(attempted).toEqual([...calls, "loop1.critique-b"]);
-    expect(JSON.stringify(result.value)).toContain("spawn");
+  test("capacity exhaustion retains completed phases without replacement", async () => {
+    const host = fixture(key => key === "director-synthesis"
+      ? { ok: false, error: "Native spawn capacity exhausted" } : child(key));
+    const result = await host.execute();
+    expect(result.status).toBe("blocked");
+    expect(result.phase).toBe("synthesis");
+    expect(result.error).toContain("Native spawn capacity exhausted");
+    expect(host.calls).toHaveLength(6);
+    expect(result.references).toHaveLength(6);
   });
 
   test("a settled stopped child is incomplete and preserves Stop evidence after siblings settle", async () => {
     const waiting = deferred<Result>(), entered = deferred<void>();
     const host = fixture(key => {
-      if (key === "independent-a") return { ok: false, runId: "stopped-native", stopped: true, error: "User Stop" };
-      if (key === "independent-b") { entered.resolve(); return waiting.promise; }
+      if (key === "independent-a-r1") return { ok: false, runId: "stopped-native", stopped: true, error: "User Stop" };
+      if (key === "independent-a-r2") { entered.resolve(); return waiting.promise; }
       return child(key);
     });
     let finished = false;
@@ -394,13 +523,13 @@ describe("review scripted workflow", () => {
       await entered.promise;
       expect(finished).toBe(false);
     } finally {
-      waiting.resolve(child("independent-b"));
+      waiting.resolve(child("independent-a-r2"));
       result = await work;
     }
     expect(result.status).toBe("failed"); // A child's Stop does not certify invocation cancellation.
     expect(result.error).toContain("User Stop");
-    expect(result.references).toContainEqual(expect.objectContaining({ key: "independent-a", runId: "stopped-native", stopped: true, error: "User Stop" }));
-    expect(host.calls).toHaveLength(3);
+    expect(result.references).toContainEqual(expect.objectContaining({ key: "independent-a-r1", runId: "stopped-native", stopped: true, error: "User Stop" }));
+    expect(host.calls).toHaveLength(5);
   });
 
   test("independent angles receive the same target, selected skills, and no peer conclusions", async () => {
@@ -408,7 +537,7 @@ describe("review scripted workflow", () => {
     const result = await host.execute();
     expect(result.status).toBe("completed");
     const independent = host.calls.filter(call => call.key.startsWith("independent-"));
-    expect(independent).toHaveLength(2);
+    expect(independent).toHaveLength(4);
     for (const { request } of independent) {
       expect(request.agent).toBe("pitako.reviewer");
       expect(request.context).toBe("fresh");
@@ -416,12 +545,12 @@ describe("review scripted workflow", () => {
       expect(request.task).toContain(args.brief);
       expect(request.task).not.toContain("PRIVATE_FINDING");
     }
-    expect(independent[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review", "blast-radius"]);
+    expect(independent[2]!.request.skill).toEqual(["verify-behavior", "ponytail-review", "blast-radius"]);
     expect(independent[1]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
     for (const { request } of host.calls) {
       expect(request.skill ?? []).not.toContain("scope-discipline");
       expect(request.task).not.toContain("Read and apply scope-discipline");
-      expect(request.model).toBeUndefined();
+      expect(request.model).toBe(keyModel(request.phase, request.output));
       expect(request.async).toBeUndefined();
       expect(request.output).toBeString();
       expect(request.outputMode).toBe("file-only");
@@ -433,105 +562,75 @@ describe("review scripted workflow", () => {
     expect(host.calls[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
   });
 
-  test("cross-examines every finding once, preserves native conversations, and synthesizes after defense", async () => {
+  test("synthesizes four independent originals directly using stable slot keys", async () => {
     const host = fixture();
     const result = await host.execute();
-    expect(host.calls.map(call => call.key)).toEqual([
-      "director-prepare", "independent-a", "independent-b", "critique-b",
-      "defense-a", "director-synthesis",
-    ]);
-    const byKey = (key: string) => host.calls.find(call => call.key === key)!.request;
-    expect(packet(byKey("critique-b")).map(original => JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8")).findings)).toContainEqual([finding]);
-    expect(packet(byKey("critique-b"))).toHaveLength(1);
-    expect(byKey("critique-b").task).toContain("Challenge both factual support and belonging");
-    expect(byKey("critique-b").resume).toBe("native-independent-b");
-    expect(byKey("defense-a").resume).toBe("native-independent-a");
-    expect(packet(byKey("defense-a")).map(original => JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8")).challenges)).toContainEqual([challenge]);
-    expect(packet(byKey("defense-a")).some(original => original.phase === "critique")).toBe(true);
-    expect(byKey("director-synthesis").resume).toBe("native-director-prepare");
-    expect(packet(byKey("director-synthesis")).map(original => JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8")).responses)).toContainEqual([response]);
-    expect(packet(byKey("director-synthesis"))).toHaveLength(4);
-    for (const { request } of host.calls.filter(call => call.request.resume)) {
-      expect(request.agent).toBeUndefined();
-      expect(request.skill).toBeUndefined();
-    }
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    const synthesis = host.calls.at(-1)!.request;
+    expect(synthesis.resume).toBe("native-director-prepare");
+    expect(packet(synthesis)).toHaveLength(4);
+    expect(packet(synthesis).every(original => original.phase === "independent")).toBe(true);
     expect(result.dispositions).toEqual([disposition]);
-    expect(result.memo).toContain("No supported findings");
     expect(JSON.stringify(result)).not.toContain("PRIVATE_FINDING");
     expect(result.references).toHaveLength(6);
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-synthesis"]);
+    for (const ref of result.references)
+      expect(ref.model).toBe(keyModel(ref.key.startsWith("independent-") ? "review-independent" : "", `${ref.key}.json`));
   });
 
-  test.each([2, 3, 4])("zero findings with %i angles skips empty calls but retains synthesis", async count => {
-    const roster = Array.from({ length: count }, (_, index) =>
-      ({ id: `angle${index}`, focus: `Risk ${index}`, skills: [] }));
-    const host = fixture(key => child(key,
-      key === "director-prepare" ? { angles: roster }
-        : key.startsWith("independent-") ? { findings: [] }
-          : key === "director-synthesis" ? { dispositions: [] } : {}));
-    const result = await host.execute();
+  test("uses each exact configured slot model without changing replay keys", async () => {
+    const models = {
+      r1: { key: "pitako.review.r1", model: "provider/reviewer-one:high" },
+      r2: { key: "pitako.review.r2", model: "provider/reviewer-two:xhigh" },
+      synthesis: { key: "pitako.review.synthesis", model: "provider/director:high" },
+    };
+    const host = fixture();
+    const result = await host.library(args, { models });
     expect(result.status).toBe("completed");
-    expect(result.dispositions).toEqual([]);
-    expect(host.calls.map(call => call.key)).toEqual([
-      "director-prepare", ...roster.map(angle => `independent-${angle.id}`), "director-synthesis",
-    ]);
-    expect(result.references).toHaveLength(count + 2);
-    expect(packet(host.calls.at(-1)!.request)).toHaveLength(count);
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    for (const { key, request } of host.calls) {
+      const slot = key.startsWith("independent-") ? key.endsWith("-r1") ? "r1" : "r2" : "synthesis";
+      expect(request.model).toBe(models[slot].model);
+      expect(result.references.find(ref => ref.key === key)?.model).toBe(models[slot].model);
+    }
   });
 
-  test("sparse findings preserve the latest native run for each author", async () => {
-    const roster = Array.from({ length: 4 }, (_, index) =>
-      ({ id: `angle${index}`, focus: `Risk ${index}`, skills: [] }));
-    const dispositions = [0, 1].map(index => ({ ...disposition, findingId: `angle${index}-1` }));
-    const host = fixture(key => {
-      if (key === "director-prepare") return child(key, { angles: roster });
-      if (key.startsWith("independent-")) return child(key,
-        { findings: ["independent-angle0", "independent-angle1"].includes(key) ? [finding] : [] });
-      if (key.startsWith("critique-")) return child(key,
-        { challenges: [{ ...challenge, findingId: key === "critique-angle0" ? "angle1-1" : "angle0-1" }] });
-      if (key.startsWith("defense-")) return child(key,
-        { responses: [{ ...response, findingId: `${key.slice("defense-".length)}-1` }] });
-      return child(key, { dispositions });
-    });
-    const result = await host.execute();
-    expect(result.status).toBe("completed");
-    expect(host.calls.map(call => call.key)).toEqual([
-      "director-prepare", ...roster.map(angle => `independent-${angle.id}`),
-      "critique-angle0", "critique-angle3", "defense-angle0", "defense-angle1", "director-synthesis",
-    ]);
-    expect(host.calls.find(call => call.key === "defense-angle0")?.request.resume)
-      .toBe("native-critique-angle0");
-    expect(host.calls.find(call => call.key === "defense-angle1")?.request.resume)
-      .toBe("native-independent-angle1");
-    expect(result.dispositions).toEqual(dispositions);
+  test.each(["director-prepare", "independent-a-r2", "director-synthesis"])(
+    "blocks a failing configured model at %s with its setting and native cause, never a fallback", async failedKey => {
+      const models = {
+        r1: { key: "pitako.review.r1", model: "provider/reviewer-one:high" },
+        r2: { key: "pitako.review.r2", model: "provider/unknown:xhigh" },
+        synthesis: { key: "pitako.review.synthesis", model: "provider/director:high" },
+      };
+      const nativeError = "Unknown subagent model in the active Pi model registry.";
+      const host = fixture(key => key === failedKey ? { ok: false, error: nativeError } : child(key));
+      const result = await host.library(args, { models });
+      const slot = failedKey.startsWith("independent-") ? "r2" : "synthesis";
+      expect(result.status).toBe("blocked");
+      for (const part of [models[slot].key, models[slot].model, nativeError]) expect(result.error).toContain(part);
+      expect(host.calls.map(call => call.key)).toEqual(
+        failedKey === "director-prepare" ? reviewKeys.slice(0, 1)
+          : failedKey === "director-synthesis" ? reviewKeys : reviewKeys.slice(0, 5));
+      expect(host.calls.filter(call => call.key === failedKey)).toHaveLength(1);
+      expect(host.calls.find(call => call.key === failedKey)?.request.model).toBe(models[slot].model);
+    },
+  );
+
+  test("zero findings retains four independent reviews and synthesis", async () => {
+    const host = fixture(key => child(key, key.startsWith("independent-") ? { findings: [] }
+      : key === "director-synthesis" ? { dispositions: [] } : {}));
+    expect((await host.execute()).status).toBe("completed");
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    expect(packet(host.calls.at(-1)!.request)).toHaveLength(4);
   });
 
-  test.each([2, 3, 4])("assigns every finding a distinct peer critic with %i dynamic angles", async count => {
-    const roster = Array.from({ length: count }, (_, index) =>
-      ({ id: `angle${index}`, focus: `Risk ${index}`, skills: [] }));
-    const findingsFor = (id: string) => [1, 2].map(ordinal =>
-      ({ ...finding, title: `${id} evidence ${ordinal}` }));
-    const allDispositions = roster.flatMap(angle => [1, 2].map(ordinal =>
-      ({ ...disposition, findingId: `${angle.id}-${ordinal}` })));
-    const host = fixture((key, request) => {
-      if (key === "director-prepare") return child(key, { angles: roster });
-      const id = key.slice(key.indexOf("-") + 1);
-      if (key.startsWith("independent-")) return child(key, { findings: findingsFor(id) });
-      if (key.startsWith("critique-")) {
-        const index = roster.findIndex(angle => angle.id === id);
-        const peer = roster[(index + 1) % count]!.id;
-        for (const entry of findingsFor(peer)) expect(readFileSync(packet(request)[0].results[0].savedOutputPath, "utf8")).toContain(entry.title);
-        for (const entry of findingsFor(id)) expect(request.task).not.toContain(entry.title);
-        return child(key, { challenges: [1, 2].map(ordinal =>
-          ({ ...challenge, findingId: `${peer}-${ordinal}` })) });
-      }
-      if (key.startsWith("defense-")) return child(key, { responses: [1, 2].map(ordinal =>
-        ({ ...response, findingId: `${id}-${ordinal}` })) });
-      return child(key, { dispositions: allDispositions });
-    });
+  test("every finding receives an angle-slot-ordinal identity", async () => {
+    const ids = ["evidence-contract-r1", "evidence-contract-r2", "a-r1", "a-r2"].flatMap(id => [`${id}-1`, `${id}-2`]);
+    const host = fixture(key => child(key, key.startsWith("independent-") ? { findings: [finding, finding] }
+      : key === "director-synthesis" ? { dispositions: ids.map(findingId => ({ ...disposition, findingId })) } : {}));
     const result = await host.execute();
     expect(result.status).toBe("completed");
-    expect(result.dispositions).toEqual(allDispositions);
-    expect(host.calls).toHaveLength(2 + 3 * count);
+    expect(result.dispositions?.map(entry => entry.findingId)).toEqual(ids);
   });
 
   test.each(["include", "uncertain", "discard"])("allows evidence-based %s without a vote", async decision => {
@@ -550,19 +649,15 @@ describe("review scripted workflow", () => {
       requirement: classification === "scoped-defect" ? finding.requirement : null,
     }));
     const dispositions = findings.map((entry, index) => ({
-      ...disposition, findingId: `a-${index + 1}`, classification: entry.classification,
+      ...disposition, findingId: `a-r1-${index + 1}`, classification: entry.classification,
       requirement: entry.requirement, decision: entry.classification === "uncertain" ? "uncertain" : "include",
     }));
     const input = { ...args, brief: `${args.brief}
-Closure review of candidate-16 against candidate-17: close admitted finding a-1.
+Closure review of candidate-16 against candidate-17: close admitted finding a-r1-1.
 Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffected coverage.` };
     const host = fixture(key => child(key,
-      key === "independent-a" ? { findings }
-        : key === "critique-b" ? { challenges: dispositions.map(entry =>
-          ({ ...challenge, findingId: entry.findingId })) }
-          : key === "defense-a" ? { responses: dispositions.map(entry =>
-            ({ ...response, findingId: entry.findingId })) }
-            : key === "director-synthesis" ? { dispositions, memo: "Scoped defect and recommendations kept separate." }
+      key === "independent-a-r1" ? { findings }
+        : key === "director-synthesis" ? { dispositions, memo: "Scoped defect and recommendations kept separate." }
               : {}));
     const result = await host.execute(input);
     expect(result.status).toBe("completed");
@@ -580,9 +675,9 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(request.task).toContain("name its distinct guarantee");
       expect(request.task).not.toContain("Inspect the complete target independently");
     }
-    for (const key of ["independent-a", "director-synthesis"]) {
+    for (const key of ["independent-a-r1", "director-synthesis"]) {
       const schema = host.calls.find(call => call.key === key)!.request.outputSchema;
-      const collection = key === "independent-a" ? "findings" : "dispositions";
+      const collection = key === "independent-a-r1" ? "findings" : "dispositions";
       expect(schema).toMatchObject({
         properties: {
           [collection]: {
@@ -599,36 +694,26 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     }
   });
 
-  test.each(["independent", "critique", "defense"])(
-    "settles all %s siblings before reporting a child failure, without replacement",
-    async phase => {
-      const waiting = deferred<Result>(), entered = deferred<void>();
-      const host = fixture(key => {
-        if (key === `${phase}-a`) throw new Error("Controlled failure");
-        if (key === `${phase}-b`) { entered.resolve(); return waiting.promise; }
-        return child(key, key === "independent-b" ? { findings: [finding] }
-          : key === "critique-a" ? { challenges: [{ ...challenge, findingId: "b-1" }] } : {});
-      });
-      let finished = false;
-      const execution = host.execute().then(result => { finished = true; return result; });
-      await entered.promise;
-      let result: Outcome;
-      try {
-        expect(finished).toBe(false);
-        expect(host.calls.at(-1)?.key).toBe(`${phase}-b`);
-      } finally {
-        waiting.resolve(child(`${phase}-b`));
-        result = await execution;
-      }
-      expect(result.status).toBe("failed");
-      expect(result.phase).toBe(phase);
-      expect(result.references).toContainEqual(expect.objectContaining({ key: `${phase}-b`, runId: `native-${phase}-b` }));
-      expect(host.calls.at(-1)?.key).toBe(`${phase}-b`);
-      expect(host.calls.some(call => call.key === "director-synthesis")).toBe(false);
-    },
-  );
+  test("settles all independent siblings before reporting failure", async () => {
+    const waiting = deferred<Result>(), entered = deferred<void>();
+    const host = fixture(key => {
+      if (key === "independent-a-r1") throw new Error("Controlled failure");
+      if (key === "independent-a-r2") { entered.resolve(); return waiting.promise; }
+      return child(key);
+    });
+    let finished = false;
+    const execution = host.execute().then(result => { finished = true; return result; });
+    await entered.promise;
+    try { expect(finished).toBe(false); }
+    finally { waiting.resolve(child("independent-a-r2")); }
+    const result = await execution;
+    expect(result.status).toBe("blocked");
+    expect(result.phase).toBe("independent");
+    expect(result.references).toContainEqual(expect.objectContaining({ key: "independent-a-r2", runId: "native-independent-a-r2" }));
+    expect(host.calls.some(call => call.key === "director-synthesis")).toBe(false);
+  });
 
-  test.each(["director-prepare", "independent-b", "critique-b", "defense-a", "director-synthesis"])(
+  test.each(["director-prepare", "independent-a-r2", "director-synthesis"])(
     "preserves a blocked outcome at %s rather than claiming review completion", async key => {
       const host = fixture(current => child(current, current === key
         ? { status: "blocked", reason: "Exact artifact unavailable" } : {}));
@@ -637,15 +722,22 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(result.error).toContain("Exact artifact unavailable");
       expect(result.memo).toBeUndefined();
       expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
+      const calls = host.calls.length;
+      const retainedBytes = readFileSync(host.stateFile, "utf8");
+      const relaunch = await host.execute();
+      expect(relaunch.status).toBe("blocked");
+      expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+      expect(host.calls).toHaveLength(calls);
+      expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     },
   );
 
   test("also settles siblings when dispatch throws synchronously", async () => {
     const waiting = deferred<Result>(), entered = deferred<void>();
     const host = fixture(key => {
-      if (key === "independent-b") { entered.resolve(); return waiting.promise; }
+      if (key === "independent-a-r2") { entered.resolve(); return waiting.promise; }
       return child(key);
-    }, "independent-a");
+    }, "independent-a-r1");
     let finished = false;
     const execution = host.execute().then(result => { finished = true; return result; });
     await entered.promise;
@@ -653,19 +745,19 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     try {
       expect(finished).toBe(false);
     } finally {
-      waiting.resolve(child("independent-b"));
+      waiting.resolve(child("independent-a-r2"));
       result = await execution;
     }
-    expect(result.status).toBe("failed");
-    expect(host.calls).toHaveLength(3);
-    expect(result.references).not.toContainEqual(expect.objectContaining({ key: "independent-a" }));
+    expect(result.status).toBe("blocked");
+    expect(host.calls).toHaveLength(5);
+    expect(result.references).not.toContainEqual(expect.objectContaining({ key: "independent-a-r1" }));
   });
 
   test.each(["director-prepare", "director-synthesis"])(
     "reports a director dispatch rejection at %s without inventing a reference", async key => {
       const host = fixture(current => child(current), key);
       const result = await host.execute();
-      expect(result.status).toBe("failed");
+      expect(result.status).toBe("blocked");
       expect(result.error).toContain("Synchronous dispatch rejection");
       expect(result.references).not.toContainEqual(expect.objectContaining({ key }));
       expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
@@ -673,12 +765,6 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   );
 
   test.each([
-    ["critique-b", { challenges: [] }],
-    ["critique-b", { challenges: [challenge, { ...challenge, findingId: "invented" }] }],
-    ["critique-b", { challenges: [challenge, challenge] }],
-    ["critique-b", { challenges: [{ ...challenge, assessment: "guess" }] }],
-    ["defense-a", { responses: [] }],
-    ["defense-a", { responses: [{ ...response, findingId: "invented" }] }],
     ["director-synthesis", { dispositions: [] }],
     ["director-synthesis", { dispositions: [disposition, disposition] }],
     ["director-synthesis", { dispositions: [{ ...disposition, findingId: "invented" }] }],
@@ -686,39 +772,64 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const host = fixture(current => child(current, current === key ? properties : {}));
     const result = await host.execute();
     expect(result.status).toBe("failed");
-    expect(result.error).toContain((properties as any).challenges?.[0]?.assessment === "guess"
-      ? "completeness/schema/association" : "finding dispositions");
+    expect(result.error).toContain("finding dispositions");
     expect(result.memo).toBeUndefined();
+    const calls = host.calls.length;
+    const retainedBytes = readFileSync(host.stateFile, "utf8");
+    const relaunch = await host.execute();
+    expect(relaunch.status).toBe("blocked");
+    expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(host.calls).toHaveLength(calls);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
   });
 
   test.each([
-    { angles: [] }, { angles: [angles[0]] }, { angles: [angles[0], angles[0]] },
+    { angles: [] }, { angles: [{ ...angles[0], id: "evidence-contract" }] }, { angles: [angles[0], angles[0]] },
     { angles: [...angles, ...angles, angles[0]] },
-    { angles: [angles[0], { ...angles[1], skills: ["execute"] }] },
-    { angles: [angles[0], { ...angles[1], id: "../escape" }] },
+    { angles: [{ ...angles[0], skills: ["execute"] }] },
+    { angles: [{ ...angles[0], id: "../escape" }] },
+    { angles: [{ ...angles[0], id: "r".repeat(30) }] },
   ])("refuses invalid director rosters before launching reviewers: %j", async properties => {
     const host = fixture(key => child(key, properties));
     const result = await host.execute();
     expect(result.status).toBe("failed");
     expect(host.calls).toHaveLength(1);
+    const retainedBytes = readFileSync(host.stateFile, "utf8");
+    const relaunch = await host.execute();
+    expect(relaunch.status).toBe("blocked");
+    expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(host.calls).toHaveLength(1);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
   });
 
-  test("does not treat process success as an adequate review or replace a failed resume", async () => {
-    const inadequate = fixture(key => key === "independent-a"
+  test("rejects a plan risk angle that duplicates decision-fidelity", async () => {
+    const host = fixture(key => child(key, { angles: [{ ...angles[0], id: "decision-fidelity" }] }));
+    const result = await host.execute({ ...args, target: { ...args.target, kind: "plan" } });
+    expect(result.status).toBe("failed");
+    expect(result.error).toContain("distinct from the fixed angle");
+    expect(host.calls).toHaveLength(1);
+  });
+
+  test("incomplete supplied model slots cannot silently use native defaults", async () => {
+    const host = fixture();
+    await expect(host.library(args, { models: { r1: { key: "pitako.review.r1" } } }))
+      .rejects.toThrow("requires its settings key and exact model string");
+    expect(host.calls).toHaveLength(0);
+  });
+
+  test("does not treat process success as an adequate review", async () => {
+    const inadequate = fixture(key => key === "independent-a-r1"
       ? { ok: true, runId: "native-empty", structuredOutput: { status: "ready" } } : child(key));
     expect((await inadequate.execute()).status).toBe("failed");
-    const resume = fixture(key => key === "critique-b" ? { ok: false } : child(key));
-    expect((await resume.execute()).phase).toBe("critique");
-    expect(resume.calls.filter(call => !call.request.resume)).toHaveLength(3);
   });
 
-  test.each(["director-prepare", "independent-a", "critique-b", "defense-a", "director-synthesis"])(
+  test.each(["director-prepare", "independent-a-r1", "director-synthesis"])(
     "retains a child's bounded setup failure and run reference at %s", async key => {
       const cause = "Setup failed after automatic recovery. Original error: controlled stale context";
       const host = fixture(current => current === key
         ? { ok: false, runId: `failed-${key}`, error: cause } : child(current));
       const result = await host.execute();
-      expect(result.status).toBe("failed");
+      expect(result.status).toBe("blocked");
       expect(result.error).toContain(cause);
       expect(result.memo).toBeUndefined();
       expect(result.references).toContainEqual(expect.objectContaining({ key, runId: `failed-${key}`, error: cause }));
@@ -729,9 +840,9 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   test("retains a terminal failed child's identity while joining its unfinished sibling", async () => {
     const waiting = deferred<Result>(), entered = deferred<void>();
     const host = fixture(key => {
-      if (key === "independent-a")
-        return { ok: false, runId: "failed-independent-a", error: "Terminal child failure" };
-      if (key === "independent-b") { entered.resolve(); return waiting.promise; }
+      if (key === "independent-a-r1")
+        return { ok: false, runId: "failed-independent-a-r1", error: "Terminal child failure" };
+      if (key === "independent-a-r2") { entered.resolve(); return waiting.promise; }
       return child(key);
     });
     let finished = false;
@@ -741,38 +852,40 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     try {
       expect(finished).toBe(false);
     } finally {
-      waiting.resolve(child("independent-b"));
+      waiting.resolve(child("independent-a-r2"));
       result = await execution;
     }
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("blocked");
     expect(result.phase).toBe("independent");
     expect(result.error).toContain("Terminal child failure");
     expect(result.references).toMatchObject([
       { key: "director-prepare", runId: "native-director-prepare" },
-      { key: "independent-a", runId: "failed-independent-a" },
-      { key: "independent-b", runId: "native-independent-b" },
+      { key: "independent-evidence-contract-r1", runId: "native-independent-evidence-contract-r1" },
+      { key: "independent-evidence-contract-r2", runId: "native-independent-evidence-contract-r2" },
+      { key: "independent-a-r1", runId: "failed-independent-a-r1" },
+      { key: "independent-a-r2", runId: "native-independent-a-r2" },
     ]);
     expect(host.calls.map(call => call.key)).toEqual([
-      "director-prepare", "independent-a", "independent-b",
+      ...reviewKeys.slice(0, 5),
     ]);
   });
 
   test("bounds long child diagnostics without losing their cause", async () => {
-    const host = fixture(key => key === "critique-b"
+    const host = fixture(key => key === "director-synthesis"
       ? { ok: false, error: `Resume unavailable: ${"x".repeat(5000)}` } : child(key));
     const result = await host.execute();
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("blocked");
     expect(result.error).toContain("Resume unavailable:");
     expect(result.error!.length).toBeLessThanOrEqual(1200);
   });
 
   test.each([
-    ["independent-a", { findings: [{ ...finding, evidence: "" }] }],
-    ["independent-a", { findings: [{ ...finding, classification: "blocking" }] }],
-    ["independent-a", { findings: [{ ...finding, requirement: null }] }],
-    ["independent-a", { findings: [{ ...finding, requirement: undefined }] }],
-    ["independent-a", { findings: null }],
-    ["independent-a", { coverage: "" }],
+    ["independent-a-r1", { findings: [{ ...finding, evidence: "" }] }],
+    ["independent-a-r1", { findings: [{ ...finding, classification: "blocking" }] }],
+    ["independent-a-r1", { findings: [{ ...finding, requirement: null }] }],
+    ["independent-a-r1", { findings: [{ ...finding, requirement: undefined }] }],
+    ["independent-a-r1", { findings: null }],
+    ["independent-a-r1", { coverage: "" }],
     ["director-synthesis", { memo: "" }],
     ["director-synthesis", { dispositions: [{ ...disposition, classification: "blocking" }] }],
     ["director-synthesis", { dispositions: [{ ...disposition, requirement: null }] }],
@@ -801,34 +914,19 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.calls).toHaveLength(0);
   });
 
-  test("long work descriptions retain early phase and angle differentiation fresh and resumed", async () => {
-    const workDescription = "Review record selection guards " + "with complete caller context ".repeat(12);
+  test("long descriptions keep the angle before the work title", async () => {
+    const workDescription = "Review selection " + "with complete caller context ".repeat(12);
     const host = fixture();
     expect((await host.execute({ ...args, workDescription })).status).toBe("completed");
-    expect(host.calls.map(call => call.key)).toEqual([
-      "director-prepare", "independent-a", "independent-b", "critique-b", "defense-a", "director-synthesis",
-    ]);
-    for (const { key, request } of host.calls) {
-      const phase = key === "director-prepare" ? "Select review angles" : key === "director-synthesis" ? "Review synthesis"
-        : key.startsWith("independent-") ? "Independent review" : key.startsWith("critique-") ? "Cross-critique" : "Author defense";
-      const angle = angles.find(angle => key.endsWith(`-${angle.id}`));
-      expect(request.label).toStartWith(`${phase}${angle ? ` — ${angle.focus}` : ""}: `);
+    for (const { request } of host.calls) {
       expect(request.label).toEndWith(workDescription.trim());
       expect(request.task.split("\n")[0]).toBe(request.label);
-      expect(request.phase).toBe(`review-${key.startsWith("director-") ? key.slice(9) === "prepare" ? "prepare" : "synthesis" : key.split("-")[0]}`);
-      expect(request.task.slice(request.label.length)).toContain(args.brief);
-      expect(request.task.slice(request.label.length)).toContain(JSON.stringify(args.target));
-      if (key.startsWith("critique-") || key.startsWith("defense-")) {
-        expect(request.resume).toBe(`native-independent-${key.split("-")[1]}`);
-      } else if (key === "director-synthesis") expect(request.resume).toBe("native-director-prepare");
-      else expect(request.context).toBe("fresh");
     }
-    expect(host.calls[1]!.request.label.indexOf(angles[0]!.focus)).toBeLessThan(host.calls[1]!.request.label.indexOf(workDescription.trim()));
-    expect(host.calls[2]!.request.label.indexOf(angles[1]!.focus)).toBeLessThan(host.calls[2]!.request.label.indexOf(workDescription.trim()));
+    expect(host.calls[3]!.request.label).toStartWith(`Independent review — ${angles[0]!.focus}: `);
   });
 
   test("current target, publication originals and access survive every fresh/resumed handoff without duplicate findings", async () => {
-    const host = fixture(key => child(key, key === "independent-b"
+    const host = fixture(key => child(key, key === "independent-a-r2"
       ? { coverage: "CONTRARY_NON_FINDING: verified fallback; uncertainty remains" } : {}));
     const outcome = await host.execute();
     expect(outcome.status).toBe("completed");
@@ -845,25 +943,34 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
         expect(original).not.toHaveProperty("value");
         expect(original.association.key).toBe(original.key);
         expect(original.association.phase).toBe(original.phase);
-        if (original.key === "independent-a") {
+        if (original.key === "independent-a-r1") {
           expect(JSON.stringify(exact).split(finding.title)).toHaveLength(2);
           expect(JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8")).findings).toEqual([finding]);
         }
-        if (key === "director-synthesis" && original.key === "independent-b")
+        if (key === "director-synthesis" && original.key === "independent-a-r2")
           expect(exact.coverage).toContain("CONTRARY_NON_FINDING");
       }
     }
     const manifest = host.persisted.get("review-standalone");
     expect(manifest.originals.map((item: any) => item.runId)).toEqual(host.calls.map(call => `native-${call.key}`));
-    expect(manifest.originals.find((item: any) => item.key === "independent-b").runId).toBe("native-independent-b");
-    expect(manifest.originals.find((item: any) => item.key === "critique-b").runId).toBe("native-critique-b");
+    expect(manifest.originals.find((item: any) => item.key === "independent-a-r2").runId).toBe("native-independent-a-r2");
     expect(manifest.originals.every((item: any) => item.publication === "published" && !item.failedOriginal)).toBe(true);
     expect(manifest.originals[0].results[0].outputReference).toEqual({ path: manifest.originals[0].results[0].savedOutputPath });
-    const replay = await host.execute();
+    const retainedBytes = readFileSync(host.stateFile, "utf8");
+    const sameArgs = await host.execute();
+    expect(sameArgs.status).toBe("blocked");
+    expect(sameArgs.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(host.calls).toHaveLength(6);
+    expect(host.persisted.get("review-standalone")).toEqual(manifest);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
+    const replay = await host.execute({ ...args, brief: "A different review contract" });
     expect(replay.status).toBe("blocked");
     expect(replay.error).toContain("reconciliation");
     expect(host.calls).toHaveLength(6);
     expect(host.persisted.get("review-standalone")).toEqual(manifest);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
+    const synthesis = host.calls.find(call => call.key === "director-synthesis")!.request;
+    expect(synthesis.task).not.toContain("When rejecting a claim");
   });
 
   test.each(["mandatory", "optional"])("distinguishes %s publication failure without generic-reference proof", async kind => {
@@ -885,27 +992,27 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
 
   test.each(["ready", "blocked"])("retains exactly one complete delivered failed %s original, never published or sufficient", async status => {
     const host = fixture((key, request) => {
-      if (key !== "independent-a") return child(key);
+      if (key !== "independent-a-r1") return child(key);
       const result = nativeOriginal(key, request, { ...child(key, { status, reason: "Partial analysis: contrary evidence remains" }),
         ok: false, results: [], error: "Mandatory output save failed" });
       return { ...result, error: `Mandatory output save failed\n\nOutput:\n${JSON.stringify(result.structuredOutput, null, 2)}` };
     });
     const result = await host.execute();
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("blocked");
     const manifest = host.persisted.get("review-standalone");
-    const original = manifest.originals.find((item: any) => item.key === "independent-a");
+    const original = manifest.originals.find((item: any) => item.key === "independent-a-r1");
     expect(original).toMatchObject({ delivery: "complete", publication: "unpublished", sufficient: false, terminal: "failed" });
     expect(original.failedOriginal.status).toBe(status);
     expect(original.failedOriginal.findings).toEqual([finding]);
     expect(original.diagnostic).toContain("Mandatory output save failed");
     expect(JSON.stringify(manifest).split(finding.title)).toHaveLength(2);
     expect(JSON.stringify(result)).not.toContain(finding.title);
-    expect(host.calls).toHaveLength(3);
+    expect(host.calls).toHaveLength(5);
   });
 
   test.each(["rejection", "missing", "unknown", "wrong-association", "text"])("does not retain an undemonstrated failed original: %s", async delivery => {
     const host = fixture((key, request) => {
-      if (key !== "independent-a") return child(key);
+      if (key !== "independent-a-r1") return child(key);
       if (delivery === "rejection") throw new Error("Rejected without object");
       if (delivery === "missing") return { ok: false, runId: "missing", error: "No original delivered" };
       if (delivery === "text") return { ok: false, runId: "text", output: JSON.stringify(child(key).structuredOutput), error: "Unproved text route" };
@@ -913,12 +1020,12 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
         : { association: { query: "wrong" } }), ok: false, results: [], error: "Save failed" };
     });
     const result = await host.execute();
-    expect(result.status).toBe("failed");
+    expect(result.status).toBe("blocked");
     const originals = host.persisted.get("review-standalone").originals;
     expect(originals.every((item: any) => !item.failedOriginal)).toBe(true);
-    const original = originals.find((item: any) => item.key === "independent-a");
+    const original = originals.find((item: any) => item.key === "independent-a-r1");
     if (delivery !== "rejection") expect(original.delivery).toBe(["missing", "text"].includes(delivery) ? "not-delivered" : "unproved");
-    expect(host.calls).toHaveLength(3);
+    expect(host.calls).toHaveLength(5);
   });
 
   test("schemas and prompts request decisions only; envelopes are workflow-owned", async () => {
@@ -942,11 +1049,11 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   });
 
   test.each(["context", "inline"])("%s cannot replace native publication", async source => {
-    const host = fixture(key => key === "independent-a"
+    const host = fixture(key => key === "independent-a-r1"
       ? { ...child(key, { coverage: `Complete ${source} analysis available` }), results: [] } : child(key));
     expect((await host.execute()).status).toBe("failed");
-    expect(host.calls.map(call => call.key)).toEqual(["director-prepare", "independent-a", "independent-b"]);
-    expect(host.persisted.get("review-standalone").originals[1]).toMatchObject({
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
+    expect(host.persisted.get("review-standalone").originals[3]).toMatchObject({
       publication: "unpublished", sufficient: false, failedOriginal: { coverage: `Complete ${source} analysis available` },
     });
   });
@@ -972,23 +1079,18 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.saves()).toBe(0);
   });
 
-  test("verified referenced originals reach consumers; a later missing original blocks the next gate before dispatch", async () => {
-    const host = fixture((key, request) => {
-      if (key === "critique-b") {
-        const original = packet(request)[0];
-        expect(JSON.parse(readFileSync(original.results[0].savedOutputPath, "utf8")).findings).toEqual([finding]);
-        rmSync(original.results[0].savedOutputPath);
-      }
-      return child(key);
-    });
+  test.each(["missing", "changed"])("an original %s before synthesis blocks dispatch", async fault => {
+    const host = fixture();
+    host.beforeVerify = () => {
+      const original = host.recovered.get("independent-a-r1")!;
+      const file = original.results![0]!.savedOutputPath!;
+      if (fault === "missing") unlinkSync(file);
+      else writeFileSync(file, JSON.stringify({ changed: true }));
+    };
     const result = await host.execute();
     expect(result.status).toBe("blocked");
-    expect(result.error).toContain("Access gate defense blocked before dispatch");
-    expect(result.error).toContain("is unavailable: missing-file");
-    expect(result.error).toContain("This pass cannot resume: start a new consultation/mission.");
-    expect(host.calls.map(call => call.key)).not.toContain("defense-a");
-    expect(host.verifications.map(entry => [entry.key, entry.output.items.map((item: any) => item.state)]))
-      .toEqual([["verify-critique", ["accessible"]], ["verify-defense", ["unavailable", "accessible"]]]);
+    expect(result.error).toContain(fault === "missing" ? "missing-file" : "content-differs");
+    expect(host.calls.some(call => call.key === "director-synthesis")).toBe(false);
   });
 
   test("a raw script path refuses to run; only the named resource binds receipts to a mission", async () => {
@@ -997,44 +1099,30 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(host.calls).toEqual([]);
   });
 
-  test("a changed published original is contradictory and stops the consumer before dispatch", async () => {
-    const host = fixture((key, request) => {
-      if (key === "critique-b") {
-        const path = packet(request)[0].results[0].savedOutputPath;
-        writeFileSync(path, JSON.stringify({ ...JSON.parse(readFileSync(path, "utf8")), coverage: "Rewritten after admission" }));
-      }
-      return child(key);
-    });
-    const result = await host.execute();
-    expect(result.status).toBe("blocked");
-    for (const part of ["is contradictory: content-differs", "Expected digest:", "does not choose a version"]) expect(result.error).toContain(part);
-    expect(host.calls.map(call => call.key)).not.toContain("defense-a");
-  });
-
   test("gates with no required originals dispatch no verifier; verified gates retain only receipt path and digest", async () => {
     const host = fixture();
     expect((await host.execute()).status).toBe("completed");
-    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-critique", "verify-defense", "verify-synthesis"]);
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-synthesis"]);
     expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
     const receipts = host.persisted.get("review-standalone").receipts;
-    expect(receipts.map((entry: any) => Object.keys(entry).sort())).toEqual(Array(3).fill(["accessible", "digest", "gate"]));
+    expect(receipts.map((entry: any) => Object.keys(entry).sort())).toEqual(Array(1).fill(["accessible", "digest", "gate"]));
     expect(receipts.every((entry: any) => entry.accessible)).toBe(true);
-    expect(host.verifications[0].output.receipt.path).toContain(join("receipts", "review", "critique.json"));
+    expect(host.verifications[0].output.receipt.path).toContain(join("receipts", "review", "synthesis.json"));
     expect(receipts[0].digest).toBe(host.verifications[0].output.receipt.digest);
   });
 
   test("whole-mission UTF-8 capacity includes unrelated keys and failed originals, without retrying save", async () => {
-    const host = fixture(key => key === "independent-a" ? { ...child(key, {
+    const host = fixture(key => key === "independent-a-r1" ? { ...child(key, {
       status: "blocked", reason: "Partial but complete original", coverage: "é".repeat(8000),
     }), ok: false, results: [], error: "Output save failed" } : child(key), undefined, { other: "é".repeat(122000) });
     const result = await host.execute() as Outcome & { persistence?: string; lastConfirmed?: any };
     expect(result.status).toBe("failed");
     expect(result.error).toContain("Whole mission exceeds 256 KiB");
     expect(result.persistence).toBe("failed");
-    expect(host.calls.map(call => call.key)).toEqual(["director-prepare", "independent-a", "independent-b"]);
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
     expect(host.saves()).toBe(3); // admission, preparation, failed batch save; no catch retry
-    const persisted = JSON.parse(readFileSync(host.missionFile, "utf8"));
-    expect(persisted.workflowState["review-standalone"].originals).toHaveLength(1);
+    const persisted = JSON.parse(readFileSync(host.stateFile, "utf8"));
+    expect(persisted["review-standalone"].originals).toHaveLength(1);
     expect(result.lastConfirmed.originals).toHaveLength(1);
   });
 
@@ -1052,14 +1140,14 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   test("manifest ordering follows dispatch rather than asynchronous sibling completion", async () => {
     const a = deferred<Result>(), bEntered = deferred<void>();
     const host = fixture(key => {
-      if (key === "independent-a") return a.promise;
-      if (key === "independent-b") { bEntered.resolve(); return child(key); }
+      if (key === "independent-a-r1") return a.promise;
+      if (key === "independent-a-r2") { bEntered.resolve(); return child(key); }
       return child(key);
     });
     const work = host.execute();
-    try { await bEntered.promise; } finally { a.resolve(child("independent-a")); await work; }
-    expect(host.persisted.get("review-standalone").originals.slice(0, 3).map((item: any) => item.key))
-      .toEqual(["director-prepare", "independent-a", "independent-b"]);
+    try { await bEntered.promise; } finally { a.resolve(child("independent-a-r1")); await work; }
+    expect(host.persisted.get("review-standalone").originals.slice(0, 5).map((item: any) => item.key))
+      .toEqual(reviewKeys.slice(0, 5));
   });
 
   test("published schema-valid but semantically invalid dispositions are not sufficient in durable state", async () => {
@@ -1134,14 +1222,46 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(original.terminal).not.toBe("succeeded");
       expect(original.failedOriginal).toBeUndefined();
       expect(host.calls).toHaveLength(1);
+      expect(host.persisted.get("review-standalone").terminalOutcome).toBe("failed");
+      const retainedBytes = readFileSync(host.stateFile, "utf8");
+      const relaunched = await host.execute();
+      expect(relaunched.status).toBe("blocked");
+      expect(relaunched.error).toContain("not implicitly restarted or migrated");
+      expect(host.calls).toHaveLength(1);
+      expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     }
   });
 
+  test.each([undefined, "stopped", "interrupted", "timedOut"] as const)(
+    "a settled verifier failure (%s) refuses standalone relaunch without dispatch or state changes", async flag => {
+      const host = fixture();
+      let verifierCalls = 0;
+      host.beforeVerify = () => {
+        verifierCalls++;
+        return { ok: false, error: "Verifier process failed", results: [{ exitCode: 1, ...(flag ? { [flag]: true } : {}) } as any] };
+      };
+      const result = await host.execute();
+      expect(result.status).toBe("blocked");
+      expect(result).toMatchObject({ nativeBarrier: flag ?? "access verifier failed" });
+      expect(result.error).toContain("Verifier process failed");
+      expect(host.persisted.get("review-standalone").terminalOutcome).toBe("blocked");
+      const retainedBytes = readFileSync(host.stateFile, "utf8");
+      const relaunched = await host.execute();
+      expect(relaunched.status).toBe("blocked");
+      expect(relaunched.error).toContain("not implicitly restarted or migrated");
+      expect(host.calls).toHaveLength(5);
+      expect(verifierCalls).toBe(1);
+      expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
+    },
+  );
+
   test("every reviewer reserves blocked for missing context and reports severe findings as ready", async () => {
     const severe = { ...finding, title: "Defect prevents a clear whole-spec result", classification: "scoped-defect" };
-    const host = fixture(key => key.startsWith("independent-a") ? child(key, { findings: [severe] }) : child(key));
+    const host = fixture(key => key.startsWith("independent-a-r1") ? child(key, { findings: [severe] }) : child(key));
     expect((await host.execute()).status).toBe("completed");
     expect(host.calls.map(call => call.key)).toContain("director-synthesis");
+    expect(host.calls.at(-1)!.request.task).toContain("Do not use votes as proof by themselves.");
+    expect(host.calls.at(-1)!.request.task).not.toContain("or a reviewer's confidence");
     for (const { request } of host.calls) {
       const task = request.task.replace(/\s+/g, " ");
       expect(task).toContain("Return status blocked only when missing material context prevents this review phase.");
@@ -1198,13 +1318,13 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   });
 
   test("a failed save reports both its original persistence cause and observed child Stop", async () => {
-    const host = fixture(key => key === "independent-a"
+    const host = fixture(key => key === "independent-a-r1"
       ? { ok: false, runId: "stopped", stopped: true, error: "User Stop during reasoning" }
       : child(key), undefined, { failAt: 3 });
     const result = await host.execute();
     expect(result.error).toContain("Essential mission save denied");
     expect(result.references).toContainEqual(expect.objectContaining({ error: "User Stop during reasoning", stopped: true }));
-    expect(host.calls).toHaveLength(3);
+    expect(host.calls).toHaveLength(5);
     expect(host.saves()).toBe(3);
   });
 
@@ -1223,52 +1343,40 @@ test.each(["intact", "missing", "changed"])("consumed review original is read by
   else expect(() => readReviewOriginal(ref)).toThrow(sha256);
 });
 
-test.each(["standalone", "execute"])("v3 %s state size is independent of fourteen report bodies", async mode => {
+test.each(["standalone", "execute"])("v3 %s state size is independent of report bodies", async mode => {
   const sizes: number[] = [];
   for (const length of [40, 40000]) {
-    const views = Array.from({ length: 4 }, (_, i) => ({ id: `v${i}`, focus: `Angle ${i}`, skills: [] }));
     const host = fixture(key => {
       const local = key.replace(/^loop1\./, "");
-      const id = local.split("-").at(-1)!;
-      const i = views.findIndex(view => view.id === id);
-      const all = views.map(view => ({ ...disposition, findingId: `${view.id}-1` }));
-      const body = local === "director-prepare" ? { angles: views }
-        : local.startsWith("independent-") ? { coverage: "x".repeat(length), findings: [finding] }
-        : local.startsWith("critique-") ? { challenges: [{ ...challenge, findingId: `v${(i + 1) % 4}-1` }] }
-        : local.startsWith("defense-") ? { responses: [{ ...response, findingId: `${id}-1` }] }
-        : { memo: "x".repeat(length), dispositions: all, screening: {
-          verdict: "clear", reason: "No material gaps", assessments: all.map(item => ({
-            findingId: item.findingId, requirement: finding.requirement, material: false,
-            consequence: "Guard prevents the scenario", reason: "Source checked",
-          })),
-        } };
-      if (mode === "standalone" && "screening" in body) delete body.screening;
+      const body: any = local.startsWith("independent-") ? { coverage: "x".repeat(length) }
+        : local === "director-synthesis" ? { memo: "x".repeat(length) } : {};
+      if (mode === "execute" && local === "director-synthesis") body.screening = {
+        verdict: "clear", reason: "No material gaps", assessments: [{
+          findingId: "a-r1-1", requirement: finding.requirement, material: false,
+          consequence: "Guard prevents the scenario", reason: "Source checked",
+        }],
+      };
       return child(local, { ...body, reason: "x".repeat(length) });
     });
     const options = mode === "execute" ? { mode, prefix: "loop1.", decisionReference: { stateKey: "root", loop: 1 } } : {};
-    const result = await host.library(args, options);
-    expect(result.status).toBe("completed");
-    expect(host.calls).toHaveLength(14);
+    expect((await host.library(args, options)).status).toBe("completed");
+    expect(host.calls).toHaveLength(6);
     const retained = host.persisted.get(mode === "execute" ? "review-root" : "review-standalone");
     expect(retained.version).toBe(3);
-    expect(retained.originals).toHaveLength(14);
+    expect(retained.originals).toHaveLength(6);
     for (const original of retained.originals) {
       expect(original).not.toHaveProperty("value");
       expect(original).not.toHaveProperty("failedOriginal");
       expect(original.digest).toMatch(/^[a-f0-9]{64}$/);
     }
-    for (const verification of host.verifications) {
-      expect(verification.output.items.every((item: any) => item.state === "accessible")).toBe(true);
-      for (const item of verification.request.items) {
-        expect(Object.keys(item).sort()).toEqual(["digest", "id", "key", "path"]);
-        expect(item.digest).toBe(canonicalDigest(JSON.parse(readFileSync(item.path, "utf8"))));
-      }
+    for (const verification of host.verifications) for (const item of verification.request.items) {
+      expect(Object.keys(item).sort()).toEqual(["digest", "id", "key", "path"]);
+      expect(item.digest).toBe(canonicalDigest(JSON.parse(readFileSync(item.path, "utf8"))));
     }
-    const bytes = Buffer.byteLength(readFileSync(host.missionFile));
+    const bytes = Buffer.byteLength(readFileSync(host.stateFile));
     expect(bytes).toBeLessThan(256 * 1024);
     sizes.push(bytes);
   }
-  // Only temp-file counter digits may vary, never the report lengths.
   expect(Math.abs(sizes[1]! - sizes[0]!)).toBeLessThan(128);
 });
 
@@ -1276,7 +1384,7 @@ test.each(["digest", "producer", "missing", "intact"])("execute replay verifies 
   return (async () => {
     const host = fixture(key => child(key.slice("loop1.".length), key.endsWith("director-synthesis") ? {
       screening: { verdict: "clear", reason: "Guard checked", assessments: [{
-        findingId: "a-1", requirement: finding.requirement, material: false,
+        findingId: "a-r1-1", requirement: finding.requirement, material: false,
         consequence: "Guard prevents wrong record", reason: "Source checked",
       }] },
     } : {}));
@@ -1285,7 +1393,7 @@ test.each(["digest", "producer", "missing", "intact"])("execute replay verifies 
     host.persisted.set("root", { loop: { number: 1, review: { references:
       [...host.recovered].map(([key, result]) => ({ key, runId: result.runId, results: result.results })),
     } } });
-    const key = "loop1.independent-a", original = host.recovered.get(key)!;
+    const key = "loop1.independent-a-r1", original = host.recovered.get(key)!;
     if (mode === "digest") original.structuredOutput = { ...(original.structuredOutput as object), coverage: "Changed replay body" };
     if (mode === "producer") original.runId = "replacement-producer";
     if (mode === "missing") unlinkSync(original.results![0]!.savedOutputPath!);
@@ -1313,8 +1421,8 @@ test.each([40000, 80000])("unpublished failures retain at most one bounded inlin
   const host = fixture(key => key.startsWith("independent-") ? {
     ...child(key, { coverage: "x".repeat(length) }), ok: false, results: [], error: "Native publication failed",
   } : child(key));
-  expect((await host.execute()).status).toBe("failed");
-  expect(host.calls).toHaveLength(3);
+  expect((await host.execute()).status).toBe("blocked");
+  expect(host.calls).toHaveLength(5);
   const retained = host.persisted.get("review-standalone").originals;
   expect(retained.filter((item: any) => item.failedOriginal)).toHaveLength(length === 40000 ? 1 : 0);
   expect(Buffer.byteLength(JSON.stringify(retained))).toBeLessThan(64 * 1024);

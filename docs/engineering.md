@@ -178,8 +178,8 @@ Available capacity/doctor information retains its provenance: it is context, not
 a reservation or guaranteed effective limit. Unknown capacity stays unknown.
 Each implementation attempt spends one extra slot on the root checkpoint sealer
 (5 per implementation attempt, 4 per verification attempt), and each execute review
-spends one `pitako.access-verifier` slot per consuming gate with required
-originals (critique, defense, synthesis: at most 3). Measured locally on a real
+spends one `pitako.access-verifier` slot before synthesis over the four independent
+originals (two angles mirrored across two model slots). Measured locally on a real
 four-angle review, one verifier process took about 40-50 ms (Node startup about
 26 ms) with 33-125 KB of stdin, well under its explicit 1 MiB ceiling; native
 dispatch overhead was not measured.

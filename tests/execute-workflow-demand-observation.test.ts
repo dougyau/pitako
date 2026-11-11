@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { executeControllerFixture, gaps, cutAt, copy, type ControllerHost } from "./fixtures/execute-workflow.ts";
+import { executeControllerFixture, gaps, cutAt, copy, candidate, type ControllerHost } from "./fixtures/execute-workflow.ts";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 
 const { fixture } = executeControllerFixture();
@@ -56,7 +56,9 @@ test.each(["first-loop", "rejected-plan"])("%s alone dispatches no observation",
 });
 
 test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps alone dispatches no observation", async mode => {
-  const host = fixture(undefined, { realCheckout: mode === "candidate-change", readOnly: true });
+  const host = fixture(undefined, { taskCount: mode === "candidate-change" ? 0 : undefined, readOnly: true });
+  if (mode === "candidate-change") host.setObservationResponse((key, value) =>
+    key === "invoke-human-1.l1.checkout" ? { ...value, checkout: candidate(1) } : value);
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.t1.a1") {
       const result = normal();
@@ -64,12 +66,20 @@ test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps 
       if (mode === "unusable-failure") delete result.structuredOutput.work;
       return result;
     }
-    if (mode === "candidate-change" && request.key === "invoke-human-1.l1.checkout") host.changeCheckout();
     return normal();
   });
   const outcome = await host.executeNative();
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");
   expect(host.history()[0].outcome).toBe("gaps");
+  if (mode === "candidate-change") {
+    expect(host.history()[0].closing).toMatchObject({
+      sameCandidate: false, candidate: candidate(1), observation: { ok: true, checkout: candidate(1) },
+    });
+    expect(host.emits.find(value => value.type === "execution-loop").reason)
+      .toBe("Candidate changed; affected checks and analyses are stale.");
+    expect(host.calls.filter(call => call.key.startsWith("invoke-human-1.l1.checkout")).map(call => call.key))
+      .toEqual(["invoke-human-1.l1.checkout"]);
+  }
   expect(host.calls.filter(call => call.key === "invoke-human-1.l2.director")).toHaveLength(1);
   expect(host.calls.some(call => call.key.endsWith(".demand-observation"))).toBe(false);
 });
@@ -175,7 +185,7 @@ function materialReviewGaps(host: ControllerHost, acceptance?: any) {
 }
 
 test("closed demand sources persist once while observations keep every retained original", async () => {
-  const host = fixture(undefined, { taskCount: 0, findings: true, angles: 3 }); host.setLimit(9);
+  const host = fixture(undefined, { taskCount: 0, findings: true }); host.setLimit(9);
   // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
   materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
     inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });

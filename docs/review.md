@@ -6,8 +6,12 @@ review and its requirements.
 The [review skill](../skills/review/SKILL.md) creates a native mission and
 launches the named resource `pitako.review` (raw script paths fail). The resource
 runs `skills/review/workflow.js`, which dispatches the packaged `pitako.reviewer`
-profile for independent angles, cross-critique, one author response, and a final
-synthesis. Before each consuming phase, the model-free `pitako.access-verifier`
+profile for exactly two angles, each independently reviewed by both model slots
+(four children), followed directly by the unchanged synthesis. The fixed angle
+is `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`, or
+`decision-fidelity` for `plan`; the director selects one distinct risk angle.
+Models use the [`pitako.review.*` settings](configuration.md#package-and-session-settings).
+Before synthesis, the model-free `pitako.access-verifier`
 compares the canonical JSON digest of each published original with the digest
 saved in review state and writes a no-clobber receipt in the mission directory.
 Reviewers read the verified originals by path; a contradictory or unavailable
