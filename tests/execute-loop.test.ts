@@ -520,7 +520,7 @@ test("final-phase findings add new tasks atomically without reopening tombstones
   expect(() => apply(request)).toThrow("finished implementation backlog");
   const finished = apply({ ...initial(root), key: "obsolete", expectedDigest: first.digest,
     director: { select: null, changes: [{ kind: "obsolete", id: "one", reason: "Superseded implementation" }], reason: "Reconcile" } });
-  expect(finished.completedTasks).toContainEqual({ id: "one", goal: "Implement one", status: "obsolete", reasons: ["From spec", "Superseded implementation"] });
+  expect(finished.completedTasks).toEqual({ tasks: [{ id: "one", status: "obsolete", summary: "Implement one", reason: "Superseded implementation" }], omitted: 0 });
   const next = { ...request, expectedDigest: finished.digest };
   const written = apply(next);
   expect(written.selected).toBeNull();

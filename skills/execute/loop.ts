@@ -360,9 +360,28 @@ export function cancelledScope(backlog: Backlog) {
   assert(bytes(summary) <= 16384, "Cancelled scope exceeds bounded workflow summary");
   return summary;
 }
+const COMPLETED_TEXT_BYTES = 240, COMPLETED_TASKS_BYTES = 16384;
+function clip(value: string) {
+  if (Buffer.byteLength(value) <= COMPLETED_TEXT_BYTES) return value;
+  let clipped = "";
+  for (const char of value) {
+    if (Buffer.byteLength(clipped + char) > COMPLETED_TEXT_BYTES - 3) break;
+    clipped += char;
+  }
+  return clipped + "…";
+}
+// HUMAN #2391 (topic #197): this summary crosses loop-io stdout and prompts, so it is bounded
+// regardless of backlog size. Complete goals and histories remain in the backlog file.
 function completedTasks(backlog: Backlog) {
-  return backlog.tasks.filter(task => ["done", "obsolete"].includes(task.status)).map(task => ({
-    id: task.id, goal: task.goal, status: task.status, reasons: task.history.map(entry => entry.reason) }));
+  const tasks: { id: string; status: Task["status"]; summary: string; reason: string }[] = [];
+  let omitted = 0, size = bytes({ tasks, omitted: Number.MAX_SAFE_INTEGER });
+  for (const task of backlog.tasks.filter(task => ["done", "obsolete"].includes(task.status))) {
+    const entry = { id: task.id, status: task.status, summary: clip(task.title ?? task.goal), reason: clip(task.history.at(-1)?.reason ?? "") };
+    const added = bytes(entry) + (tasks.length ? 1 : 0);
+    if (omitted || size + added > COMPLETED_TASKS_BYTES) omitted++;
+    else { tasks.push(entry); size += added; }
+  }
+  return { tasks, omitted };
 }
 function writeBacklog(root: string, current: { path: string; digest: string | null }, backlog: Backlog) {
   const raw = JSON.stringify(backlog, null, 2) + "\n", directory = path.dirname(current.path);

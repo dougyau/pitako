@@ -339,7 +339,7 @@ test("oversize admission projections fail closed with a bounded JSON error, neve
   const f = await groupedFixture("advance");
   const current = readBacklog(f.root, "example");
   current.backlog!.tasks[0]!.status = "obsolete";
-  current.backlog!.tasks[0]!.goal = "x".repeat(70 * 1024);
+  current.backlog!.acceptance[0]!.command = "x".repeat(70 * 1024);
   current.backlog!.lastApplied = null;
   writeFileSync(current.path, JSON.stringify(current.backlog));
   const request = { operation: "selection", key: "oversize", invocation, intentions: [], requests: { cursor: 0 },
@@ -350,6 +350,39 @@ test("oversize admission projections fail closed with a bounded JSON error, neve
   expect(output.exit).toBe(1);
   expect(JSON.parse(output.stdout)).toMatchObject({ error: "loop-io", reason: "loop-io admission projection exceeds 61440 bytes" });
   expect(Buffer.byteLength(output.stdout)).toBeLessThan(1024);
+});
+
+test("a finished long backlog crosses the final-phase selection as a bounded projection", async () => {
+  const f = await groupedFixture("advance");
+  const current = readBacklog(f.root, "example");
+  const { title: _title, ...template } = current.backlog!.tasks[0]!;
+  current.backlog!.tasks = Array.from({ length: 30 }, (_, index) => ({ ...structuredClone(template), id: `done-${index}`,
+    ...(index % 2 ? { title: `Done task ${index}` } : {}), status: "done" as const, goal: `Goal ${index} ${"g".repeat(4096)}`,
+    history: Array.from({ length: 8 }, (_, entry) => ({ invocation, loop: 1, event: "update",
+      reason: `Reason ${index}.${entry} ${"r".repeat(2048)}` })) }));
+  current.backlog!.lastApplied = null;
+  writeFileSync(current.path, JSON.stringify(current.backlog));
+  const request = { operation: "selection", key: "finished", invocation, intentions: [], requests: { cursor: 0 },
+    apply: { specId: "example", dbPath: f.dbPath, key: "finished-apply", invocation, loop: 1, authority,
+      expectedDigest: readBacklog(f.root, "example").digest,
+      director: { select: null, changes: [], reason: "No pending tasks" } } };
+  const output = await launch(f, request);
+  expect(output.exit, output.stdout + output.stderr).toBe(0);
+  expect(Buffer.byteLength(output.stdout)).toBeLessThan(61440);
+  const applied = receipt(output.stdout).steps.find((step: any) => step.operation === "apply").result;
+  expect(applied.selected).toBeNull();
+  const { tasks, omitted } = applied.completedTasks;
+  expect(tasks.length).toBeGreaterThan(0);
+  expect(tasks.length + omitted).toBe(30);
+  expect(Buffer.byteLength(JSON.stringify(applied.completedTasks))).toBeLessThanOrEqual(16384);
+  expect(tasks.map((task: any) => task.id)).toEqual(Array.from({ length: tasks.length }, (_, index) => `done-${index}`));
+  expect(tasks[0]).toMatchObject({ id: "done-0", status: "done", summary: expect.stringMatching(/^Goal 0 g+…$/),
+    reason: expect.stringMatching(/^Reason 0\.7 r+…$/) });
+  expect(tasks[1]).toMatchObject({ id: "done-1", summary: "Done task 1" });
+  // Complete goals and histories stay on disk.
+  const kept = readBacklog(f.root, "example").backlog!.tasks[0]!;
+  expect(kept.goal).toHaveLength("Goal 0 ".length + 4096);
+  expect(kept.history).toHaveLength(8);
 });
 
 test.each(["request", "gate-marker", "candidate", "seal"])("close rejects changed %s on replay without rerunning gates", async damage => {

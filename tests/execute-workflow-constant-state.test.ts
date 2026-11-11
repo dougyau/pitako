@@ -396,7 +396,8 @@ test("a final review with production-sized originals and native metadata stays i
   expect(peakBytes).toBeLessThan(MISSION_STATE_MAX_BYTES - 32 * 1024);
   const loop = host.current().loop;
   expect(loop.selection.receipt).not.toHaveProperty("completedTasks");
-  expect(loop.completedTasks).toHaveLength(11);
+  expect(loop.completedTasks).toMatchObject({ omitted: 0 });
+  expect(loop.completedTasks.tasks).toHaveLength(11);
   for (const ref of loop.review.references) {
     expect(ref).not.toHaveProperty("acceptance");
     for (const item of ref.results ?? []) {
