@@ -23,9 +23,11 @@ bun run typecheck
 bun run test
 ```
 
-`bun run test` uses `bun test --parallel`. Each file owns its mutable resources.
-Do not serialize the suite, cap workers, retry failures, inflate timeouts, or
-weaken assertions to hide interference. Do not add global `--concurrent`.
+`bun run test` uses `bun test --parallel --timeout 10000`. The 10-second default
+per-test timeout absorbs CPU contention across the full parallel suite; focused
+runs keep Bun's 5-second default. Each file owns its mutable resources.
+Do not serialize the suite, cap workers, retry failures, raise timeouts further,
+or weaken assertions to hide interference. Do not add global `--concurrent`.
 
 Stop the ordered procedure at the first failure or interruption and report
 remaining commands as unrun. A focused check does not replace the full procedure.

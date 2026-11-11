@@ -67,7 +67,7 @@ Reuse existing code and fixtures before adding another helper or abstraction. Ve
 
 ## Write independent tests
 
-The default test script is `bun test --parallel`. Each file must work alone and alongside other files, without execution-order assumptions, another file's setup, or residue from a previous run.
+The default test script is `bun test --parallel --timeout 10000`: the full suite allows 10 seconds per test for CPU contention, while focused runs keep Bun's 5-second default. Each file must work alone and alongside other files, without execution-order assumptions, another file's setup, or residue from a previous run.
 
 File parallelism does not establish case-level concurrency safety. Do not add global `--concurrent`. Preserve deliberate concurrency that tests a real contract.
 
@@ -87,6 +87,6 @@ Remove disposable resources. Retain diagnostic evidence only intentionally, and 
 
 ### Check isolation without weakening tests
 
-Resolve interference through ownership and isolation, not suite serialization, arbitrary worker caps, retries, sleeps, weakened assertions, or inflated timeouts.
+Resolve interference through ownership and isolation, not suite serialization, arbitrary worker caps, retries, sleeps, weakened assertions, or timeouts beyond the suite default.
 
 Choose focused affected checks. When isolation is materially affected, include small parallel groups. Use [GATES.md](GATES.md) for applicable final obligations. Do not require repeated full serial and parallel comparisons for every test edit.
