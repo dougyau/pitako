@@ -1682,13 +1682,20 @@ function checkpointFallback(observed, ref, task) {
   // Reconcile the exact operation/result without inventing its original evidence.
   // Non-pause recovery retains its existing material-progress routes.
   const lastRestore = descriptor.restore ?? frame.operations.at(-1);
-  if (lastRestore && (!evidence || frame.evidence.includes(evidence) || prior.some(item => item.evidence === evidence ||
+  // A restoring writer that published nothing leaves exactly its dispatch-time
+  // evidence. Only current human input naming that exact writer renews it, once:
+  // the renewed attempt has a new key that this input does not name.
+  const renewal = !!descriptor.restore && !!evidence && evidence === descriptor.restore.evidence &&
+    resolution?.loop === loop.number && !loop.archived && ["accepted", "applied"].includes(resolution.stage) &&
+    !resolution.currentBarrier && resolution.operations?.some(item => item.key === descriptor.key);
+  if (lastRestore && !renewal && (!evidence || frame.evidence.includes(evidence) || prior.some(item => item.evidence === evidence ||
       pauseRestoration && !item.evidence &&
         same(item.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause ?? lastRestore.confirmedPause)))) {
     const error = new Error("Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.");
     error.nativeFailure = { code: "recovery", reason: error.message, ref: clone(ref) };
     throw error;
   }
+  if (renewal) resolution.stage = "applied";
   checkpointObservation = undefined;
   const manifest = `${config.root}/.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`;
   // The modifying worker reads and validates these exact bytes through the owned
@@ -3161,6 +3168,16 @@ try {
     loop.plan.rejection = { diagnostic: loop.halt.reason, ref: clone(loop.plan.ref) };
     delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
     invocation.currentView = null; activePlan = null;
+    await save();
+  }
+  // A technical halt raised before any director plan or writer names no retained
+  // producer: replay re-runs the same retained pre-director intention, which
+  // re-halts if its cause persists. Discharge it durably before that dispatch so
+  // no later writer launches under a stale halt the checkpoint hook refuses.
+  if (loop?.halt?.code === "recovery" && loop.phase === "director" && !loop.plan && !loop.attempt && !loop.archived) {
+    if (resolution?.stage === "accepted" && resolution.loop === loop.number && same(resolution.halt, loop.halt))
+      resolution.stage = "applied";
+    delete loop.halt;
     await save();
   }
   while (true) {
