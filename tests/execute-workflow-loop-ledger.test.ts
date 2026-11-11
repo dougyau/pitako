@@ -185,7 +185,11 @@ describe("fused loop ledger publication", () => {
     host.setFailSave(value => !!value.loop?.archived);
     expect((await host.execute()).status).toBe("partial");
     const retained = host.current();
-    const body = JSON.stringify(retained.intentions[0].input.record);
+    // State keeps the frozen archive identity, not a second copy of the loop.
+    expect(retained.intentions[0].input.record).toEqual({ kind: "loop", loop: 1 });
+    expect(retained.intentions[0].archive.bodyIdentity).toMatch(/^\d+:\d+$/);
+    const drain = host.launches.find(call => call.key === "invoke-human-1.l1.finishDrain")!;
+    const body = JSON.stringify(JSON.parse(drain.task).intentions[0].input.record);
     expect(retained.finishDrain.stage).toBe("receipt");
     expect(retained.loop.archived).toBeUndefined();
     host.setFailSave();
@@ -195,6 +199,34 @@ describe("fused loop ledger publication", () => {
     expect(calls.map(call => call.key)).toEqual(["invoke-human-1.l1.gaps"]);
     expect(calls.every(call => JSON.stringify(JSON.parse(call.task).record) === body)).toBe(true);
     expect(host.records()).toHaveLength(2);
+  });
+
+  test.each([false, true])("a queued gaps archive rebuilds identical bytes after a save cut; source mutation=%s", async mutate => {
+    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.agent === "pitako.execution-director") result.structuredOutput.select = "missing";
+      return result;
+    });
+    host.setFailSave(value => !!value.finishDrain?.dispatched);
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    const retained = host.current();
+    expect(retained.intentions.map((entry: any) => entry.input.record?.kind)).toEqual(["loop"]);
+    expect(retained.intentions[0].input.record).not.toHaveProperty("body");
+    expect(host.launches.some(call => /finishDrain/.test(call.key))).toBe(false);
+    host.setFailSave();
+    if (mutate) retained.loop.plan.rejection.diagnostic = "Changed after the archive was queued";
+    const output = await host.execute();
+    if (mutate) {
+      expect(output.reason).toContain("Loop 1 archive source fields changed before publication");
+      expect(host.launches.some(call => /finishDrain/.test(call.key))).toBe(false);
+      expect(host.records().map((record: any) => record.kind)).toEqual([]);
+    } else {
+      expect(output.status, output.reason).toBe("partial");
+      const [archive] = host.records().filter((record: any) => record.kind === "loop");
+      expect(archive.body.plan.rejection.diagnostic).toBe(retained.loop.plan.rejection.diagnostic);
+      expect(host.current().intentions).toEqual([]);
+    }
   });
 
   test.each(["director-permission", "worker-block", "exception", "stop"])("resumable %s leaves the loop open without archiving", async halt => {
