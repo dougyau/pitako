@@ -39,6 +39,12 @@ const nodeNative = nativeCheckpointFixture(composition);
 beforeAll(() => nodeNative.startNativeCheckpoint({ native: true }));
 const { startNativeCheckpoint, nativeCheckpointCase, nativeCheckpointInput } = native;
 
+function linkedWorktrees(main: string, siblings: string[]) {
+  const members = [main, ...siblings];
+  const worktrees = members.map(root => `worktree ${root}\0HEAD ${"1".repeat(40)}\0branch refs/heads/${path.basename(root)}\0\0`).join("");
+  for (const root of members) composition.fake.fakeRepo(root, { commonDir: path.join(main, ".git"), worktrees });
+}
+
 describe("plan/execute packaged composition", () => {
   // SDK/Node loader preparation is file-owned setup, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
@@ -54,7 +60,7 @@ describe("plan/execute packaged composition", () => {
       fs.writeSync(1,'owned stdout');fs.writeSync(2,'owned stderr');
       fs.writeFileSync(process.argv[1],'ready');
       process.stdin.once('data',()=>{fs.writeFileSync(process.argv[2],'finished');process.exit(${mode === "failure" ? 7 : 0});});
-    `, marker, path.join(root, "finished")], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    `, marker, path.join(root, "finished")], { cwd: root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     let continuations = 0;
     const primary = new Error("Controlled checkpoint child failed");
     const lifecycle = checkpointLifecycle(child, ([exit]) => {
@@ -113,7 +119,7 @@ describe("plan/execute packaged composition", () => {
       hostPending = false;
       process.stdout.write(output);process.stderr.write('outer settled');
       setImmediate(()=>{});
-    `], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    `], { cwd: root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     let continuations = 0;
     const lifecycle = checkpointLifecycle(child, () => { continuations++; }, { marker: release, roots: [root] });
     try {
@@ -149,7 +155,7 @@ describe("plan/execute packaged composition", () => {
       ${synchronousHostRelease(release)}
       hostPending = true;
       process.exit(7);
-    `], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    `], { cwd: root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     const lifecycle = checkpointLifecycle(child, ([exit]) => {
       expect(exit).toBe(7);
       throw primary;
@@ -212,8 +218,9 @@ describe("plan/execute packaged composition", () => {
     const expanded = resource.resolve(args);
     const installed = path.join(nativeRoot, "node_modules/pitako");
     for (const file of ["skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
+      "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
       "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/execute-checkpoint.ts", "extensions/execute-settings.ts", "extensions/execute-state.ts",
-      "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/git-process-observer.ts",
+      "extensions/canonical.mjs", "extensions/hash-ledger.mjs",
       "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file);
       mkdirSync(path.dirname(target), { recursive: true });
@@ -464,6 +471,7 @@ describe("plan/execute packaged composition", () => {
     writeFileSync(globalFile, '\uFEFF{"pitako":{"execute":{"maxCycles":2}}}');
     // Real resource creation in startup cwd A, with resolution and host execution in B.
     const setup = `
+      import ${JSON.stringify(new URL("./fixtures/git-fake-bootstrap.mjs", import.meta.url).href)};
       import { executionResource } from ${JSON.stringify(path.resolve("extensions/plan-execute.ts"))};
       const resources = ["linux", "win32"].map(platform => executionResource(platform));
       process.chdir(${JSON.stringify(root)});
@@ -987,7 +995,7 @@ describe("plan/execute packaged composition", () => {
 
   test("Windows host commands transport exact arguments without cmd expansion or POSIX quoting", () => {
     const main = repository(), root = path.join(main, 'quoted\'" & %PATH% !expansion!');
-    execFileSync("git", ["worktree", "add", "-qb", "quoted", root], { cwd: main, stdio: "ignore" });
+    linkedWorktrees(main, [root]);
     const source = path.join(root, ".pitako/plans/assignment.md");
     mkdirSync(path.dirname(source), { recursive: true });
     const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.`).join("\n")}`;
@@ -1018,7 +1026,7 @@ describe("plan/execute packaged composition", () => {
 
   test("POSIX host grants invoke the packaged Node entry without interpreting root metacharacters", () => {
     const main = repository(), root = path.join(main, "sibling ' & %PATH% !");
-    execFileSync("git", ["worktree", "add", "-qb", "quoted", root], { cwd: main, stdio: "ignore" });
+    linkedWorktrees(main, [root]);
     const spec = assignmentSpec(root);
     const expanded = resourceWithAgentDir(path.join(main, "private-agent")).resolve({ root, id: "assignment", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/actual-mission.json" });
     const grant = expanded.hostCommands.find(item => item.key === "inspect-initial")!;
@@ -1063,7 +1071,9 @@ describe("plan/execute packaged composition", () => {
       expect(() => executionResource().resolve({ ...args, missionId })).toThrow("missionId");
     expect(expanded.script).toContain('"missionId":"native.mission-1"');
     // Preliminary physical discovery is independently checked at native admission.
-    expect(() => executionResource().resolve({ ...args, root: tmpdir() })).toThrow("explicitly prepare admission");
+    const outside = mkdtempSync(path.join(tmpdir(), "pitako-admission-outside-")); roots.push(outside);
+    composition.fake.outside(outside);
+    expect(() => executionResource().resolve({ ...args, root: outside })).toThrow("explicitly prepare admission");
     hooks.get("session_start")!({}, ctx(second));
     expect(resolveWorkflowResource("pitako.execute", args, first).ok).toBe(false);
     expect(resolveWorkflowResource("pitako.execute", args, second).ok).toBe(true);
@@ -1089,6 +1099,7 @@ describe("plan/execute packaged composition", () => {
 
   test("foreground subdirectory is not treated as launch cwd; the public launch must match the designated root", () => {
     const root = repository(), nested = path.join(root, "src"); mkdirSync(nested);
+    composition.fake.fakeRepo(root, { nested: ["src"] });
     assignmentSpec(root);
     const hooks = new Map<string, (event: unknown, context: unknown) => unknown>();
     planExecute({ on: (name: string, hook: (event: unknown, context: unknown) => unknown) => { hooks.set(name, hook); } } as unknown as ExtensionAPI);
@@ -1102,7 +1113,7 @@ describe("plan/execute packaged composition", () => {
     expect(call(root)).toBeUndefined(); expect(call("..")).toBeUndefined();
     expect(call()).toMatchObject({ block: true }); expect(call(nested)).toMatchObject({ block: true });
     const sibling = path.join(root, "..", `${path.basename(root)}-sibling`); roots.push(sibling);
-    execFileSync("git", ["worktree", "add", "-qb", "sibling", sibling], { cwd: root, stdio: "ignore" });
+    linkedWorktrees(root, [sibling]);
     expect(call(sibling)).toMatchObject({ block: true });
     expect(call(sibling, sibling)).toBeUndefined();
     expect(call(nested, nested)).toMatchObject({ block: true });
@@ -1125,15 +1136,15 @@ describe("plan/execute packaged composition", () => {
     const parent = path.join(main, ...(mode === "long-path" ? Array.from({ length: 12 }, (_, index) => `${index}-` + '中é"\\'.repeat(22)) : ["siblings"]));
     mkdirSync(parent, { recursive: true });
     const root = path.join(parent, "designated");
-    const git = (...args: string[]) => execFileSync("git", args, { cwd: main, stdio: "ignore" });
-    git("worktree", "add", "-qb", "designated", root);
+    const members = [root];
+    linkedWorktrees(main, members);
     const content = `---\npitako-spec: 1\nid: assignment\nstatus: complete\n---\n${SPEC_SECTIONS.map(title => `## ${title}\nAgreed ${title}.`).join("\n")}\n`;
     const locations: string[] = [];
     // Cross the preview byte limit with longer paths, not more Git worktrees.
     for (let index = 0; index < (mode === "siblings" ? 3 : 1); index++) {
       const sibling = mode === "long-path" ? root : path.join(parent, `sibling-${index}`,
         ...Array.from({ length: 8 }, (_, part) => `segment-${part}-` + 'é中"\\'.repeat(20)));
-      if (sibling !== root) git("worktree", "add", "-qb", `sibling-${index}`, sibling);
+      if (sibling !== root) { members.push(sibling); linkedWorktrees(main, members); }
       const target = path.join(sibling, ".pitako/plans/assignment.md");
       mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); locations.push(target);
     }
@@ -2087,7 +2098,7 @@ describe("compact admission and preliminary capture", () => {
   test("native admission rediscovers changed local-first selection and physical root", () => {
     const { root, args, resource, source } = inputs();
     const sibling = path.join(root, "../", path.basename(root) + "-sibling"); roots.push(sibling);
-    execFileSync("git", ["worktree", "add", "-qb", "sibling", sibling], { cwd: root, stdio: "ignore" });
+    linkedWorktrees(root, [sibling]);
     const target = path.join(sibling, ".pitako/plans/assignment.md"); mkdirSync(path.dirname(target), { recursive: true });
     writeFileSync(target, spec());
     rmSync(source);
@@ -2203,12 +2214,12 @@ describe("deterministic observer", () => {
   });
 
   test("deterministic observer binds cwd, publishes last, accepts identical retries and rejects changed observations", async () => {
-    const root = repository(), entry = path.resolve("skills/execute/observe.mjs");
+    const root = repository({ paths: ["wip"] }), entry = path.resolve("skills/execute/observe.mjs");
     const spec = { content: "immutable spec", digest: digest("immutable spec") };
     let request: any = { expected: { invocation: "observer-test", count: 0, head: null },
       body: { spec, record: { kind: "loop", loop: 1, body: { review: "clear" } } } };
     const run = async (input = request) => {
-      const child = Bun.spawn(["node", entry], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const child = Bun.spawn(["node", entry], { cwd: root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       // Deliver the request exactly as the registered external-cli runner frames stdin.
       child.stdin.write(buildExternalCliPrompt("Fixed actual-cwd observer", typeof input === "string" ? input : JSON.stringify(input))); child.stdin.end();
       return checkpointLifecycle(child, ([exit, stdout]) => {
@@ -2223,6 +2234,7 @@ describe("deterministic observer", () => {
       expect(existsSync(path.join(root, ".pi/subagents/execute/observer-test/000000.json"))).toBe(false);
     }
     const initial = await run();
+    expect(initial.ok, JSON.stringify(initial)).toBe(true);
     expect(initial).toMatchObject({ version: 1, ok: true, root, commonDir: path.join(root, ".git"),
       checkout: { head: checkoutEvidence(root).head, fingerprint: checkoutEvidence(root).fingerprint }, ledger: { count: 2, head: initial.ledger.head } });
     expect(await run()).toEqual(initial); // Crash after link, before the root admits stdout.
@@ -2233,8 +2245,9 @@ describe("deterministic observer", () => {
     const dirty = await run(); expect(dirty.ok, JSON.stringify(dirty)).toBe(true);
     expect(dirty.checkout.fingerprint).not.toBe(initial.checkout.fingerprint);
     expect(dirty.checkout.head).toBe(initial.checkout.head);
-    execFileSync("git", ["add", "wip"], { cwd: root });
-    execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "changed"], { cwd: root });
+    composition.fake.set(root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], {
+      stdout: `${"2".repeat(40)}\nmain\n`, stderr: "", status: 0,
+    });
     request = { expected: { invocation: "observer-test", ...dirty.ledger },
       body: { record: { kind: "loop", loop: 3, body: {} } } };
     const committed = await run(); expect(committed.checkout.head).not.toBe(initial.checkout.head);
@@ -2244,8 +2257,10 @@ describe("deterministic observer", () => {
   test("deterministic observer returns complete bounded failure for invalid checkout and oversized output", async () => {
     const root = repository(), nested = path.join(root, "nested"); mkdirSync(nested);
     const invalid = mkdtempSync(path.join(tmpdir(), "pitako-observer-invalid-")); roots.push(invalid);
+    composition.fake.fakeRepo(root, { nested: ["nested"] });
+    composition.fake.outside(invalid);
     for (const cwd of [nested, invalid]) {
-      const child = Bun.spawn(["node", path.resolve("skills/execute/observe.mjs")], { cwd, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const child = Bun.spawn(["node", path.resolve("skills/execute/observe.mjs")], { cwd, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       child.stdin.write("ignore"); child.stdin.end();
       await checkpointLifecycle(child, ([exit, stdout]) => {
         expect(exit).toBe(0); expect(Buffer.byteLength(stdout)).toBeLessThan(65536);
@@ -2257,7 +2272,7 @@ describe("deterministic observer", () => {
     const producer = new URL("../skills/execute/observe.ts", import.meta.url).href;
     for (const ok of [true, false]) {
       const script = `import ${JSON.stringify(loader)}; const {observationOutput}=await import(${JSON.stringify(producer)}); process.stdout.write(observationOutput({version:1,ok:${ok},reason:'"\\\\😀'.repeat(20000)}));`;
-      const child = Bun.spawn(["node", "--input-type=module", "-e", script], { cwd: root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+      const child = Bun.spawn(["node", "--input-type=module", "-e", script], { cwd: root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       child.stdin.end();
       await checkpointLifecycle(child, ([exit, stdout]) => {
         expect(exit).toBe(0); expect(Buffer.byteLength(stdout)).toBeLessThan(65536);

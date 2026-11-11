@@ -4,29 +4,22 @@ import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "bun:test";
+import { guardEnv } from "./fixtures/git-fake-env.ts";
 
 const node = Bun.which("node");
 if (!node) throw new Error("worktree setup tests require Node");
 const nodePath: string = node;
-const gitEnv: NodeJS.ProcessEnv = { ...process.env };
+const gitEnv: NodeJS.ProcessEnv = guardEnv({ ...process.env });
 for (const key of Object.keys(gitEnv)) if (key.startsWith("GIT_")) delete gitEnv[key];
 Object.assign(gitEnv, { GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1", GIT_CONFIG_COUNT: "0" });
-
-function git(cwd: string, ...args: string[]) {
-  const result = spawnSync("git", ["-c", "core.hooksPath=/dev/null", ...args], {
-    cwd, env: gitEnv, encoding: "utf8", timeout: 10000,
-  });
-  if (result.error || result.status !== 0) throw new Error(result.error?.message ?? result.stderr);
-  return result.stdout;
-}
 
 function repository(root: string) {
   const principal = path.join(root, "z principal with spaces");
   const target = path.join(root, "a linked with spaces");
-  mkdirSync(principal);
-  git(principal, "init", "-b", "main");
-  git(principal, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--allow-empty", "-m", "fixture");
-  git(principal, "worktree", "add", "-b", "linked", target);
+  mkdirSync(path.join(principal, ".git/hooks"), { recursive: true });
+  mkdirSync(path.join(principal, ".git/worktrees/linked"), { recursive: true });
+  mkdirSync(target);
+  writeFileSync(path.join(target, ".git"), `gitdir: ${principal}/.git/worktrees/linked\n`);
   return { principal, target };
 }
 
@@ -71,6 +64,38 @@ function fixture() {
     const bin = path.join(root, "bin");
     const log = path.join(root, "calls.jsonl");
     mkdirSync(bin);
+    const table: Record<string, { stdout: string; status: number }> = {};
+    function setGit(cwd: string, args: string[], stdout: string, status = 0) {
+      table[JSON.stringify(["-C", cwd, ...args])] = { stdout, status };
+      const quote = (value: string) => `'${value.replaceAll("'", "'\\''")}'`;
+      // Declared script double: shell builtins only, exact argv and fixed byte outputs.
+      const entries = Object.entries(table).map(([key, answer]) => {
+        const argv: string[] = JSON.parse(key);
+        const matches = [`[ "$#" -eq ${argv.length} ]`,
+          ...argv.map((arg, i) => `[ "\${${i + 1}}" = ${quote(arg)} ]`)];
+        // printf %b's octal escapes preserve NULs without storing them in shell variables.
+        const bytes = Array.from(Buffer.from(answer.stdout), byte => `\\0${byte.toString(8).padStart(3, "0")}`).join("");
+        return `if ${matches.join(" && ")}; then
+  printf '%b' '${bytes}'
+  exit ${answer.status}
+fi`;
+      });
+      writeFileSync(path.join(bin, "git"), `#!/bin/sh
+${entries.join("\n")}
+printf 'Undeclared setup Git call:' >&2
+printf ' <%s>' "$@" >&2
+printf '\\n' >&2
+exit 128
+`);
+    }
+    const worktrees = ["worktree", "list", "--porcelain", "-z"];
+    for (const cwd of [principal, target]) {
+      setGit(cwd, worktrees, `worktree ${principal}\0HEAD fixture\0\0`);
+      setGit(cwd, ["rev-parse", "--path-format=absolute", "--git-common-dir"], `${principal}/.git\n`);
+      setGit(cwd, ["rev-parse", "--is-bare-repository"], "false\n");
+      setGit(cwd, ["rev-parse", "--show-toplevel"], `${cwd}\n`);
+    }
+    chmodSync(path.join(bin, "git"), 0o755);
     for (const checkout of [principal, target]) {
       mkdirSync(path.join(checkout, "scripts"));
       copyFileSync(new URL("../scripts/setup-worktree.sh", import.meta.url), path.join(checkout, "scripts/setup-worktree.sh"));
@@ -95,18 +120,18 @@ process.exit(Number(process.env.CODEGRAPH_EXIT || 0));
     }
     const onPath = path.join(bin, "codegraph");
     cli(onPath, "codegraph");
-    // Logging doubles use Bun; Git and Node still exercise native discovery and SQLite.
+    // Logging doubles use Bun; Node still exercises native SQLite.
     symlinkSync(nodePath, path.join(bin, "node"));
-    const env = {
+    const env = guardEnv({
       ...gitEnv, PATH: `${bin}:/usr/bin:/bin`, CALL_LOG: log, FIXTURE_RUNTIME: process.execPath,
       CODEGRAPH_DIR: "", EXPECTED_GRAPH_DIR: ".codegraph", T3CODE_PROJECT_ROOT: path.join(root, "not-the-principal"),
       CODEGRAPH_NO_WATCH: "1", CODEGRAPH_FORCE_WATCH: "0", CODEGRAPH_NO_DOWNLOAD: "0", DO_NOT_TRACK: "0",
-    };
+    });
     const wrapper = (checkout = target) => path.join(checkout, "scripts/setup-worktree.sh");
     function run(overrides: Record<string, string> = {}, checkout = target) {
       writeFileSync(log, "");
       const result = spawnSync("/bin/bash", [wrapper(checkout)], {
-        cwd: root, env: { ...env, ...overrides }, encoding: "utf8", timeout: 10000,
+        cwd: root, env: guardEnv({ ...env, ...overrides }), encoding: "utf8", timeout: 10000,
       });
       expect(result.error).toBeUndefined();
       return { ...result, calls: calls() };
@@ -114,7 +139,7 @@ process.exit(Number(process.env.CODEGRAPH_EXIT || 0));
     function calls(): Array<{ command: string; cwd: string; args: string[]; env?: string[]; dbExists?: boolean }> {
       return readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
     }
-    return { root, principal, target, bin, log, cli, onPath, env, wrapper, run, calls };
+    return { root, principal, target, bin, log, cli, onPath, env, wrapper, run, calls, setGit, worktrees };
   } catch (error) {
     rmSync(root, { recursive: true, force: true });
     throw error;
@@ -145,6 +170,31 @@ function expectInvocation(result: ReturnType<ReturnType<typeof fixture>["run"]>,
       env: ["0", "1", "1", "1"], dbExists: operation === "sync" },
   ]);
 }
+
+test("setup Git double matches exact argv and preserves declared bytes and status", () => {
+  const f = fixture();
+  try {
+    const cwd = path.join(f.root, "quoted ' checkout");
+    const args = ["literal *", "$HOME", "", "line\nbreak"];
+    const stdout = "worktree café\0HEAD fixture\0\0\\%'\n";
+    f.setGit(cwd, args, stdout, 17);
+    const invoke = (argv: string[]) => spawnSync(path.join(f.bin, "git"), argv, { env: f.env, timeout: 10000 });
+    const result = invoke(["-C", cwd, ...args]);
+    expect(result.status).toBe(17);
+    expect(result.stdout).toEqual(Buffer.from(stdout));
+    expect(result.stderr).toEqual(Buffer.alloc(0));
+    for (const argv of [["-C", cwd, ...args, "extra"], ["-C", cwd, ...args.slice(0, -1)], ["-C", cwd, ...args.slice().reverse()]]) {
+      const missing = invoke(argv);
+      expect(missing.status).toBe(128);
+      expect(missing.stdout).toEqual(Buffer.alloc(0));
+      expect(missing.stderr.toString()).toContain("Undeclared setup Git call");
+    }
+    f.setGit(cwd, args, "\0updated\n");
+    const updated = invoke(["-C", cwd, ...args]);
+    expect(updated.status).toBe(0);
+    expect(updated.stdout).toEqual(Buffer.from("\0updated\n"));
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
 
 test("T3 declares one synchronous worktree hook and its command prepares the target", () => {
   const declaration = JSON.parse(readFileSync(new URL("../t3.json", import.meta.url), "utf8"));
@@ -319,18 +369,12 @@ test("worktree setup propagates setup, init, sync and corrupt database failures"
 test("worktree setup rejects failed discovery and unavailable or bare principals before init", () => {
   const f = fixture();
   try {
-    const bare = path.join(f.root, "bare repository");
-    git(f.root, "clone", "--bare", f.principal, bare);
-    const bareLinked = path.join(f.root, "bare linked");
-    git(bare, "worktree", "add", "-b", "bare-linked", bareLinked);
-    mkdirSync(path.join(bareLinked, "scripts"));
-    for (const script of ["setup.sh", "setup-worktree.sh"]) {
-      copyFileSync(path.join(f.target, "scripts", script), path.join(bareLinked, "scripts", script));
-    }
-    const bareResult = f.run({}, bareLinked);
+    f.setGit(f.target, f.worktrees, `worktree ${f.principal}\0bare\0\0`);
+    const bareResult = f.run();
     expect(bareResult.status).not.toBe(0);
     expect(bareResult.stderr).toContain("non-bare principal Git checkout");
     expect(bareResult.calls).toHaveLength(1);
+    f.setGit(f.target, f.worktrees, `worktree ${f.principal}\0HEAD fixture\0\0`);
     // Move the principal without repairing its registered common directory.
     renameSync(f.principal, path.join(f.root, "moved-principal"));
     const failed = f.run();
@@ -338,6 +382,7 @@ test("worktree setup rejects failed discovery and unavailable or bare principals
     expect(failed.calls).toHaveLength(1);
     expect(failed.stdout).not.toContain("Worktree setup complete");
     rmSync(path.join(f.target, ".git"));
+    f.setGit(f.target, f.worktrees, "", 128);
     expect(f.run().status).not.toBe(0);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
@@ -370,20 +415,10 @@ test("worktree setup validates the discovered principal belongs to the same repo
     const foreignRoot = path.join(f.root, "foreign");
     mkdirSync(foreignRoot);
     const foreign = repository(foreignRoot).principal;
-    const realGit = Bun.which("git");
-    if (!realGit) throw new Error("worktree setup tests require Git");
-    const gitDouble = path.join(f.bin, "git");
-    writeFileSync(gitDouble, `#!${nodePath}
-const args = process.argv.slice(2);
-if (args.slice(2).join(" ") === "worktree list --porcelain -z") {
-  process.stdout.write("worktree " + ${JSON.stringify(foreign)} + "\\0HEAD fixture\\0\\0");
-} else {
-  const result = require("node:child_process").spawnSync(${JSON.stringify(realGit)}, args, {stdio:"inherit"});
-  if (result.error) throw result.error;
-  process.exit(result.status ?? 1);
-}
-`);
-    chmodSync(gitDouble, 0o755);
+    f.setGit(f.target, f.worktrees, `worktree ${foreign}\0HEAD fixture\0\0`);
+    f.setGit(foreign, ["rev-parse", "--is-bare-repository"], "false\n");
+    f.setGit(foreign, ["rev-parse", "--show-toplevel"], `${foreign}\n`);
+    f.setGit(foreign, ["rev-parse", "--path-format=absolute", "--git-common-dir"], `${foreign}/.git\n`);
     const result = f.run();
     expect(result.status).not.toBe(0);
     expect(result.stderr).toContain("not an available checkout of this repository");

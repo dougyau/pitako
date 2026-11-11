@@ -38,13 +38,11 @@ load, composition, Board, session naming, and the scripted workflows are the
 main retirement regressions. Use small parallel groups when ownership changes.
 No configured-model or provider request is required.
 
-Workflow controller fixtures default to controlled checkout; use
-`realCheckout: true` for byte/identity, drift, restoration and command assertions.
-`processes()` / `expectProcessBudget(maximum)` count owned helper Git and direct
-fixture children; set bounds from measured counts + ~10% (at least +2).
-Registered composition fixtures remain explicitly real: their IPC returns Git
-counts and charges shared native runtimes once per test, excluding other
-descendants of those counted children.
+Workflow fixtures use declared Git answers while keeping real files for
+byte/identity, drift and restoration assertions.
+`processes()` / `expectProcessBudget(maximum)` count direct fixture children,
+charging shared native runtimes once per test and excluding their descendants.
+The existing non-Git process-budget maxima remain unchanged.
 
 ## Capture through ordinary codemode
 

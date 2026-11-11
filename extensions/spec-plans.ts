@@ -1,9 +1,8 @@
-import { execFileSync } from "node:child_process";
+import { gitPort } from "./git-port.ts";
 import { createHash } from "node:crypto";
 import { closeSync, lstatSync, openSync, readFileSync, readSync, readlinkSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { registeredWorktrees, workspacePaths } from "./board/workspace.ts";
-import { gitProcessStarted } from "./git-process-observer.ts";
 
 export const SPEC_SECTIONS = ["Objective", "Scope", "Exclusions", "Expected behavior", "Constraints", "Decisions and reasons", "Acceptance criteria", "Verification", "Source context", "Non-blocking uncertainty"] as const;
 // Version 2 anchors the plan to the reported problem and requires an origin per criterion.
@@ -30,8 +29,7 @@ export function gitRead(root: string, ...args: string[]): string {
   if (cached !== undefined) return cached;
   const env = { ...process.env, LC_ALL: "C", GIT_OPTIONAL_LOCKS: "0" };
   for (const key of Object.keys(env)) if (key.startsWith("GIT_") && key !== "GIT_OPTIONAL_LOCKS") delete (env as NodeJS.ProcessEnv)[key];
-  gitProcessStarted(root);
-  const output = execFileSync("git", args, { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
+  const output = gitPort().read(args, { cwd: root, env, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], maxBuffer: 32 * 1024 * 1024 });
   if (indexReads.has(key)) indexReadCache?.reads.set(root + "\0" + key, output);
   return output;
 }

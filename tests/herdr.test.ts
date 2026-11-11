@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -7,19 +7,19 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { parse } from "smol-toml";
 import { herdrSetupNotice } from "../extensions/herdr.ts";
 import pitako from "../extensions/index.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
 function checkout(run: (root: string, configure: (source: string) => void) => void) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-herdr-"));
+  const fake = gitFakeFixture();
   try {
-    const env = { ...process.env };
-    for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
-    execFileSync("git", ["init", "--quiet", root], { env });
-    mkdirSync(path.join(root, "scripts"));
+    fake.fakeRepo(root, { nested: ["scripts"] });
     mkdirSync(path.join(root, ".herdr"));
     writeFileSync(path.join(root, "scripts/setup-worktree.sh"), "exit 93\n");
     run(root, source => writeFileSync(path.join(root, ".herdr/worktree.toml"), source));
   } finally {
-    rmSync(root, { recursive: true, force: true });
+    try { fake.dispose(); }
+    finally { rmSync(root, { recursive: true, force: true }); }
   }
 }
 

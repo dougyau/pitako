@@ -13,8 +13,8 @@ import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInter
 import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
 
-const { fixture } = executeControllerFixture();
 const recoveryComposition = realCheckoutCompositionFixture();
+const { fixture } = executeControllerFixture(recoveryComposition.fake);
 const recoveryScripts = recoveryComposition.scripts;
 
 // Association/access witnesses belong to the in-progress manifest, not compact references.

@@ -8,7 +8,7 @@ import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composit
 
 const composition = realCheckoutCompositionFixture();
 const scripts = composition.scripts;
-const { fixture } = executeControllerFixture();
+const { fixture } = executeControllerFixture(composition.fake);
 
 test("a reviewed task uses standalone gate and seal with one trailing drain", async () => {
   const host = fixture();

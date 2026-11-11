@@ -1,5 +1,5 @@
-import { afterEach, expect, spyOn, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { createHash } from "node:crypto";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs";
@@ -20,23 +20,23 @@ import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/s
 import { createMission, missionRecordPath, resolveMissionStoreLocation } from "../node_modules/pi-subagents/src/missions/store.js";
 import { createMissionWorkflowState } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 
+let fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { fake = gitFakeFixture(); });
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { try { fake.dispose(); } finally { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); } });
 const repo = path.resolve(import.meta.dir, "..");
 const digest = (s: string | Buffer) => createHash("sha256").update(s).digest("hex");
 const artifact = (p: string) => { const v = JSON.parse(readFileSync(p, "utf8")); expect(digest(v.data)).toBe(v.sha256); return JSON.parse(v.data); };
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-create-")); roots.push(root);
-  const git = (...args: string[]) => { const r = spawnSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }); expect(r.status, r.stderr).toBe(0); return r.stdout.trim(); };
-  git("init", "--quiet"); writeFileSync(path.join(root, "modified"), "committed\n");
-  git("add", "modified"); git("-c", "user.name=fixture", "-c", "user.email=fixture@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "Base");
+  fake.fakeRepo(root, { paths: ["modified", "untracked", "absent"] });
   writeFileSync(path.join(root, "modified"), "prior uncommitted WIP\n");
   writeFileSync(path.join(root, "untracked"), "new untracked bytes\n");
   const location = resolveMissionStoreLocation({ projectRoot: root, agentDir: path.join(root, ".pi", "subagents", "agent") });
   const mission = createMission(location, { title: "Checkpoint fixture", objective: "Capture the pending writer unit" });
   const missionPath = missionRecordPath(location, mission.id);
   const state = createMissionWorkflowState(location, mission.id);
-  const association = { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: mission.id, missionPath,
+  const association = { root, commonDir: path.join(root, ".git"), missionId: mission.id, missionPath,
     invocation: "fixture", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 5, sourceRefs: [] };
   const intent: CheckpointIntent = { version: 2, association, key: "invoke-fixture.l1.t1.a1", taskId: "owned", attempt: 1,
     loop: 1, cursor: 0, phase: "implementation", planRef: { key: "plan", runId: "director" },
@@ -53,7 +53,7 @@ function fixture() {
   finally { if (old === undefined) delete process.env.PI_SUBAGENT_EXTENSION_BINDINGS; else process.env.PI_SUBAGENT_EXTENSION_BINDINGS = old; }
   const manager = {};
   const call = async (kind: string, paths?: string[], signal?: AbortSignal) => (await tool.execute("call", { kind, ...(paths ? { paths } : {}) }, signal, undefined, { cwd: root, sessionManager: manager })).structuredContent;
-  return { root, git, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager, handlers };
+  return { root, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager, handlers };
 }
 const paths = ["modified", "untracked", "absent"];
 

@@ -7,8 +7,8 @@ import { executeControllerFixture, copy, type Result } from "./fixtures/execute-
 import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
 
-const { fixture } = executeControllerFixture();
 const acceptanceComposition = realCheckoutCompositionFixture();
+const { fixture } = executeControllerFixture(acceptanceComposition.fake);
 const acceptanceScripts = acceptanceComposition.scripts;
 function acceptanceCheckout(host: ReturnType<typeof fixture>, request: { agent?: string; key: string; task: string }) {
   if (request.agent === "pitako.checkpoint-sealer" ||

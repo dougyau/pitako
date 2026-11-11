@@ -2,7 +2,8 @@
  * Git invocation shared by every git tool: fixed env, no pager, no colour, no prompts.
  */
 
-import { abnormalExit, type RunOptions, type RunResult, run } from "../core/index.ts";
+import { abnormalExit, type RunOptions, type RunResult } from "../core/index.ts";
+import { gitPort } from "../../git-port.ts";
 
 export const GIT_ENV: Readonly<Record<string, string>> = {
 	GIT_TERMINAL_PROMPT: "0",
@@ -31,7 +32,7 @@ export function git(args: readonly string[], opts: GitRunOptions): Promise<RunRe
 		stdin: opts.stdin,
 		maxBytes: opts.maxBytes,
 	};
-	return run(options);
+	return gitPort().run(options);
 }
 
 /**

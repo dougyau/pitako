@@ -1,5 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,8 +10,10 @@ import checkpointCreate from "../extensions/checkpoint-create.ts";
 import { checkpointDirectory, sealCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { EXECUTE_STATE_VERSION, executionStatePath } from "../extensions/execute-state.ts";
 
+let fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { fake = gitFakeFixture(); });
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { try { fake.dispose(); } finally { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); } });
 const artifact = (file: string) => {
   const envelope = JSON.parse(readFileSync(file, "utf8"));
   expect(createHash("sha256").update(envelope.data).digest("hex")).toBe(envelope.sha256);
@@ -19,13 +21,9 @@ const artifact = (file: string) => {
 };
 function fixture(bound = true) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-write-hook-")); roots.push(root);
-  const git = (...args: string[]) => {
-    const result = spawnSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
-    expect(result.status, result.stderr).toBe(0); return result.stdout.trim();
-  };
-  git("init", "--quiet"); writeFileSync(path.join(root, "file"), "WIP");
-  git("add", "file"); git("-c", "user.name=test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--quiet", "-m", "base");
-  const association = { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "hook", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] };
+  fake.fakeRepo(root, { paths: ["file", "new", "added", "moved", "deleted", "destination"], ignored: ["ignored/new"] });
+  writeFileSync(path.join(root, "file"), "WIP");
+  const association = { root, commonDir: path.join(root, ".git"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "hook", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] };
   const intent: CheckpointIntent = { version: 2, association, key: "worker", taskId: "task", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: { key: "plan" }, progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const attempt: any = { key: intent.key, bindingKey: intent.key, taskId: "task", number: 1, index: 0, stage: "launched", checkpoint: intent };
   const record: any = { version: EXECUTE_STATE_VERSION, association, consumedLoops: 1, tasks: {}, loop: { number: 1, cursor: 0, phase: "implementation", plan: { stage: "admitted", ref: intent.planRef }, manifest: ["task"], attempt } };

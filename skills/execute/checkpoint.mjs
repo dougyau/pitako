@@ -4,6 +4,7 @@ import { registerHooks, stripTypeScriptTypes } from "node:module";
 // Owned writer helper, deliberately separate from the read-only host inspector.
 const sources = new Set([
   "../../extensions/execute-checkpoint.ts", "../../extensions/spec-plans.ts",
+  "../../extensions/git-port.ts", "../../extensions/dev-tools/core/process.ts",
   "../../extensions/board/workspace.ts", "../../extensions/board/paths.ts",
   "../../extensions/errors.ts",
 ].map(source => new URL(source, import.meta.url).href));
