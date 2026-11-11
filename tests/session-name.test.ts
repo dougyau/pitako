@@ -1,7 +1,19 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import pitako from "../extensions/index.ts";
 import { isPitakoPlaceholder, sessionDisplayName, sessionNameAction } from "../extensions/session-name.ts";
+
+let outside: string, fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => {
+  outside = mkdtempSync(path.join(tmpdir(), "pitako-session-name-"));
+  fake = gitFakeFixture();
+  fake.outside(outside);
+});
+afterEach(() => { try { fake.dispose(); } finally { rmSync(outside, { recursive: true, force: true }); } });
 
 function harness(current: string | undefined, entries: unknown[] = []) {
   let name = current;
@@ -11,7 +23,7 @@ function harness(current: string | undefined, entries: unknown[] = []) {
   const statuses: Array<string | undefined> = [];
   const context = {
     hasUI: true,
-    cwd: process.cwd(),
+    cwd: outside,
     sessionManager: { getSessionId: () => "test-session", getEntries: () => entries },
     ui: { notify() {}, setStatus(_key: string, value?: string) { statuses.push(value); } },
   };
@@ -33,6 +45,26 @@ function harness(current: string | undefined, entries: unknown[] = []) {
 }
 
 describe("session name handlers", () => {
+  test("Herdr startup discovers only the owned non-repository directory", async () => {
+    const previous = { HERDR_ENV: process.env.HERDR_ENV, PI_SUBAGENT_CHILD: process.env.PI_SUBAGENT_CHILD };
+    process.env.HERDR_ENV = "1";
+    delete process.env.PI_SUBAGENT_CHILD;
+    const host = harness(undefined);
+    try {
+      await host.emit("session_start");
+      expect(fake.calls.map(({ cwd, args }) => ({ cwd, args }))).toEqual([{
+        cwd: outside,
+        args: ["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"],
+      }]);
+    } finally {
+      await host.emit("session_shutdown");
+      for (const [key, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   test("uses first saved user text, including text blocks, and preserves custom names", async () => {
     for (const content of ["  Repair   titles\nDetails", [{ type: "text", text: "  Repair   titles\nDetails" }]]) {
       const entries = [{ type: "message", message: { role: "user", content } }];

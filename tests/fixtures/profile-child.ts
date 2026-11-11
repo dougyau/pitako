@@ -1,4 +1,5 @@
 // HOME, cwd and every session are private; external providers are controlled.
+import "./git-fake-bootstrap.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";

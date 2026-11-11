@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
-import { execFileSync, spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -9,16 +9,20 @@ import { apply, backlogPath, boardView, currentHumanPostIds, gate, metricBefore,
 import { openBoard, viewEntry, BINDING_BAND_BYTES, GATE_RESERVE, viewBudget } from "../extensions/board/store.ts";
 import { recordContextPeak, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
 const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+let fake: ReturnType<typeof gitFakeFixture> | undefined;
+afterEach(() => {
+  try { fake?.dispose(); } finally { fake = undefined; for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); }
+});
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-execute-loop-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe", env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
-  git("init", "-q"); writeFileSync(path.join(root, "product"), "original"); writeFileSync(path.join(root, ".gitignore"), "cache/\n");
-  git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Initial");
+  fake ??= gitFakeFixture();
+  fake.fakeRepo(root, { paths: ["product", ".gitignore", ...Array.from({ length: 50 }, (_, i) => `untracked-product-file-${i}`)] });
+  writeFileSync(path.join(root, "product"), "original"); writeFileSync(path.join(root, ".gitignore"), "cache/\n");
   return { root, previousConfirmedUnit: null, dbPath: path.join(root, ".pi/board.db"), specId: "example" };
 }
 const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
@@ -126,7 +130,7 @@ test("keyed apply replays, halts on human edits and adopts valid human bytes on 
   const adopted = await prepare(f); expect(adopted.backlog!.tasks[0]!.goal).toBe("Human goal"); expect(adopted.digest).not.toBe(first.digest);
   expect(appliedTemporaryFiles(f.root)).toEqual([]);
 });
-function appliedTemporaryFiles(root: string) { return execFileSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: root, encoding: "utf8" }).split("\n").filter(s => s.endsWith(".tmp")); }
+function appliedTemporaryFiles(root: string) { return readdirSync(root, { recursive: true }).filter(s => String(s).endsWith(".tmp")); }
 
 test("add/split/update/obsolete preserve tombstones and reject identity/status changes or reuse", () => {
   const { root } = fixture(); let state = apply(initial(root));
@@ -890,7 +894,7 @@ test("gate receipt carries the attempt's durable context peak, or explicit absen
   const f = fixture();
   const checkpoint: CheckpointIntent = { version: 2, key: "worker-attempt", taskId: "one", attempt: 1, loop: 1, cursor: 0,
     phase: "implementation", planRef: null, association: { root: f.root,
-      commonDir: execFileSync("git", ["rev-parse", "--path-format=absolute", "--git-common-dir"], { cwd: f.root, encoding: "utf8" }).trim(),
+      commonDir: path.join(f.root, ".git"),
       missionId: "mission", missionPath: path.join(f.root, ".pi/mission.json"), invocation: "exec1",
       source: path.join(f.root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] } };
   expect((await gate(attempt(f, { checkpoint, key: "missing-peak" }))).contextPeak).toBeNull();

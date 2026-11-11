@@ -21,12 +21,8 @@ const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
 
 async function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-drain-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe",
-    env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
-  git("init", "-q");
+  composition.fake.fakeRepo(root, { paths: ["product"] });
   writeFileSync(path.join(root, "product"), "original");
-  git("add", ".");
-  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Initial");
   const dbPath = path.join(root, ".pi/board.db");
   const task: Task = { id: "one", title: "One task", goal: "Implement one", expectedResult: "Done", status: "pending",
     origin: { kind: "spec", ref: "spec" }, specRefs: ["acceptance-1"], dependsOn: [],
@@ -116,11 +112,11 @@ async function finalState(f: Awaited<ReturnType<typeof fixture>>, output: string
 test("drains in persisted order and returns an immutable receipt by reference, including empty finish drains", async () => {
   const f = await fixture();
   // Keep the external CLI boundary once; the interruption matrix owns disk replay.
-  const child = Bun.spawn(["node", entry], { cwd: f.root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(["node", entry], { cwd: f.root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(JSON.stringify(f.request)); child.stdin.end();
   const first = (await composition.checkpointLifecycle(child,
     ([exit, stdout, stderr]) => ({ exit, stdout, stderr })).result)!;
-  expect(first.exit, first.stderr).toBe(0);
+  expect(first.exit, first.stdout + first.stderr).toBe(0);
   const state = await finalState(f, first.stdout);
   const replay = await launch(f);
   expect(replay.exit, replay.stderr).toBe(0);
@@ -444,7 +440,7 @@ test("a damaged ledger chain reaches the CLI boundary as a human-only ledger int
   const f = await fixture(), first = await launch(f);
   expect(first.exit, first.stderr).toBe(0);
   writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation, "000001.json"), "{}");
-  const child = Bun.spawn(["node", entry], { cwd: f.root, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+  const child = Bun.spawn(["node", entry], { cwd: f.root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(JSON.stringify(f.request)); child.stdin.end();
   const replay = (await composition.checkpointLifecycle(child,
     ([exit, stdout, stderr]) => ({ exit, stdout, stderr })).result)!;

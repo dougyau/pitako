@@ -1,5 +1,5 @@
-import { afterEach, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -9,18 +9,18 @@ import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 
 const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
+let fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { fake = gitFakeFixture(); });
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { try { fake.dispose(); } finally { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); } });
 
 function fixture(): GateInput {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-gate-receipt-")); roots.push(root);
-  const git = (...args: string[]) => execFileSync("git", args, { cwd: root, stdio: "pipe",
-    env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
-  git("init", "-q");
+  fake.fakeRepo(root, { paths: ["product", ".gitignore"] });
   writeFileSync(path.join(root, "product"), "original");
   writeFileSync(path.join(root, ".gitignore"), "cache/\n");
   mkdirSync(path.join(root, "cache"));
-  git("add", "."); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Initial");
+
   return { root, specId: "example", invocation: "exec1", loop: 1, attempt: 1, key: "worker.gate",
     writerSettled: true, workerStatus: "complete", dbPath: path.join(root, ".pi/board.db"),
     task: { id: "one", gates: [{ id: "focused", command: "echo gate >> cache/runs; printf passed", cwd: ".", timeoutMs: 1000 }],
@@ -59,9 +59,10 @@ test.each(["id", "command", "cwd", "timeoutMs", "metric-command", "metric-timeou
   if (mode === "progress") input.task.progress.nonImproving++;
   if (mode === "target") input.task.metric!.target++;
   if (mode === "candidate-fingerprint") writeFileSync(path.join(input.root, "product"), "changed");
-  if (mode === "candidate-head") execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-    "commit", "--allow-empty", "-qm", "New head"], { cwd: input.root, stdio: "pipe",
-    env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } });
+  if (mode === "candidate-head") {
+    fake.set(input.root, ["rev-parse", "HEAD"], { stdout: "2".repeat(40) + "\n", stderr: "", status: 0 });
+    fake.set(input.root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nmain\n", stderr: "", status: 0 });
+  }
   if (mode === "malformed") writeFileSync(receiptFile(input), "{");
   if (mode === "whitespace") writeFileSync(receiptFile(input), readFileSync(receiptFile(input), "utf8") + " ");
   if (mode === "corrupt" || mode.startsWith("identity-")) {

@@ -3,6 +3,7 @@ import { chmodSync, copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { expect, test } from "bun:test";
+import { guardEnv } from "./fixtures/git-fake-env.ts";
 
 // Each case owns its checkout, commands, and log; synchronous runs settle before cleanup.
 function withSetup(check: (fixture: ReturnType<typeof setupFixture>) => void) {
@@ -53,11 +54,11 @@ esac
   function run(overrides: Record<string, string | undefined> = {}, args: string[] = []) {
     writeFileSync(log, "");
     const result = spawnSync("/bin/bash", [path.join(checkout, "scripts/setup.sh"), ...args], {
-      cwd: root, env: {
+      cwd: root, env: guardEnv({
         ...process.env, PATH: `${bin}:/usr/bin:/bin`, CALL_LOG: log, REAL_NODE: realNode,
         CODEGRAPH_DIR: "", CODEGRAPH_NO_WATCH: "1", CODEGRAPH_FORCE_WATCH: "0",
         CODEGRAPH_NO_DOWNLOAD: "0", DO_NOT_TRACK: "0", ...overrides,
-      },
+      }),
       encoding: "utf8", timeout: 10000,
     });
     return { ...result, calls: readFileSync(log, "utf8") };
@@ -219,19 +220,11 @@ test("setup rejects missing Bun before installation", () =>
     expect(missing.calls).not.toContain("install --frozen-lockfile");
   }));
 
-test("setup rejects an unsupported actual Node before installation", () => {
-  const root = mkdtempSync(path.join(tmpdir(), "pitako-setup-node-"));
-  try {
-    mkdirSync(path.join(root, "scripts"));
-    copyFileSync(new URL("../scripts/setup.sh", import.meta.url), path.join(root, "scripts/setup.sh"));
-    writeFileSync(path.join(root, "package.json"), '{"engines":{"node":">=99.0.0","bun":">1.4.2"}}');
-    const result = spawnSync("/bin/bash", [path.join(root, "scripts/setup.sh")], {
-      cwd: tmpdir(), encoding: "utf8", timeout: 10000,
-    });
+test("setup rejects an unsupported actual Node before installation", () =>
+  withSetup(({ checkout, run }) => {
+    writeFileSync(path.join(checkout, "package.json"), '{"engines":{"node":">=99.0.0","bun":">1.4.2"}}');
+    const result = run();
     expect(result.status).toBeGreaterThan(0);
     expect(result.stderr).toContain("does not satisfy >=99.0.0");
     expect(result.stdout).not.toContain("bun install");
-  } finally {
-    rmSync(root, { recursive: true, force: true });
-  }
-});
+  }));

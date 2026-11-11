@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from "bun:test";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { execFileSync } from "node:child_process";
 import { cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -9,17 +10,26 @@ import { boardWorkspace } from "../extensions/board/workspace.ts";
 import { applyCheckpoint, captureCheckpoint, checkpointDirectory, completeCheckpoint, prepareCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
-function git(root: string, ...args: string[]) { return execFileSync("git", args, { cwd: root, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim(); }
+let fake: ReturnType<typeof gitFakeFixture> | undefined;
+afterEach(() => {
+  try { fake?.dispose(); } finally {
+    fake = undefined;
+    for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  }
+});
+const productPaths = ["owned", "modified", "deleted", "new", "unrelated", "a", "b", "owned.ts", "link", ".pi-product", ".pitako-product"];
+function family(commonDir: string, members: string[]) {
+  const worktrees = members.map(root => `worktree ${root}\0HEAD ${"1".repeat(40)}\0branch refs/heads/${path.basename(root)}\0\0`).join("");
+  return members.map(root => fake!.fakeRepo(root, { commonDir, worktrees, paths: productPaths }))[0]!;
+}
 function fixture() {
   const base = mkdtempSync(path.join(tmpdir(), "pitako-spec-plans-")); roots.push(base);
   const main = path.join(base, "main"), sibling = path.join(base, "sibling"), other = path.join(base, "other");
-  for (const root of [main, other]) {
-    mkdirSync(root); git(root, "init", "-q");
-    git(root, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
-  }
-  git(main, "worktree", "add", "-qb", "sibling", sibling);
-  return { base, main, sibling, other };
+  fake = gitFakeFixture();
+  fake.outside(base);
+  const mainRepo = family(path.join(main, ".git"), [main, sibling]);
+  fake.fakeRepo(other, { paths: productPaths });
+  return { base, main, mainRepo, sibling, other };
 }
 function spec(id = "demo") { return `---\npitako-spec: 1\nid: ${id}\nstatus: complete\n---\n# Example\n${SPEC_SECTIONS.map(title => `## ${title}\nSubstantive agreed ${title}.`).join("\n")}\n`; }
 function put(root: string, content = spec()) {
@@ -189,7 +199,8 @@ describe("spec-plan discovery and concrete input", () => {
     expect(selected.selected?.source).toBe(siblingSource);
     expect(selected.root).toBe(main);
     expect(selected.commonDir).toBe(path.join(main, ".git"));
-    const second = path.join(path.dirname(main), "second"); git(main, "worktree", "add", "-qb", "second", second);
+    const second = path.join(path.dirname(main), "second");
+    family(path.join(main, ".git"), [main, sibling, second]);
     const secondSource = put(second);
     expect(discoverSpec(main, "demo").selected).toBeUndefined();
     expect(discoverSpec(main, "demo").candidates.map(item => item.source).sort()).toEqual([siblingSource, secondSource].sort());
@@ -201,11 +212,10 @@ describe("spec-plan discovery and concrete input", () => {
   });
 
   test.each([false, true])("selects a sibling spec from a bare-backed normal worktree (explicit source: %s)", (explicit) => {
-    const { base, other } = fixture();
+    const { base } = fixture();
     const bare = path.join(base, "bare.git"), designated = path.join(base, "designated"), sourceRoot = path.join(base, "source");
-    git(other, "clone", "--bare", "-q", other, bare);
-    git(bare, "worktree", "add", "-qb", "designated", designated);
-    git(bare, "worktree", "add", "-qb", "source", sourceRoot);
+    family(bare, [designated, sourceRoot]);
+    fake!.set(bare, ["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"], { stdout: `false\ntrue\n${bare}\n`, stderr: "", status: 0 });
     const source = put(sourceRoot);
     expect(() => designatedWorkspace(bare)).toThrow("bare; no worktree");
     expect(() => discoverSpec(bare, "demo", source)).toThrow("bare; no worktree");
@@ -221,6 +231,7 @@ describe("spec-plan discovery and concrete input", () => {
     const { main, sibling, other } = fixture();
     const local = put(main); put(sibling);
     rmSync(sibling, { recursive: true });
+    fake!.set(main, ["worktree", "list", "--porcelain", "-z"], { stdout: `worktree ${main}\0\0worktree ${sibling}\0prunable gitdir file points to non-existent location\0\0`, stderr: "", status: 0 });
     expect(designatedWorkspace(main)).toEqual({ physicalRoot: main, identity: path.join(main, ".git") });
     expect(discoverSpec(main, "demo").selected?.source).toBe(local);
     expect(() => boardWorkspace(main)).toThrow("unavailable");
@@ -232,10 +243,10 @@ describe("spec-plan discovery and concrete input", () => {
   });
 
   test("rejects a registered sibling replaced by a symlink to a same-repository subdirectory before reading its spec", () => {
-    const { main, sibling } = fixture();
+    const { main, sibling, mainRepo } = fixture();
     const legitimate = put(sibling);
     expect(discoverSpec(main, "demo").selected?.source).toBe(legitimate);
-    const nested = path.join(main, "src"); mkdirSync(nested);
+    const nested = path.join(main, "src"); mainRepo!.inside(nested);
     put(nested);
     rmSync(sibling, { recursive: true }); symlinkSync(nested, sibling);
     expect(() => discoverSpec(main, "demo")).toThrow("not a subdirectory");
@@ -273,10 +284,10 @@ describe("spec-plan discovery and concrete input", () => {
   });
 
   test("validates IDs, physical roots and symlink escapes before reading candidates", () => {
-    const { main, sibling, other } = fixture(); put(other);
+    const { main, sibling, other, mainRepo } = fixture(); put(other);
     for (const id of ["../demo", "a/b", "", "x.md", "a\n"]) expect(() => discoverSpec(main, id)).toThrow("ID");
     expect(() => designatedWorkspace(".")).toThrow("absolute");
-    const nested = path.join(main, "src"); mkdirSync(nested);
+    const nested = path.join(main, "src"); mainRepo!.inside(nested);
     expect(() => designatedWorkspace(nested)).toThrow("not a subdirectory");
     expect(() => designatedWorkspace(path.dirname(main))).toThrow();
     mkdirSync(path.join(main, ".pitako/plans"), { recursive: true });
@@ -290,14 +301,17 @@ describe("spec-plan discovery and concrete input", () => {
     const copied = path.join(base, "copied"); mkdirSync(copied);
     writeFileSync(path.join(copied, ".git"), readFileSync(path.join(sibling, ".git")));
     put(copied);
-    expect(git(copied, "rev-parse", "--show-toplevel")).toBe(copied);
+    const worktrees = `worktree ${path.join(base, "main")}\0\0worktree ${sibling}\0\0`;
+    fake!.fakeRepo(copied, { commonDir: path.join(base, "main", ".git"), worktrees });
     expect(() => designatedWorkspace(copied)).toThrow("not registered");
     expect(() => discoverSpec(copied, "demo")).toThrow("not registered");
   });
 
   test("planning root inspection works before the first commit without weakening execution evidence", () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-plan-unborn-")); roots.push(root);
-    git(root, "init", "-q");
+    fake = gitFakeFixture();
+    fake.fakeRepo(root);
+    fake.set(root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "", stderr: "fatal: ambiguous argument 'HEAD'", status: 128 });
     const script = path.resolve("skills/execute/inspect.mjs");
     const result = JSON.parse(execFileSync("node", [script, root, "demo", "", "root"], { encoding: "utf8" }));
     expect(result).toEqual({ physicalRoot: root, identity: path.join(root, ".git") });
@@ -309,12 +323,15 @@ describe("spec-plan discovery and concrete input", () => {
     const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
     // Copy only owned shipped resources; no dependency install, Pi loader or provider.
     for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
-      "extensions/spec-plans.ts", "extensions/git-process-observer.ts", "extensions/execute-retained.ts", "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
+      "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
+      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
     const entry = path.join(installed, "skills/execute/inspect.mjs");
     const invoke = (root: string, ...extra: string[]) => JSON.parse(execFileSync("node", [entry, root, "demo", "", ...extra], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
-    const unborn = path.join(base, "unborn"); mkdirSync(unborn); git(unborn, "init", "-q");
+    const unborn = path.join(base, "unborn");
+    fake!.fakeRepo(unborn);
+    fake!.set(unborn, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "", stderr: "fatal: ambiguous argument 'HEAD'", status: 128 });
     expect(invoke(unborn, "root")).toEqual({ physicalRoot: unborn, identity: path.join(unborn, ".git") });
     expect(() => invoke(unborn)).toThrow(); // Root-only planning does not weaken strict execution.
     // Two chunks cover installed UTF-8 transport; the repo-path test below covers the larger fixture.
@@ -363,22 +380,25 @@ describe("spec-plan discovery and concrete input", () => {
   });
 
   test("checkout evidence recognizes gitlinks and observes submodule heads and nested dirty/untracked bytes", () => {
-    const { main, other } = fixture();
-    git(main, "-c", "protocol.file.allow=always", "submodule", "add", "-q", other, "module");
-    git(main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qam", "Track submodule");
-    const module = path.join(main, "module"), unchanged = checkoutEvidence(main);
+    const { main } = fixture();
+    const module = path.join(main, "module");
+    fake!.fakeRepo(main, { paths: [...productPaths, "module"], stage: `160000 ${"1".repeat(40)} 0\tmodule\0` });
+    fake!.fakeRepo(module, { paths: ["tracked.txt", "nested"] });
+    const unchanged = checkoutEvidence(main);
     expect(unchanged.status).toBe(""); expect(checkoutEvidence(main)).toEqual(unchanged);
-    writeFileSync(path.join(module, "tracked.txt"), "one"); git(module, "add", "tracked.txt");
-    git(module, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Module identity changed");
+    writeFileSync(path.join(module, "tracked.txt"), "one");
+    fake!.set(module, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nmain\n", stderr: "", status: 0 });
     const changedHead = checkoutEvidence(main);
     expect(changedHead.fingerprint).not.toBe(unchanged.fingerprint);
     writeFileSync(path.join(module, "tracked.txt"), "two"); const dirty = checkoutEvidence(main);
     writeFileSync(path.join(module, "tracked.txt"), "three"); expect(checkoutEvidence(main).fingerprint).not.toBe(dirty.fingerprint);
-    git(module, "-c", "protocol.file.allow=always", "submodule", "add", "-q", other, "nested");
-    const nested = path.join(module, "nested", "untracked.txt");
+    fake!.set(module, ["ls-files", "--stage", "-z"], { stdout: `160000 ${"1".repeat(40)} 0\tnested\0`, stderr: "", status: 0 });
+    const nestedRoot = path.join(module, "nested");
+    fake!.fakeRepo(nestedRoot, { paths: ["untracked.txt"] });
+    const nested = path.join(nestedRoot, "untracked.txt");
     writeFileSync(nested, "first untracked bytes"); const before = checkoutEvidence(main);
     writeFileSync(nested, "other untracked bytes"); expect(checkoutEvidence(main).fingerprint).not.toBe(before.fingerprint);
-    git(main, "submodule", "deinit", "-f", "module");
+    rmSync(path.join(module, ".git"), { recursive: true });
     expect(() => checkoutEvidence(main)).not.toThrow();
     expect(checkoutEvidence(main).fingerprint).not.toBe(unchanged.fingerprint);
   });
@@ -388,18 +408,14 @@ describe("spec-plan discovery and concrete input", () => {
     const tracked = `${directory}/nested/tracked`, added = `${directory}/nested/added`;
     mkdirSync(path.dirname(path.join(main, tracked)), { recursive: true });
     writeFileSync(path.join(main, tracked), "initial metadata");
-    git(main, "add", tracked);
-    git(main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "Track metadata");
     const before = checkoutEvidence(main).fingerprint;
     writeFileSync(path.join(main, added), "untracked metadata");
     expect(checkoutEvidence(main).fingerprint).toBe(before);
     writeFileSync(path.join(main, tracked), "dirty metadata");
     expect(checkoutEvidence(main).fingerprint).toBe(before);
-    git(main, "add", tracked, added);
     expect(checkoutEvidence(main).fingerprint).toBe(before);
     rmSync(path.join(main, tracked));
     expect(checkoutEvidence(main).fingerprint).toBe(before);
-    git(main, "add", tracked);
     expect(checkoutEvidence(main).fingerprint).toBe(before);
 
     // Similarly named product paths remain observable, including index-only changes.
@@ -407,7 +423,7 @@ describe("spec-plan discovery and concrete input", () => {
     writeFileSync(product, "product bytes");
     const untracked = checkoutEvidence(main).fingerprint;
     expect(untracked).not.toBe(before);
-    git(main, "add", `${directory}-product`);
+    fake!.set(main, ["diff", "--cached", "--binary", "--", ".", ":(top,exclude).pi", ":(top,exclude).pitako"], { stdout: `staged ${directory}-product`, stderr: "", status: 0 });
     const staged = checkoutEvidence(main).fingerprint;
     expect(staged).not.toBe(untracked);
     writeFileSync(product, "different product bytes");
@@ -418,10 +434,11 @@ describe("spec-plan discovery and concrete input", () => {
     const { main } = fixture(); const before = checkoutEvidence(main);
     writeFileSync(path.join(main, "owned.ts"), "one"); const dirty = checkoutEvidence(main);
     expect(dirty.fingerprint).not.toBe(before.fingerprint);
-    git(main, "add", "owned.ts"); git(main, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "-qm", "wip: partial");
+    fake!.set(main, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nmain\n", stderr: "", status: 0 });
     expect(checkoutEvidence(main).head).not.toBe(before.head);
     writeFileSync(path.join(main, "owned.ts"), "two"); expect(checkoutEvidence(main).fingerprint).not.toBe(dirty.fingerprint);
-    git(main, "checkout", "--detach", "-q"); expect(checkoutEvidence(main).branch).toBe("HEAD");
+    fake!.set(main, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nHEAD\n", stderr: "", status: 0 });
+    expect(checkoutEvidence(main).branch).toBe("HEAD");
     const link = path.join(main, "link"); symlinkSync("owned.ts", link); const linked = checkoutEvidence(main).fingerprint;
     rmSync(link); symlinkSync("other.ts", link); expect(checkoutEvidence(main).fingerprint).not.toBe(linked);
   });
@@ -461,7 +478,7 @@ describe("preliminary capture", () => {
     const { main, sibling, base } = fixture();
     expect(() => preliminarySpec(main, "demo")).toThrow("Missing complete spec-plan");
     put(sibling);
-    const third = path.join(base, "third"); git(main, "worktree", "add", "-qb", "third", third); const source = put(third);
+    const third = path.join(base, "third"); family(path.join(main, ".git"), [main, sibling, third]); const source = put(third);
     expect(() => preliminarySpec(main, "demo")).toThrow("Ambiguous spec-plan");
     expect(preliminarySpec(main, "demo", source).source).toBe(source);
   });

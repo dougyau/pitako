@@ -2,7 +2,7 @@ import type { JsonValue } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
-import { spawnSync } from "node:child_process";
+import { gitPort } from "./git-port.ts";
 import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
 import { parseApplyPatch } from "pi-codex-tools";
@@ -141,7 +141,7 @@ function hookPath(root: string, cwd: string, input: unknown): string | null {
   if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
   const protectedDirectory = relative.split(path.sep).find(part => part === ".pi" || part === ".pitako");
   if (protectedDirectory) throw new Error(`Writes inside ${protectedDirectory}/ are forbidden.`);
-  const ignored = spawnSync("git", ["check-ignore", "--quiet", "--", relative], { cwd: root });
+  const ignored = gitPort().status(["check-ignore", "--quiet", "--", relative], { cwd: root });
   if (ignored.status === 0) return null;
   if (ignored.status !== 1) throw new Error("Cannot determine whether write path is gitignored.");
   return relative.split(path.sep).join("/");

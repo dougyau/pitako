@@ -2,7 +2,8 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import board from "../extensions/board/index.ts";
 import { getBoardDbPath, getPiAgentDir, getPitakoDataDir } from "../extensions/board/paths.ts";
@@ -22,6 +23,8 @@ import { boardWorkspace, currentWorkspace, repositoryIdentity } from "../extensi
 import { packageRoot } from "../extensions/stack.ts";
 import { workspaceCrashOwnership } from "./fixtures/workspace-crash-ownership.ts";
 
+let fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { fake = gitFakeFixture(); });
 const tempDirs: string[] = [];
 const fixture = workspaceCrashOwnership(tempDirs);
 function ownDatabase<T extends { close(): void }>(db: T): T {
@@ -40,18 +43,20 @@ const openSqlite: typeof openSqliteUnowned = async (...args) => ownDatabase(awai
 
 afterEach(() => {
   fixture.requireReleased();
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  try { fake.dispose(); }
+  finally { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); }
 });
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
   tempDirs.push(dir);
+  fake.outside(dir);
   return dir;
 }
 
 function gitRepo(): string {
   const dir = tempDir("pitako-board-repo-");
-  execFileSync("git", ["init"], { cwd: dir, stdio: "ignore" });
+  fake.fakeRepo(dir);
   return dir;
 }
 
@@ -90,10 +95,9 @@ function gitWorktreePair(executionName = "execution"): { source: string; executi
   const base = tempDir("pitako-board-worktrees-");
   const source = path.join(base, "source");
   const execution = path.join(base, executionName);
-  mkdirSync(source, { recursive: true });
-  execFileSync("git", ["init", "-q", "-b", "main"], { cwd: source, stdio: "ignore" });
-  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "initial", "-q"], { cwd: source, stdio: "ignore" });
-  execFileSync("git", ["worktree", "add", "-q", "-b", "execution", execution], { cwd: source, stdio: "ignore" });
+  const worktrees = `worktree ${source}\0HEAD ${"1".repeat(40)}\0branch refs/heads/main\0\0worktree ${execution}\0HEAD ${"1".repeat(40)}\0branch refs/heads/execution\0\0`;
+  fake.fakeRepo(source, { worktrees });
+  fake.fakeRepo(execution, { commonDir: path.join(source, ".git"), worktrees });
   return { source, execution };
 }
 
@@ -124,7 +128,7 @@ describe("workspace", () => {
   test("uses the git root, including from a subdirectory, and isolates other directories", fixture.ownedCase("uses the git root, including from a subdirectory, and isolates other directories", () => {
     const repo = gitRepo();
     const nested = path.join(repo, "src");
-    mkdirSync(nested);
+    fake.fakeRepo(repo, { nested: ["src"] });
     const other = gitRepo();
     const loose = tempDir("pitako-board-loose-");
     expect(currentWorkspace(nested)).toBe(currentWorkspace(repo));
@@ -139,13 +143,12 @@ describe("workspace", () => {
   }));
 
   test("bare-backed worktrees share Board identity without an administrative legacy root", fixture.ownedCase("bare-backed worktrees share Board identity without an administrative legacy root", () => {
-    const seed = gitRepo(), base = tempDir("pitako-board-bare-worktrees-");
+    const base = tempDir("pitako-board-bare-worktrees-");
     const bare = path.join(base, "bare.git"), source = path.join(base, "source"), execution = path.join(base, "execution");
-    const git = (cwd: string, ...args: string[]) => execFileSync("git", args, { cwd, stdio: "ignore" });
-    git(seed, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
-    git(seed, "clone", "--bare", "-q", seed, bare);
-    git(bare, "worktree", "add", "-qb", "source", source);
-    git(bare, "worktree", "add", "-qb", "execution", execution);
+    const worktrees = `worktree ${bare}\0bare\0\0worktree ${source}\0HEAD ${"1".repeat(40)}\0branch refs/heads/source\0\0worktree ${execution}\0HEAD ${"1".repeat(40)}\0branch refs/heads/execution\0\0`;
+    fake.fakeRepo(source, { commonDir: bare, worktrees });
+    fake.fakeRepo(execution, { commonDir: bare, worktrees });
+    fake.set(bare, ["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"], { stdout: `false\ntrue\n${bare}\n`, stderr: "", status: 0 });
     expect(() => boardWorkspace(bare)).toThrow("bare; no worktree");
     for (const physicalRoot of [source, execution]) {
       const workspace = boardWorkspace(physicalRoot);
@@ -527,7 +530,7 @@ describe("board store", () => {
     right.close();
   }));
 
-  test("preserves trailing spaces in a real Git worktree execution root", fixture.ownedCase("preserves trailing spaces in a real Git worktree execution root", async () => {
+  test("preserves trailing spaces in a Git worktree execution root", fixture.ownedCase("preserves trailing spaces in a Git worktree execution root", async () => {
     const { execution } = gitWorktreePair("execution ");
     expect(currentWorkspace(execution)).toBe(execution);
     const board = await openBoard(path.join(tempDir("pitako-board-trailing-root-"), "board.db"));
@@ -998,7 +1001,7 @@ describe("board tools", () => {
     expect(denied.isError).toBe(true);
     expect(denied.details?.error).toMatch(/another workspace/);
 
-    mkdirSync(path.join(repoA, "src"));
+    fake.fakeRepo(repoA, { nested: ["src"] });
     const visible = await read.execute("r2", { topicId: 1 }, undefined, undefined, { cwd: path.join(repoA, "src") });
     expect(textOf(visible)).toContain("FINDING");
     expect(textOf(visible)).toContain("reply to #");

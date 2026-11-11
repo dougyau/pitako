@@ -9,29 +9,23 @@ import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts
 import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
 const composition = realCheckoutCompositionFixture();
-const { roots, disposers } = composition;
+const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
 beforeAll(() => runtime.startNativeCheckpoint());
 const entry = path.resolve("skills/execute/loop-io.mjs");
 
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-task-delta-")); roots.push(root);
-  const budget = processBudget(root); disposers.push(budget.dispose);
-  const git = (...args: string[]) => {
-    budget.counts.git++;
-    return execFileSync("git", args, { cwd: root, encoding: "utf8",
-      env: { PATH: process.env.PATH, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
-  };
-  git("init", "-q");
+  const budget = processBudget();
+  composition.fake.fakeRepo(root, { paths: ["product", "zeta", "alpha", "prior-wip",
+    ...Array.from({ length: 205 }, (_, index) => `new-${String(index).padStart(3, "0")}`)] });
   writeFileSync(path.join(root, "product"), "original");
-  git("add", ".");
-  git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-qm", "Initial");
   const intents: CheckpointIntent[] = [];
   function attempt() {
     const number = intents.length + 1;
     const intent: CheckpointIntent = { version: 2, key: `worker.a${number}`, taskId: "one", attempt: number,
       loop: 1, cursor: 0, phase: "implementation", planRef: { key: "director" },
-      association: { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"),
+      association: { root, commonDir: path.join(root, ".git"),
         missionId: "mission", missionPath: path.join(root, ".pi/mission.json"), invocation: "delta",
         source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 30, sourceRefs: [] } };
     intent.baseline = captureBaseline({ intent }).candidate;

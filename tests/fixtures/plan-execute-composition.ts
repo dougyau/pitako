@@ -7,7 +7,9 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import type { WorkflowScriptChildResult } from "../../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import registerPlanExecute, { executionResource } from "../../extensions/plan-execute.ts";
 import { preliminarySpec, SPEC_SECTIONS } from "../../extensions/spec-plans.ts";
-import { processBudget, expectProcessBudget, type Processes } from "./process-budget.ts";
+import { expectProcessBudget, type Processes } from "./process-budget.ts";
+import { gitFakeFixture } from "./git-fake-fixture.ts";
+import { gitFakeBootstrap } from "./git-fake-env.ts";
 
 // Controller tests control external dispatch; native wiring cases retain the real SDK runner.
 export async function controlledWorkflow(options: any) {
@@ -325,31 +327,19 @@ export async function registeredCheckpoint(request: any, root: string, loadExten
   };
 }
 
-// Registered composition scenarios require real Git identity, captures and writer bytes.
-// The name makes that opt-in explicit; protocol-only cases use executeControllerFixture.
+// Registered composition scenarios keep real captures and writer bytes, with declared Git identity.
 export function realCheckoutCompositionFixture() {
+  const fake = gitFakeFixture();
   const roots: string[] = [], disposers: (() => void)[] = [];
-  const budgets = new Map<string, ReturnType<typeof processBudget>>();
   const opaqueChildren = new Set<unknown>();
-  let directChildren = 0, directGit = 0, externalRootGit = 0;
+  let directChildren = 0;
   const countedExecFileSync = ((...args: Parameters<typeof execFileSync>) => {
-    if (args[0] === "git") directGit++;
-    else directChildren++;
+    directChildren++;
     return execFileSync(...args);
   }) as typeof execFileSync;
-  // Shared native runtimes are charged once per test they serve. Git inside
-  // their IPC cases is returned explicitly; other descendants remain opaque.
+  // Shared native runtimes are charged once per test they serve; descendants remain opaque.
   const recordOpaque = (child: unknown) => { opaqueChildren.add(child); };
-  const recordGit = (root: string, count: number) => {
-    const budget = budgets.get(root);
-    if (budget) budget.counts.git += count;
-    else externalRootGit += count;
-  };
-  const processes = (): Processes => {
-    const total: Processes = { git: directGit + externalRootGit, sealer: 0, loopIO: 0, gates: 0, other: directChildren + opaqueChildren.size };
-    for (const budget of budgets.values()) for (const key of Object.keys(total) as (keyof Processes)[]) total[key] += budget.counts[key];
-    return total;
-  };
+  const processes = (): Processes => ({ sealer: 0, loopIO: 0, gates: 0, other: directChildren + opaqueChildren.size });
   const workflowSettlements: Promise<void>[] = [];
   const checkpointCancellations = new Set<() => void>();
   async function settleWorkflows() {
@@ -357,11 +347,11 @@ export function realCheckoutCompositionFixture() {
     for (const cancel of checkpointCancellations) cancel();
     await Promise.all(workflowSettlements.splice(0));
   }
+  afterAll(async () => { await settleWorkflows(); fake.dispose(); });
   afterEach(async () => {
     await settleWorkflows();
     for (const dispose of disposers.splice(0)) dispose();
-    for (const budget of budgets.values()) budget.dispose();
-    budgets.clear(); opaqueChildren.clear(); directChildren = 0; directGit = 0; externalRootGit = 0;
+    opaqueChildren.clear(); directChildren = 0;
     for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   });
   function checkpointLifecycle<T>(child: Bun.Subprocess<"pipe", "pipe", "pipe">,
@@ -403,15 +393,15 @@ export function realCheckoutCompositionFixture() {
     workflowSettlements.push(settled);
     return { result, observed, settled, cancel };
   }
-  function repository() {
+  function repository(options: Parameters<typeof fake.fakeRepo>[1] = {}) {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-workflow-resource-")); roots.push(root);
-    const budget = processBudget(root); budgets.set(root, budget);
-    const git = (...args: string[]) => { budget.counts.git++; return execFileSync("git", args, { cwd: root, stdio: "ignore" }); };
-    git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial"); return root;
+    fake.fakeRepo(root, { paths: ["owned", "unrelated", "earlier", "deleted", "created", "new", "product", "wip", "package.json"], ...options });
+    mkdirSync(path.join(root, ".git/info"), { recursive: true });
+    return root;
   }
   // Reuse a file-owned Node process: grouped operations require their real cwd,
   // but repeated cold loader processes are not part of the behavior under test.
-  const runtime = nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows, recordOpaque, recordGit });
+  const runtime = nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows, recordOpaque });
   let useRuntime = false;
   beforeAll(async () => { if (useRuntime) await runtime.startNativeCheckpoint(); });
   const scripts = { ...deterministicScripts,
@@ -422,7 +412,7 @@ export function realCheckoutCompositionFixture() {
       if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Deterministic fixture cancelled");
       return JSON.parse(result[1]);
     } };
-  return { roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository, processes, recordOpaque, recordGit,
+  return { fake, roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository, processes, recordOpaque,
     execFileSync: countedExecFileSync,
     expectProcessBudget: (maximum: number) => expectProcessBudget(processes(), maximum),
     get scripts() { useRuntime = true; return scripts; } };
@@ -432,7 +422,7 @@ export type CompositionFixture = ReturnType<typeof realCheckoutCompositionFixtur
 // One file-owned process runs controlled boundaries; one case retains native SDK loading. Each message
 // still creates fresh storage, roots and launch-bound tool registrations. Cases
 // are awaited by the file's normal test order; other files remain parallel.
-export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows, recordOpaque, recordGit }: Pick<CompositionFixture, "workflowSettlements" | "checkpointCancellations" | "settleWorkflows" | "recordOpaque" | "recordGit">) {
+export function nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows, recordOpaque }: Pick<CompositionFixture, "workflowSettlements" | "checkpointCancellations" | "settleWorkflows" | "recordOpaque">) {
   let nativeCheckpoint: ReturnType<typeof spawn> | undefined;
   let nativeCheckpointRoot: string;
   let nativeCheckpointExit: Promise<[number, string, string]>;
@@ -472,6 +462,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         return {runWorkflowScript,loadExtensions};
       })();
       (async()=>{
+        await import(${JSON.stringify(gitFakeBootstrap)});
         if(${sdk}) {
           const {loadExtensions}=await sdk();
           await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
@@ -486,14 +477,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         }
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
-          const gitCounts={}, observers=[];
           try {
-            if(input.sdk!==false){
-              const {observeGitProcesses}=await import(${JSON.stringify(new URL("../../extensions/git-process-observer.ts", import.meta.url).href)});
-              for(const root of new Set([input.root,input.nativeRoot].filter(Boolean))){
-                gitCounts[root]=0;observers.push(observeGitProcesses(root,()=>{gitCounts[root]++;}));
-              }
-            }
             if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.loopIO=${JSON.stringify(path.resolve("skills/execute/loop-io.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};}
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
             const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
@@ -501,12 +485,12 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
             if(input.metadata?.inlineLoopIO && input.sdk!==false){if(${native})await import(${JSON.stringify(new URL("../../skills/execute/loader.mjs", import.meta.url).href)});input.metadata.loopOperations={...await import(${JSON.stringify(new URL("../../skills/execute/loop.ts", import.meta.url).href)}),baseline:(await import(${JSON.stringify(new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href)})).captureBaseline};}
             const value=await (0,eval)('('+harness+')')(input,runWorkflowScript,${childResponse.toString()},
               input.sdk===false?{}:{...require('node:fs'),...require('node:child_process'),...await import(input.module??input.checkpointModule),...await import(input.evidence??input.evidenceModule),loadExtensions,hash:data=>require('node:crypto').createHash('sha256').update(data).digest('hex')},${registeredCheckpoint.toString()});
-            send({value,gitCounts});
+            send({value});
           } catch(error) {
-            if(process.connected)send({error:String(error.stack??error),gitCounts});
+            if(process.connected)send({error:String(error.stack??error)});
             else {console.error(error);process.exitCode=1;}
           }
-          finally {for(const dispose of observers)dispose();process.chdir(cwd);if(prior===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=prior;}
+          finally {process.chdir(cwd);if(prior===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=prior;}
         });
         send({ready:true});
       })().catch(error=>{console.error(error);process.exitCode=1;disconnect();});
@@ -521,7 +505,6 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     child.on("message", (message: any) => {
       if (message.ready) ready();
       else {
-        for (const [root, count] of Object.entries(message.gitCounts ?? {})) recordGit(root, count as number);
         const reply = nativeCheckpointReply;
         nativeCheckpointReply = undefined;
         reply?.([message.error ? 1 : 0, JSON.stringify(message.value), message.error ?? ""]);

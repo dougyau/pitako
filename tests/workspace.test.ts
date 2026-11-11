@@ -1,57 +1,54 @@
-import * as childProcess from "node:child_process";
-import { execFileSync } from "node:child_process";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { mkdirSync, mkdtempSync, renameSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
-import { afterEach, describe, expect, spyOn, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { currentWorkspace, repositoryIdentity } from "../extensions/board/workspace.ts";
 
+const identityArgs = ["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"];
 const tempDirs: string[] = [];
+let fake: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { fake = gitFakeFixture(); });
 
 afterEach(() => {
-  for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  try { fake.dispose(); }
+  finally { for (const dir of tempDirs.splice(0)) rmSync(dir, { recursive: true, force: true }); }
 });
 
 function tempDir(prefix: string): string {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
   tempDirs.push(dir);
+  fake.outside(dir);
   return dir;
 }
 
-function git(cwd: string, args: string[]): string {
-  return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
-}
-
 function initRepo(dir: string): void {
-  mkdirSync(dir);
-  execFileSync("git", ["init", "-q"], { cwd: dir, stdio: "ignore" });
-  execFileSync("git", ["-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-m", "init", "-q"], { cwd: dir, stdio: "ignore" });
+  fake.fakeRepo(dir);
 }
 
 describe("workspace Git identity", () => {
-  test("uses two fresh Git processes per discovery and observes same-cwd identity changes", () => {
+  test("uses two fresh Git reads per discovery and observes same-cwd identity changes", () => {
     const base = tempDir("pitako-worktree-refresh-");
     const repo = path.join(base, "repo");
     const other = path.join(base, "other");
     initRepo(repo);
     initRepo(other);
-    const capture = spyOn(childProcess, "execFileSync");
-    try {
-      expect(currentWorkspace(repo)).toBe(repo);
-      expect(capture).toHaveBeenCalledTimes(2);
-      expect(repositoryIdentity(repo)).toBe(path.join(repo, ".git"));
-      expect(capture).toHaveBeenCalledTimes(4);
+    const start = fake.calls.length;
+    expect(currentWorkspace(repo)).toBe(repo);
+    expect(fake.calls.length - start).toBe(2);
+    expect(repositoryIdentity(repo)).toBe(path.join(repo, ".git"));
+    expect(fake.calls.length - start).toBe(4);
 
-      renameSync(path.join(repo, ".git"), path.join(base, "saved.git"));
-      expect(repositoryIdentity(repo)).toBe(repo);
-      writeFileSync(path.join(repo, ".git"), `gitdir: ${path.join(other, ".git")}\n`);
-      expect(repositoryIdentity(repo)).toBe(path.join(other, ".git"));
-      expect(currentWorkspace(repo)).toBe(repo);
-      writeFileSync(path.join(repo, ".git"), "gitdir: missing-git-directory\n");
-      expect(() => repositoryIdentity(repo)).toThrow(/Git|git/i);
-    } finally {
-      capture.mockRestore();
-    }
+    renameSync(path.join(repo, ".git"), path.join(base, "saved.git"));
+    fake.outside(repo);
+    expect(repositoryIdentity(repo)).toBe(repo);
+    writeFileSync(path.join(repo, ".git"), `gitdir: ${path.join(other, ".git")}\n`);
+    fake.fakeRepo(repo, { commonDir: path.join(other, ".git") });
+    expect(repositoryIdentity(repo)).toBe(path.join(other, ".git"));
+    expect(currentWorkspace(repo)).toBe(repo);
+    writeFileSync(path.join(repo, ".git"), "gitdir: missing-git-directory\n");
+    fake.set(repo, identityArgs, { stdout: "", stderr: "fatal: invalid git directory", status: 128 });
+    expect(() => repositoryIdentity(repo)).toThrow(/Git|git/i);
   });
 
   test("keeps worktree paths local and identifies their shared Git repository", () => {
@@ -60,17 +57,16 @@ describe("workspace Git identity", () => {
     const linked = path.join(base, "linked");
     const separate = path.join(base, "separate");
     initRepo(main);
-    git(main, ["worktree", "add", "-b", "linked", linked]);
+    const linkedRepo = fake.fakeRepo(linked, { commonDir: path.join(main, ".git") });
     initRepo(separate);
     const mainNested = path.join(main, "src");
     const linkedNested = path.join(linked, "src");
     mkdirSync(mainNested);
     mkdirSync(linkedNested);
 
-    const commonDir = git(linked, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
-    const worktrees = git(main, ["worktree", "list", "--porcelain", "-z"]).split("\0");
-    expect(worktrees).toContain(`worktree ${main}`);
-    expect(worktrees).toContain(`worktree ${linked}`);
+    fake.fakeRepo(main).inside(mainNested);
+    linkedRepo.inside(linkedNested);
+    const commonDir = linkedRepo.commonDir;
     expect(commonDir).toBe(path.join(main, ".git"));
 
     expect(currentWorkspace(mainNested)).toBe(main);
@@ -88,6 +84,9 @@ describe("workspace Git identity", () => {
     try {
       expect(currentWorkspace(linkedNested)).toBe(linked);
       expect(repositoryIdentity(linkedNested)).toBe(commonDir);
+      for (const call of fake.calls.slice(-4)) {
+        for (const key of Object.keys(call.env)) expect(key.startsWith("GIT_")).toBe(false);
+      }
     } finally {
       spoof.restore();
     }
@@ -103,8 +102,7 @@ describe("workspace Git identity", () => {
     }
     const repo = path.join(base, "separate-git-dir");
     const common = path.join(base, "common\n ");
-    mkdirSync(repo);
-    execFileSync("git", ["init", "-q", `--separate-git-dir=${common}`], { cwd: repo, stdio: "ignore" });
+    fake.fakeRepo(repo, { commonDir: common });
     expect(currentWorkspace(repo)).toBe(repo);
     expect(repositoryIdentity(repo)).toBe(common);
   });
@@ -117,12 +115,13 @@ describe("workspace Git identity", () => {
     expect(repositoryIdentity(looseAlias)).toBe(loose);
 
     const bare = tempDir("pitako-worktree-bare-");
-    execFileSync("git", ["init", "--bare", "-q"], { cwd: bare, stdio: "ignore" });
+    fake.set(bare, identityArgs, { stdout: `false\ntrue\n${bare}\n`, stderr: "", status: 0 });
     expect(() => currentWorkspace(bare)).toThrow(/bare|work.tree/i);
     expect(() => repositoryIdentity(bare)).toThrow(/bare|work.tree/i);
 
     const invalid = tempDir("pitako-worktree-invalid-");
     writeFileSync(path.join(invalid, ".git"), "gitdir: missing-git-directory\n");
+    fake.set(invalid, identityArgs, { stdout: "", stderr: "fatal: invalid git directory", status: 128 });
     expect(() => currentWorkspace(invalid)).toThrow(/Git|git/i);
     expect(() => repositoryIdentity(invalid)).toThrow(/Git|git/i);
   });

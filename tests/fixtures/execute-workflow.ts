@@ -1,9 +1,12 @@
 import { afterEach, expect } from "bun:test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { processBudget, expectProcessBudget, type Processes } from "./process-budget.ts";
+import type { createGitFake } from "./git-fake.ts";
+import { gitFakeBootstrap } from "./git-fake-env.ts";
+import { gitFakeFixture } from "./git-fake-fixture.ts";
 const { appendLedger, verifyLedger, loopSummaries, canonicalJSON, summarizeLoops } = await import(path.resolve("skills/execute/ledger.mjs"));
 import { canonicalDigest, canonicalJSON as canonicalViewJSON } from "../../extensions/canonical.mjs";
 import { captureBaseline, captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
@@ -59,35 +62,41 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
 type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
   realCheckout?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
 type OwnedResources = { roots: string[]; settlements: Promise<unknown>[]; disposers: (() => void)[]; controlledProcesses: (() => Processes)[] };
-export function executeControllerFixture() {
+export function executeControllerFixture(fake?: ReturnType<typeof createGitFake>) {
   const owned: OwnedResources = { roots: [], settlements: [], disposers: [], controlledProcesses: [] };
+  let ownedFake: ReturnType<typeof gitFakeFixture> | undefined;
   afterEach(async () => {
     await Promise.all(owned.settlements.splice(0));
     try {
-      const total: Processes = { git: 0, sealer: 0, loopIO: 0, gates: 0, other: 0 };
+      const total: Processes = { sealer: 0, loopIO: 0, gates: 0, other: 0 };
       for (const processes of owned.controlledProcesses.splice(0))
         for (const [key, count] of Object.entries(processes())) total[key as keyof Processes] += count;
       // All controlled fixtures in this test measured zero processes; allow +2.
       expectProcessBudget(total, 2);
     } finally {
-      for (const dispose of owned.disposers.splice(0)) dispose();
-      for (const root of owned.roots.splice(0)) rmSync(root, { recursive: true, force: true });
+      const disposers = owned.disposers.splice(0);
+      if (ownedFake) disposers.push(ownedFake.dispose);
+      ownedFake = undefined;
+      const errors: unknown[] = [];
+      for (const dispose of disposers) {
+        try { dispose(); } catch (error) { errors.push(error); }
+      }
+      for (const root of owned.roots.splice(0)) {
+        try { rmSync(root, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+      }
+      if (errors.length) throw new AggregateError(errors, "Controller fixture cleanup failed");
     }
   });
-  return { fixture: (content?: string, options?: FixtureOptions) => ownedFixture(owned, content, options) };
+  return { fixture: (content?: string, options?: FixtureOptions) =>
+    ownedFixture(owned, content, options, fake ?? (ownedFake ??= gitFakeFixture())) };
 }
 export type ControllerHost = ReturnType<typeof ownedFixture>;
-function ownedFixture({ roots, settlements, disposers, controlledProcesses }: OwnedResources, content = "COMPLETE IMMUTABLE SPECS", options: FixtureOptions = {}) {
+function ownedFixture({ roots, settlements, disposers, controlledProcesses }: OwnedResources, content = "COMPLETE IMMUTABLE SPECS", options: FixtureOptions = {}, fake?: ReturnType<typeof createGitFake>) {
   // Controller protocol tests use controlled candidates/checkpoints. Opt into
   // realCheckout for byte, drift, restoration or command-execution assertions.
   const root = mkdtempSync(path.join(tmpdir(), "pitako-execute-controller-")); roots.push(root);
-  const budget = processBudget(root);
-  disposers.push(budget.dispose);
-  const git = (...args: string[]) => { budget.counts.git++; return execFileSync("git", args, { cwd: root, stdio: "ignore" }); };
-  if (options.realCheckout) {
-    git("init", "-q");
-    git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "commit", "--allow-empty", "-qm", "initial");
-  }
+  const budget = processBudget();
+  if (fake) fake.fakeRepo(root, { paths: ["src/change1.ts", "src/change2.ts", "candidate-drift", "late.ts"] });
   const config = { ...globalConfig, root, preliminary: undefined as any };
   const observedCandidate = (): Candidate => {
     if (!options.realCheckout) return copy(checkout);
@@ -223,7 +232,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         else {
           budget.counts.loopIO++;
           const response = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")],
-            { cwd: root, input: request.task, encoding: "utf8" });
+            { cwd: root, env: process.env, input: request.task, encoding: "utf8" });
           if (response.status !== 0) throw new Error(response.stdout + response.stderr);
           delta = JSON.parse(response.stdout);
         }
@@ -257,7 +266,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
           if (!options.realCheckout) return { id: gate.id, status: "pass", exit: 0, ms: 1, tail: "Controlled gate passed", logRef: `/native/gates/${request.key}/${gate.id}.log` };
           const start = Date.now();
           budget.counts.gates++;
-          const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd),
+          const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd), env: process.env,
             encoding: "utf8", timeout: gate.timeoutMs });
           const output = (command.stdout ?? "") + (command.stderr ?? "");
           const logRef = path.join(directory, `${index}.log`);
@@ -299,9 +308,10 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         budget.counts.sealer++;
         // A private process preserves the sealer's cwd boundary without reloading Node's TS hook.
         const response = spawnSync(process.execPath, ["--eval", `
+          import ${JSON.stringify(gitFakeBootstrap)};
           import { sealCheckpointRequest } from ${JSON.stringify(path.resolve("extensions/execute-checkpoint.ts"))};
           console.log(JSON.stringify(sealCheckpointRequest(JSON.parse(await Bun.stdin.text()))));
-        `], { cwd: root, input: request.task, encoding: "utf8" });
+        `], { cwd: root, env: process.env, input: request.task, encoding: "utf8" });
         if (response.status !== 0) throw new Error(response.stderr);
         observed = JSON.parse(response.stdout);
       }

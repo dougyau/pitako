@@ -1,5 +1,5 @@
 import { afterEach, expect, test } from "bun:test";
-import { execFileSync, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,37 +11,42 @@ import { copy, cutAt, executeControllerFixture } from "./fixtures/execute-workfl
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 import { captureBaseline, beginHookEffect, closeHookEffect, applyCheckpoint, captureCheckpoint, checkpointDirectory, prepareCheckpoint, restoreCheckpoint, sealCheckpoint, sealCheckpointRequest, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
 const sealerPrompt = "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.";
 
 const roots: string[] = [];
 const processDisposers: (() => void)[] = [];
 afterEach(() => {
-  for (const dispose of processDisposers.splice(0)) dispose();
-  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  const errors: unknown[] = [];
+  for (const dispose of processDisposers.splice(0).reverse()) {
+    try { dispose(); } catch (error) { errors.push(error); }
+  }
+  for (const root of roots.splice(0)) {
+    try { rmSync(root, { recursive: true, force: true }); } catch (error) { errors.push(error); }
+  }
+  if (errors.length) throw new AggregateError(errors, "Sealer fixture cleanup failed");
 });
 const script = path.resolve("skills/execute/checkpoint.mjs");
 const sha = (value: string) => createHash("sha256").update(value).digest("hex");
 function fixture(paths = ["owned"]) {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-sealer-")); roots.push(root);
-  const budget = processBudget(root); processDisposers.push(budget.dispose);
-  const git = (...args: string[]) => {
-    budget.counts.git++;
-    return execFileSync("git", args, { cwd: root, encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_NOSYSTEM: "1" } }).trim();
-  };
-  git("init", "-q"); git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "base");
+  const budget = processBudget();
+  const fake = gitFakeFixture();
+  processDisposers.push(fake.dispose);
+  fake.fakeRepo(root, { paths: [...new Set([...paths, "owned", "foreign", "deleted", ".gitignore", "other", "new", "late", "unrelated"])], ignored: ["build"] });
   writeFileSync(path.join(root, "owned"), "before");
-  const intent: CheckpointIntent = { version: 2, association: { root, commonDir: git("rev-parse", "--path-format=absolute", "--git-common-dir"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "test", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 3, sourceRefs: [] }, key: "test.a1", taskId: "task", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: {}, progress: { consumedLoops: 1, admitted: {}, previous: null } };
+  const intent: CheckpointIntent = { version: 2, association: { root, commonDir: path.join(root, ".git"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "test", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 3, sourceRefs: [] }, key: "test.a1", taskId: "task", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: {}, progress: { consumedLoops: 1, admitted: {}, previous: null } };
   const run = (kind: "unit" | "pause" | null, extra = {}, cwd = root) => {
     budget.counts.sealer++;
-    const result = spawnSync("node", [script, "--seal-stdin"], { cwd, encoding: "utf8",
+    const result = spawnSync("node", [script, "--seal-stdin"], { cwd, env: process.env, encoding: "utf8",
       // The registered runtime agent's actual stdin framing, not bare JSON.
       input: buildExternalCliPrompt(sealerPrompt, JSON.stringify({ v: 1, intent, kind, ...extra })) });
     return { ...result, value: result.status === 0 ? JSON.parse(result.stdout) : undefined };
   };
   const capture = () => captureCheckpoint(intent, paths);
   const change = (value: string) => applyCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from(value).toString("base64"), mode: 0o644 } }]);
-  return { root, git, intent, run, capture, change, directory: checkpointDirectory(intent),
+  return { root, fake, intent, run, capture, change, directory: checkpointDirectory(intent),
     processes: budget.processes, expectProcessBudget: (maximum: number) => expectProcessBudget(budget.processes(), maximum) };
 }
 
@@ -497,7 +502,7 @@ test("never-closed effects prevent sealing without product writes and retain arb
 });
 
 test.each(["capture", "effect", "postimage"])("insufficient %s evidence halts restoration without overwriting product bytes", missing => {
-  const f = fixture(); const seq = beginHookEffect(f.intent, "write", ["owned"]);
+  const f = fixture(["owned"]); const seq = beginHookEffect(f.intent, "write", ["owned"]);
   writeFileSync(path.join(f.root, "owned"), "partial bytes");
   if (missing === "capture") rmSync(path.join(f.directory, "capture-000000.json"));
   else {
@@ -572,52 +577,55 @@ function dispatchBaseline(f: ReturnType<typeof fixture>) {
   f.intent.baseline = { head, fingerprint };
   expect(captureBaseline({ intent: f.intent }).candidate).toEqual(f.intent.baseline!);
 }
-test("sealing observes the real checkout once per request", () => {
-  const f = fixture(); dispatchBaseline(f); f.capture(); f.change("after");
+test("sealing observes the checkout once per request", () => {
+  const f = fixture(["owned"]); dispatchBaseline(f); f.capture(); f.change("after");
   const cwd = process.cwd();
   try {
     process.chdir(f.root);
     const observed = checkoutEvidence(f.root);
-    const before = f.processes().git;
+    const before = f.fake!.calls.length;
     expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" }).outcome).toBe("sealed");
     // Three workspace reads, four HEAD/index reads (combined HEAD/branch,
     // cached diff, stage listing, HEAD), and one full observation's file listing
     // + status. Before sealing reuse there were six listings/statuses: 19 Git calls.
-    expect(f.processes().git - before).toBe(9);
+    expect(f.fake!.calls.length - before).toBe(9);
     const point = JSON.parse(JSON.parse(readFileSync(path.join(f.directory, "unit.json"), "utf8")).data);
     expect(point.candidate).toEqual(observed); // Includes status and branch, not only fingerprint.
     // Standalone publication still performs attribution and retains deep equality.
     expect(sealCheckpoint(f.intent, "unit", true).digest).toBe(sha(readFileSync(path.join(f.directory, "unit.json"), "utf8")));
-    const again = f.processes().git;
+    const again = f.fake!.calls.length;
     expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" }).outcome).toBe("sealed");
-    expect(f.processes().git - again).toBe(9);
+    expect(f.fake!.calls.length - again).toBe(9);
     // A later call must not reuse the earlier observation, including in the
     // attribution-error catch inside the operation's stable-checkout scope.
     writeFileSync(path.join(f.root, "foreign"), "unjournaled");
-    const changed = f.processes().git;
+    const changed = f.fake!.calls.length;
     expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" })).toMatchObject({
       outcome: "mismatch", paths: [{ path: "foreign", actual: sha("unjournaled") }],
     });
-    expect(f.processes().git - changed).toBe(9);
+    expect(f.fake!.calls.length - changed).toBe(9);
     expect(() => sealCheckpoint(f.intent, "unit", true)).toThrow("Unjournaled candidate change");
   } finally { process.chdir(cwd); }
 });
-test.each(["HEAD", "index"])("in-process sealing rejects a real %s change between requests", changed => {
-  const f = fixture(); dispatchBaseline(f); f.capture(); f.change("after");
+test.each(["HEAD", "index"])("in-process sealing rejects a %s change between requests", changed => {
+  const f = fixture(["owned"]); dispatchBaseline(f); f.capture(); f.change("after");
   const cwd = process.cwd();
   try {
     process.chdir(f.root);
     expect(sealCheckpointRequest({ v: 1, intent: f.intent, kind: null }).outcome).toBe("observed");
-    if (changed === "index") f.git("add", "owned");
-    else f.git("-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "new HEAD");
+    if (changed === "index") f.fake!.set(f.root, ["ls-files", "--stage", "-z"], { stdout: `100644 ${"2".repeat(40)} 0\towned\0`, stderr: "", status: 0 });
+    else {
+      f.fake!.set(f.root, ["rev-parse", "HEAD"], { stdout: "2".repeat(40) + "\n", stderr: "", status: 0 });
+      f.fake!.set(f.root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nmain\n", stderr: "", status: 0 });
+    }
     expect(() => sealCheckpointRequest({ v: 1, intent: f.intent, kind: "unit" })).toThrow("HEAD/index changed");
     expect(existsSync(path.join(f.directory, "unit.json"))).toBe(false);
   } finally { process.chdir(cwd); }
 });
 test("dispatch map uses checkoutEvidence paths, absence, modes and ignored-output exclusions", () => {
-  const f = fixture();
+  const f = fixture(["owned"]);
   writeFileSync(path.join(f.root, "deleted"), "tracked");
-  f.git("add", "deleted");
+  f.fake!.set(f.root, ["ls-files", "--stage", "-z"], { stdout: `100644 ${"2".repeat(40)} 0\tdeleted\0`, stderr: "", status: 0 });
   const { unlinkSync } = require("node:fs"); unlinkSync(path.join(f.root, "deleted"));
   writeFileSync(path.join(f.root, ".gitignore"), "ignored\n");
   writeFileSync(path.join(f.root, "ignored"), "build");
