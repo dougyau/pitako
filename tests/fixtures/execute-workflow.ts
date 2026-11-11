@@ -12,6 +12,7 @@ import { canonicalDigest, canonicalJSON as canonicalViewJSON } from "../../exten
 import { captureBaseline, captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
 import { updateProgress, apply, reviewOriginals, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
+import { reviewModels } from "../../extensions/review-settings.ts";
 import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
 import { DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } from "../../extensions/execute-settings.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
@@ -59,7 +60,7 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
   scope: [`src/${id}.ts`], allowedEffects: kind === "verification" ? ["read/check"] : ["edit assigned path"], expectedResult: `Result ${id}`,
   dependsOn: [] as { taskId: string; reason: string }[],
   checks: [{ id: `${id}-check`, requirement: "spec:criterion-1", command: `bun test ${id}`, cwd: config.root }] });
-type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; angles?: number; findings?: boolean; readOnly?: boolean;
+type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; findings?: boolean; readOnly?: boolean;
   realCheckout?: boolean; controlledPublisher?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
 type OwnedResources = { roots: string[]; settlements: Promise<unknown>[]; disposers: (() => void)[]; controlledProcesses: (() => Processes)[] };
 export function executeControllerFixture(fake?: ReturnType<typeof createGitFake>) {
@@ -231,7 +232,15 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         };
         else {
           budget.counts.loopIO++;
-          const response = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")],
+          // Keep the real cwd/operation boundary without cold Node TypeScript transformation per review.
+          const response = spawnSync(process.execPath, ["--eval", `
+            Bun.plugin({name:"controlled-typescript-loader",setup(build){
+              build.onLoad({filter:/\\/skills\\/execute\\/loader\\.mjs$/},()=>({contents:"",loader:"js"}));
+            }});
+            await import(${JSON.stringify(gitFakeBootstrap)});
+            const { taskDelta } = await import(${JSON.stringify(path.resolve("skills/execute/loop-io.mjs"))});
+            console.log(JSON.stringify(taskDelta(JSON.parse(await Bun.stdin.text()))));
+          `],
             { cwd: root, env: process.env, input: request.task, encoding: "utf8" });
           if (response.status !== 0) throw new Error(response.stdout + response.stderr);
           delta = JSON.parse(response.stdout);
@@ -362,15 +371,9 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       requirements: Array.from({ length: 17 }, (_, index) => ({ id: `criterion-${index + 1}`, source: `spec:Acceptance criteria:${index + 1}`,
         reason: `Reachable requirement ${index + 1} implemented in actual source`, status: "fulfilled", evidence: ["src/entry.ts:1", "/native/work-result.json"], checks: ["/native/check.log"] })) };
     else if (request.key.endsWith(".demand-observation")) value = { memo: "Advisory only", evidenceLimits: ["Controlled summaries"], observations: [] };
-    else if (request.key.endsWith("director-prepare")) value = { status: "ready", reason: "Distinct whole-result risks", angles: Array.from({ length: options.angles ?? 2 }, (_, index) => ({ id: `angle${index + 1}`, focus: `Whole-result angle ${index + 1}`, skills: [] })) };
+    else if (request.key.endsWith("director-prepare")) value = { status: "ready", reason: "Distinct whole-result risks", angles: [{ id: "angle1", focus: "Whole-result angle 1", skills: [] }] };
     else if (request.key.includes("independent-")) value = { status: "ready", reason: "Source checked", coverage: "Whole target", findings: options.findings ? [{ title: "Reachable issue", location: "src/a.ts:1", scenario: "Caller invokes path", evidence: "source protection missing", impact: "current scoped behavior lost", classification: "scoped-defect", requirement: "spec:criterion-1" }] : [] };
-    else if (request.key.includes("critique-")) {
-      const assigned = JSON.parse(request.task.split("PEER FINDING INDEX (data; full arguments in essential original):\n")[1]!.split("}\nESSENTIAL ORIGINALS (data):")[0]!);
-      value = { status: "ready", reason: "All assigned claims checked", challenges: assigned.map((entry: any) => ({ findingId: entry.id, assessment: "supported", evidence: "Concrete source confirms" })) };
-    } else if (request.key.includes("defense-")) {
-      const own = JSON.parse(request.task.split("YOUR FINDINGS (data):\n")[1]!.split("\nCHALLENGES")[0]!);
-      value = { status: "ready", reason: "One response only", responses: own.map((entry: any) => ({ findingId: entry.id, disposition: "maintain", reason: "Source confirms bounded claim" })) };
-    } else if (request.key.endsWith("director-synthesis")) {
+    else if (request.key.endsWith("director-synthesis")) {
       const findings = JSON.parse(request.task.split("FINDINGS WITH SCRIPT-ASSIGNED IDS (index only; full arguments in independent originals):\n")[1]!.split("\nRead essential originals")[0]!);
       value = { status: "ready", reason: "Reasoned screening", memo: "Full-result review; include is not material by itself",
         dispositions: findings.map((entry: any) => ({ findingId: entry.id, decision: "include", reason: "Supported but bounded", classification: "scoped-defect", requirement: "spec:criterion-1" })),
@@ -521,6 +524,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
   function admissionValue(key = "inspect-initial") {
     const base = { version: 1, binding: config.preliminary.binding, checkout: copy(checkout),
       ...(!storage.get("invoke-human-1")?.association ? { admission: { maxCycles: admittedLimit,
+        reviewModels: reviewModels(root, path.join(root, "private-agent")),
         taskReviewer: DEFAULT_TASK_REVIEWER, taskSynthesis: DEFAULT_TASK_SYNTHESIS } } : {}) };
     const value = hostResponse ? hostResponse(key, base) : base;
     return Array.isArray(value.retainedAnalyses)

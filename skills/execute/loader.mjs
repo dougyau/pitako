@@ -21,6 +21,7 @@ const sources = new Set([
   "../../extensions/board/paths.ts",
   "../../extensions/errors.ts",
   "../../extensions/execute-settings.ts",
+  "../../extensions/review-settings.ts",
 ].map(source => new URL(source, import.meta.url).href));
 registerHooks({
   load(url, context, nextLoad) {

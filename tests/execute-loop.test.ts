@@ -699,7 +699,8 @@ test("Node apply injects current topic HUMAN IDs, rejects forged authority and r
   } finally { board.close(); }
   const script = path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs");
   const invoke = (input: object) => {
-    const result = spawnSync("node", [script], { cwd: f.root, input: JSON.stringify({ operation: "apply", dbPath: f.dbPath, ...input }), encoding: "utf8" });
+    const result = spawnSync("node", [script], { cwd: f.root, input: JSON.stringify({ operation: "apply", dbPath: f.dbPath, ...input }), encoding: "utf8",
+      env: { ...process.env, NODE_COMPILE_CACHE: path.join(f.root, ".pi/node-compile-cache") } });
     return { status: result.status, receipt: JSON.parse(result.stdout.trim()) };
   };
   const excepted = (humanRef: number) => ({ id: "loader", command: "false", cwd: ".", exception: { humanRef, reason: `HUMAN #${humanRef} permits failure` } });

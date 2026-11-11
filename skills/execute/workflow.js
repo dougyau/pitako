@@ -139,7 +139,7 @@ function nativeReference(childKey, result) {
       .replaceAll(JSON.stringify(result.structuredOutput, null, 2), "[retained failed original]")
       .replaceAll(JSON.stringify(result.structuredOutput), "[retained failed original]");
   for (const field of ["agent", "runId", "asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "artifactPaths", "externalAdapter",
-    ...(review ? ["nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "state"] : [])])
+    ...(review ? ["model", "nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "state"] : [])])
     if (result?.[field] !== undefined) ref[field] = result[field];
   // Native acceptance metadata is large and constant for read-only reviewers; only
   // its recovery barrier is control evidence. Per-result debug paths stay in the
@@ -3018,6 +3018,17 @@ try {
       if (admitted[name] !== undefined && (typeof admitted[name] !== "string" || admitted[name].trim() !== admitted[name] ||
           !/^[^/\s:*?,]+\/[^\s*?,]+(?::(?:off|minimal|low|medium|high|xhigh|max))?$/.test(admitted[name])))
         throw new Error(`Invalid pitako.execute.${name} admission receipt.`);
+    const reviewModels = admitted.reviewModels === undefined ? {
+      r1: { key: "pitako.review.r1", model: "anthropic/claude-opus-5-5:high" },
+      r2: { key: "pitako.review.r2", model: "openai-codex/gpt-6.1-sol:xhigh" },
+      synthesis: { key: "pitako.review.synthesis", model: "anthropic/claude-opus-5-5:high" },
+    } : admitted.reviewModels;
+    for (const slot of ["r1", "r2", "synthesis"])
+      if (reviewModels?.[slot]?.key !== `pitako.review.${slot}` ||
+          typeof reviewModels[slot].model !== "string" ||
+          reviewModels[slot].model.trim() !== reviewModels[slot].model ||
+          !/^[^/\s:*?,]+\/[^\s*?,]+(?::(?:off|minimal|low|medium|high|xhigh|max))?$/.test(reviewModels[slot].model))
+        throw new Error(`Invalid pitako.review.${slot} admission receipt.`);
     invocation = {
       version: config.stateVersion, association: { missionId: config.missionId, missionPath: config.missionPath,
         invocation: config.invocation, root: metadata.root, commonDir: metadata.commonDir,
@@ -3026,6 +3037,7 @@ try {
       revivalContextPeak: admitted.revivalContextPeak ?? 120000,
       taskReviewer: admitted.taskReviewer ?? "openai-codex/gpt-6.1-sol:xhigh",
       taskSynthesis: admitted.taskSynthesis ?? "anthropic/claude-opus-5-5:high",
+      reviewModels: clone(reviewModels),
       admissionBinding: current.binding, amendments: clone(config.amendments ?? []), startedAt: Date.now(), consumedLoops: 0, ledger: { count: 0, head: null }, sealPending: null,
       recoverySeq: 0, lastRecoveryRef: null, lastConfirmed: null, usageTotals: { tokens: 0, known: 0, unknown: 0 },
       tasks: {}, taskFrame: null, loop: null,
@@ -3736,7 +3748,7 @@ Return structured_output after all owned journaled writes settle.`,
       await reconcileAnalysis();
       progress();
       let reviewBudgetError;
-      // reviewPhase owns its actual dynamic angles/critique/one-defense/synthesis.
+      // reviewPhase owns its fixed+risk angles mirrored over two slots, then synthesis.
       // Replay reconciles each retained call; repeating a key is not observation.
       // The deterministic access verifier is idempotent, model-free and writes only
       // receipts: dispatch it directly, not as a retained model analysis call.
@@ -3769,6 +3781,7 @@ No own writer is active. Do not run checks or repair. Only clear screening permi
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
       }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute",
+        models: invocation.reviewModels,
         decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate },
         access: { missionPath: config.missionPath, namespace: `execute-${config.invocation}` },
       });

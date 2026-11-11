@@ -328,7 +328,10 @@ describe("spec-plan discovery and concrete input", () => {
       const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
     }
     const entry = path.join(installed, "skills/execute/inspect.mjs");
-    const invoke = (root: string, ...extra: string[]) => JSON.parse(execFileSync("node", [entry, root, "demo", "", ...extra], { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }));
+    const invoke = (root: string, ...extra: string[]) => JSON.parse(execFileSync("node", [entry, root, "demo", "", ...extra], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
+      env: { ...process.env, NODE_COMPILE_CACHE: path.join(base, "node-compile-cache") },
+    }));
     const unborn = path.join(base, "unborn");
     fake!.fakeRepo(unborn);
     fake!.set(unborn, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "", stderr: "fatal: ambiguous argument 'HEAD'", status: 128 });

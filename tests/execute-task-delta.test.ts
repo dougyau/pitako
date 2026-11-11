@@ -11,7 +11,7 @@ import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtu
 const composition = realCheckoutCompositionFixture();
 const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
-beforeAll(() => runtime.startNativeCheckpoint());
+beforeAll(() => runtime.startNativeCheckpoint({ extension: false }));
 const entry = path.resolve("skills/execute/loop-io.mjs");
 
 function fixture() {

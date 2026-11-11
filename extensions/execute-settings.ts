@@ -5,7 +5,7 @@ import path from "node:path";
 // needs strict, read-only diagnostics for these extension-owned keys instead.
 export const DEFAULT_TASK_REVIEWER = "openai-codex/gpt-6.1-sol:xhigh";
 export const DEFAULT_TASK_SYNTHESIS = "anthropic/claude-opus-5-5:high";
-function isExecuteReviewModel(value: unknown): value is string {
+export function isExecuteReviewModel(value: unknown): value is string {
   return typeof value === "string" && value.trim() === value &&
     /^[^/\s:*?,]+\/[^\s*?,]+(?::(?:off|minimal|low|medium|high|xhigh|max))?$/.test(value);
 }

@@ -38,10 +38,11 @@ test.each(["pitako.review", "pitako.architecture"])("%s launches only by name wi
 });
 
 test("named resolution inlines data args and the mission binding; invalid bindings fail", () => {
-  const { missionPath } = store();
-  const review = analysisResource("pitako.review").resolve({ missionId: "native.mission-1", missionPath, brief: "B", workDescription: "W",
+  const { root, missionPath } = store();
+  const review = analysisResource("pitako.review", root, root).resolve({ missionId: "native.mission-1", missionPath, brief: "B", workDescription: "W",
     target: { kind: "diff", reference: "r", material: "m" } });
   expect(review.script).toStartWith(`const args = ${JSON.stringify({ brief: "B", workDescription: "W", target: { kind: "diff", reference: "r", material: "m" } })};\nconst pitakoAccess = ${JSON.stringify({ missionPath, namespace: "review" })};\n`);
+  expect(review.script).toContain('const pitakoReviewModels = {"r1":{"key":"pitako.review.r1","model":"anthropic/claude-opus-5-5:high"}');
   const architecture = analysisResource("pitako.architecture").resolve({ missionId: "native.mission-1", missionPath, consultation: "stream-parser" });
   expect(architecture.script).toContain(`const pitakoAccess = ${JSON.stringify({ missionPath, namespace: "architecture-stream-parser" })};`);
   expect(() => analysisResource("pitako.review").resolve({ missionPath })).toThrow("requires an existing native missionId");
@@ -53,15 +54,21 @@ test("named resolution inlines data args and the mission binding; invalid bindin
 });
 
 test("session registration adds the verifier and both named resources, disposing all together", () => {
-  const { missionPath } = store();
+  const { root, missionPath } = store();
   const { handlers, disposed } = hooks();
-  const sessionId = randomUUID(), ctx = { sessionManager: { getSessionId: () => sessionId } };
-  handlers.get("session_start")!({}, ctx);
+  const sessionId = randomUUID(), ctx = { cwd: root, sessionManager: { getSessionId: () => sessionId } };
+  const previous = process.env.PI_CODING_AGENT_DIR;
+  process.env.PI_CODING_AGENT_DIR = root;
   try {
+    handlers.get("session_start")!({}, ctx);
     for (const name of ["pitako.review", "pitako.architecture"])
       expect(resolveWorkflowResource(name, { missionId: "native.mission-1", missionPath, consultation: "c" }, sessionId)).toMatchObject({ ok: true });
     expect(JSON.stringify(resolveWorkflowResource("pitako.execute", {}, sessionId))).not.toContain("Unknown workflow resource");
-  } finally { handlers.get("session_shutdown")!({}, ctx); }
+  } finally {
+    handlers.get("session_shutdown")!({}, ctx);
+    if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
+    else process.env.PI_CODING_AGENT_DIR = previous;
+  }
   expect(disposed).toContain("pitako.access-verifier");
   for (const name of ["pitako.review", "pitako.architecture"])
     expect(resolveWorkflowResource(name, { missionId: "native.mission-1", missionPath, consultation: "c" }, sessionId)).toMatchObject({ ok: false });

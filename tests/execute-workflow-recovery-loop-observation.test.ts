@@ -1825,8 +1825,8 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.some(call => call.key.endsWith(".review.defense-a") || call.key.includes(".review.defense"))).toBe(false);
   });
 
-  test.each([2, 3, 4])("real %s-angle review includes critiques, one defense and synthesis, not include=material", async angles => {
-    const host = fixture("FULL SPECS", { angles, findings: true });
+  test("real mirrored two-angle review runs directly to synthesis, not include=material", async () => {
+    const host = fixture("FULL SPECS", { findings: true });
     const inlineOriginals = observeInlineReviewOriginals(host);
     const goal = "Improve record selection\n " + "with complete caller evidence ".repeat(12);
     host.setRespond((request, normal) => {
@@ -1837,16 +1837,16 @@ describe("workflow-owned execute controller", () => {
     // A scoped-defect finding returned as ready reaches synthesis instead of stopping execute.
     expect((await host.execute()).status).toBe("complete");
     const verifiers = host.calls.filter(call => call.agent === "pitako.access-verifier");
-    // One model-free verifier per consuming gate: critique, defense and synthesis.
-    expect(verifiers.map(call => call.key)).toEqual(["critique", "defense", "synthesis"].map(gate => `invoke-human-1.l2.review.verify-${gate}`));
+    // Only synthesis consumes independent originals.
+    expect(verifiers.map(call => call.key)).toEqual(["synthesis"].map(gate => `invoke-human-1.l2.review.verify-${gate}`));
     expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
-    expect(host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier")).toHaveLength(3 * angles + 2);
+    expect(host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier")).toHaveLength(6);
     for (const call of host.calls.filter(item => item.key.includes(".review.") && item.agent !== "pitako.access-verifier"))
       expect(call.task).toContain("Return status blocked only when missing material context prevents this review phase.");
-    expect(host.calls.filter(call => call.key.includes(".review.") && call.resume)).toHaveLength(2 * angles + 1);
+    expect(host.calls.filter(call => call.key.includes(".review.") && call.resume)).toHaveLength(1);
     const requests = host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier");
     expect(new Set(requests.map(request => request.phase))).toEqual(new Set([
-      "review-prepare", "review-independent", "review-critique", "review-defense", "review-synthesis",
+      "review-prepare", "review-independent", "review-synthesis",
     ]));
     const manifest = host.storage.get("review-invoke-human-1");
     expect(manifest.originals).toHaveLength(requests.length);
@@ -1854,7 +1854,7 @@ describe("workflow-owned execute controller", () => {
       const label = request.label ?? "";
       expect(label).toBe(request.task.split("\n")[0]);
       expect(label).toContain("Loop 2 result");
-      const angle = request.key.match(/(?:independent|critique|defense)-angle(\d+)$/)?.[1];
+      const angle = request.key.match(/independent-angle(\d+)-r[12]$/)?.[1];
       if (angle) expect(label.indexOf(`Whole-result angle ${angle}`)).toBeLessThan(label.indexOf("Loop 2 result"));
       expect(request.task).toContain("FULL SPECS");
       expect(request.task).toContain("ADMITTED PLAN CONTEXT");
@@ -1868,6 +1868,7 @@ describe("workflow-owned execute controller", () => {
       const original = inlineOriginals.get(request.key);
       expect(canonicalDigest(readReviewOriginal(retained))).toBe(original.digest);
       expect(ref.runId).toBe(original.runId);
+      expect(ref.model).toBe(request.model);
       expect(ref.outputReference).toBe(`/native/output/${request.key}.json`);
       expect(original.results).toBeUndefined(); // canonical witnesses belong to execute, not a second manifest copy
       expect(manifest.decision.reference).toMatchObject({ stateKey: "invoke-human-1", loop: 2 });
@@ -2229,6 +2230,13 @@ describe("workflow-owned execute controller", () => {
       "invoke-human-1.l1.final-gaps", "invoke-human-1.l1.checkout", "invoke-human-1.l2.advance.prepare", "invoke-human-1.l2.advance.requests",
       "invoke-human-1.l2.demandOriginals", "invoke-human-1.l2.demand-observation"]);
     expect(beforeDirector.find(call => call.key.endsWith(".final-gaps"))!.task).toContain("final-phase");
+    const gapInput = JSON.parse(beforeDirector.find(call => call.key.endsWith(".final-gaps"))!.task);
+    expect(JSON.stringify(gapInput)).toContain("invoke-human-1.l1.review.director-synthesis");
+    const synthesisCall = host.calls[synthesis]!;
+    expect(synthesisCall.task).toContain("evidence-contract-r1-1");
+    expect(synthesisCall.task).toContain("evidence-contract-r2-1");
+    expect(synthesisCall.task).toContain("angle1-r1-1");
+    expect(synthesisCall.task).toContain("angle1-r2-1");
     expect(beforeDirector.some(call => call.agent === "pitako.worker")).toBe(false);
     const report = host.emits.find(value => value.type === "execution-loop" && value.loop === 1);
     expect(report.next).toBe("continue loop 2"); expect(report.verification.compliance.status).toBe("not-run");
@@ -3016,9 +3024,9 @@ describe("workflow-owned execute controller", () => {
   });
 
   test.each(["review", "compliance"])("native child capacity exhausted during %s preserves phase and refs without omitted phases, replacement mission or own budget", async phase => {
-    const host = fixture("FULL SPEC", { angles: 4, findings: true, taskCount: 0 });
+    const host = fixture("FULL SPEC", { findings: true, taskCount: 0 });
     host.setRespond((request, normal) => {
-      if (phase === "review" ? request.key.includes("critique-") : request.key.endsWith(".compliance"))
+      if (phase === "review" ? request.key.endsWith("director-synthesis") : request.key.endsWith(".compliance"))
         throw Error("Run fan-out limit reached at root (64/64 used; 1 requested, 0 remaining). No children from this admission group were started. Start a new top-level run or raise config.maxSubagentSpawnsPerRun.");
       return normal();
     });
@@ -3110,7 +3118,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.history()[0].halt.code).toBe("semantic-block");
   });
 
-  test.each(["director-prepare", "independent-angle1"])("thrown native permission receipt at %s crosses the shared review boundary as a barrier", async phase => {
+  test.each(["director-prepare", "independent-angle1-r1"])("thrown native permission receipt at %s crosses the shared review boundary as a barrier", async phase => {
     const host = fixture(undefined, { taskCount: 0 });
     host.setRespond((request, normal) => {
       if (request.key.endsWith(phase)) throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
@@ -3158,7 +3166,7 @@ describe("workflow-owned execute controller", () => {
     const unit = '\\"é界';
     const content = unit.repeat(Math.floor(MAX_SPEC_BYTES / Buffer.byteLength(unit))) + "x".repeat(MAX_SPEC_BYTES % Buffer.byteLength(unit));
     expect(Buffer.byteLength(content)).toBe(39936);
-    const host = fixture(content, { metadataPadding: 7000, angles: 4, findings: true, taskCount: 0 });
+    const host = fixture(content, { metadataPadding: 7000, findings: true, taskCount: 0 });
     const inlineOriginals = observeInlineReviewOriginals(host);
     host.storage.set("other-owned-history", { content: "h".repeat(90000) });
     const essentialBytes: number[] = [];
@@ -3203,7 +3211,7 @@ describe("workflow-owned execute controller", () => {
       expect(manifest.decision).toEqual({ reference: { stateKey: "invoke-human-1", loop: loop.number } });
       expect(manifest.query).toBe(JSON.stringify(loop.candidate));
       expect(manifest.revision).toBe(1);
-      expect(manifest.originals).toHaveLength(14);
+      expect(manifest.originals).toHaveLength(6);
       for (const retained of manifest.originals) {
         expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
         const original = inlineOriginals.get(retained.key);
@@ -3216,7 +3224,7 @@ describe("workflow-owned execute controller", () => {
         const exact = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
         expect(original.association).toEqual({ namespace: manifest.namespace, query: manifest.query, revision: manifest.revision,
           phase: host.calls.find(call => call.key === original.key)!.phase!.replace("review-", ""),
-          producer: original.key.includes(".director-") ? "director" : original.key.split("-").at(-1),
+          producer: original.key.includes(".director-") ? "director" : original.key.split(".review.independent-")[1],
           key: original.key, attempt: original.attempt });
         expect(original.digest).toBe(canonicalDigest(exact));
         expect(original.id).toBe(`${original.association.key}.v1.a1`);

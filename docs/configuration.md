@@ -162,6 +162,34 @@ This review runs between passing task gates and sealing for complete
 file-writing tasks. Rejection permits one same-slot repair and re-review; unit
 requires admission. It does not change final-phase full review or compliance.
 
+Full review in standalone `/review` and `/execute` final acceptance uses exactly
+two angles: `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`,
+or `decision-fidelity` for `plan` (including specs), plus one director-selected
+risk angle with a different id. Both model slots review each angle independently
+(four read-only `pitako.reviewer` children), followed directly by the unchanged
+synthesis. There are no critique or defense phases.
+
+Full-review model settings use a separate namespace:
+
+| Key | Default |
+| --- | --- |
+| `pitako.review.r1` | `anthropic/claude-opus-5-5:high` |
+| `pitako.review.r2` | `openai-codex/gpt-6.1-sol:xhigh` |
+| `pitako.review.synthesis` | `anthropic/claude-opus-5-5:high` |
+
+Use nested JSON, for example `{"pitako":{"review":{"r1":"provider/model:high"}}}`.
+These are exact `provider/id[:thinking]` strings, with global agent
+`settings.json` followed by project `.pi/settings.json` precedence per key.
+Invalid values are rejected with the file and key; there is no fallback.
+Standalone `/review` reads these settings through its named analysis resource
+and freezes them in the resolved script and invocation state for replay.
+`/execute` reads and freezes them at admission for its final `solution` review;
+settings changes do not alter either mode's frozen selections on replay.
+Each configured value is sent unchanged as the child `model`.
+`synthesis` selects both the prepare director and final synthesis model.
+An unknown or failing configured model stops review with the settings key,
+model, and native error; no other model is substituted.
+
 `plan` and `execute` are advertised skills, with `/plan` and `/execute` prompt
 templates. Planning gathers evidence and confirms specs without implementation;
 execution uses native pi-subagents missions and the `pitako.execute` resource

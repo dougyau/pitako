@@ -117,7 +117,7 @@ test("capacity and positive activity prevent grouped redispatch", async () => {
   expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close")).toHaveLength(1);
 });
 
-test.each([false, true])("workflow admits actual grouped CLI projections and drains linked intentions (continuation: %s)", async continuation => {
+test.each([false, true])("workflow admits actual grouped CLI projections and drains linked intentions (continuation: %s)", continuation => composition.ownWorkflow(async () => {
   const host = fixture(undefined, { realCheckout: true });
   host.setLimit(1);
   let workers = 0;
@@ -169,14 +169,16 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
       asyncDir, externalAdapter: { outputArtifacts: { stdoutPath, stderrPath } },
       output: stdout.slice(-65536), results: [{ exitCode: exit }] } as any;
   });
-  const output = await host.executeNative();
+  // This case owns the CLI transport; native sandbox dispatch is covered by composition.
+  const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
   expect(output.reason).toContain("1 authorized loops consumed");
-  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
+  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent),
+    host.launches.map(call => call.key).join("\n"))
     .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker",
       ...(continuation ? ["close", "pitako.worker"] : []),
       "gate", "taskDelta", "pitako.reviewer", "pitako.reviewer", "pitako.request-observer",
       ...(continuation ? ["drain"] : []), "pitako.checkpoint-sealer", "drain"]);
   expect(host.records().map((record: any) => record.kind)).toEqual(continuation ? ["spec", "unit", "unit", "loop"] : ["spec", "unit", "loop"]);
   expect(host.current().intentions).toEqual([]);
-});
+}));

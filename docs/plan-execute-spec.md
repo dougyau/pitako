@@ -305,8 +305,9 @@ before aggregation, even after a failure; material contradictions remain open.
 
 ### Shared adversarial review, then individual compliance
 
-After mandatory checks, the root runs the REAL shared review: two to four dynamic
-whole-result perspectives, cross-critique, one defense and synthesis, all with
+After mandatory checks, the root runs the REAL shared review: `evidence-contract`
+plus one director-selected risk angle, each independently reviewed by both model
+slots, followed directly by the unchanged synthesis, all with
 complete specs/current candidate. Reasoned screening is clear/material-gaps/
 blocked; include means substantiated, not blocking, and completed is protocol
 termination only. Clear alone launches exactly one fresh reviewer-profile
@@ -757,7 +758,7 @@ as started only with its retained native reference; no generic resume of
 failed/completed roots, new replacement root or foreground polling is provided.
 
 No historical marker/closure ceremony or bare --unblock bypass survives. Tests exercise
-shared review with two/three/four angles and findings, native capacity exhaustion,
+shared review with two mirrored angles and findings, native capacity exhaustion,
 full state-file bounds and compact projection of large reports. Maximum UTF-8
 snapshots/metadata, inert preliminary transport, immutable association and bounded
 synchronous discovery in resolve remain owned guarantees. Presentation checks

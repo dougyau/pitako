@@ -136,6 +136,8 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       }
     })();
     // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
+    if (input.operation === "taskDelta" && process.cwd() !== metadata.root && metadata.runDeterministic)
+      return metadata.runDeterministic(key, request, metadata, checkout);
     if (input.operation === "taskDelta" && process.cwd() === metadata.root) return (async () => {
       const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
       const { operation, ...params } = input;
@@ -257,7 +259,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   else if (key.endsWith(".demand-observation")) value = { memo: "Inherited demands remain advisory",
     evidenceLimits: ["Controlled source evidence only"], observations: [] };
   else if (key.endsWith("director-prepare")) value = { status: "ready", reason: "Whole result perspectives", angles: [
-    { id: "a", focus: "Correctness", skills: [] }, { id: "b", focus: "Requirements", skills: [] }] };
+    { id: "a", focus: "Correctness", skills: [] }] };
   else if (key.includes("independent-")) value = { status: "ready", reason: "Source inspected", coverage: "Complete candidate", findings: [] };
   else if (key.endsWith("director-synthesis")) value = { status: "ready", reason: "No material gaps", memo: "Whole-result analysis",
     dispositions: [], screening: { verdict: "clear", reason: "Current candidate inspected", assessments: [] } };
@@ -342,10 +344,17 @@ export function realCheckoutCompositionFixture() {
   const processes = (): Processes => ({ sealer: 0, loopIO: 0, gates: 0, other: directChildren + opaqueChildren.size });
   const workflowSettlements: Promise<void>[] = [];
   const checkpointCancellations = new Set<() => void>();
+  function ownWorkflow<T>(work: () => Promise<T>): Promise<T> {
+    const result = work();
+    workflowSettlements.push(result.then(() => {}, () => {}));
+    return result;
+  }
   async function settleWorkflows() {
     // A runner timeout does not settle a test's workflow continuation.
-    for (const cancel of checkpointCancellations) cancel();
-    await Promise.all(workflowSettlements.splice(0));
+    do {
+      for (const cancel of checkpointCancellations) cancel();
+      await Promise.all(workflowSettlements.splice(0));
+    } while (workflowSettlements.length);
   }
   afterAll(async () => { await settleWorkflows(); fake.dispose(); });
   afterEach(async () => {
@@ -372,7 +381,7 @@ export function realCheckoutCompositionFixture() {
         const observation = await observed;
         // Teardown joins without running assertions or rejecting an abandoned await.
         if (cancelled) return;
-        return consume(observation);
+        return await consume(observation);
       } finally {
         if (child.exitCode === null && child.signalCode === null) child.kill();
         // Promise.all alone can reject before another stream or exit settles.
@@ -399,11 +408,11 @@ export function realCheckoutCompositionFixture() {
     mkdirSync(path.join(root, ".git/info"), { recursive: true });
     return root;
   }
-  // Reuse a file-owned Node process: grouped operations require their real cwd,
+  // Reuse a file-owned process: grouped operations require their real cwd,
   // but repeated cold loader processes are not part of the behavior under test.
   const runtime = nativeCheckpointFixture({ workflowSettlements, checkpointCancellations, settleWorkflows, recordOpaque });
   let useRuntime = false;
-  beforeAll(async () => { if (useRuntime) await runtime.startNativeCheckpoint(); });
+  beforeAll(async () => { if (useRuntime) await runtime.startNativeCheckpoint({ extension: false }); });
   const scripts = { ...deterministicScripts,
     runDeterministic: async (key: string, request: any, metadata: any, checkout: any) => {
       const result = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
@@ -412,7 +421,7 @@ export function realCheckoutCompositionFixture() {
       if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Deterministic fixture cancelled");
       return JSON.parse(result[1]);
     } };
-  return { fake, roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, checkpointLifecycle, repository, processes, recordOpaque,
+  return { fake, roots, disposers, workflowSettlements, checkpointCancellations, settleWorkflows, ownWorkflow, checkpointLifecycle, repository, processes, recordOpaque, runtime,
     execFileSync: countedExecFileSync,
     expectProcessBudget: (maximum: number) => expectProcessBudget(processes(), maximum),
     get scripts() { useRuntime = true; return scripts; } };
@@ -427,19 +436,37 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
   let nativeCheckpointRoot: string;
   let nativeCheckpointExit: Promise<[number, string, string]>;
   let nativeCheckpointReply: ((value: [number, string, string] | undefined) => void) | undefined;
+  let startupOptions: Parameters<typeof startNativeCheckpoint>[0];
   const nativeCheckpointExits: { promise: Promise<[number, string, string]>; cancelled: boolean }[] = [];
-  // Harnesses without workflow/extension loading pass `sdk: false`; those
-  // importing loader.mjs still need the Node executable for its module hooks.
+  // Bun loads controlled TypeScript factories directly; native SDK wiring keeps Node.
   async function startNativeCheckpoint({
-    sdk = true, native = false, executable = sdk ? "node" : process.execPath,
-  }: { sdk?: boolean; native?: boolean; executable?: string } = {}) {
+    sdk = true, native = false, extension = true, executable = native ? "node" : process.execPath,
+  }: { sdk?: boolean; native?: boolean; extension?: boolean; executable?: string } = {}) {
     if (nativeCheckpoint) throw Error("Checkpoint fixture already running");
+    startupOptions = { sdk, native, extension, executable };
     nativeCheckpointRoot ??= mkdtempSync(path.join(tmpdir(), "pitako-checkpoint-node-"));
     let ready!: () => void;
     const started = new Promise<void>(resolve => { ready = resolve; });
     const child = spawn(executable, ["-e", `
+      if(process.versions.bun)Bun.plugin({
+        name:'controlled-typescript-loader',
+        setup(build){
+          // Bun already loads this source closure; Node's registerHooks is not available.
+          build.onLoad({filter:/\\/skills\\/execute\\/loader\\.mjs$/},()=>({contents:'',loader:'js'}));
+        },
+      });
       const disconnect=()=>{if(process.connected)process.disconnect();};
-      process.on('SIGTERM',()=>{process.exitCode ||= 143;disconnect();});
+      // Node can receive the peer's disconnect while SIGTERM is closing IPC.
+      process.on('error',error=>{
+        if(error.code==='ERR_IPC_DISCONNECTED' && !process.connected)return;
+        console.error(error);process.exitCode=1;
+      });
+      process.on('SIGTERM',()=>{
+        process.exitCode ||= 143;
+        // Runner timeout cleanup can signal an idle file-owned child without its case owner.
+        if(process.connected)process.send({cancelled:true},disconnect);
+        else disconnect();
+      });
       const send=value=>{
         if(process.connected)process.send(value,error=>{
           if(error){console.error(error);process.exitCode=1;disconnect();}
@@ -455,9 +482,20 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
           runWorkflowScript = nativeRun;
           loadExtensions = nativeLoad;
         } else {
-          // Same controlled AsyncFunction boundary as execute-workflow.ts.
+          // Controlled cases exercise the owned factory, not Pi's SDK loader.
+          // The explicit native case above retains real SDK loading and dispatch.
           runWorkflowScript = ${controlledWorkflow.toString()};
-          loadExtensions = (await import(${JSON.stringify(new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href)})).loadExtensionsCached;
+          loadExtensions = async paths => {
+            const extensions=[], errors=[];
+            for(const file of paths) {
+              try {
+                const {default:factory}=await import(require('node:url').pathToFileURL(file).href), tools=new Map();
+                await factory({on(){},registerTool:definition=>tools.set(definition.name,{definition})});
+                extensions.push({tools});
+              } catch(error) {errors.push({path:file,error:String(error.stack??error)});}
+            }
+            return {extensions,errors};
+          };
         }
         return {runWorkflowScript,loadExtensions};
       })();
@@ -465,7 +503,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         await import(${JSON.stringify(gitFakeBootstrap)});
         if(${sdk}) {
           const {loadExtensions}=await sdk();
-          await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
+          if(${extension})await loadExtensions([${JSON.stringify(path.resolve("extensions/checkpoint-create.ts"))}],process.cwd());
           // File-owned extension and persistence loading must finish before ready.
           if(!${native})await Promise.all([
             import(${JSON.stringify(new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href)}),
@@ -504,6 +542,7 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     child.on("error", error => { errors += String(error.stack ?? error); });
     child.on("message", (message: any) => {
       if (message.ready) ready();
+      else if (message.cancelled) operation.cancelled = true;
       else {
         const reply = nativeCheckpointReply;
         nativeCheckpointReply = undefined;
@@ -564,22 +603,31 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
     checkpointCancellations.add(cancel);
     const result = (async () => {
       try {
-        if (!nativeCheckpoint) await startNativeCheckpoint();
+        // A cancelled preceding case can still be draining synchronous host work.
+        const preceding = nativeCheckpointExits.at(-1);
+        if (preceding?.cancelled) await preceding.promise;
+        if (cancelled) return;
+        if (!nativeCheckpoint) await startNativeCheckpoint(startupOptions);
         child ??= nativeCheckpoint;
         operation ??= nativeCheckpointExits.at(-1);
         if (cancelled) { await operation?.promise; return; }
         if (!child || nativeCheckpointReply) throw Error("Native checkpoint fixture unavailable or busy");
         recordOpaque(child);
         const response = new Promise<[number, string, string] | undefined>(resolve => {
-          nativeCheckpointReply = value => resolve(cancelled ? undefined : value);
+          const reply = (value: [number, string, string] | undefined) => resolve(cancelled ? undefined : value);
+          nativeCheckpointReply = reply;
           child!.send({input:{...input,agentDir:path.join(path.dirname(input.missionPath),"private-agent")},harness}, error => {
-            if (error) resolve(cancelled ? undefined : [1, "", String(error.stack ?? error)]);
+            if (error) {
+              if (nativeCheckpointReply === reply) nativeCheckpointReply = undefined;
+              resolve(cancelled ? undefined : [1, "", String(error.stack ?? error)]);
+            }
           });
         });
         const value = await response;
         if (cancelled || !child.connected) await operation!.promise; // Joins this child and both streams.
-        if (!cancelled && value) return consume(value);
+        if (!cancelled && value) return await consume(value);
       } finally {
+        if (cancelled) await operation?.promise;
         checkpointCancellations.delete(cancel);
       }
     })();

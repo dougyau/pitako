@@ -643,8 +643,10 @@ verdict still fails does it run acceptance fresh once. No slot renewal, seal or
 replay weakening, native barrier bypass or generic restart authority is implied.
 
 After final mandatory checks the root runs the REAL shared adversarial review:
-two to four dynamic whole-result perspectives, cross-critique, one defense and
-synthesis. The trusted assembly is a lexical library marker, COMPLETE unchanged
+`evidence-contract` plus one director-selected risk angle, each independently
+reviewed by both model slots, followed directly by the unchanged synthesis.
+The models use admission-frozen `pitako.review.*` settings.
+The trusted assembly is a lexical library marker, COMPLETE unchanged
 review source, then execute source; no protocol copy, slicing, imports or nested
 workflow API. The root supplies a concrete `workDescription` and preserves
 `label`, `phase` and first-line task titles through fresh/resumed adapters.
