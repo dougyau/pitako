@@ -3759,7 +3759,8 @@ Assess single-outcome decomposition and necessary dependencies independently; sc
 Do not repeat correct completed implementation merely to improve its past decomposition.
 Candidate including WIP: ${JSON.stringify(loop.candidate)}.
 Actual final checks/result references: ${JSON.stringify(loopResults())}.
-Done/obsolete tasks and reasons: ${JSON.stringify(loop.completedTasks)}.
+Done/obsolete tasks (bounded summary: title or clipped goal and last reason; omitted counts tasks beyond the cap): ${JSON.stringify(loop.completedTasks)}.
+Complete goals and histories of every task: ${invocation.backlogPath}.
 Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
 Current Board HUMAN rulings, DECISIONs and authority: ${JSON.stringify(invocation.currentView)}.
 ${acceptanceBrief()}
