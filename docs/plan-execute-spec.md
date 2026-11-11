@@ -882,7 +882,9 @@ inconclusive status and historical IDs alone are not activity. Positive current
 pertinent activity is a conflict. Actual native Stop/refusal/permission/capacity
 and essential-save barriers remain binding. A recorded Stop requires a real later
 human continuation request before effects, never reuse of an old answer.
-Restoration never rewinds consumed loops, attempts, admitted results or immutable
+A restoring writer that stopped before publishing new checkpoint evidence is
+renewed only by current human input naming that exact writer, once per input;
+replay alone never renews it. Restoration never rewinds consumed loops, attempts, admitted results or immutable
 originals. Renew evidence invalidated by the restored candidate, then reach pending
 work, final checks, review and compliance.
 

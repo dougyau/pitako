@@ -217,6 +217,43 @@ describe("fused loop ledger publication", () => {
     expect(host.current().loop.archived).toBeUndefined();
   });
 
+  const isPrepare = (request: any) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "prepare";
+  const overflow = (request: any, normal: () => any): any => isPrepare(request) ? { ...normal(), ok: false,
+    output: JSON.stringify({ error: "loop-io", reason: "HUMAN + DECISION overflow: ask the human to consolidate", viewOverflow: true }) } : normal();
+  test.each(["unblock", "relaunch"])("a %s after a pre-director view overflow clears the halt before the writer launches", async route => {
+    const host = fixture(); host.setLimit(1);
+    host.setRespond(overflow);
+    const blocked = await host.execute();
+    expect(blocked.status).toBe("blocked");
+    expect(host.current().loop).toMatchObject({ phase: "director", halt: { code: "recovery" } });
+    expect(host.calls.some(call => call.agent === "pitako.execution-director")).toBe(false);
+    // The checkpoint hook refuses every write while the durable loop has a halt.
+    const atLaunch: any[] = [];
+    host.setRespond((request, normal) => {
+      if (request.agent === "pitako.worker") atLaunch.push(structuredClone(host.current().loop));
+      return normal();
+    });
+    const output = await host.execute(route === "unblock"
+      ? { unblock: true, resolution: { loop: 1, text: "Board consolidated into one HUMAN post." } } : {});
+    expect(atLaunch).toHaveLength(1);
+    expect(atLaunch[0]).toMatchObject({ phase: "implementation", attempt: { stage: "launched" } });
+    expect(atLaunch[0].halt).toBeUndefined();
+    expect(output.status, output.reason).not.toBe("blocked");
+    if (route === "unblock") expect(host.history()[0].resolutions[0]).toMatchObject({ stage: "applied", halt: { code: "recovery" } });
+  });
+
+  test("a persisting pre-director view overflow halts again before any director", async () => {
+    const host = fixture(); host.setLimit(1);
+    host.setRespond(overflow);
+    expect((await host.execute()).status).toBe("blocked");
+    const output = await host.execute({ unblock: true, resolution: { loop: 1, text: "Board consolidated." } });
+    expect(output.status).toBe("blocked");
+    expect(output.reason).toContain("consolidate");
+    expect(host.current().loop.halt).toMatchObject({ code: "recovery" });
+    expect(host.calls.filter(isPrepare)).toHaveLength(2);
+    expect(host.calls.some(call => ["pitako.execution-director", "pitako.worker"].includes(call.agent!))).toBe(false);
+  });
+
   test.each(["close", "gaps"])("a native Stop during %s cannot be retried without new human input", async phase => {
     const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
     host.setRespond((request, normal) => {

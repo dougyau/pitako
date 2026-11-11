@@ -2839,6 +2839,57 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
   });
 
+  test.each(["stopped", "interrupted"])("a restoring writer %s before any effect is renewed once per current human resolution", async signal => {
+    const host = fixture(undefined, { realCheckout: true });
+    cutAt(host, value => !!value.loop?.attempt?.launch);
+    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
+    // A writer stopped before its first effect leaves the witness unchanged.
+    host.setHostResponse((key, value) => {
+      const loop = host.current()?.loop, attempt = loop?.attempt;
+      return !key.startsWith("inspect-") || !attempt ? value : { ...value, checkpointObservation: {
+        key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
+        evidence: digest("unchanged checkpoint observation") } };
+    });
+    host.setStatus(ref => {
+      if (!ref.includes(".t1.a1")) return copy(host.native.get(ref) ?? { ok: true, results: [] });
+      return { ok: true, results: [] };
+    });
+    // Every restoring writer stops before its first effect: no new preimages.
+    let restoring = true;
+    const atLaunch: any[] = [];
+    host.setRespond((request, normal) => {
+      if (request.agent !== "pitako.worker") return normal();
+      atLaunch.push(copy(host.current().loop));
+      if (restoring) return { ...host.result(request, null), ok: false, [signal]: true };
+      const saved = host.current(), restore = saved.loop.attempt.restore;
+      restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+      return normal();
+    });
+    const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key.split(".").at(-1));
+    expect((await host.execute()).status).not.toBe("complete");
+    expect(workers()).toEqual(["a1", "a2"]);
+    // Replay without human input never renews the modifying route.
+    const replay = await host.execute();
+    expect(replay.status).not.toBe("complete");
+    expect(workers()).toEqual(["a1", "a2"]);
+    // One current human resolution naming the stopped restoration renews it once.
+    const first = { unblock: true, resolution: { loop: 1, text: "Restart the stopped restoration." } };
+    const renewed = await host.execute(first);
+    expect(renewed.status).not.toBe("complete");
+    expect(workers(), renewed.reason).toEqual(["a1", "a2", "a3"]);
+    expect(atLaunch.at(-1).halt).toBeUndefined();
+    expect(atLaunch.at(-1).attempt.restore.sourceKeys).toContain("invoke-human-1.l1.t1.a1");
+    // The consumed resolution cannot renew the next stopped restoration.
+    expect((await host.execute(first)).status).not.toBe("complete");
+    expect((await host.execute()).status).not.toBe("complete");
+    expect(workers()).toEqual(["a1", "a2", "a3"]);
+    restoring = false;
+    const output = await host.execute({ unblock: true, resolution: { loop: 1, text: "Restart it again." } });
+    expect(output.status, output.reason).toBe("complete");
+    expect(workers()).toEqual(["a1", "a2", "a3", "a4"]);
+    expect(atLaunch.at(-1).halt).toBeUndefined();
+  });
+
   test.each(["plan", "writer"])("native rejected %s status preserves causal cancellation, not its error wording", async phase => {
     const host = fixture();
     cutAt(host, value => !!value.loop?.attempt?.launch);
