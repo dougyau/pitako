@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import { createRequire, registerHooks, stripTypeScriptTypes } from "node:module";
+import { createRequire } from "node:module";
 
 // Node >=22.19 supports these hooks. Native stripping alone rejects node_modules.
 // Only the owned observation/inspector source closure is loaded here, never package dependencies.
@@ -23,15 +23,18 @@ const sources = new Set([
   "../../extensions/execute-settings.ts",
   "../../extensions/review-settings.ts",
 ].map(source => new URL(source, import.meta.url).href));
-registerHooks({
-  load(url, context, nextLoad) {
-    if (!sources.has(url)) return nextLoad(url, context);
-    return { format: "module", shortCircuit: true,
-      // Board's parameter property needs transformation; Node 26 only supports stripping.
-      source: url.endsWith("/board/store.ts")
-        ? require("typescript").transpileModule(readFileSync(new URL(url), "utf8"), {
-          compilerOptions: { target: "ES2022", module: "ESNext" }, fileName: new URL(url).pathname,
-        }).outputText
-        : stripTypeScriptTypes(readFileSync(new URL(url), "utf8"), { sourceUrl: url }) };
-  },
-});
+if (!process.versions.bun) {
+  const { registerHooks, stripTypeScriptTypes } = await import("node:module");
+  registerHooks({
+    load(url, context, nextLoad) {
+      if (!sources.has(url)) return nextLoad(url, context);
+      return { format: "module", shortCircuit: true,
+        // Board's parameter property needs transformation; Node 26 only supports stripping.
+        source: url.endsWith("/board/store.ts")
+          ? require("typescript").transpileModule(readFileSync(new URL(url), "utf8"), {
+            compilerOptions: { target: "ES2022", module: "ESNext" }, fileName: new URL(url).pathname,
+          }).outputText
+          : stripTypeScriptTypes(readFileSync(new URL(url), "utf8"), { sourceUrl: url }) };
+    },
+  });
+}

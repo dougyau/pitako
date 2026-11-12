@@ -37,12 +37,12 @@ export function safePath(file, createDirectories = false) {
 
 const recordPath = (directory, seq) => safePath(path.join(directory, `${String(seq).padStart(6, "0")}.json`));
 
-function readBytes(file) {
+function readBytes(file, encoding = "utf8") {
   safePath(file);
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     if (!fstatSync(fd).isFile()) throw new Error("Ledger record is not a regular file.");
-    return readFileSync(fd, "utf8");
+    return readFileSync(fd, encoding);
   } finally { closeSync(fd); }
 }
 export function validateExpected(expected) {
@@ -75,6 +75,13 @@ export function prepareAppend(directory, next) {
 
 export function publish(directory, record) {
   const file = recordPath(directory, record.seq), bytes = canonicalJSON(record);
+  publishBytes(file, bytes);
+  return { count: record.seq + 1, head: digest(bytes) };
+}
+
+export function publishBytes(file, bytes) {
+  const directory = path.dirname(file);
+  safePath(directory, true);
   const temporary = path.join(directory, `${randomUUID()}.tmp`);
   const fd = openSync(temporary, "wx", 0o600);
   try { writeFileSync(fd, bytes); fsyncSync(fd); }
@@ -83,10 +90,9 @@ export function publish(directory, record) {
     safePath(file);
     try { linkSync(temporary, file); }
     catch (error) { if (error.code !== "EEXIST") throw error; }
-    if (readBytes(file) !== bytes) throw new Error("Ledger publication conflict.");
+    if (!readBytes(file, null).equals(Buffer.from(bytes))) throw new Error("Ledger publication conflict.");
     syncDirectory(directory);
   } finally { unlinkSync(temporary); }
-  return { count: record.seq + 1, head: digest(bytes) };
 }
 
 // pi-subagents external-cli stdin is "<System instructions>\n...\n\n<Task>\n<task>".
@@ -95,4 +101,3 @@ export function readRequest(input) {
   const marker = "\n<Task>\n", at = input.indexOf(marker);
   return JSON.parse(at === -1 ? input : input.slice(at + marker.length));
 }
-

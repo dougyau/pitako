@@ -80,6 +80,7 @@
     "@juicesharp/rpiv-config": "2.15.0",
     "@nicknisi/pi-ast-grep": "0.3.4",
     "@vndv/pi-codegraph": "0.1.11",
+    "diff": "8.0.4",
     "intelephense": "1.18.5",
     "pi-blackhole": "0.5.17",
     "pi-codex-tools": "0.4.1",

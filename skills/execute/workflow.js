@@ -2236,6 +2236,11 @@ function reviewTask(descriptor, task) {
     if (delta.unsettled === true) { review.unsettled = true; return; }
     if (!Array.isArray(delta.touched) || !Array.isArray(delta.netChanged) || delta.netChanged.length > 200 ||
         ![...delta.touched, ...delta.netChanged].every(text)) throw new Error("Invalid task delta evidence.");
+    const diff = delta.diff;
+    if (delta.touched.length ? !diff || typeof diff.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(diff.sha256) ||
+        diff.path !== `${config.root}/.pi/subagents/execute/${config.invocation}/task-deltas/diff-${diff.sha256}.patch` ||
+        ![diff.bytes, diff.lines, diff.omitted].every(value => Number.isSafeInteger(value) && value >= 0) ||
+        diff.lines < 1 : diff !== null) throw new Error("Invalid task delta evidence.");
     if (!delta.touched.length) return;
     const carried = !!task.remaining?.length || (task.progress?.last5?.length ?? 0) > 0 ||
       (task.progress?.nonImproving ?? 0) > 0;
@@ -2244,7 +2249,13 @@ ${invocation.association.source} (SHA-256 ${invocation.association.digest}).
 ${fullContext()}
 Frozen amendments: ${JSON.stringify(invocation.amendments ?? [])}.
 Task definition: ${JSON.stringify(task)}.
-Delta reference: ${JSON.stringify(descriptor.delta.ref)}.
+Delta reference: ${JSON.stringify(diff)}.
+a/ = slot baseline before attempt 1, b/ = current candidate.
+Verify sha256 with file_sha256 first; a missing or mismatched diff is a blocking finding of uncertain provenance.
+Read the absolute path with read offset paging, using the index start lines (grep skips the gitignored .pi/).
+Non-rendered statuses are declared limits: do not claim to have reviewed unavailable bytes, and do not deduct for that alone.
+git_diff and watchdog_diff compare with HEAD and include earlier loops' WIP.
+The diff covers only this loop; for carried tasks, earlier-loop work is visible only in current source.
 Changed-file evidence: ${JSON.stringify(delta)}.
 Observed gate results (command definitions and status, exit, bounded tail, log reference):
 ${JSON.stringify({ definitions: task.gates, results: descriptor.gate.receipt.gates })}.
