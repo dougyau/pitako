@@ -482,6 +482,24 @@ contains the task, delta reference, observed gate results and deterministic
 The models are frozen at admission from `pitako.execute.taskReviewer` and
 `pitako.execute.taskSynthesis`; see [configuration](../../docs/configuration.md).
 
+Both children receive a digest-bound `pitako-slot-diff v1` artifact at
+`.pi/subagents/execute/<invocation>/task-deltas/diff-<sha256>.patch`.
+Here `a/` is the slot baseline before attempt 1 and `b/` is the current candidate,
+including all attempts in the slot. Verify the supplied `sha256` with
+`file_sha256` first; a missing or mismatched diff is a blocking finding of
+uncertain provenance. Read the supplied absolute path with `read` offset paging,
+using the index's section start lines; grep skips the gitignored `.pi/`.
+This readable artifact is not a patch for `git apply`.
+
+The complete index includes digests and declared-limit statuses for paths without
+hunks: `protected`, `gitlink`, `symlink`, `unjournaled`, `preimage-mismatch`,
+`binary`, `invalid-utf8`, `too-large`, `omitted-cap` and `unchanged`.
+Only `rendered` paths have hunks. Do not claim to have reviewed unavailable bytes
+or deduct for a declared limit alone. For per-task review, use the supplied slot
+diff instead of `watchdog_diff`, `git_diff` or HEAD comparisons, which include
+earlier loops' WIP. The diff covers only this loop; for carried tasks, earlier-loop
+work is visible only in current source.
+
 Admission requires all three final scores at least 9 and no blocking finding.
 Introduced defects and unmet task goals/expected results block. Inherited-only
 findings outside the task goal are non-blocking notes by reference with a bounded

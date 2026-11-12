@@ -227,9 +227,14 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       const input = JSON.parse(request.task);
       if (input.operation === "taskDelta") {
         let delta;
-        if (!options.realCheckout) delta = {
-          touched: captures.has(input.intents.at(-1).key) ? ["src/change1.ts"] : [], netChanged: [], overflow: null,
-        };
+        if (!options.realCheckout) {
+          const touched = captures.has(input.intents.at(-1).key) ? ["src/change1.ts"] : [];
+          const sha256 = "a".repeat(64);
+          delta = { touched, netChanged: [], overflow: null, diff: touched.length ? {
+            path: `${root}/.pi/subagents/execute/${input.invocation}/task-deltas/diff-${sha256}.patch`,
+            sha256, bytes: 100, lines: 4, omitted: 0,
+          } : null };
+        }
         else {
           budget.counts.loopIO++;
           // Keep the real cwd/operation boundary without cold Node TypeScript transformation per review.

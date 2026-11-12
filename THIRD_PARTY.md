@@ -25,6 +25,7 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [@colbymchenry/codegraph](https://github.com/colbymchenry/codegraph) | MIT | CodeGraph CLI |
 | [Pi](https://github.com/earendil-works/pi) | MIT | Host |
 | [smol-toml](https://github.com/squirrelchat/smol-toml) 1.9.1 | BSD-3-Clause | Read Herdr worktree configuration without executing it. |
+| [diff](https://github.com/kpdecker/jsdiff) 8.0.4 | BSD-3-Clause | Render the per-task slot diff. |
 
 License text for pi-web-access: `docs/licenses/pi-web-access-LICENSE`. For Ponytail, see `docs/licenses/ponytail-LICENSE` and the package's own `LICENSE` after install. For pi-codex-tools, see `docs/licenses/pi-codex-tools-LICENSE` and `docs/licenses/pi-codex-tools-NOTICE`.
 

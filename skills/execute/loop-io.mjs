@@ -2,12 +2,13 @@ import "./loader.mjs";
 import { readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
+import { structuredPatch } from "diff";
 import { appendLedger, isLedgerIntegrityError, ledgerPath, loopSummaries, readRequest, verifyLedger } from "./ledger.mjs";
-import { publish, safePath } from "../../extensions/hash-ledger.mjs";
+import { publish, publishBytes, safePath } from "../../extensions/hash-ledger.mjs";
 import { canonicalDigest, canonicalJSON, sha256 } from "../../extensions/canonical.mjs";
 import { observeRequests } from "./observe.mjs";
 const { viewBudget } = await import("../../extensions/board/store.ts");
-const { captureBaseline, checkpointTaskDelta, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
+const { captureBaseline, checkpointTaskDelta, readCheckpointTaskBytes, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
 const { checkoutEvidence } = await import("../../extensions/spec-plans.ts");
 const { prepare, apply, gate, currentHumanPostIds, readBacklog, reviewOriginals } = await import("./loop.ts");
 
@@ -185,6 +186,85 @@ export async function drain(input, { afterEffect = () => {}, afterStep = () => {
   });
 }
 
+const slotDiffLegend = [
+  "pitako-slot-diff v1",
+  "a/ = slot baseline before attempt 1; b/ = current candidate.",
+  "Index: status<TAB>section start line or -<TAB>pre mode -> post mode<TAB>pre sha256<TAB>post sha256<TAB>JSON path.",
+  "Symlink and gitlink values are checkout digests. Non-rendered statuses declare unavailable content.",
+  "Sections: ---/+++ paths, @@ logical-line ranges @@, then space/-/+ content; | continues the preceding logical line.",
+  "\\ CRLF restores CR before LF; \\ No newline at end of file removes final LF. Chunks preserve bytes.",
+  "Reading evidence only: this artifact cannot be applied with git apply.",
+];
+
+function slotDiffLine(line) {
+  if (line === "\\ No newline at end of file") return [line];
+  const prefix = line[0], crlf = line.endsWith("\r");
+  const bytes = Buffer.from(line.slice(1, crlf ? -1 : undefined));
+  const lines = [];
+  let start = 0;
+  do {
+    let end = Math.min(start + 4096, bytes.length);
+    while (end < bytes.length && (bytes[end] & 0xc0) === 0x80) end--;
+    lines.push((start ? "|" : prefix) + bytes.subarray(start, end).toString("utf8"));
+    start = end;
+  } while (start < bytes.length);
+  if (crlf) lines.push("\\ CRLF");
+  return lines;
+}
+
+const slotDiffPath = (side, record, digest) => {
+  if (digest === null) return "/dev/null";
+  const name = `${side}/${record.path}`;
+  return /[\s"\\\x00-\x1f\x7f]/u.test(name) ? JSON.stringify(name) : name;
+};
+
+/** Pure rendering keeps all content limits visible in the complete index. */
+export function renderSlotDiff(records, current) {
+  let sectionBytes = 0, omitted = 0;
+  const entries = records.map(record => {
+    let status = record.status, section = [], hunks = 0;
+    if (["verified", "unchanged"].includes(status)) {
+      const before = record.before, after = current.get(record.path);
+      const binary = bytes => /[\x00-\x08\x0b\x0c\x0e-\x1f]|\r(?!\n)/.test(bytes.toString("latin1"));
+      if (binary(before) || binary(after)) status = "binary";
+      else {
+        let oldText, newText;
+        try {
+          const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+          oldText = decoder.decode(before); newText = decoder.decode(after);
+        } catch { status = "invalid-utf8"; }
+        if (status !== "invalid-utf8") {
+          const patch = structuredPatch("", "", oldText, newText, "", "", { context: 3, maxEditLength: 2000 });
+          if (patch === undefined) status = "too-large";
+          else if (status !== "unchanged") {
+            section = [`--- ${slotDiffPath("a", record, record.pre)}`, `+++ ${slotDiffPath("b", record, record.post)}`];
+            hunks = patch.hunks.length;
+            for (const hunk of patch.hunks) {
+              section.push(`@@ -${hunk.oldLines ? hunk.oldStart : hunk.oldStart - 1},${hunk.oldLines} +${hunk.newLines ? hunk.newStart : hunk.newStart - 1},${hunk.newLines} @@`);
+              for (const line of hunk.lines) section.push(...slotDiffLine(line));
+            }
+            const size = Buffer.byteLength(section.join("\n") + "\n");
+            if (sectionBytes + size > 512 * 1024) { status = "omitted-cap"; section = []; }
+            else { status = "rendered"; sectionBytes += size; }
+          }
+        }
+      }
+    }
+    if (canonicalJSON(record.pre) !== canonicalJSON(record.post) && (status !== "rendered" || !hunks)) omitted++;
+    return { record, status, section };
+  });
+  let nextLine = slotDiffLegend.length + 2 + entries.length;
+  const mode = value => value === null ? "-" : value.mode.toString(8).padStart(6, "0");
+  const index = entries.map(({ record, status, section }) => {
+    const start = section.length ? nextLine : "-";
+    nextLine += section.length;
+    return [status, start, `${mode(record.pre)} -> ${mode(record.post)}`,
+      record.pre?.hash ?? "-", record.post?.hash ?? "-", JSON.stringify(record.path)].join("\t");
+  });
+  const lines = [...slotDiffLegend, `index ${entries.length}`, ...index, ...entries.flatMap(entry => entry.section)];
+  return { bytes: Buffer.from(lines.join("\n") + "\n"), lines: lines.length, omitted };
+}
+
 export function taskDelta({ root, invocation, intents }) {
   if (root !== process.cwd() || !Array.isArray(intents) ||
       intents.some(intent => intent.association.root !== root || intent.association.invocation !== invocation))
@@ -197,11 +277,19 @@ export function taskDelta({ root, invocation, intents }) {
     throw error;
   }
   const { touched, netChanged } = delta;
+  const current = readCheckpointTaskBytes(root, delta.records);
+  let diff = null;
+  if (touched.length) {
+    const rendered = renderSlotDiff(delta.records, current), digest = sha256(rendered.bytes);
+    const file = path.join(ledgerPath(root, invocation), "task-deltas", `diff-${digest}.patch`);
+    publishBytes(file, rendered.bytes);
+    diff = { path: file, sha256: digest, bytes: rendered.bytes.length, lines: rendered.lines, omitted: rendered.omitted };
+  }
   const overflow = netChanged.slice(200);
   const reference = overflow.length ? publishResult(
     path.join(ledgerPath(root, invocation), "task-deltas", canonicalDigest(overflow)),
     { result: overflow, resultDigest: canonicalDigest(overflow) }) : null;
-  return { touched, netChanged: netChanged.slice(0, 200), overflow: reference };
+  return { touched, netChanged: netChanged.slice(0, 200), overflow: reference, diff };
 }
 
 async function runOperation(operation, input) {

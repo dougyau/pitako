@@ -114,6 +114,15 @@ Empty results do not prove absence. Missing indexes or language servers are
 limits, not evidence that the code is defective.
 `watchdog_diff` does not inspect committed ranges; require a supplied artifact
 for those ranges. Do not claim to have reviewed unavailable bytes.
+For execute per-task review, the supplied slot diff replaces `watchdog_diff`,
+`git_diff` and HEAD comparisons, which include earlier loops' WIP. Its `a/` is
+the slot baseline before attempt 1; `b/` is the current candidate across all slot
+attempts. Verify its supplied `sha256` with `file_sha256` before reading; a missing
+or mismatched diff is a blocking finding of uncertain provenance. Read the absolute
+path with `read` offset paging using the index start lines (grep skips gitignored
+`.pi/`). Non-`rendered` statuses are declared limits: do not claim to have reviewed
+unavailable bytes or deduct for that alone. The diff covers only this loop; for
+carried tasks, earlier-loop work is visible only in current source.
 
 Apply verify-behavior as the common evidence standard. Read task-selected skills
 when their triggers apply. A missing new test is not itself a bug; existing

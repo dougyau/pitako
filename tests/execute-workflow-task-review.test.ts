@@ -25,6 +25,25 @@ test.each([false, true])("file-writing task is reviewed before unit admission (n
   expect(children[0]!.task).toContain('"netChanged":[]');
   expect(children[0]!.task).toContain("carried: false");
   const saved = host.snapshots.find(value => value.loop?.attempt?.taskReview?.synthesis);
+  const deltaRef = saved.loop.attempt.delta.ref;
+  for (const child of children) {
+    const diff = JSON.parse(child.task.match(/^Delta reference: (.*)\.$/m)![1]!);
+    expect(diff).toEqual({
+      path: `${host.root}/.pi/subagents/execute/human-1/task-deltas/diff-${"a".repeat(64)}.patch`,
+      sha256: "a".repeat(64), bytes: 100, lines: 4, omitted: 0,
+    });
+    expect(child.task).not.toContain(`Delta reference: ${JSON.stringify(deltaRef)}.`);
+    for (const instruction of [
+      "a/ = slot baseline before attempt 1, b/ = current candidate.",
+      "Verify sha256 with file_sha256 first; a missing or mismatched diff is a blocking finding of uncertain provenance.",
+      "Read the absolute path with read offset paging, using the index start lines (grep skips the gitignored .pi/).",
+      "Non-rendered statuses are declared limits: do not claim to have reviewed unavailable bytes, and do not deduct for that alone.",
+      "git_diff and watchdog_diff compare with HEAD and include earlier loops' WIP.",
+      "The diff covers only this loop; for carried tasks, earlier-loop work is visible only in current source.",
+      "Uncertain provenance blocks; carried task defects affecting its result block regardless of origin.",
+      '"touched":["src/change1.ts"]', '"netChanged":[]',
+    ]) expect(child.task).toContain(instruction);
+  }
   expect(saved.loop.attempt.seal).toBeUndefined();
   for (const stage of ["reviewer", "synthesis"]) {
     const original = saved.loop.attempt.taskReview[stage];
@@ -33,6 +52,60 @@ test.each([false, true])("file-writing task is reviewed before unit admission (n
     expect(original.projection.admitted).toBe(true);
   }
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["unit"]);
+});
+
+const invalidDiffs = [
+  { name: "off-prefix path", patch: { path: "/tmp/diff.patch" } },
+  { name: "non-canonical path", patch: { path: "task-deltas/../diff.patch" } },
+  { name: "missing path", patch: { path: undefined } },
+  ...["", "a".repeat(63), "a".repeat(65), "g".repeat(64), 123].map(sha256 => ({
+    name: `malformed digest ${sha256}`, patch: { sha256 },
+  })),
+  ...["bytes", "lines", "omitted"].flatMap(field =>
+    [-1, 0.5, Number.MAX_SAFE_INTEGER + 1, "1", null].map(value => ({
+      name: `${field} ${JSON.stringify(value)}`, patch: { [field]: value },
+    }))),
+  { name: "zero lines", patch: { lines: 0 } },
+];
+
+test.each(invalidDiffs)("invalid task delta diff: $name", async ({ patch }) => {
+  const host = fixture(); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta") {
+      const delta = JSON.parse(result.output!);
+      const diff = { ...delta.diff, ...patch };
+      if ("sha256" in patch && !("path" in patch))
+        diff.path = `${host.root}/.pi/subagents/execute/human-1/task-deltas/diff-${patch.sha256}.patch`;
+      result.output = JSON.stringify({ ...delta, diff });
+    }
+    return result;
+  });
+  const output = await host.execute();
+  expect(output.reason).toContain("Invalid task delta evidence.");
+  expect(host.launches.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key))).toHaveLength(0);
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("pending");
+});
+
+test.each(["missing", "null", "empty-touched", "empty-touched-missing"])("diff contradicts touched: %s", async contradiction => {
+  const host = fixture(); host.setLimit(1);
+  host.setRespond((request, normal) => {
+    const result = normal();
+    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta") {
+      const delta = JSON.parse(result.output!);
+      if (contradiction === "missing") delete delta.diff;
+      else if (contradiction === "null") delta.diff = null;
+      else {
+        delta.touched = [];
+        if (contradiction === "empty-touched-missing") delete delta.diff;
+      }
+      result.output = JSON.stringify(delta);
+    }
+    return result;
+  });
+  const output = await host.execute();
+  expect(output.reason).toContain("Invalid task delta evidence.");
+  expect(host.launches.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key))).toHaveLength(0);
 });
 
 test("inherited-only findings remain notes and do not block", async () => {

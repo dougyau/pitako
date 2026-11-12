@@ -175,6 +175,14 @@
     "integrity": "sha512-u3nyf7ZciAv1GOijVpI0TDt9At5wmEi7lSHSlRrnjuThv1DcB7fgGBqqrz+fGZ54jAfTpOOX0JXwxSIg3pnxQA==",
     "license": "MIT"
   },
+  "diff": {
+    "version": "8.0.4",
+    "registry": "https://registry.npmjs.org/diff/8.0.4",
+    "tarball": "https://registry.npmjs.org/diff/-/diff-8.0.4.tgz",
+    "integrity": "sha512-DPi0FmjiSU5EvQV0++GFDOJ9ASQUVFh5kD+OzOnYdi7n3Wpm9hWWGfB/O2blfHcMVTL5WkQXSnRiK9makhrcnw==",
+    "gitHead": "2d42fc673b9c20689e98c60c34dc81b03162c5c9",
+    "license": "BSD-3-Clause"
+  },
   "smol-toml": {
     "version": "1.9.1",
     "registry": "https://registry.npmjs.org/smol-toml/1.9.1",

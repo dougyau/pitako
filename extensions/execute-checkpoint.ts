@@ -243,10 +243,28 @@ function manifestDigest(directory: string) {
   return hash(files.map(file => readFileSync(path.join(directory, file), "utf8")).join(""));
 }
 // The caller supplies the complete, ordered slot history, including unwritten attempts.
+export type CheckpointTaskRecord = {
+  path: string;
+  status: "protected" | "gitlink" | "symlink" | "unjournaled" | "preimage-mismatch" | "unchanged" | "verified";
+  pre: CheckoutDigest;
+  post: CheckoutDigest;
+  listed: boolean;
+  unlistedHash?: string | null;
+  before?: Buffer;
+};
+function unlistedTaskHash(root: string, file: string): string | null {
+  try { return imageDigest(image(root, file))?.hash ?? null; }
+  catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOTDIR" ||
+        error instanceof Error && /symlink|regular files/.test(error.message)) return null;
+    throw error;
+  }
+}
 export const checkpointTaskDelta = operation((intents: CheckpointIntent[]) => {
   const first = intents[0];
   if (!first || first.attempt !== 1) throw new Error("Task delta requires the first slot attempt.");
   const touched = new Set<string>();
+  const preimages = new Map<string, Image>();
   let baseline: Baseline | undefined;
   for (const [offset, intent] of intents.entries()) {
     if (intent.attempt !== offset + 1 || intent.taskId !== first.taskId ||
@@ -273,7 +291,10 @@ export const checkpointTaskDelta = operation((intents: CheckpointIntent[]) => {
             !equal(restored.position, { loop: intent.loop, cursor: intent.cursor, phase: intent.phase }))
           throw new Error("Checkpoint restored observation conflicts.");
       }
-      for (const file of manifest.files) touched.add(file.path);
+      for (const file of manifest.files) {
+        touched.add(file.path);
+        if (!preimages.has(file.path)) preimages.set(file.path, file.image);
+      }
     } else if (readdirSync(directory).some(file => /^(capture-|effect-|hook-effect-)/.test(file))) {
       throw new Error("Task delta journal lacks a manifest.");
     }
@@ -281,8 +302,51 @@ export const checkpointTaskDelta = operation((intents: CheckpointIntent[]) => {
   const current = checkoutSnapshot(first.association.root).files;
   const netChanged = [...new Set([...Object.keys(baseline!.files), ...Object.keys(current)])]
     .filter(file => !equal(baseline!.files[file] ?? null, current[file] ?? null)).sort();
-  return { touched: [...touched].sort(), netChanged };
+  const records: CheckpointTaskRecord[] = [...new Set([...netChanged, ...touched])].sort().map(file => {
+    const pre = baseline!.files[file] ?? null, post = current[file] ?? null;
+    // checkoutSnapshot retains directory modes only for gitlinks.
+    const modes = [pre, post].map(value => value === null ? null : value.mode & 0o170000);
+    const status = file.split("/").some(part => part.startsWith(".env")) ? "protected"
+      : modes.includes(0o040000) ? "gitlink"
+      : modes.includes(0o120000) ? "symlink"
+      : !preimages.has(file) ? "unjournaled"
+      : !equal(imageDigest(preimages.get(file)!), pre) ? "preimage-mismatch"
+      : equal(pre, post) ? "unchanged" : "verified";
+    const listed = Object.hasOwn(current, file);
+    return { path: file, status, pre, post, listed,
+      ...(["verified", "unchanged"].includes(status)
+        ? { before: Buffer.from(preimages.get(file)?.bytes ?? "", "base64"),
+          ...(!listed ? { unlistedHash: unlistedTaskHash(first.association.root, file) } : {}) } : {}) };
+  });
+  return { touched: [...touched].sort(), netChanged, records };
 });
+// Read against the delta snapshot, not a new snapshot that could bless a concurrent writer.
+export function readCheckpointTaskBytes(root: string, records: CheckpointTaskRecord[]) {
+  const bytes = new Map<string, Buffer>();
+  for (const record of records) {
+    if (!["verified", "unchanged"].includes(record.status) || record.before === undefined) continue;
+    // Unlisted paths still need drift detection, but never supply a b/ side.
+    if (!record.listed) {
+      if (unlistedTaskHash(root, record.path) !== record.unlistedHash)
+        throw new Error(`digest mismatch: ${record.path} (concurrent writer)`);
+      bytes.set(record.path, Buffer.alloc(0));
+      continue;
+    }
+    let observed: Image;
+    try { observed = image(root, record.path); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOTDIR") observed = null;
+      else {
+        if (!(error instanceof Error) || !/symlink|regular files/.test(error.message)) throw error;
+        throw new Error(`digest mismatch: ${record.path} (concurrent writer)`);
+      }
+    }
+    if ((imageDigest(observed)?.hash ?? null) !== (record.post?.hash ?? null))
+      throw new Error(`digest mismatch: ${record.path} (concurrent writer)`);
+    bytes.set(record.path, Buffer.from(observed?.bytes ?? "", "base64"));
+  }
+  return bytes;
+}
 export function captureCheckpoint(intent: CheckpointIntent, paths: string[]) {
   const directory = checkpointDirectory(intent), root = intent.association.root;
   if (!Array.isArray(paths) || !paths.length || new Set(paths).size !== paths.length)
