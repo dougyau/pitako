@@ -3,7 +3,7 @@ import { existsSync, readFileSync, rmSync } from "node:fs";
 import path from "node:path";
 import { readReviewOriginal, readBacklog } from "../skills/execute/loop.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
-import { restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
+import { applyCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
@@ -1752,7 +1752,7 @@ describe("workflow-owned execute controller", () => {
 
   // A write-free worker block has no pause seal. Current input answering that exact
   // block continues the task in the same loop; anything else keeps the halt.
-  test.each(["continue", "repeat-block", "foreign-halt", "captured", "stale-resolution"])(
+  test.each(["continue", "successor-cut", "repeat-block", "foreign-halt", "captured", "stale-resolution"])(
     "current input continues a write-free worker block without a new slot: %s", async mode => {
       const host = fixture(); host.setLimit(1);
       const reason = "Human decision required: choose the supported API", text = "Use the supported v2 API";
@@ -1768,6 +1768,7 @@ describe("workflow-owned execute controller", () => {
       if (mode === "foreign-halt") halted.loop.halt.ref = { ...halted.loop.halt.ref, key: "invoke-human-1.l1.other" };
       if (mode === "captured") halted.loop.attempt.capturedPaths = 1;
       const input = { unblock: true, resolution: { loop: 1, text } };
+      const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key);
       if (mode === "stale-resolution") {
         // The retained input answered an earlier impediment, not this block.
         const set = host.state.set;
@@ -1779,9 +1780,20 @@ describe("workflow-owned execute controller", () => {
         host.state.set = set;
         host.current().loop.resolutions[0].halt.reason = "Earlier impediment";
       }
-      const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key);
+      if (mode === "successor-cut") {
+        // A cut before the successor launches must not leave an unobservable writer key.
+        const set = host.state.set;
+        host.state.set = async (key, value: any) => {
+          await set(key, value);
+          if (value.loop?.attempt?.number === 2 && !value.loop.attempt.checkpoint) throw Error("Cut after the successor intention");
+        };
+        expect((await host.execute(input)).reason).toContain("Essential persistence failed");
+        host.state.set = set;
+        expect(host.current().loop.attempt).toMatchObject({ number: 2, stage: "intention", undispatched: true });
+        expect(workers()).toEqual(["invoke-human-1.l1.t1.a1"]);
+      }
       host.emits.length = 0;
-      const outcome = await host.execute(mode === "stale-resolution" ? {} : input);
+      const outcome = await host.execute(["stale-resolution", "successor-cut"].includes(mode) ? {} : input);
       expect(host.current().consumedLoops).toBe(1);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
       if (mode === "foreign-halt" || mode === "captured" || mode === "stale-resolution") {
@@ -1793,7 +1805,7 @@ describe("workflow-owned execute controller", () => {
       expect(workers()).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
       expect(host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!.task).toContain(text);
       expect(host.current().loop.resolutions.at(-1).stage).toBe("applied");
-      if (mode === "continue") {
+      if (mode === "continue" || mode === "successor-cut") {
         expect(outcome.status, outcome.reason).toBe("partial");
         expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 2, status: "complete" });
         return;
@@ -1804,6 +1816,37 @@ describe("workflow-owned execute controller", () => {
       expect((await host.execute()).status).toBe("blocked");
       expect(workers()).toHaveLength(2);
     });
+
+  // A blocked restorer can change historical paths while capturing none of its own.
+  test("current input does not directly continue a write-free block of a restoring attempt", async () => {
+    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
+    const block = (request: any) => host.result(request, { status: "blocked", work: "Located the conflicting API",
+      remaining: ["Choose the supported API"], knowledge: { findings: [], handoff: "Awaiting the API decision" } });
+    host.setRespond((request, normal) => {
+      if (request.key === "invoke-human-1.l1.t1.a1") {
+        host.worker(request);
+        applyCheckpoint(host.current().loop.attempt.checkpoint, [{ path: "src/change1.ts",
+          image: { bytes: Buffer.from("partial owned work").toString("base64"), mode: 0o644 } }]);
+        return { ok: false, output: "", error: "Writer disappeared" };
+      }
+      if (request.key === "invoke-human-1.l1.t1.a2") {
+        const restore = host.current().loop.attempt.restore;
+        restoreCheckpoint(restore.sourceKeys.map((key: string) =>
+          host.current().taskFrame.sources.find((entry: any) => entry.key === key)), restore.authority);
+        return block(request);
+      }
+      return normal();
+    });
+    expect((await host.execute()).status).toBe("blocked");
+    const attempt = host.current().loop.attempt;
+    expect(attempt).toMatchObject({ number: 2, capturedPaths: 0, result: { status: "blocked" } });
+    expect(attempt.restore).toBeDefined();
+    expect(attempt.result.checkpoint.confirmation).toBeUndefined();
+    const outcome = await host.execute({ unblock: true, resolution: { loop: 1, text: "Use the supported v2 API" } });
+    expect(outcome.status).toBe("blocked");
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(2);
+    expect(host.current().loop.attempt.humanContinuation).toBeUndefined();
+  });
 
   test("complete additional spec sources are immutable context for all fresh phases", async () => {
     const host = fixture("SELECTED SNAPSHOT INTACT");

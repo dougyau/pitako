@@ -3491,7 +3491,7 @@ Publish one selection with the native output binding then END. Native permission
               bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
               boardPostIds: source.boardPostIds ?? [] } : {}),
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
-            stage: "intention", continuationRef: previous.ref,
+            stage: "intention", undispatched: true, continuationRef: previous.ref,
             ...(source.foldedNextBaseline ? { checkpoint: clone(source.foldedNextBaseline), foldedBaseline: clone(source.foldedNextBaseline) } : {}),
             ...(pauseSource ? { pauseSource } : {}) };
           await save();
