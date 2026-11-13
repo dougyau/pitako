@@ -82,7 +82,7 @@ test("registered checkpoint_create captures actual WIP, untracked bytes, absence
   expect(readFileSync(f.intent.association.missionPath, "utf8")).toBe(beforeMission);
 });
 
-test.each(["valid", "previous", "pending-budget", "seal-budget", "stopped", "stale"])(
+test.each(["valid", "continuation", "foreign-admitted", "previous", "pending-budget", "seal-budget", "stopped", "stale"])(
   "registered later-loop first capture validates previous unit: %s", async mode => {
     const f = fixture();
     const earlier = structuredClone(f.intent);
@@ -97,16 +97,24 @@ test.each(["valid", "previous", "pending-budget", "seal-budget", "stopped", "sta
     f.intent.progress = { consumedLoops: 2, admitted: {}, previous: {
       taskId: earlier.taskId, attempt: earlier.attempt, resultRef,
       checkpointRef: seal.checkpointRef, digest: seal.digest } };
+    // An unsealed admitted continuation of the pending task keeps the earlier unit.
+    if (mode === "continuation" || mode === "foreign-admitted") {
+      const id = mode === "continuation" ? f.intent.taskId : "other";
+      (f.record as any).tasks = { [id]: { admitted: ["continue"], completed: null, last: null } };
+      f.intent.progress.admitted = { [id]: ["continue"] };
+      f.intent.attempt = f.loop.attempt.number = 2;
+    }
     if (mode === "previous") f.intent.progress.previous!.resultRef = { key: "wrong" };
     if (mode === "pending-budget") f.record.consumedLoops = f.intent.progress.consumedLoops = 3;
     if (mode === "stopped") (f.loop as any).halt = { code: "stop" };
     if (mode === "stale") f.loop.attempt.stage = "result";
     f.persist();
     const beforeState = readFileSync(f.statePath, "utf8");
-    const outcome = await f.call("pre", paths);
-    expect(outcome.ok).toBe(mode === "valid");
-    expect(existsSync(path.join(checkpointDirectory(f.intent), "manifest.json"))).toBe(mode === "valid");
-    if (mode === "valid") expect(artifact(outcome.manifestRef).intent.progress).toEqual(f.intent.progress);
+    const outcome = await f.call("pre", paths), accepted = mode === "valid" || mode === "continuation";
+    expect(outcome.ok).toBe(accepted);
+    if (mode === "foreign-admitted") expect(outcome.error.message).toBe("Confirmed unit lacks admitted pending-position provenance.");
+    expect(existsSync(path.join(checkpointDirectory(f.intent), "manifest.json"))).toBe(accepted);
+    if (accepted) expect(artifact(outcome.manifestRef).intent.progress).toEqual(f.intent.progress);
     expect(readFileSync(f.statePath, "utf8")).toBe(beforeState);
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   });
