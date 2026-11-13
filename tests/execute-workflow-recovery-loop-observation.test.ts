@@ -1750,6 +1750,61 @@ describe("workflow-owned execute controller", () => {
     })));
   });
 
+  // A write-free worker block has no pause seal. Current input answering that exact
+  // block continues the task in the same loop; anything else keeps the halt.
+  test.each(["continue", "repeat-block", "foreign-halt", "captured", "stale-resolution"])(
+    "current input continues a write-free worker block without a new slot: %s", async mode => {
+      const host = fixture(); host.setLimit(1);
+      const reason = "Human decision required: choose the supported API", text = "Use the supported v2 API";
+      const block = (request: any) => host.result(request, { status: "blocked", work: "Located the conflicting API",
+        remaining: [reason], knowledge: { findings: [], handoff: "Awaiting the API decision" }, diagnosis: reason });
+      host.setRespond((request, normal) => request.key === "invoke-human-1.l1.t1.a1" ||
+        mode === "repeat-block" && request.key === "invoke-human-1.l1.t1.a2" ? block(request) : normal());
+      expect(await host.execute()).toMatchObject({ status: "blocked", loopsConsumed: 1 });
+      const halted = host.current();
+      expect(halted.loop.attempt).toMatchObject({ capturedPaths: 0, result: { status: "blocked" } });
+      expect(halted.loop.attempt.result.checkpoint.confirmation).toBeUndefined();
+      expect(halted.lastConfirmed).toBeNull();
+      if (mode === "foreign-halt") halted.loop.halt.ref = { ...halted.loop.halt.ref, key: "invoke-human-1.l1.other" };
+      if (mode === "captured") halted.loop.attempt.capturedPaths = 1;
+      const input = { unblock: true, resolution: { loop: 1, text } };
+      if (mode === "stale-resolution") {
+        // The retained input answered an earlier impediment, not this block.
+        const set = host.state.set;
+        host.state.set = async (key, value: any) => {
+          await set(key, value);
+          if (value.loop?.resolutions?.length) throw Error("Cut after retaining the input");
+        };
+        expect((await host.execute(input)).reason).toContain("Essential persistence failed");
+        host.state.set = set;
+        host.current().loop.resolutions[0].halt.reason = "Earlier impediment";
+      }
+      const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key);
+      host.emits.length = 0;
+      const outcome = await host.execute(mode === "stale-resolution" ? {} : input);
+      expect(host.current().consumedLoops).toBe(1);
+      expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
+      if (mode === "foreign-halt" || mode === "captured" || mode === "stale-resolution") {
+        expect(outcome.status).toBe("blocked");
+        expect(workers()).toEqual(["invoke-human-1.l1.t1.a1"]);
+        expect(host.current().loop.attempt.humanContinuation).toBeUndefined();
+        return;
+      }
+      expect(workers()).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+      expect(host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!.task).toContain(text);
+      expect(host.current().loop.resolutions.at(-1).stage).toBe("applied");
+      if (mode === "continue") {
+        expect(outcome.status, outcome.reason).toBe("partial");
+        expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 2, status: "complete" });
+        return;
+      }
+      // The answer applies once: a later block halts again and needs new input.
+      expectImpediment(host, outcome, "blocked", reason);
+      expect(host.current().loop.attempt).toMatchObject({ number: 2, result: { status: "blocked" } });
+      expect((await host.execute()).status).toBe("blocked");
+      expect(workers()).toHaveLength(2);
+    });
+
   test("complete additional spec sources are immutable context for all fresh phases", async () => {
     const host = fixture("SELECTED SNAPSHOT INTACT");
     const sourceRefs = [{ path: "/stable/.pitako/plans/inherited.md", digest: "f".repeat(64) }];

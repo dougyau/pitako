@@ -2746,6 +2746,14 @@ function confirmedPausePending() {
     result.checkpoint?.confirmation?.kind === "pause" && taskId === result.taskId && attempt === result.attempt &&
     same(resultRef, result.ref) && same(receipt, result.checkpoint.confirmation);
 }
+// A blocked writer's close seals a pause whenever it captured paths, and that
+// seal is this result's confirmation. Without either, the block wrote nothing.
+function writeFreeWorkerBlock() {
+  const attempt = loop?.attempt, result = attempt?.stage === "result" && attempt.result;
+  return loop?.phase === "implementation" && result?.status === "blocked" && result.remainingCount > 0 &&
+    loop.halt?.code === "semantic-block" && same(loop.halt.ref, result.ref) && !attempt.restore &&
+    !attempt.capturedPaths && !result.checkpoint?.confirmation;
+}
 function retainWorkerBlock(result) {
   loop.outcome = "blocked";
   loop.halt = { status: "blocked", code: "semantic-block", reason: result.diagnosis, ref: result.ref };
@@ -3165,9 +3173,21 @@ try {
     // Admission and the exact restoration intention share one essential save.
     await checkpointFallback(observed, ref, { id: paused.taskId });
   }
+  // A write-free worker block has no pause to restore. Current input answering
+  // that exact block continues the same task in this loop with a fresh attempt.
+  // Restoring attempts are excluded: their capturedPaths counts only their own
+  // journal, and a blocked restorer may hold unreceipted restored bytes.
+  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
+      writeFreeWorkerBlock() && same(resolution.halt, loop.halt)) {
+    resolution.stage = "applied";
+    loop.attempt.humanContinuation = { loop: resolution.loop, halt: clone(resolution.halt) };
+    delete loop.halt;
+    delete loop.outcome;
+    await save();
+  }
   // Recover the old result-committed/outcome-not-committed cut before plan recovery.
   if (loop?.attempt?.stage === "result" && loop.attempt.result?.status === "blocked" &&
-      (!loop.halt || loop.halt.code === "semantic-block"))
+      !loop.attempt.humanContinuation && (!loop.halt || loop.halt.code === "semantic-block"))
     retainWorkerBlock(loop.attempt.result);
   // Historical read-only parser rejection is re-evaluated from exact originals,
   // not a new authorization or an extra implementation slot.
@@ -3440,12 +3460,13 @@ Publish one selection with the native output binding then END. Native permission
         if (loop.attempt?.stage === "result") {
           // Result is committed before cursor movement: do not repeat completed edits.
           const previous = loop.attempt.result;
-          if (previous.status === "blocked") return finish("blocked", loop.halt.reason);
+          const human = !!loop.attempt.humanContinuation;
+          if (previous.status === "blocked" && !human) return finish("blocked", loop.halt.reason);
           if (previous.status === "complete") {
             await settleTask();
             loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
           }
-          if (!previous.usefulContinuation) break;
+          if (!previous.usefulContinuation && !human) break;
           let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
             confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
           if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
