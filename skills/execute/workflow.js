@@ -1630,7 +1630,8 @@ function confirmedUnitForPending() {
   if (point.position.loop < loop.number) {
     // lastConfirmed survives task-loop retirement; its verified seal is the
     // previous writer's baseline, not the cleared per-loop result projection.
-    if (Object.values(invocation.tasks).some(task => task.admitted.length) ||
+    // Unsealed admitted attempts of the pending task do not replace it.
+    if (Object.entries(invocation.tasks).some(([id, task]) => id !== loop.attempt.taskId && task.admitted.length) ||
         point.position.phase !== "implementation" || loop.cursor !== 0 ||
         point.progress.consumedLoops !== point.position.loop || invocation.consumedLoops !== loop.number ||
         point.checkpointRef !== `${config.root}/.pi/subagents/checkpoints/${point.resultRef.key}/unit.json`)

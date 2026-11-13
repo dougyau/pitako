@@ -113,6 +113,42 @@ describe("workflow-owned execute controller", () => {
     expectProcessBudget([host.processes(), recoveryComposition.processes()], 214);
   });
 
+  test.each(["published", "unpublished"])("an unsealed continuation keeps an earlier loop's unit as recovery provenance for a %s lost writer", async capture => {
+    const host = fixture(undefined, { realCheckout: true, taskCount: 2 }); host.setLimit(2);
+    host.setRespond((request, normal) => {
+      if (request.agent === "pitako.checkpoint-sealer" ||
+          request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+        return recoveryScripts.runDeterministic(request.key, request,
+          { ...recoveryScripts, root: host.root, inlineSealer: true }, undefined);
+      // Write-free continuation: no capture, so its close observes and seals nothing.
+      if (request.key === "invoke-human-1.l2.t1.a1")
+        return host.result(request, { status: "continue", work: "Investigated the pending branch",
+          remaining: ["Same pending defect"], knowledge: { findings: [], handoff: "Branch located" },
+          diagnosis: "Still pending", continuation: { mode: "fresh", reason: "Fix the located branch" }, usefulProgress: true });
+      if (request.key === "invoke-human-1.l2.t1.a2") {
+        expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 1, cursor: 1 } });
+        expect(host.current().loop.attempt.checkpoint.progress.admitted).toEqual({ change2: ["continue"] });
+        if (capture === "published") host.worker(request);
+        return { ok: false, output: "", error: "Writer disappeared" };
+      }
+      if (request.key === "invoke-human-1.l2.t1.a3") {
+        const restore = host.current().loop.attempt.restore;
+        expect(restore.authority.confirmedUnit).toMatchObject({ taskId: "change1", position: { loop: 1 } });
+        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+        const restored = restoreCheckpoint(sources, restore.authority);
+        const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
+        return host.result(request, { ...host.worker(request), restoreReceipt: { ...restored, restoredRef } });
+      }
+      return normal();
+    });
+    const output = await host.execute();
+    expect(host.current().loop.halt?.reason).toBeUndefined();
+    expect(output.status, output.reason).toBe("partial");
+    expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a3")).toHaveLength(1);
+    expect(host.current().tasks.change2.completed).toMatchObject({ attempt: 3 });
+    expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change2", position: { loop: 2, cursor: 1 } });
+  });
+
   test.each(["spawn", "nonzero", "stdout", "published-crash", "state-save"])(
     "v6 seal automatically reconciles transient %s without a halt or discarded pending data", async failure => {
       const host = fixture(); host.setLimit(1);

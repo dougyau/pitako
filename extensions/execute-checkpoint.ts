@@ -449,6 +449,10 @@ export function applyCheckpoint(intent: CheckpointIntent, changes: { path: strin
   prepareCheckpoint(intent, changes);
   completeCheckpoint(intent);
 }
+// An earlier-loop unit stays the confirmed point at the first cursor of a later
+// loop until this loop admits a seal: any seal replaces lastConfirmed, and a
+// sealed pause clears the next intent's previous. Unsealed admitted attempts of
+// the pending task itself therefore keep that unit as provenance.
 export function previousUnitMatches(pending: CheckpointIntent, unit: ConfirmedUnit): boolean {
   const position = unit.position as { loop?: number } | null;
   const progress = unit.progress as CheckpointProgress | null;
@@ -457,7 +461,7 @@ export function previousUnitMatches(pending: CheckpointIntent, unit: ConfirmedUn
     checkpointRef: unit.checkpointRef, digest: unit.digest,
   }) && (equal(unit.position, { loop: pending.loop, cursor: pending.cursor, phase: pending.phase }) ||
     (typeof position?.loop === "number" && position.loop < pending.loop && pending.cursor === 0 &&
-      Object.keys(pending.progress?.admitted ?? {}).length === 0 &&
+      Object.keys(pending.progress?.admitted ?? {}).every(id => id === pending.taskId) &&
       pending.progress?.consumedLoops === pending.loop && progress?.consumedLoops === position.loop));
 }
 
