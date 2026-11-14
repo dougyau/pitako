@@ -137,7 +137,7 @@ describe("workflow-owned execute controller", () => {
       if (request.key === "invoke-human-1.l2.t1.a3") {
         const restore = host.current().loop.attempt.restore;
         expect(restore.authority.confirmedUnit).toMatchObject({ taskId: "change1", position: { loop: 1 } });
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
         const restored = restoreCheckpoint(sources, restore.authority);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         return host.result(request, { ...host.worker(request), restoreReceipt: { ...restored, restoredRef } });
@@ -1811,7 +1811,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().loop.resolutions.at(-1).stage).toBe("applied");
       if (mode === "continue" || mode === "successor-cut") {
         expect(outcome.status, outcome.reason).toBe("partial");
-        expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 2, status: "complete" });
+        expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2 });
         return;
       }
       // The answer applies once: a later block halts again and needs new input.
@@ -1829,14 +1829,13 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a1") {
         host.worker(request);
-        applyCheckpoint(host.current().loop.attempt.checkpoint, [{ path: "src/change1.ts",
+        applyCheckpoint(expandWorkerReferences(host.current()).loop.attempt.checkpoint, [{ path: "src/change1.ts",
           image: { bytes: Buffer.from("partial owned work").toString("base64"), mode: 0o644 } }]);
         return { ok: false, output: "", error: "Writer disappeared" };
       }
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const restore = host.current().loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) =>
-          host.current().taskFrame.sources.find((entry: any) => entry.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]), restore.authority);
         return block(request);
       }
       return normal();
