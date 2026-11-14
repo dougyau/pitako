@@ -15,7 +15,7 @@ test("30 single-task loops retain constant state across pauses, recoveries and -
   let peak: any, peakBytes = 0;
   host.setSaveObserver((value, bytes) => {
     expect(value).not.toHaveProperty("loops");
-    if (value.loop?.kind === "task") {
+    if (value.loop?.kind === "task" && !value.loop.archived) {
       expect(value.loop.selection?.receipt).not.toHaveProperty("completedTasks");
       expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
       expect(value.loop.selection.receipt.digest).toBe(value.loop.taskBacklogDigest);
@@ -298,29 +298,44 @@ test("selection admission compacts views atomically while replay retains full vi
   host.setFailSave(value => value.loop?.plan?.stage === "admitted");
   expect((await host.execute()).reason).toContain("Essential persistence failed");
   const retained = host.current();
-  for (const slot of ["prepare", "selection"]) {
-    expect(retained.loop[slot].receipt.view).toHaveProperty("posts");
+  expect(retained.loop.prepare.receipt).not.toHaveProperty("view");
+  expect(retained.loop.selection.receipt.view).toHaveProperty("posts");
+  for (const slot of ["prepare", "selection"])
     expect(retained.loop[slot].receipt.viewDigest).toMatch(/^[a-f0-9]{64}$/);
-  }
   host.setFailSave();
   expect((await host.execute()).status).toBe("complete");
   expect(host.calls.filter(call => call.key === "invoke-human-1.l1.selection")).toHaveLength(1);
   let admissions = 0, settlements = 0, gates = 0;
   for (const state of host.snapshots) {
-    if (state.loop?.plan?.stage === "admitted") {
+    if (state.loop?.plan?.stage === "admitted" && !state.loop.archived) {
       admissions++;
-      for (const slot of ["prepare", "selection"]) {
-        const receipt = state.loop[slot].receipt;
-        expect(receipt.view).toEqual({ topicId: 1, viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes });
-      }
+      expect(state.loop.prepare.receipt).not.toHaveProperty("view");
+      const receipt = state.loop.selection.receipt;
+      expect(receipt.view).toEqual({ topicId: 1, viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes });
       if (state.currentView) expect(state.currentView).toHaveProperty("posts");
     }
-    if (state.loop?.settlement?.receipt) {
-      settlements++;
-      expect(state.loop.settlement.receipt).not.toHaveProperty("view");
-    }
     const gate = state.loop?.attempt?.gate?.receipt;
-    if (gate) { gates++; expect(gate.view).toHaveProperty("posts"); }
+    if (gate) {
+      gates++;
+      if (state.loop.attempt.close) {
+        expect(gate).not.toHaveProperty("view");
+        expect(state.loop.attempt.close.receipt.projection).not.toHaveProperty("view");
+      } else expect(gate.view).toHaveProperty("posts");
+    }
+  }
+  // Settlement is drained with the grouped transport, not retained inline.
+  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io")) {
+    const input = JSON.parse(call.task);
+    const keys = new Set((input.intentions ?? []).filter((entry: any) => entry.operation === "apply").map((entry: any) => entry.key));
+    const output = host.native.get(call.key)?.output;
+    if (!output || !keys.size) continue;
+    const projection = JSON.parse(output).projection;
+    const steps = (projection?.steps ?? []).flatMap((step: any) =>
+      step.operation === "drain" ? step.result.projection.steps : [step]);
+    for (const step of steps) if (keys.has(step.key)) {
+      settlements++;
+      expect(step.result).not.toHaveProperty("view");
+    }
   }
   expect(admissions).toBeGreaterThan(0);
   expect(settlements).toBeGreaterThan(0);
@@ -331,8 +346,8 @@ test("a digest-only prepare with no current view is fetched under a fresh retry 
   const host = fixture();
   host.setFailSave(value => value.loop?.plan?.stage === "intention");
   expect((await host.execute()).reason).toContain("Essential persistence failed");
-  const retained = host.current(), receipt = retained.loop.prepare.receipt;
-  receipt.view = { topicId: receipt.view.topicId, viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes };
+  const retained = host.current();
+  expect(retained.loop.prepare.receipt).not.toHaveProperty("view");
   retained.currentView = null;
   host.setFailSave();
   expect((await host.execute()).status).toBe("complete");
@@ -403,100 +418,4 @@ test("a final review with production-sized originals and native metadata stays i
       expect(item.savedOutputPath).toBeTruthy();
     }
   }
-}, 20_000);
-
-// Magnitudes mirror execute-task-review-extra-20261111b: a reviewed repair rejected twice
-// ends its loop in gaps while both pause seals and the loop archive await one drain.
-function rejectedRepairHost(scale: number) {
-  const host = fixture(undefined, { metadataPadding: 48 * scale }); host.setLimit(1);
-  const pad = (label: string, size: number) => `${label} ` + "x".repeat(size);
-  const session = `/srv/agent/.pi/agent/sessions/--srv-agent-repos-worktrees-project-checkout-${"w".repeat(16 * scale)}--`;
-  host.setRespond((request, normal) => {
-    const result = normal(), value = result.structuredOutput;
-    if (request.agent === "pitako.worker") Object.assign(value, { work: pad("work", 2048),
-      remaining: Array.from({ length: 6 }, (_, index) => pad(`remaining-${index}`, 512)),
-      knowledge: { findings: [pad("finding", 512)], handoff: pad("handoff", 2048) } });
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate") {
-      const receipt = JSON.parse(result.output!);
-      for (const gate of receipt.gates) gate.tail = pad("tail", 2040);
-      result.output = JSON.stringify(receipt);
-    }
-    if (request.key.endsWith(".task-synthesis")) {
-      Object.assign(value, {
-        correctness: { verdict: pad("Unfinished required path", 512), score: 8, findings: Array.from({ length: 3 }, (_, index) => ({
-          summary: pad(`Required path ${index} remains broken`, 512), evidence: "src/change1.ts:1", introducedByDelta: false, affectsTask: true })) },
-        conflict: false, remaining: Array.from({ length: 3 }, (_, index) => pad(`Fix required path ${index}`, 512)),
-        diagnosis: pad("Synthesis diagnosis", 1024), revival: pad("Repair the source-evidenced paths", 1024) });
-      writeFileSync(result.results![0]!.savedOutputPath!, JSON.stringify(value));
-    }
-    return result;
-  });
-  // Production native references: long session paths and three debug artifacts per run.
-  host.setLaunchRespond(async (request, normal) => {
-    const result = await normal();
-    if (!result.runId || request.agent === "pitako.loop-io") return result;
-    const asyncDir = `/tmp/pi-subagents-uid-1000/async-subagent-runs/${result.runId}`;
-    const saved = `${session}/subagent-artifacts/outputs/0f3e1c55-2f1d-4b0e-9d1e-6c4fd0a1b2c3/${request.key}.json`;
-    return { ...result, asyncDir, outputReference: result.outputReference ?? saved,
-      outputArtifactPath: `${session}/subagent-artifacts/${result.runId}_${request.agent}_output.md`,
-      artifactPaths: [asyncDir, saved, `${session}/2026-11-10T17-47-24-111Z_01a1c692-604d-7717/${result.runId}/run-0/session.jsonl`],
-      results: result.results?.map(item => item.structuredOutputPath?.startsWith(host.root) ? item
-        : { ...item, structuredOutputPath: `${asyncDir}/structured-output/pi-subagent-structured-oezMfl/output.json` }) } as any;
-  });
-  return host;
-}
-async function rejectedRepair(scale: number) {
-  const host = rejectedRepairHost(scale);
-  let peakBytes = 0, coexisting = false;
-  host.setSaveObserver((value, bytes) => {
-    peakBytes = Math.max(peakBytes, bytes);
-    const kinds = (value.intentions ?? []).map((entry: any) => entry.input.record?.kind);
-    coexisting ||= kinds.includes("loop") && kinds.includes("unit");
-    for (const intention of value.intentions ?? []) {
-      if (intention.operation !== "ledger") continue;
-      // One archive copy: the frozen loop stays in `loop`, never again in its intention.
-      if (intention.input.record.kind === "loop") expect(intention.input.record).not.toHaveProperty("body");
-      else for (const earlier of intention.input.record.body.results) {
-        expect(earlier.attempt).not.toBe(intention.input.record.body.attempt);
-        if (earlier.sealed) expect(Object.keys(earlier).sort()).toEqual(["attempt", "sealed", "status", "taskId"]);
-        else expect(earlier.checkpoint?.confirmation).toBeUndefined();
-      }
-      if (intention.input.spec) expect(intention.input.spec).toEqual({ digest: value.association.digest });
-    }
-  });
-  const output = await host.execute();
-  expect(output.status, output.reason).toBe("partial");
-  expect(output.reason).not.toContain("Essential persistence failed");
-  expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind))
-    .toEqual(["pause", "pause"]);
-  expect(host.history()[0].outcome).toBe("gaps");
-  const records = host.records(); // verifies the chain against state's head
-  expect(records.map((record: any) => record.kind)).toEqual(["spec", "unit", "unit", "loop"]);
-  // The repair's unit record cites the first attempt's own sealed record instead of copying it.
-  const [first, repair, archive] = records.slice(1);
-  expect(repair.body.results).toEqual([{ taskId: "change1", attempt: 1, status: first.body.result.status,
-    sealed: { key: first.body.result.ref.key, digest: first.body.result.checkpoint.confirmation.digest } }]);
-  expect(repair.body.result.attempt).toBe(2);
-  expect(archive.body.results.map((result: any) => result.attempt)).toEqual([2]);
-  expect(archive.body.attempt.result).toEqual(archive.body.results[0]);
-  const drains = host.launches.filter(call => /finishDrain/.test(call.key)).map(call => JSON.parse(call.task).intentions.length);
-  return { peakBytes, coexisting, drains };
-}
-
-// At this scale the previous duplicated intentions exceeded the native limit before the drain.
-test("a twice-rejected reviewed repair ending in gaps keeps one archive copy at production magnitudes", async () => {
-  const { peakBytes, coexisting, drains } = await rejectedRepair(30);
-  console.log(`rejected reviewed repair peak: ${peakBytes} bytes`);
-  // Enough headroom: the loop archive waits for the trailing drain with the pending seal.
-  expect(coexisting).toBe(true);
-  expect(drains).toEqual([1, 3]);
-  expect(peakBytes).toBeLessThan(MISSION_STATE_MAX_BYTES - 64 * 1024);
-}, 20_000);
-
-test("a loop archive without native headroom first publishes pending seals", async () => {
-  const { peakBytes, coexisting, drains } = await rejectedRepair(60);
-  console.log(`headroom-drained repair peak: ${peakBytes} bytes`);
-  expect(coexisting).toBe(false);
-  expect(drains).toEqual([1, 2, 1]); // earlier seal; repair seal and settlement; loop archive
-  expect(peakBytes).toBeLessThan(MISSION_STATE_MAX_BYTES - 32 * 1024);
 }, 20_000);

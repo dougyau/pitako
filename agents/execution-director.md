@@ -89,6 +89,10 @@ workflow supplies bounded views and publishes deterministically. Use FINDINGs
 for known dead ends; pending work belongs in the backlog. Review/compliance gaps
 arrive as new final-phase tasks, never reopened completed tasks.
 
+Test only strictly necessary observable behavior, not implementation details or
+assumptions (calibration constants, internal sequences, impossible fixtures or
+test-only bypass scaffolding). Prefer fixing or deleting tests over adding them.
+
 Use verify-behavior for causal failure analysis: read the actual error/test,
 identify concrete pending work and useful repairs, preserve required guarantees.
 No blind retries, deadline inflation, arbitrary attempt quotas or green-until-done

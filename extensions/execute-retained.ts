@@ -3,7 +3,7 @@ import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { createRequire } from "node:module";
-import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState, expandWorkerReferences } from "./execute-state.ts";
 import { canonicalDigest } from "./canonical.mjs";
 const { safePath } = createRequire(import.meta.url)("./hash-ledger.mjs") as { safePath(file: string): string };
 
@@ -36,7 +36,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		typeof context.invocation !== "string" || typeof context.missionId !== "string")
 		throw new Error("Expected exact mission and invocation for retained analysis inspection.");
 	const mission = readJson(executionStatePath({ missionPath: context.missionPath, missionId: context.missionId }));
-	const invocation = record(mission) ? mission[`invoke-${context.invocation}`] : undefined;
+	const invocation = expandWorkerReferences(record(mission) ? mission[`invoke-${context.invocation}`] : undefined);
 	if (!record(invocation)) return undefined;
 	const association = invocation.association;
 	// A failed pre-admission request has no originals. Legacy roots never acquire
@@ -55,18 +55,54 @@ function retainedProjection(root: string, source: string, digest: string, contex
 	if (!record(loop) || !["director", "implementation", "review", "compliance"].includes(String(loop.phase))) return undefined;
 	const review = record(loop.review) ? loop.review : {};
 	const compliance = record(loop.compliance) ? loop.compliance : {};
+	const generations = record(loop.analysisGenerations) ? loop.analysisGenerations : {};
+	const generation = Number(generations["final-review"] ?? 1);
+	const rootKey = `invoke-${context.invocation}`;
+	const suffix = `.l${loop.number}.g${generation}.review.`;
+	const reviewPrefix = generation === 1 ? `${rootKey}.l${loop.number}.review.`
+		: `${rootKey.length + suffix.length <= 83 ? rootKey
+			: `${rootKey.slice(0, 83 - suffix.length - 13)}-${canonicalDigest(rootKey).slice(0, 12)}`}${suffix}`;
+	const demandKey = `${rootKey}.l${loop.number}${Number(generations["demand-observation"] ?? 1) > 1
+		? `.g${generations["demand-observation"]}` : ""}.demand-observation`;
 	const refs: unknown[] = [
 		...(Array.isArray(review.references) ? review.references : []),
 		...(compliance.ref ? [compliance.ref] : []),
 	];
+	// Native mission children retain the workflow-key association across root relaunches.
+	// Anchor their parent to a receipted sibling, never to a bare-key status lookup.
+	const nativeMission = readJson(context.missionPath);
+	const children = record(nativeMission) && Array.isArray(nativeMission.workflowChildren)
+		? nativeMission.workflowChildren.filter(record) : [];
+	const calls = Array.isArray(loop.analysisCalls) ? loop.analysisCalls.filter(record) : [];
+	const parents = new Set(children.filter(child => calls.some(call => record(call.ref) &&
+		call.key === child.key && typeof call.ref.runId === "string" && call.ref.runId === child.runId))
+		.map(child => child.workflowRunId));
+	for (const call of calls) {
+		if (loop.halt && record(loop.halt) && loop.halt.code === "timeout" &&
+			loop.halt.class === "final-review" && call.stage === "intention" &&
+			typeof call.key === "string" && call.key.startsWith(reviewPrefix) &&
+			record(call.ref) && call.ref.runId === undefined) {
+			const matches = children.filter(child => child.key === call.key && parents.has(child.workflowRunId));
+			if (!matches.length) continue;
+			if (matches.length !== 1 || matches[0]!.agent !== "pitako.reviewer")
+				throw new Error("Conflicting retained review sibling producer reference.");
+			const child = matches[0]!;
+			// Foreground children acquire their runId only on completion.
+			if (child.runId === undefined) continue;
+			if (typeof child.runId !== "string")
+				throw new Error("Conflicting retained review sibling producer reference.");
+			refs.push({ key: call.key, runId: child.runId, agent: child.agent,
+				...(Array.isArray(child.artifactPaths) ? { artifactPaths: child.artifactPaths } : {}) });
+		}
+	}
 	for (const call of Array.isArray(loop.analysisCalls) ? loop.analysisCalls : []) {
-		if (record(call) && call.key === `invoke-${context.invocation}.l${loop.number}.demand-observation` &&
+		if (record(call) && call.key === demandKey &&
 			(loop.phase !== "director" || loop.plan || !record(call.ref) || typeof call.ref.runId !== "string")) continue;
 		const reference = record(call) ? call.ref : undefined;
 		// Settled task reviews grow during this very resource's replay, not at admission.
 		if (bound && record(reference) && typeof call.key === "string" &&
 			call.key.startsWith(`invoke-${context.invocation}.l${loop.number}.`) &&
-			/\.t\d+\.a\d+\.task-(reviewer|synthesis)$/.test(call.key)) {
+			/\.t\d+\.a\d+(?:\.g[23])?\.task-(reviewer|synthesis)$/.test(call.key)) {
 			const taskResults = record(invocation.tasks) ? Object.values(invocation.tasks).filter(record)
 				.flatMap(task => [task.last, task.completed]) : [];
 			const attempts = [loop.attempt, ...(Array.isArray(loop.results) ? loop.results : []), ...taskResults].filter(record);
@@ -117,9 +153,10 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		try {
 			const prefix = `invoke-${context.invocation}.l${loop.number}.`;
 			if (typeof ref.key !== "string" ||
-				!(ref.key.startsWith(`${prefix}review.`) || ref.key === `${prefix}compliance` ||
-					ref.key.startsWith(prefix) && /^t\d+\.a\d+\.task-(reviewer|synthesis)$/.test(ref.key.slice(prefix.length)) ||
-				ref.key === `${prefix}demand-observation` && loop.phase === "director" && !loop.plan ||
+				!(ref.key.startsWith(reviewPrefix) || /^g[23]\.compliance$/.test(ref.key.slice(prefix.length)) && ref.key.startsWith(prefix) ||
+					ref.key === `${prefix}compliance` ||
+					ref.key.startsWith(prefix) && /^t\d+\.a\d+(?:\.g[23])?\.task-(reviewer|synthesis)$/.test(ref.key.slice(prefix.length)) ||
+				ref.key === demandKey && loop.phase === "director" && !loop.plan ||
 				ref.key.startsWith(`${prefix}recover`) && recoveries.some(item => record(item.ref) &&
 					item.ref.key === ref.key && isDeepStrictEqual(item.ref, ref))) ||
 				typeof ref.runId !== "string" || typeof ref.asyncDir !== "string" ||

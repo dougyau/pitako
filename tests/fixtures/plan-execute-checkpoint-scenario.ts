@@ -75,6 +75,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         continuationScript, laterScript,
         metadata: { inlineLoopIO: true, withTask: true, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
         module: new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href,
+        stateModule: new URL("../../extensions/execute-state.ts", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
         sealer: path.resolve("skills/execute/checkpoint.mjs"),
         loaderModule: new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
@@ -83,6 +84,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         inspector: new URL("../../skills/execute/inspect.ts", import.meta.url).href,
         validator: import.meta.resolve("@earendil-works/pi-ai") };
       const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any, loadCheckpoint: typeof registeredCheckpoint) => {
+        const { expandWorkerReferences } = await import(input.stateModule);
         const storage = new Map<string, any>(), originals = new Map<string, any>(), calls: string[] = [], snapshots: any[] = [], points: any[] = [];
         const hostObservations: any[] = [];
         let recoveryReplay = false;
@@ -109,7 +111,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           if (!cut && input.mode === "admission-cut" && admission) { cut = true; throw Error("Before checkpoint admission save"); }
           storage.set(key, structuredClone(value)); io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage))); // Only the admission/cursor ordering projection is observed below;
           // retain full native state in storage/on disk, not in every IPC snapshot.
-          snapshots.push({ loops: value.loop ? [value.loop].map((loop: any) => ({ cursor: loop.cursor,
+          const observed = expandWorkerReferences(value);
+          snapshots.push({ loops: observed.loop ? [observed.loop].map((loop: any) => ({ cursor: loop.cursor,
             results: loop.results?.map((entry: any) => ({ taskId: entry.taskId, status: entry.status ?? value.tasks[entry.taskId]?.completed?.status ?? value.tasks[entry.taskId]?.last?.status })) })) : [] });
           if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && value.loop?.attempt?.stage === "result" && value.loop.attempt.taskId === "second") {
             pauseAdmissionCut = true; throw Error("Cut after durable pause admission before yield");
@@ -168,7 +171,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               };
             }
             if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
-            const pending = storage.get("invoke-human-1")?.loop;
+             const pending = expandWorkerReferences(storage.get("invoke-human-1"))?.loop;
             if (request.agent === "pitako.checkpoint-sealer") {
               const seal = JSON.parse(request.task), second = seal.intent.taskId === "second";
               if (second && input.mode === "refused") { sealError = "Native control refuses checkpoint capture"; throw Error(sealError); }
@@ -234,7 +237,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 selection.changes.push({ kind: "add", task: second, reason: "Preserve the next pending unit" });
               }
             } else if (request.agent === "pitako.worker") {
-              const invocation = storage.get("invoke-human-1"), loop = invocation.loop, intent = loop.attempt.checkpoint;
+              const invocation = expandWorkerReferences(storage.get("invoke-human-1")), loop = invocation.loop, intent = loop.attempt.checkpoint;
               const second = intent.taskId === "second";
               if (cooperativePause && second && intent.attempt > 1) {
                 continuing = true;
@@ -276,7 +279,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 const restore = loop.attempt.restore;
                 let receipt;
                 try { receipt = io.restoreCheckpoint(restore.sourceKeys.map((key: string) =>
-                  invocation.taskFrame.sources.find((source: any) => source.key === key)), restore.authority); }
+                  invocation.taskFrame.intents[key]), restore.authority); }
                 catch (error) {
                   // A real worker reports its concrete helper impediment, not a
                   // transport disappearance that would invite checkpoint replay.
@@ -363,14 +366,14 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         };
         const result = await run(options as any);
         const finish = async () => {
-        const original = structuredClone(storage.get("invoke-human-1"));
+        const original = expandWorkerReferences(structuredClone(storage.get("invoke-human-1")));
         const originalArchives = structuredClone(archives);
         const callsAtYield = [...calls];
         let unitReplay: any;
         if (unitMode && input.mode.includes("reentry")) {
           if (input.mode.endsWith("reentry-mismatched-previous")) {
             const retained = storage.get("invoke-human-1");
-            retained.taskFrame.sources[0].progress.previous.digest = "0".repeat(64);
+            retained.taskFrame.intents[retained.taskFrame.sources[0]].progress.previous.digest = "0".repeat(64);
             io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage)));
           }
           recoveryReplay = true; unitReplay = await run(options as any);
@@ -386,7 +389,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           }
         }
         let resumed: any;
-        const collect = () => ({ launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: storage.get("invoke-human-1"), calls, snapshots, points, sealError,
+        const collect = () => ({ launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: expandWorkerReferences(storage.get("invoke-human-1")), calls, snapshots, points, sealError,
           owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") });
         if (pauseMode && !cooperativePause) {
           const checkpoint = original.lastConfirmed;
@@ -401,7 +404,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           resumed = await run({ ...options, script: input.continuationScript } as any);
           if (input.mode === "pause-later-input") { laterContinuing = true; resumed = await run({ ...options, script: input.laterScript } as any); }
           if (input.mode === "pause-twice") {
-            secondPause = { result: resumed.value, retained: structuredClone(storage.get("invoke-human-1")), calls: [...calls], archives: structuredClone(archives) };
+            secondPause = { result: resumed.value, retained: expandWorkerReferences(structuredClone(storage.get("invoke-human-1"))), calls: [...calls], archives: structuredClone(archives) };
             if (input.preparePause) {
               if (secondPause.retained.lastConfirmed?.kind !== "pause")
                 throw Error("Missing private real second pause");
@@ -461,9 +464,10 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           : actual.retained.loop;
         const history = (records: any[], retained: any[], tasks: any) => [...new Map(
           // A unit record's own attempt is `result`; earlier sealed attempts are cited by their records.
-          [...records.flatMap(record => [...(record.body.results ?? []).filter((result: any) => !result.sealed),
-            ...(record.kind === "unit" ? [record.body.result] : [])]), ...retained.flatMap(entry => entry.ref ? [entry] :
-            [tasks[entry.taskId].completed, tasks[entry.taskId].last].filter(result => result?.attempt === entry.attempt))]
+          [...retained.flatMap(entry => entry.ref ? [entry] :
+            [tasks[entry.taskId].completed, tasks[entry.taskId].last].filter(result => result?.attempt === entry.attempt)),
+            ...records.flatMap(record => [...(record.body.results ?? []).filter((result: any) => !result.sealed),
+            ...(record.kind === "unit" ? [record.body.result] : [])])]
             .map(result => [`${result.taskId}:${result.attempt}`, result])).values()]
           .sort((a: any, b: any) => ["first", "second", "final"].indexOf(a.taskId) - ["first", "second", "final"].indexOf(b.taskId) || a.attempt - b.attempt);
         loop.results = history(actual.archives, loop.results, actual.retained.tasks);
@@ -669,7 +673,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               expect(actual.retained.taskFrame.operations).toHaveLength(1);
               expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2"]);
+              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2.capacity-1", "invoke-human-1.l2.t1.a2"]);
             }
             expect(actual.resumed.action.started).toBe(false);
             const replayed = observed.find((entry: any) => entry.replay);

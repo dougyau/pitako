@@ -13,7 +13,8 @@ import { captureBaseline, captureCheckpoint } from "../../extensions/execute-che
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
 import { updateProgress, apply, reviewOriginals, cancelledScope, readBacklog } from "../../skills/execute/loop.ts";
 import { reviewModels } from "../../extensions/review-settings.ts";
-import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, compactWorkerReferences, expandWorkerReferences } from "../../extensions/execute-state.ts";
+import { stateCapacity } from "../../skills/execute/loop-io.mjs";
 import { DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } from "../../extensions/execute-settings.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
@@ -25,7 +26,7 @@ const reviewSource = readFileSync(new URL("../../skills/workflow-canonical.js", 
 // Shared by tests/execute-workflow-*.test.ts. Mutable state lives in the per-file
 // factory below: each test file owns its roots and settlements, even when Bun
 // loads several files in one process.
-export const source = `const pitakoReviewLibraryMode = true;\n${reviewSource}\n${executeSource}`;
+export const source = `${compactWorkerReferences.toString()}\n${expandWorkerReferences.toString()}\nconst pitakoReviewLibraryMode = true;\n${reviewSource}\n${executeSource}`;
 const globalConfig = {
   root: "/owned/designated", id: "spec", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/exact-mission",
   inspections: ["initial", "loop-1", "loop-2", "loop-3", "loop-4", "initial.r1", "initial.r2"].map(phase => ({ key: `inspect-${phase}`, command: "READ" })),
@@ -41,6 +42,7 @@ type Request = { key: string; agent?: string; resume?: string; context?: string;
 export type Result = Omit<Partial<WorkflowScriptChildResult>, "state"> & { ok: boolean; state?: string; structuredOutput?: any; [key: string]: any };
 export type Outcome = { status: string; reason: string; loopsConsumed: number; loopReport: any; tokens: any; elapsedMs: number; [key: string]: any };
 export function resolvedLoop(state: any) {
+  state = expandWorkerReferences(state);
   const loop = state.loop;
   return loop && { ...loop, results: loop.results.map((entry: any) => entry.ref ? entry
     : state.tasks[entry.taskId]?.completed ?? state.tasks[entry.taskId]?.last ?? entry) };
@@ -225,6 +227,22 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
     }
     if (request.agent === "pitako.loop-io") {
       const input = JSON.parse(request.task);
+      if (input.operation === "stateCapacity") {
+        // Mirror the entire native store in owned mission storage; exercise the
+        // production stat rather than assuming unrelated state is absent.
+        const missionPath = path.join(root, ".pi/subagents/native-missions/capacity.json");
+        const whole = Object.fromEntries([...storage].map(([key, value]) => [key, compactWorkerReferences(copy(value))]));
+        whole[`invoke-${input.invocation}`].association.missionPath = missionPath;
+        const observedInput = { ...input, missionPath };
+        const stateFile = executionStatePath(observedInput);
+        mkdirSync(path.dirname(stateFile), { recursive: true });
+        writeFileSync(stateFile, JSON.stringify(whole));
+        const observed = stateCapacity(observedInput);
+        const response = result(request, observed);
+        delete response.structuredOutput;
+        response.output = JSON.stringify(observed);
+        return response;
+      }
       if (input.operation === "taskDelta") {
         let delta;
         if (!options.realCheckout) {
@@ -390,7 +408,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
     get: async (key: string) => copy(storage.get(key)),
     set: async (key: string, value: unknown) => {
       if (failSave?.(value)) throw Error("Controlled essential persistence cut");
-      const next = { ...Object.fromEntries(storage), [key]: value };
+      const next = { ...Object.fromEntries([...storage].map(([key, value]) => [key, compactWorkerReferences(value)])), [key]: value };
       const serialized = JSON.stringify(next, null, 2);
       const bytes = Buffer.byteLength(serialized);
       if (bytes > MISSION_STATE_MAX_BYTES) {
@@ -398,8 +416,8 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         throw Error(`Mission state exceeds the 256 KiB limit (${bytes} bytes; maximum ${MISSION_STATE_MAX_BYTES} bytes).`);
       }
       // Reuse the measured native JSON bytes for the isolated persisted value.
-      storage.set(key, JSON.parse(serialized)[key]);
-      if (options.retainSnapshots !== false) snapshots.push(copy(value));
+      storage.set(key, expandWorkerReferences(JSON.parse(serialized)[key]));
+      if (options.retainSnapshots !== false) snapshots.push(expandWorkerReferences(copy(value)));
       saveObserver?.(value, bytes, serialized);
     },
   };
@@ -410,9 +428,18 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
     mkdirSync(path.dirname(file), { recursive: true }); writeFileSync(file, bytes);
     const projection = copy(value);
     for (const step of projection.steps) {
+      if (step.operation === "prepare" || step.operation === "apply" && projection.operation !== "selection") {
+        delete step.result.acceptance;
+        delete step.result.acceptanceHistory;
+      }
+      if (step.operation === "apply" && projection.operation !== "selection") delete step.result.view;
       if (step.operation === "apply" && (projection.operation !== "selection" || step.result.selected !== null))
         delete step.result.completedTasks;
-      if (step.operation === "gate") for (const gate of step.result.receipt.gates) gate.tail = "";
+      if (step.operation === "gate") {
+        for (const gate of step.result.receipt.gates) gate.tail = "";
+        projection.view = step.result.receipt.view;
+        delete step.result.receipt.view;
+      }
       if (projection.operation === "close" && step.operation === "requests" &&
           projection.steps.some((step: any) => step.operation === "nextRequests")) {
         const { requests, ...page } = step.result;
@@ -533,7 +560,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         taskReviewer: DEFAULT_TASK_REVIEWER, taskSynthesis: DEFAULT_TASK_SYNTHESIS } } : {}) };
     const value = hostResponse ? hostResponse(key, base) : base;
     return Array.isArray(value.retainedAnalyses)
-      ? { ...value, recoveryDigest: digest(JSON.stringify(value.retainedAnalyses)) } : value;
+      ? { ...value, recoveryDigest: digest(JSON.stringify([value.retainedAnalyses, value.retainedReferences])) } : value;
   }
   function workflowConfig(override: object) {
     let observed;
@@ -541,6 +568,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
     catch { return { ...config, ...override }; } // Actual failure still occurs at the host boundary.
     return { ...config, ...(observed.recoveryDigest ? { recovery: {
       originals: observed.retainedAnalyses, digest: observed.recoveryDigest,
+      references: observed.retainedReferences,
     } } : {}), ...override };
   }
   const runs = {

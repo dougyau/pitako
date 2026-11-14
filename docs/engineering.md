@@ -316,13 +316,29 @@ the admitted loops without it return partial. Standalone /review remains advisor
 Compact explicit native-state result projections retain exact producer/run,
 outputReference/outputArtifactPath/outputPathMapping/artifactPaths and optional
 structuredOutputPath. No whole prompts/reports/child objects are duplicated.
+Execute saves share byte-identical worker reference witnesses in `workerReferences`,
+including references without optional agent/run IDs. Distinct launch/status
+witnesses stay separate, and expansion restores independent control fields.
+Repeated byte-identical admitted-result projections are stored once in
+`admittedResults`, with `admittedResultReference` indexes at each use.
+Readers expand both storage-only tables before validation, restoring independent
+objects and exact property order so frozen seal/ledger bodies retain their exact JSON bytes.
 The identical active-plan cache is optional within the entire 256 KiB state file;
 essential snapshot/frozen descriptor/progress failure stops unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. Current v5 state holds current control/progress and usage
-totals, not an accumulating loop array. Full completed results are stored once
-per task, with completed attempts referencing them; pending continuations retain
-their last result. Closing rebuilds deterministic bytes from immutable source
+archived then discarded. Current v9 state holds current control/progress and usage
+totals, not an accumulating loop array. Version-8 state, including paused
+invocations, is rejected without migration at the existing workflow, checkpoint,
+retained-reader and inspector boundaries. Sealed attempts retain report-equivalent
+fields and evidence references; unsealed results remain whole. taskFrame stores
+checkpoint intents once by key with reviewIntents/sources key lists.
+After foldLoop/ledger admission, the end of admitDrain compacts archived loops
+inside groupedIO's rollback boundary. Reader-required gate/delta/settlement
+markers and predicate-selected recovery inputs supplement the base allow-list;
+reader output stays identical (HUMAN #2797). The final-close archive is not
+compacted there. Full bodies remain in published ledger records and
+digest-verified receipt files; published originals/digests never change.
+Closing rebuilds deterministic bytes from immutable source
 fields, freezing only mutable usage/resolution inputs.
 Three-loop rings retain plan-rejection diagnostics, native closing references
 and bounded summaries. Reports, review/compliance and directors receive these
@@ -345,6 +361,56 @@ director or partial. Native replay is not exactly-once/read-only reattachment.
 Reconcile available complete results and Git/WIP before cursor advancement;
 otherwise use checkpoint-first restoration, never blind writer redispatch. Positive actual activity/Stop/permission/recovery
 barriers matter, not missing historical inventory or universal certificates.
+
+Advance reduces its grouped receipt to `{path, digest}` and removes input before
+currentView/preparedNext and subsequent saves; preparedNext/loop.prepare omit
+view. Retention is not universally digest-only: validated compact transport
+projections exist during admission, currentView remains, and selection apply
+keeps acceptance/history (also retained by final loops for prompts). Prepare and
+nested drain apply projections omit acceptance/history; nested applies omit view.
+Non-final gate receipts omit view, transferring the fresh Board view outside the
+retained gate instead. Final-attempt gate view remains.
+Full receipts are published before stdout and verified by digest on reuse.
+
+Before each worker launch, fresh loop-io whole-file accounting enforces
+`U + S + sum(K) + R <= 262144` bytes of pretty-printed JSON: unrelated bytes U,
+execute frame S, itemized known reservations K (seal body twice, close,
+conditional restore sources, gate receipt and native references), and calibrated
+residual R (118784 bytes). Byte-identical checkpoint intentions share storage
+across live and frozen owners; expansion preserves ordered bytes before use or
+publication. An over-limit decision is saved before pending seal
+drainage and returns blocked `state-capacity`, with numbers and "use a new
+mission"; identical reentry dispatches no writer. This is not a capacity check
+at admission/before directors/final loops without workers, a native spawn
+reservation, or a guarantee that arbitrary histories fit. An in-flight sealed
+task can remain unsettled in the backlog and be selected in the new mission.
+
+Execute-owned analysisDispatch freezes a four-hour reviewer default
+(`REVIEWER_TIMEOUT_MS = 14400000`), including resumed final synthesis; workers
+default to four hours. Coordinator `args.timeouts` is validated operational config
+only, never immutable context/binding/association/hostRequest. Sticky overrides,
+empty-object reset and effective values/since reporting precede dispatch by
+essential save; existing intentions keep frozen values. Task/final gates use
+`max(command.timeoutMs ?? 1800000, gateFloorMs ?? 0)` without backlog mutation.
+Gate/close totals are always derived from the frozen task:
+`min(2147483647, max(14400000, sum(effective command timeouts) +
+(metric ? 1800000 : 0) + 3600000))`.
+
+A native barrier-free timeout yields partial `timeout` with class/key/launchedMs.
+Only a strictly greater relevant override and exact terminal producer evidence
+allow generation renewal; retired references/generation are saved before launch.
+The cap is three generations per step; final review renews the whole read-only
+phase, gates use `.gN`, close retries use `.rN`, and workers use new attempts.
+Restoring workers require the exact timed-out writer; other no-evidence cases
+still require human renewal. Final acceptance errors remain environment halts,
+not timeout retries. Operational input cannot clear Stop, denial, needs-decision,
+currentBarrier, state-capacity or spawn-budget barriers, or supply HUMAN unblock
+text. Native terminal status does not prove subprocess quiescence; timeout/Stop
+races and tool deadlines remain limits. One-hour overhead is unmeasured and a
+floor increase need not fix overhead timeouts. No installed-copy hotfix changes,
+v8 migration, standalone review/pre-pr or director/inspector/non-close timeout
+changes are implied. See the [coordinator contract](../skills/execute/SKILL.md#coordinator-timeouts-v9)
+for executable input, validation and halt-specific actions.
 
 An available complete native original is consumed before optional inspector
 fallback. The active root durably records a compact recovery subject/stage,

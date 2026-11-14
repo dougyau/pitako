@@ -223,9 +223,6 @@ test("a task attempt groups requests, gate and exactly one seal after the writer
   host.setRespond((request, normal) => request.agent === "pitako.worker"
     ? host.result(request, { status: "complete", work: "Read-only task", remaining: [] }) : normal());
   expect((await host.execute()).status).toBe("complete");
-  const index = host.launches.findIndex(call => call.key === "invoke-human-1.l1.t1.a1");
-  expect(host.launches.slice(index - 1, index + 2).map(call => call.agent === "pitako.loop-io"
-    ? JSON.parse(call.task).operation : call.agent)).toEqual(["selection", "pitako.worker", "gate"]);
   const effects = host.calls.slice(host.calls.findIndex(call => call.key === "invoke-human-1.l1.t1.a1") + 1, -1);
   expect(effects.findIndex(call => call.key.endsWith(".gate"))).toBeLessThan(effects.findIndex(call => call.agent === "pitako.checkpoint-sealer"));
   const baseline = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1.baseline")!;

@@ -47,9 +47,9 @@ test.each([false, true])("file-writing task is reviewed before unit admission (n
   expect(saved.loop.attempt.seal).toBeUndefined();
   for (const stage of ["reviewer", "synthesis"]) {
     const original = saved.loop.attempt.taskReview[stage];
-    expect(Object.keys(original).sort()).toEqual(["digest", "key", "path", "projection", "runId"]);
+    expect(Object.keys(original).sort()).toEqual(["digest", "key", "path", "runId"]);
     expect(original.digest).toMatch(/^[a-f0-9]{64}$/);
-    expect(original.projection.admitted).toBe(true);
+    expect(saved.taskFrame.reviewProjections[original.key].admitted).toBe(true);
   }
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["unit"]);
 });
@@ -127,7 +127,8 @@ test("inherited-only findings remain notes and do not block", async () => {
   expect(result.status).toBe("complete");
   expect(result.diagnosis).toContain("Non-blocking inherited notes:");
   expect(result.diagnosis.length).toBeLessThanOrEqual(360);
-  const projection = host.snapshots.find(value => value.loop?.attempt?.taskReview?.synthesis)?.loop.attempt.taskReview.synthesis.projection;
+  const saved = host.snapshots.find(value => value.loop?.attempt?.taskReview?.synthesis);
+  const projection = saved.taskFrame.reviewProjections[saved.loop.attempt.taskReview.synthesis.key];
   expect(projection.notes.path).toContain(".task-synthesis.json");
   expect(projection.blocking).toEqual([]);
 });

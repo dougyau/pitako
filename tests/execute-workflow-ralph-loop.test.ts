@@ -46,8 +46,6 @@ test("a complete worker with failed focused gates seals pause and continues the 
   const output = await host.execute();
   expect(output.status).toBe("partial");
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
-  const operations = host.calls.filter(call => call.agent === "pitako.loop-io").map(call => JSON.parse(call.task).operation);
-  expect(operations).toEqual(["prepare", "apply", "baseline", "gate", "baseline", "gate", "taskDelta", "apply"]);
   expect(output.boardTopicId).toBe(1);
   expect(host.calls.filter(call => /\.a1\.task-/.test(call.key))).toHaveLength(0);
   expect(host.calls.filter(call => /\.a2\.task-/.test(call.key))).toHaveLength(2);
@@ -297,7 +295,8 @@ test.each(["selection", "unknown-update", "reused-id"])("invalid director %s ret
     : mode === "unknown-update" ? "Cannot change unknown task or tombstone" : "Task ID never reused");
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
   expect(host.history()[0]!.plan.stage).toBe("admitted");
-  expect(host.history()[0]!.directorRetry.rejectedRef.key).toBe("invoke-human-1.l1.director");
+  const rejected = host.snapshots.find(value => value.loop?.directorRetry)?.loop.directorRetry;
+  expect(rejected.rejectedRef.key).toBe("invoke-human-1.l1.director");
 });
 
 test.each(["conflict", "schema", "decisions"])("backlog %s halts without a writer", async mode => {
@@ -494,7 +493,7 @@ test.each(["intact", "missing", "stale"])("final acceptance %s receipt on replay
 });
 
 
-test.each(["timeout", "error"])("final acceptance %s blocks as environment with logs and no repair task", async status => {
+test.each(["timeout", "error"])("final acceptance %s retains actionable logs with no repair task", async status => {
   const host = fixture(undefined, { taskCount: 0 }); host.setLimit(2);
   host.setRespond((request, normal) => {
     if (isGate(request)) {
@@ -505,10 +504,10 @@ test.each(["timeout", "error"])("final acceptance %s blocks as environment with 
     return normal();
   });
   const output = await host.execute();
-  expect(output.status).toBe("blocked");
-  expect(output.reason).toContain("environment failure");
+  expect(output.status).toBe(status === "timeout" ? "partial" : "blocked");
+  expect(output.reason).toContain(status === "timeout" ? "gateFloorMs strictly greater" : "environment failure");
   expect(output.reason).toContain("/owned/final-suite.log");
-  expect(host.current().loop.halt.code).toBe("environment");
+  expect(host.current().loop.halt.code).toBe(status === "timeout" ? "timeout" : "environment");
   expect(host.current().lastFinalAcceptance).toBeUndefined();
   expect(host.calls.some(call => call.agent === "pitako.worker" || call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   expect(readBacklog(host.root, "spec").backlog!.tasks).toEqual([]);
@@ -523,7 +522,7 @@ test.each(["review", "compliance"])("final-phase %s findings become durable task
     const retained = host.storage.get("review-invoke-human-1");
     for (const original of retained?.originals ?? []) expect(original).not.toHaveProperty("value");
     expect(serialized).not.toContain("LARGE_REVIEW_");
-    if (value.loop?.task) {
+    if (value.loop?.task && !value.loop.archived) {
       expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
       expect(JSON.stringify(value.loop.selection.receipt)).not.toContain(value.loop.task.origin.ref);
     }
@@ -912,7 +911,7 @@ test.each(["missing", "fresh", "resume", "too-long", "bad-mode", "missing-reason
     return result;
   });
   expect((await host.execute()).status).toBe("partial");
-  const value = host.history()[0]!.results[0]!;
+  const value = host.records().find((record: any) => record.kind === "loop" && record.loop === 1)!.body.results[0];
   if (["too-long", "bad-mode", "missing-reason"].includes(mode)) {
     expect(value.status).toBe("rejected"); expect(value.rejection).toContain("continuation opinion");
   } else {

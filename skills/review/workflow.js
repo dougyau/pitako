@@ -121,7 +121,7 @@ Finish with structured_output matching the requested schema, not JSON in prose.`
     // invocation so retained state stays constant across loops; the prefix still
     // names each call. Replay must match the retained decision.
     const stateVersion = 3;
-    const stateKey = integrated ? `review-${decisionReference.stateKey}` : `review-${prefix || "standalone"}`;
+    const stateKey = integrated ? `review-${decisionReference.stateKey}${decisionReference.generation > 1 ? `.g${decisionReference.generation}` : ""}` : `review-${prefix || "standalone"}`;
     let lastConfirmed, persistenceError, terminalOutcome, admitted = false;
     function save() {
       const snapshot = JSON.parse(JSON.stringify({ version: stateVersion, namespace: prefix || "standalone", query: target.reference, revision: 1,

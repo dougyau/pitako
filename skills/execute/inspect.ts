@@ -5,7 +5,7 @@ import path from "node:path";
 import { boundRetainedAnalyses, retainedAnalyses } from "../../extensions/execute-retained.ts";
 import { checkpointEvidence, previousUnitMatches } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
-import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "../../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState, expandWorkerReferences } from "../../extensions/execute-state.ts";
 
 type Inspection = { root: string; id: string; source: string; part?: string; context?: string; agentDir?: string; lines: string[] };
 function emitBounded(run: Inspection, value: unknown) {
@@ -208,7 +208,7 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
     let mission;
     try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const invocation = mission?.[`invoke-${context.invocation}`];
+    const invocation = expandWorkerReferences(mission?.[`invoke-${context.invocation}`]);
     if (invocation !== undefined && invocation?.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(invocation?.version));
     const loop = invocation?.loop, attempt = loop?.attempt;
     if (loop?.phase === "implementation" && (attempt?.checkpoint || attempt?.restore?.checkpoint || attempt?.restore?.sourceKeys) && (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status))) {
@@ -219,7 +219,7 @@ function observeCheckpoint(found: { root: string; commonDir: string; selected?: 
           association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
         throw new Error("Checkpoint observation association mismatch.");
       const retainedSources = (attempt.restore?.sourceKeys ?? invocation.taskFrame?.restorationKeys ?? []).map((key: string) => {
-        const intent = invocation.taskFrame?.sources?.find((item: any) => item.key === key);
+        const intent = invocation.taskFrame?.intents?.[key];
         if (!intent) throw new Error("Missing authenticated restoration source intent.");
         return intent;
       });

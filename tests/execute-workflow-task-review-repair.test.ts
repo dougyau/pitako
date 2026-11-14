@@ -117,7 +117,7 @@ test("saved rejection survives a result-save cut without renewing the repair", a
   });
   host.setFailSave(value => value.loop?.attempt?.number === 1 && value.loop.attempt.stage === "result");
   await host.execute();
-  expect(host.current().loop.attempt.taskReview.synthesis.projection.admitted).toBe(false);
+  expect(host.current().taskFrame.reviewProjections[host.current().loop.attempt.taskReview.synthesis.key].admitted).toBe(false);
   expect(host.current().taskFrame.reviewRepair.exhausted).toBe(false);
   host.setFailSave();
   const output = await host.execute();

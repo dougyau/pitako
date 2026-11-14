@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
 import { parseApplyPatch } from "pi-codex-tools";
 import { beginHookEffect, closeHookEffect, recordContextPeak, createCheckpoint, previousUnitMatches, type CheckpointIntent } from "./execute-checkpoint.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState, expandWorkerReferences } from "./execute-state.ts";
 import { effectiveProfile } from "./profile.ts";
 
 const namespace = "pitako.checkpoint/1";
@@ -27,7 +27,7 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
     const association = binding.association;
     if (association.root !== cwd || typeof association.invocation !== "string" ||
         typeof association.missionPath !== "string") throw new Error("Checkpoint execution workspace mismatch.");
-    const record = JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`];
+    const record = expandWorkerReferences(JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`]);
     if (record && record.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(record.version));
     if (!record || !equal(record.association, association))
       throw new Error("Checkpoint durable association mismatch.");

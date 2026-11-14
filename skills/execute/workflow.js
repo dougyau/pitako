@@ -68,7 +68,16 @@ function retainNativeCall(promise) {
 }
 const utf8Bytes = value => encodeURIComponent(value).replace(/%[0-9A-F]{2}|[^%]/g, "x").length;
 const clone = value => JSON.parse(JSON.stringify(value));
-const excerpt = value => typeof value === "string" ? value.slice(0, 360) : "";
+function retainedText(value, { units, bytes }) {
+  let result = "", remaining = bytes;
+  for (const point of typeof value === "string" ? value.toWellFormed() : "") {
+    const size = utf8Bytes(JSON.stringify(point)) - 2;
+    if (size > remaining || units !== undefined && result.length + point.length > units) break;
+    result += point; remaining -= size;
+  }
+  return result;
+}
+const excerpt = value => retainedText(value, { units: 360, bytes: 1080 });
 function same(a, b) {
   // JSON object key order is not part of the published definition.
   if (a === b) return true;
@@ -150,6 +159,8 @@ function nativeReference(childKey, result) {
     const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath) || text(entry.savedOutputPath))
       .map(entry => Object.fromEntries(["structuredOutputPath", "savedOutputPath"].filter(field => text(entry[field])).map(field => [field, entry[field]])));
     if (witnesses?.length) ref.results = witnesses;
+    if (childKey === loop?.attempt?.key && loop.attempt.referenceCapacity)
+      assertWorkerReferenceCapacity(ref, result);
     return ref;
   }
   if (result?.key !== undefined && result.key !== childKey && result.key !== result.runId) ref.nativeKey = result.key;
@@ -243,6 +254,7 @@ function dispatch(requests) {
     });
     return results;
   }).catch(error => {
+    if (error?.workerReferenceCapacity) throw error;
     if (error?.spawnBudgetExhausted) throw error;
     if (error?.nativeBarrier) {
       if (resolution && ["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier))
@@ -363,7 +375,7 @@ function transientSaveError(error) {
 }
 function persistState(stateKey, value, optionalPlan = null) {
   // Freeze once and serialize saves: a retried older projection must not overwrite a newer receipt.
-  const frozen = clone(value);
+  const frozen = compactWorkerReferences(clone(value));
   const projections = [frozen, ...(optionalPlan ? [{ ...frozen, activePlan: clone(optionalPlan) }] : [])];
   function writeProjection(index, attempt = 1) {
     return Promise.resolve().then(() => state.set(stateKey, projections[index])).catch(error => {
@@ -388,7 +400,130 @@ function maxCycles() { return invocation?.association?.maxCycles ?? null; }
 // The native setter measures the whole file as indented JSON (pi-subagents
 // workflow-state.js, 256 KiB). The quarter left covers other keys and later saves.
 const DRAIN_BEFORE_ARCHIVE_BYTES = 192 * 1024;
-function stateBytes() { return utf8Bytes(JSON.stringify({ [key]: { ...invocation, activePlan: null } }, null, 2)); }
+const prettyBytes = value => utf8Bytes(JSON.stringify(value, null, 2));
+function stateBytes() { return prettyBytes({ [key]: compactWorkerReferences({ ...invocation, activePlan: null }) }); }
+// Historical capped-window measurement: 118250 B, rounded to 116 KiB; known
+// close/gate bodies and native growth are counted separately. Behavioral capacity
+// tests cover pre-worker blocking and ordinary continuation, not this calibration.
+const WORKER_STATE_RESIDUAL_BYTES = 116 * 1024;
+function workerStateCapacity() {
+  const descriptor = loop.attempt, task = selectedTasks()[0];
+  const previous = invocation.tasks[task.id].last;
+  // Future bounded worker knowledge/gate output belongs to R, not known K.
+  const close = clone(closeAttemptInput(descriptor, task,
+    { status: "complete", knowledge: { findings: [], handoff: "" } }));
+  const closeBytes = prettyBytes(close);
+  for (const kind of ["unit", "pause"]) if (close.seal[kind].restoreSources) {
+    delete close.seal[kind].restoreSources;
+  }
+  const K = {
+    sealBodyTwice: previous ? 2 * prettyBytes(sealRecord(previous).body) : 0,
+    close: prettyBytes(close),
+    conditional: closeBytes - prettyBytes(close),
+    gate: descriptor.gate?.receipt ? prettyBytes(descriptor.gate.receipt) : 0,
+    native: descriptor.referenceCapacity.windowBytes,
+  };
+  const U = descriptor.capacityIO.receipt.unrelated, S = stateBytes(), R = WORKER_STATE_RESIDUAL_BYTES;
+  return { U, S, K, R, total: U + S + Object.values(K).reduce((sum, bytes) => sum + bytes, 0) + R };
+}
+function workerReferenceFrame(ref) {
+  return { [key]: { loop: { attempt: { launch: ref } } } };
+}
+function workerReferenceCapacity(childKey) {
+  // Only settled current-run producers establish the native artifact roots.
+  // A fresh capacity observer also supplies routing after a director-less relaunch.
+  const observer = loop.attempt?.capacityIO;
+  const currentObserver = observer?.stage === "receipt" &&
+    references.find(ref => ref.key === observer.ref?.key && ref.runId === observer.ref?.runId);
+  const producer = currentObserver || loop.plan?.stage === "admitted" &&
+    references.find(ref => ref.key === loop.plan.ref?.key && ref.runId === loop.plan.ref?.runId);
+  const paths = producer && [
+    producer.asyncDir, producer.outputReference, producer.outputArtifactPath,
+    producer.outputPathMapping?.savedPath, ...(producer.artifactPaths ?? []),
+    ...(producer.results ?? []).flatMap(entry => [entry.savedOutputPath, entry.structuredOutputPath]),
+  ].filter(value => typeof value === "string" && value.startsWith("/"));
+  // pi-subagents 0.87: shared/artifacts.js:186-195 (fixed artifact kinds);
+  // runs/foreground/subagent-executor.js:3334-3353 (120-byte run segment,
+  // <=128-byte workflow key), :4185 (UUID), :4226-4238 (<=5 artifact paths);
+  // :7456-7492 (one UUID/run-0/session.jsonl below the shared session root);
+  // runs/shared/structured-output.js:375-389 (six random chars + fixed names).
+  // 512 covers those suffixes in serialized UTF-8, including child session paths.
+  // Missing current-run evidence uses PATH_MAX serialized bytes per path.
+  const pathBytes = paths?.length ? Math.max(...paths.map(value =>
+    utf8Bytes(JSON.stringify(value.slice(0, value.lastIndexOf("/") + 1))) - 2)) + 512 : 4096;
+  const pathname = "/" + "x".repeat(pathBytes - 1);
+  const ref = { key: childKey, agent: "pitako.worker", runId: "x".repeat(128),
+    asyncDir: pathname, outputReference: pathname, outputArtifactPath: pathname,
+    outputPathMapping: { requestedPath: pathname, savedPath: pathname },
+    artifactPaths: Array(5).fill(pathname), launchedMs: 86400000,
+    terminalOutcome: { state: "x".repeat(64), reason: "x".repeat(64) },
+    results: [{ agent: "pitako.worker", structuredOutputPath: pathname, savedOutputPath: pathname,
+      state: "x".repeat(64), timedOut: true, exitCode: -9007199254740991,
+      terminalOutcome: { state: "x".repeat(64), reason: "x".repeat(64) } }] };
+  // Replay may admit a complete status response with different paths while the
+  // launch remains retained. All five result consumers share that second route.
+  // Only launch carries timeout controls; nativeReference keeps result paths.
+  const resultRef = clone(ref);
+  delete resultRef.launchedMs;
+  delete resultRef.terminalOutcome;
+  resultRef.results = [{ structuredOutputPath: pathname, savedOutputPath: pathname }];
+  resultRef.asyncDir = "/" + "y".repeat(pathBytes - 1);
+  const window = compactWorkerReferences({ copies: [ref, ...Array.from({ length: 5 }, () => clone(resultRef))] });
+  return { bytes: prettyBytes(workerReferenceFrame(ref)),
+    windowBytes: prettyBytes({ [key]: window }), pathBytes,
+    source: paths?.length ? producer.key : "PATH_MAX" };
+}
+function observeWorkerStateCapacity() {
+  const descriptor = loop.attempt;
+  const observation = (descriptor.capacityIO?.observation ?? 0) + 1;
+  descriptor.capacityIO = { key: `${descriptor.key}.capacity-${observation}`,
+    observation, retry: 0, stage: "intention" };
+  return loopIO("capacityIO", { operation: "stateCapacity", root: config.root,
+    missionPath: invocation.association.missionPath, missionId: invocation.association.missionId,
+    invocation: config.invocation }, descriptor).then(receipt => {
+    if (!["total", "execute", "unrelated"].every(field =>
+        Number.isSafeInteger(receipt[field]) && receipt[field] >= 0) ||
+        receipt.execute < prettyBytes({ [key]: {} }) ||
+        receipt.total !== receipt.execute + receipt.unrelated)
+      throw new Error("Invalid whole-file state capacity observation; no worker dispatched.");
+    descriptor.referenceCapacity = workerReferenceCapacity(descriptor.key);
+    return receipt;
+  });
+}
+function assertWorkerReferenceCapacity(ref, original) {
+  const prediction = loop.attempt.referenceCapacity;
+  const path = value => typeof value === "string" && value.startsWith("/") &&
+    utf8Bytes(JSON.stringify(value)) - 2 <= prediction.pathBytes;
+  const outcome = value => value === undefined || value && !Array.isArray(value) &&
+    Object.keys(value).every(field => ["state", "reason"].includes(field)) &&
+    Object.values(value).every(value => typeof value === "string" && utf8Bytes(JSON.stringify(value)) - 2 <= 64);
+  const supported = ref.externalAdapter === undefined &&
+    (ref.agent === undefined || ref.agent === "pitako.worker") &&
+    (ref.runId === undefined || typeof ref.runId === "string" && utf8Bytes(JSON.stringify(ref.runId)) - 2 <= 128) &&
+    ["asyncDir", "outputReference", "outputArtifactPath"].every(field => ref[field] === undefined || path(ref[field])) &&
+    (ref.outputPathMapping === undefined || ref.outputPathMapping && !Array.isArray(ref.outputPathMapping) &&
+      Object.keys(ref.outputPathMapping).every(field => ["requestedPath", "savedPath"].includes(field)) &&
+      Object.values(ref.outputPathMapping).every(value => typeof value === "string" &&
+        utf8Bytes(JSON.stringify(value)) - 2 <= prediction.pathBytes)) &&
+    (ref.artifactPaths === undefined || Array.isArray(ref.artifactPaths) && ref.artifactPaths.length <= 5 && ref.artifactPaths.every(path)) &&
+    outcome(ref.terminalOutcome) &&
+    (ref.results === undefined || Array.isArray(ref.results) && ref.results.length <= 1 && ref.results.every(entry =>
+      entry && !Array.isArray(entry) && Object.keys(entry).every(field =>
+        ["agent", "structuredOutputPath", "savedOutputPath", "state", "timedOut", "exitCode", "terminalOutcome"].includes(field)) &&
+      (entry.agent === undefined || entry.agent === "pitako.worker") &&
+      ["structuredOutputPath", "savedOutputPath"].every(field => entry[field] === undefined || path(entry[field])) &&
+      (entry.state === undefined || typeof entry.state === "string" && utf8Bytes(JSON.stringify(entry.state)) - 2 <= 64) &&
+      (entry.timedOut === undefined || typeof entry.timedOut === "boolean") &&
+      (entry.exitCode === undefined || entry.exitCode === null || Number.isSafeInteger(entry.exitCode)) &&
+      outcome(entry.terminalOutcome)));
+  const actual = prettyBytes(workerReferenceFrame(ref));
+  if (!supported || actual > prediction.bytes) {
+    const cause = barrier(original ?? ref);
+    if (cause) throw nativeBarrier(cause, { key: loop.attempt.key });
+    throw Object.assign(new Error(`Worker native reference exceeds its prelaunch capacity prediction (${actual} bytes; reserved ${prediction.bytes}; supported shape: ${!!supported}); use a new mission. Native originals remain unchanged; inspect the exact worker key before recovery.`),
+      { workerReferenceCapacity: { actual, reserved: prediction.bytes, supported: !!supported, key: loop.attempt.key } });
+  }
+}
 function save() {
   if ((loop?.phase === "closing" && !loop.closing || loop?.outcome === "gaps") && !loop.archivePending && !loop.archived)
     loop.archivePending = frozenLoopArchive(loop.phase !== "closing");
@@ -624,13 +759,157 @@ function projection(childKey, result) {
 // Analysis keys are launch identities, not a read-only reattachment API.
 // Keep compact intentions/receipts; replay must observe the exact native producer.
 const analysisResults = new Map();
-function analysisSettled(observed, ref) {
+function analysisStep(childKey) {
+  if (childKey.includes(".review.")) return "final-review";
+  if (/\.task-reviewer$/.test(childKey)) return "task-reviewer";
+  if (/\.task-synthesis$/.test(childKey)) return "task-synthesis";
+  if (childKey.endsWith(".demand-observation")) return "demand-observation";
+  return "compliance";
+}
+function generationKey(base, step) {
+  const generation = loop.analysisGenerations?.[step.startsWith("task-") ? `${base}.${step}` : step] ?? 1;
+  return generation === 1 ? base : `${base}.g${generation}`;
+}
+function reviewPrefix() {
+  const generation = loop.analysisGenerations?.["final-review"] ?? 1;
+  if (generation === 1) return `${key}.l${loop.number}.review.`;
+  const suffix = `.l${loop.number}.g${generation}.review.`;
+  const base = key.length + suffix.length <= 83 ? key
+    : `${key.slice(0, 83 - suffix.length - 13)}-${canonicalDigest(key).slice(0, 12)}`;
+  return `${base}${suffix}`;
+}
+function demandKey() {
+  return `${generationKey(`${key}.l${loop.number}`, "demand-observation")}.demand-observation`;
+}
+function reviewStateKey() {
+  const generation = loop.analysisGenerations?.["final-review"] ?? 1;
+  return `review-${key}${generation === 1 ? "" : `.g${generation}`}`;
+}
+function analysisBarrier(result, ref) {
+  return barrier(result, ref) ?? [result, ...(result?.results ?? [])].filter(Boolean)
+    .map(item => barrier(item) ??
+      (item.state === "cancelled" || ["stopped", "cancelled"].includes(item.terminalOutcome?.reason) ? "stopped" :
+        item.toolBudgetBlocked || item.acceptance?.recovery || item.terminalOutcome?.reason === "budget_exhausted"
+          ? "native child barrier" : null))
+    .find(Boolean) ?? null;
+}
+function nativeTimeout(result) {
+  const entries = [result, ...(result?.results ?? [])].filter(Boolean);
+  return !analysisBarrier(result) &&
+    (result?.results?.some(item => item.timedOut === true) ||
+      entries.some(item => item.terminalOutcome?.reason === "timeout"));
+}
+function terminalAnalysis(result, ref) {
+  if (analysisBarrier(result, ref.runId ?? ref.key)) return false;
+  return ["complete", "completed", "failed"].includes(result?.state) ||
+    analysisSettled(result, ref) || managementAnalysisState(result, ref) === "failed" ||
+    closedProducerProcesses(result);
+}
+function haltAnalysisTimeout(call, result) {
+  if (!nativeTimeout(result)) return Promise.resolve();
+  const step = analysisStep(call.key);
+  call.timeout = true;
+  // Keep the exact native timeout witnesses even for non-review analysis roles.
+  call.ref = { ...call.ref, ...nativeReference(call.key, result),
+    ...(result.terminalOutcome ? { terminalOutcome: result.terminalOutcome } : {}) };
+  if (result.results?.length) call.ref.results = result.results.map((entry, index) => ({
+    ...call.ref.results?.[index],
+    ...Object.fromEntries(["timedOut", "terminalOutcome", "exitCode", "state"]
+      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])),
+  }));
+  const slot = step.startsWith("task-") ? `${loop.attempt.key}.${step}` : step;
+  const capped = (loop.analysisGenerations?.[slot] ?? 1) >= 3;
+  loop.halt ??= { code: "timeout", status: "partial", class: step, key: call.key,
+    launchedMs: call.timeoutMs, ref: clone(call.ref),
+    reason: `${step} ${call.key} timed out at ${call.timeoutMs} ms. ${capped
+      ? "The three-generation limit is reached; use a new invocation."
+      : `Relaunch with args.timeouts.reviewerMs strictly greater than ${call.timeoutMs}.`}` };
+  return save().then(() => { throw new Error(loop.halt.reason); });
+}
+function renewAnalysisTimeout() {
+  const halt = loop?.halt;
+  if (halt?.code !== "timeout" || !["task-reviewer", "task-synthesis", "demand-observation", "compliance", "final-review"].includes(halt.class))
+    return;
+  if (effectiveTimeouts().reviewerMs <= halt.launchedMs) return;
+  const step = halt.class;
+  const slot = step.startsWith("task-") ? `${loop.attempt.key}.${step}` : step;
+  const generation = loop.analysisGenerations?.[slot] ?? 1;
+  if (generation >= 3) {
+    halt.reason = `${step} reached the three-generation limit; use a new invocation.`;
+    return save();
+  }
+  const call = loop.analysisCalls?.find(call => call.key === halt.key);
+  if (!call?.timeout || !nativeTimeout(halt.ref)) return;
+  // Re-observe exact producers, including settled siblings of a whole review phase.
+  const retiring = step === "final-review"
+    ? loop.analysisCalls.filter(call => call.key.includes(".review.")) : [call];
+  const retiredRefs = new Map();
+  let settled = true;
+  return retiring.reduce((previous, entry) => previous.then(() => {
+    let ref = loop.review?.references?.find(ref => ref.key === entry.key) ?? entry.ref;
+    if (!text(ref.runId) && entry.stage === "intention")
+      ref = config.recovery?.references?.find(ref => ref.key === entry.key) ?? ref;
+    // Only the exact native admission rejection proves a sibling never started.
+    if (!text(ref.runId) && budgetRejected(entry.key)) {
+      retiredRefs.set(entry.key, ref);
+      return;
+    }
+    if (!text(ref.runId)) { settled = false; return; }
+    return observeStatus(ref.runId, true).then(observed => {
+      const cause = analysisBarrier(observed, ref.runId ?? ref.key);
+      if (cause) throw nativeBarrier(cause, ref);
+      if (!text(ref.runId) || observed?.runId && observed.runId !== ref.runId ||
+          observed?.agent && ref.agent && observed.agent !== ref.agent ||
+          observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
+          !terminalAnalysis(observed, ref)) settled = false;
+      retiredRefs.set(entry.key, ref);
+    });
+  }), Promise.resolve()).then(() => {
+    if (!settled) {
+      halt.reason = `${step} timeout renewal requires exact terminal, barrier-free producer evidence for every retiring step; reconcile the retained producers. No replacement dispatched.`;
+      return save();
+    }
+    const before = clone(loop), rejectedKeys = invocation.budgetRejectedKeys;
+    (loop.retired ??= []).push(...retiring.map(entry =>
+      clone(entry.key === halt.key ? halt.ref : retiredRefs.get(entry.key))));
+    loop.analysisCalls = loop.analysisCalls.filter(entry => !retiring.includes(entry));
+    if (rejectedKeys)
+      invocation.budgetRejectedKeys = rejectedKeys.filter(childKey => !retiring.some(entry => entry.key === childKey));
+    (loop.analysisGenerations ??= {})[slot] = generation + 1;
+    if (step === "final-review") {
+      delete loop.review; delete loop.reviewSynthesis; delete loop.reviewOriginals;
+    }
+    if (step === "compliance") delete loop.compliance;
+    delete loop.halt;
+    delete loop.outcome;
+    return save().catch(error => {
+      Object.keys(loop).forEach(field => delete loop[field]); Object.assign(loop, before);
+      if (rejectedKeys) invocation.budgetRejectedKeys = rejectedKeys;
+      throw error;
+    });
+  }).catch(error => {
+    // This pre-budget observation precedes admissionValidated; retain current
+    // Stop/denial evidence here rather than relying on the general catch below.
+    if (!error?.nativeBarrier || persistenceFailed) throw error;
+    loop.halt = { code: "native-barrier",
+      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+      cause: error.nativeBarrier, reason: String(error.message),
+      ref: clone(error.nativeReference ?? halt.ref) };
+    return save().then(() => { throw error; });
+  });
+}
+function managementAnalysisState(observed, ref) {
   let lines = typeof observed?.output === "string" ? observed.output.split(/\r?\n/) : [];
   if (lines[0] === `Status target: run ${ref.runId ?? ref.key}` &&
       /^Spawn budget:/.test(lines[1] ?? "") && /^Active async capacity:/.test(lines[2] ?? ""))
     lines = lines.slice(3);
-  return observed?.ok && (observed.state === "complete" ||
-    ((lines[0] === `Run: ${ref.runId ?? ref.key}` || lines[0] === `Nested run: ${ref.runId ?? ref.key}`) && lines.includes("State: complete")));
+  if (observed?.ok &&
+      (lines[0] === `Run: ${ref.runId ?? ref.key}` || lines[0] === `Nested run: ${ref.runId ?? ref.key}`))
+    return lines.find(line => line.startsWith("State: "))?.slice(7);
+}
+function analysisSettled(observed, ref) {
+  // Failed management status proves retirement, never successful original admission.
+  return observed?.ok && (observed.state === "complete" || managementAnalysisState(observed, ref) === "complete");
 }
 function retainedReadOnlyOriginal(observed, ref) {
   // Management status is not the original. Prefer its complete native body;
@@ -655,8 +934,9 @@ function observeAnalysis(call, verifiedTaskOriginal) {
   return observeStatus(ref).then(observed => {
     if (call.ref.runId && observed?.runId && call.ref.runId !== observed.runId)
       throw new Error("Analysis producer/run identity conflicts with retained receipt.");
-    const cause = barrier(observed, ref);
+    const cause = analysisBarrier(observed, ref);
     if (cause) throw nativeBarrier(cause, call.ref);
+    if (nativeTimeout(observed)) return haltAnalysisTimeout(call, observed);
     const taskOriginal = Object.values(loop.attempt?.taskReview ?? {}).find(ref => ref?.key === call.key && ref.digest);
     const publishedRef = taskOriginal ?? loop.review?.references?.find(ref => ref.key === call.key);
     const originalRef = publishedRef ?? call.ref;
@@ -678,7 +958,7 @@ function observeAnalysis(call, verifiedTaskOriginal) {
       })) };
     }
     // Only reviewTask's fresh disk/digest check permits using the saved projection.
-    const verifiedProjection = verifiedTaskOriginal === taskOriginal && taskOriginal?.projection &&
+    const verifiedProjection = verifiedTaskOriginal === taskOriginal && taskOriginal && reviewProjection(taskOriginal) &&
       observed?.runId === taskOriginal.runId && analysisSettled(observed, originalRef);
     if (!observed?.ok || !text(observed.runId) || !observed.structuredOutput && !verifiedProjection) {
       if (call.barrier) throw nativeBarrier(call.barrier);
@@ -699,7 +979,7 @@ function reconcileAnalysis() {
   // Older retained phase receipts already identify producers; missing intention
   // metadata never licenses relaunching them.
   const hasIntentions = !!loop.analysisCalls?.length;
-  const calls = [...(loop.analysisCalls ?? [])].filter(call => call.key !== `${key}.l${loop.number}.demand-observation`);
+  const calls = [...(loop.analysisCalls ?? [])].filter(call => call.key !== demandKey());
   for (const ref of [...(loop.review?.references ?? []), loop.compliance?.ref].filter(Boolean)) {
     if (!calls.some(call => call.key === ref.key))
       calls.push({ key: ref.key, stage: "receipt", ref: { key: ref.key, ...(text(ref.runId) ? { runId: ref.runId } : {}) },
@@ -707,7 +987,7 @@ function reconcileAnalysis() {
   }
   if (!hasIntentions && loop.halt?.code === "native-barrier" && !calls.some(call => call.barrier))
     return Promise.reject(nativeBarrier(loop.halt.cause ?? "analysis receipt unavailable; settlement uncertain"));
-  loop.analysisCalls = [...(loop.analysisCalls ?? []).filter(call => call.key === `${key}.l${loop.number}.demand-observation`), ...calls];
+  loop.analysisCalls = [...(loop.analysisCalls ?? []).filter(call => call.key === demandKey()), ...calls];
   // Observe the whole retained group before a missing sibling may be launched.
   return calls.reduce((settled, call) =>
     settled.then(() => budgetRejected(call.key) ? undefined : analysisResults.get(call.key) ?? observeAnalysis(call)), Promise.resolve()).then(() => {
@@ -897,24 +1177,132 @@ function reconcileInterruptedOperations() {
       return save();
     });
 }
+const REVIEWER_TIMEOUT_MS = 14400000;
+function effectiveTimeouts() {
+  const values = invocation?.timeouts?.values ?? {};
+  return { reviewerMs: values.reviewerMs ?? REVIEWER_TIMEOUT_MS,
+    workerMs: values.workerMs ?? 14400000, gateFloorMs: values.gateFloorMs ?? 0 };
+}
+function timeoutReport() {
+  return { values: effectiveTimeouts(), since: invocation?.timeouts?.since ?? null };
+}
+function updateTimeouts() {
+  if (config.timeouts === undefined) return Promise.resolve();
+  const values = Object.keys(config.timeouts).length
+    ? { ...(invocation.timeouts?.values ?? {}), ...config.timeouts } : {};
+  if (invocation.timeouts && same(values, invocation.timeouts.values)) return Promise.resolve();
+  invocation.timeouts = { values: clone(values),
+    since: { loop: loop?.number ?? 0, attempt: loop?.attempt?.number ?? 0 } };
+  return save();
+}
+function effectiveGates(gates) {
+  return gates.map(gate => ({ ...gate,
+    timeoutMs: Math.max(gate.timeoutMs ?? 1800000, effectiveTimeouts().gateFloorMs) }));
+}
+function gateTaskFor(task) {
+  return { id: task.id, gates: effectiveGates(task.gates ?? task.checks.map(check => ({
+    id: check.id, command: check.command, cwd: check.cwd, timeoutMs: check.timeoutMs ?? 1800000 }))),
+    metric: task.metric ?? null, progress: clone(loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] }) };
+}
+function gateOperationTimeout(task) {
+  return Math.min(2147483647, Math.max(14400000,
+    task.gates.reduce((sum, gate) => sum + (gate.timeoutMs ?? 1800000), 0) +
+      (task.metric ? 1800000 : 0) + 3600000));
+}
+function haltGateTimeout(descriptor, step, launchedMs, result) {
+  const pending = descriptor.gate;
+  const ref = clone(pending.ref);
+  if (result) {
+    if (result.terminalOutcome) ref.terminalOutcome = clone(result.terminalOutcome);
+    ref.results = (result.results ?? []).map(entry => Object.fromEntries(
+      ["timedOut", "terminalOutcome", "exitCode", "state"]
+        .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
+  }
+  pending.timeout = true;
+  loop.halt = { code: "timeout", status: "partial", class: step,
+    key: ref.key, launchedMs, ref,
+    reason: `${step} ${ref.key} timed out at ${launchedMs} ms.${step === "final-acceptance"
+      ? ` ${acceptanceResults().blocking.filter(gate => gate.status === "timeout").map(gate => `${gate.id}: ${gate.logRef}`).join("; ")}.` : ""} ${(descriptor.gateGeneration ?? 1) >= 3
+      ? "The three-generation limit is reached; use a new invocation."
+      : `Relaunch with args.timeouts.gateFloorMs strictly greater than ${launchedMs}.`}` };
+  return save();
+}
+function renewGateTimeout() {
+  const halt = loop?.halt;
+  if (halt?.code !== "timeout" || !["gate-transport", "final-acceptance"].includes(halt.class)) return;
+  const descriptor = halt.class === "final-acceptance" ? loop.finalAttempt
+    : [loop.attempt, loop.finalAttempt].find(value => value?.gate?.ref?.key === halt.key);
+  const pending = descriptor?.gate;
+  if (!pending?.timeout || pending.ref?.key !== halt.key) return;
+  const task = descriptor === loop.finalAttempt
+    ? { id: "final-acceptance", gates: loop.acceptance, metric: null } : loop.task;
+  const freshTask = gateTaskFor(task);
+  const raised = halt.class === "gate-transport" ? effectiveTimeouts().gateFloorMs > halt.launchedMs &&
+    gateOperationTimeout(freshTask) > halt.launchedMs
+    : effectiveTimeouts().gateFloorMs > halt.launchedMs;
+  if (!raised) return;
+  const generation = descriptor.gateGeneration ?? 1;
+  if (generation >= 3) {
+    halt.reason = `${halt.class} reached the three-generation limit; use a new invocation.`;
+    return save();
+  }
+  if ((halt.class === "gate-transport" && !nativeTimeout(halt.ref)) || !text(halt.ref.runId)) return;
+  return observeStatus(halt.ref.runId, true).then(observed => {
+    const cause = analysisBarrier(observed, halt.ref.runId);
+    if (cause) {
+      loop.halt = { code: "native-barrier", status: ["stopped", "interrupted"].includes(cause) ? "cancelled" : "blocked",
+        cause, ref: clone(halt.ref), reason: `Gate timeout renewal encountered ${cause}; no replacement dispatched.` };
+      return save();
+    }
+    if (observed?.runId && observed.runId !== halt.ref.runId ||
+        observed?.key && ![halt.key, halt.ref.runId].includes(observed.key) ||
+        observed?.agent && observed.agent !== halt.ref.agent || !terminalAnalysis(observed, halt.ref)) {
+      halt.reason = `${halt.class} timeout renewal requires exact terminal, barrier-free producer evidence; reconcile ${halt.ref.runId}. No replacement dispatched.`;
+      return save();
+    }
+    const before = clone(loop);
+    (loop.retired ??= []).push(clone(halt.ref));
+    descriptor.gateGeneration = generation + 1;
+    descriptor.gate = { key: `${descriptor.key}.g${generation + 1}.gate`, stage: "intention",
+      retry: 0, task: freshTask };
+    if (descriptor === loop.finalAttempt) descriptor.freshAuthorized = true;
+    delete loop.halt;
+    delete loop.outcome;
+    return save().catch(error => {
+      Object.keys(loop).forEach(field => delete loop[field]); Object.assign(loop, before);
+      throw error;
+    });
+  }).catch(error => {
+    // Renewal observes native barriers before admissionValidated.
+    if (!error?.nativeBarrier || persistenceFailed) throw error;
+    loop.halt = { code: "native-barrier",
+      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+      cause: error.nativeBarrier, reason: String(error.message),
+      ref: clone(error.nativeReference ?? halt.ref) };
+    return save().then(() => { throw error; });
+  });
+}
 function analysisDispatch(requests) {
   return Promise.allSettled(requests.map(request => Promise.resolve().then(() => {
     loop.analysisCalls ??= [];
     let call = loop.analysisCalls.find(entry => entry.key === request.key);
     if (call && !budgetRejected(call.key)) return analysisResults.get(call.key) ?? observeAnalysis(call);
     if (!call) {
-      call = { key: request.key, stage: "intention", ref: { key: request.key } };
+      call = { key: request.key, stage: "intention", ref: { key: request.key },
+        timeoutMs: effectiveTimeouts().reviewerMs };
       loop.analysisCalls.push(call);
     }
     return save().then(() => {
       if (persistenceFailed) throw new Error(persistenceReason);
-      return dispatch([request]);
+      return dispatch([{ ...request, timeoutMs: call.timeoutMs }]);
     }).then(([result]) => {
       call.stage = "receipt";
-      call.ref = request.key.includes(".review.") || /\.task-(reviewer|synthesis)$/.test(request.key) || request.key === `${key}.l${loop.number}.demand-observation`
+      call.ref = request.key.includes(".review.") || /\.task-(reviewer|synthesis)$/.test(request.key) || request.key === demandKey()
         ? nativeReference(request.key, result)
         : { key: request.key, ...(text(result?.runId) ? { runId: result.runId } : {}) };
-      call.barrier = barrier(result);
+      call.barrier = analysisBarrier(result);
+      // The first receipt must retain timeout evidence even if management status cannot replay it.
+      if (!call.barrier && nativeTimeout(result)) return haltAnalysisTimeout(call, result);
       return save().then(() => {
         if (call.barrier) throw nativeBarrier(call.barrier,
           request.key.endsWith(".demand-observation") || /\.task-(reviewer|synthesis)$/.test(request.key) ? call.ref : undefined);
@@ -931,7 +1319,8 @@ function analysisDispatch(requests) {
     });
   }))).then(settled => {
     // Settle sibling receipt saves before the root persists an exhaustion/barrier.
-    const failure = settled.find(item => item.status === "rejected" && !item.reason?.spawnBudgetExhausted) ??
+    const failure = settled.find(item => item.status === "rejected" && item.reason?.nativeBarrier) ??
+      settled.find(item => item.status === "rejected" && !item.reason?.spawnBudgetExhausted) ??
       settled.find(item => item.status === "rejected");
     if (failure) throw failure.reason;
     return settled.map(item => item.value);
@@ -947,7 +1336,7 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
     skill: ["verify-behavior", ...(scopeDiscipline ? ["scope-discipline"] : [])],
     task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
     // Keep awaited final-result admission; live steps reach the main session from the child session file.
-    ...(implementation ? { timeoutMs: 14400000,
+    ...(implementation ? { timeoutMs: loop.attempt.timeoutMs,
       ...(!resume ? { extensionBindings: { "pitako.checkpoint/1": { association: clone(invocation.association), key: loop.attempt.key } } } : {}),
       acceptance: {
       level: "none", reason: "Execute root owns mandatory checks, shared adversarial review and whole-spec compliance; avoid duplicate inferred gates.",
@@ -1007,7 +1396,7 @@ const LOOP_IO_CONTROL = { needsAttentionAfterMs: 1_800_000 };
 function loopIORequest(childKey, input) {
   return { key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
     outputMode: "inline", outputSchema: false, reads: false, progress: false,
-    control: LOOP_IO_CONTROL, ...(input.operation === "close" ? { timeoutMs: 14400000 } : {}),
+    control: LOOP_IO_CONTROL, ...(input.operation === "close" ? { timeoutMs: gateOperationTimeout(input.gate.task) } : {}),
     task: JSON.stringify(input) };
 }
 function queueIntention(intention) {
@@ -1049,6 +1438,7 @@ function admitDrain(transport, intentions) {
   const receipt = transport.projection;
   if (receipt?.invocation !== config.invocation || !Array.isArray(receipt.steps) ||
       receipt.steps.length !== intentions.length) throw new Error("Invalid loop-io drain projection.");
+  let archived = false;
   for (let index = 0; index < intentions.length; index++) {
     const intention = intentions[index], step = receipt.steps[index], value = step.result;
     if (step.key !== intention.key || step.operation !== intention.operation)
@@ -1058,10 +1448,14 @@ function admitDrain(transport, intentions) {
           value?.count !== Math.max(1, invocation.ledger.count) + 1 || !/^[a-f0-9]{64}$/.test(value.head ?? ""))
         throw new Error("Invalid drained ledger anchor.");
       invocation.ledger = { count: value.count, head: value.head };
+      if (intention.input.record.kind === "unit") compactSealedAttempts(intention.input.record.body);
       if (intention.input.record.kind === "loop") {
         if (!validSummaries(value.summaries)) throw new Error("Invalid drained loop summaries.");
         loop.archived = true; delete loop.archivePending; delete loop.archiveQueued;
+        // A resumed drain closes the loop even if its interruption cleared the outcome.
+        loop.outcome = value.summaries.at(-1).status;
         foldLoop(value.summaries);
+        archived = true;
       }
     } else {
       if (!/^[a-f0-9]{64}$/.test(value?.digest ?? "") || !Array.isArray(value.cancelledScope))
@@ -1073,6 +1467,7 @@ function admitDrain(transport, intentions) {
       invocation.excludedScope = Object.fromEntries(value.cancelledScope.map(task => [task.id, task]));
     }
   }
+  if (archived) compactArchivedLoop();
 }
 function groupedIO(slot, input, owner = loop) {
   if (slot === "finishDrain" && owner[slot]?.admitted && invocation.intentions?.length) {
@@ -1100,15 +1495,20 @@ function groupedIO(slot, input, owner = loop) {
     }
     if (!pending.admitted) {
       const before = clone(invocation);
-      if (input.operation === "drain") admitDrain(transport, intentions);
-      else {
-        const drain = projection.steps[0];
-        if (drain?.operation !== "drain" || drain.key !== `${pending.key}.drain`) throw new Error("Missing drain-first receipt.");
-        admitDrain(drain.result, intentions);
+      try {
+        if (input.operation === "drain") admitDrain(transport, intentions);
+        else {
+          const drain = projection.steps[0];
+          if (drain?.operation !== "drain" || drain.key !== `${pending.key}.drain`) throw new Error("Missing drain-first receipt.");
+          admitDrain(drain.result, intentions);
+        }
+        invocation.intentions = (invocation.intentions ?? []).slice(pending.intentionCount);
+        invocation.receiptReference = reference;
+        pending.admitted = true;
+      } catch (error) {
+        invocation = before; loop = invocation.loop;
+        throw error;
       }
-      invocation.intentions = (invocation.intentions ?? []).slice(pending.intentionCount);
-      invocation.receiptReference = reference;
-      pending.admitted = true;
       function persist(attempt = 1) {
         return save().then(() => {
           persistenceFailed = false; persistenceReason = null;
@@ -1156,7 +1556,9 @@ function admitBaseline(intent, receipt) {
   return { ...clone(intent), baseline: candidate(receipt.candidate) };
 }
 function advanceLoop(slot = "advance", number = loop.number) {
-  if (loop[slot]?.stage === "receipt" && !loop[slot].receipt?.projection && !invocation.currentView) {
+  if (loop[slot]?.stage === "receipt" && !loop[slot].receipt?.projection) {
+    // The admitted prepare is complete; resume any interrupted request/cancellation work.
+    if (invocation.currentView) return observeMainRequests().then(() => save());
     // A new observation is not a replay of the completed immutable prepare.
     const generation = (loop[slot].generation ?? 0) + 1;
     loop[slot] = { key: `${key}.l${loop.number}.${slot}.v${generation}`, generation, retry: 0, stage: "intention" };
@@ -1165,17 +1567,17 @@ function advanceLoop(slot = "advance", number = loop.number) {
   return groupedIO(slot, { operation: "advance", prepare: { specId: config.id,
     previousConfirmedUnit: complete?.taskId ?? invocation.lastBacklogUnit ?? null, loop: number } }).then(transport => {
     const prepared = groupedStep(transport, "prepare");
+    // The full grouped evidence is already published and admitted. Release it
+    // before request observation can save the new view alongside the old loop.
+    loop[slot].receipt = receiptReference(transport);
+    delete loop[slot].input;
+    const { view, ...prepareReceipt } = prepared;
     invocation.backlogPath = prepared.path; invocation.backlogDigest = prepared.digest;
     invocation.excludedScope = Object.fromEntries((prepared.cancelledScope ?? []).map(task => [task.id, task]));
-    invocation.currentView = prepared.view; invocation.boardTopicId = prepared.view.topicId;
-    if (number === loop.number) loop.prepare = { stage: "receipt", receipt: clone(prepared) };
-    else invocation.preparedNext = { stage: "receipt", receipt: clone(prepared) };
-    return observeGroupedRequests(transport).then(() => {
-      // Keep the ordinary projections, not a second copy of all grouped evidence.
-      loop[slot].receipt = receiptReference(transport);
-      delete loop[slot].input;
-      return save();
-    });
+    invocation.currentView = view; invocation.boardTopicId = view.topicId;
+    if (number === loop.number) loop.prepare = { stage: "receipt", receipt: clone(prepareReceipt) };
+    else invocation.preparedNext = { stage: "receipt", receipt: clone(prepareReceipt) };
+    return observeGroupedRequests(transport).then(() => save());
   });
 }
 // Runtime operations have durable intentions and fresh retry keys, like gate.
@@ -1237,6 +1639,8 @@ function loopIO(slot, input, owner = loop) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
         pending.retry++; delete pending.ref; return save().then(run);
       }
+      if (input.operation === "stateCapacity" && input.root === config.root)
+        references.push(nativeReference(childKey, result));
       if (["advance", "selection", "close", "drain"].includes(input.operation)) {
         receiptReference(receipt);
         pending.receipt = receipt; pending.stage = "receipt";
@@ -1383,7 +1787,7 @@ function observeDemands() {
     id: source.ref.key, ...source.ref,
   }));
   const verified = retained.length ? loopIO("demandOriginals", { operation: "reviewOriginals", originals: retained }) : Promise.resolve();
-  const childKey = `${key}.l${loop.number}.demand-observation`;
+  const childKey = demandKey();
   return verified.then(() => collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
 INDIVIDUAL READ-ONLY DEMAND OBSERVATION, not product review or a future plan.
 Read and apply scope-discipline. Read exact full originals and relevant causal references below.
@@ -1646,7 +2050,50 @@ function confirmedUnitForPending() {
     throw new Error("Confirmed unit conflicts with admitted pending progress.");
   return clone(point);
 }
-function checkpointFallback(observed, ref, task) {
+function frameIntent(sourceKey) {
+  const intent = invocation.taskFrame.intents?.[sourceKey];
+  if (!intent) throw new Error("Missing authenticated checkpoint source intent.");
+  return intent;
+}
+function retainFrameIntent(intent, list, first = false) {
+  const frame = invocation.taskFrame;
+  const intents = frame.intents ??= {};
+  if (intents[intent.key] && !same(intents[intent.key], intent))
+    throw new Error("Checkpoint source intent conflicts with retained bytes.");
+  intents[intent.key] ??= clone(intent);
+  const keys = frame[list] ??= [];
+  if (!keys.includes(intent.key)) first ? keys.unshift(intent.key) : keys.push(intent.key);
+}
+function renewWorkerTimeout() {
+  const halt = loop?.halt, descriptor = loop?.attempt;
+  if (halt?.code !== "timeout" || halt.class !== "worker" || !descriptor?.restore ||
+      halt.key !== descriptor.key || effectiveTimeouts().workerMs <= halt.launchedMs ||
+      (descriptor.timeoutGeneration ?? 1) >= 3) return;
+  const withholdRenewal = () => {
+    halt.reason = "Worker timeout renewal requires exact native timeout and terminal, barrier-free producer evidence; reconcile the retained writer. No replacement dispatched.";
+    return save();
+  };
+  if (!nativeTimeout(descriptor.launch) ||
+      descriptor.launch.key !== descriptor.key || !same(halt.ref, descriptor.launch) ||
+      descriptor.launch.results?.some(entry => entry.agent && entry.agent !== "pitako.worker") ||
+      descriptor.launch.launchedMs !== descriptor.timeoutMs || !text(descriptor.launch.runId)) return withholdRenewal();
+  const ref = descriptor.launch;
+  return Promise.resolve().then(() => observeStatus(ref.runId, true)).then(observed => {
+    assertFallbackProducer(observed, ref);
+    const cause = analysisBarrier(observed, ref.runId);
+    if (cause) throw nativeBarrier(cause, ref);
+    if (!terminalAnalysis(observed, ref) ||
+        observed?.key && ![ref.key, ref.runId].includes(observed.key)) return withholdRenewal();
+    return checkpointFallback(observed, ref, selectedTasks()[0], true);
+  }).catch(error => {
+    if (!error?.nativeBarrier || persistenceFailed) throw error;
+    loop.halt = { code: "native-barrier",
+      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+      cause: error.nativeBarrier, reason: String(error.message), ref: clone(ref) };
+    return save().then(() => { throw error; });
+  });
+}
+function checkpointFallback(observed, ref, task, timeoutRenewal = false) {
   const descriptor = loop.attempt;
   assertFallbackProducer(observed, ref);
   if (!descriptor.checkpoint || loopResults().some(result => result.taskId === task.id && result.status === "complete"))
@@ -1692,26 +2139,35 @@ function checkpointFallback(observed, ref, task) {
   // Reconcile the exact operation/result without inventing its original evidence.
   // Non-pause recovery retains its existing material-progress routes.
   const lastRestore = descriptor.restore ?? frame.operations.at(-1);
-  // A restoring writer that published nothing leaves exactly its dispatch-time
-  // evidence. Only current human input naming that exact writer renews it, once:
-  // the renewed attempt has a new key that this input does not name.
-  const renewal = !!descriptor.restore && !!evidence && evidence === descriptor.restore.evidence &&
+  // Unchanged restoration evidence needs current human input or the separately
+  // checked terminal-timeout exception; neither renews an unnamed future writer.
+  const renewal = timeoutRenewal || !!descriptor.restore && !!evidence && evidence === descriptor.restore.evidence &&
     resolution?.loop === loop.number && !loop.archived && ["accepted", "applied"].includes(resolution.stage) &&
     !resolution.currentBarrier && resolution.operations?.some(item => item.key === descriptor.key);
   if (lastRestore && !renewal && (!evidence || frame.evidence.includes(evidence) || prior.some(item => item.evidence === evidence ||
       pauseRestoration && !item.evidence &&
         same(item.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause ?? lastRestore.confirmedPause)))) {
+    if (descriptor.restore && nativeTimeout(descriptor.launch)) {
+      const launchedMs = descriptor.launch.launchedMs;
+      loop.halt ??= { code: "timeout", status: "partial", class: "worker", key: descriptor.key,
+        launchedMs, ref: clone(descriptor.launch),
+        reason: `Restoring worker ${descriptor.key} timed out at ${launchedMs} ms. ${(descriptor.timeoutGeneration ?? 1) >= 3
+          ? "The three-generation limit is reached; use a new invocation."
+          : `Relaunch with args.timeouts.workerMs strictly greater than ${launchedMs}.`}` };
+      return save().then(() => { throw new Error(loop.halt.reason); });
+    }
     const error = new Error("Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.");
     error.nativeFailure = { code: "recovery", reason: error.message, ref: clone(ref) };
     throw error;
   }
-  if (renewal) resolution.stage = "applied";
+  if (renewal && !timeoutRenewal) resolution.stage = "applied";
   checkpointObservation = undefined;
   const manifest = `${config.root}/.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`;
   // The modifying worker reads and validates these exact bytes through the owned
   // helper before any effect. No model inspector/result rescue is a prerequisite.
   const checkpoint = { key: descriptor.checkpoint.key, manifest };
-  const sources = [clone(descriptor.checkpoint), ...(frame.sources ?? []).filter(source => source.key !== descriptor.checkpoint.key)].sort((a, b) => b.attempt - a.attempt);
+  const sources = [clone(descriptor.checkpoint), ...(frame.sources ?? []).filter(sourceKey => sourceKey !== descriptor.checkpoint.key)
+    .map(frameIntent)].sort((a, b) => b.attempt - a.attempt);
   const confirmedUnit = descriptor.restore?.authority?.confirmedUnit ?? confirmedUnitForPending();
   const observations = sources.map(source => ({ key: source.key,
     manifest: `${config.root}/.pi/subagents/checkpoints/${source.key}/manifest.json` }));
@@ -1722,6 +2178,8 @@ function checkpointFallback(observed, ref, task) {
     checkpoint: clone(checkpoint) };
 
   loop.attempt = { taskId: task.id, index: loop.cursor, number: descriptor.number + 1,
+    ...(timeoutRenewal ? { timeoutGeneration: (descriptor.timeoutGeneration ?? 1) + 1 } : {}),
+    timeoutMs: effectiveTimeouts().workerMs,
     key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`, stage: "intention",
     continuationRef: descriptor.result?.ref ?? null, ...(descriptor.pauseSource ? { pauseSource: clone(descriptor.pauseSource) } : {}), restore: { undispatched: true,
       sourceKeys: sources.map(source => source.key), evidence, observation: checkpoint, observations,
@@ -1738,11 +2196,12 @@ function checkpointFallback(observed, ref, task) {
   // Unsealed interrupted sources have no admitted manifest digest; retain their full v2 intents.
   for (const source of sources) if (!frame.restorationKeys.includes(source.key)) {
     frame.restorationKeys.push(source.key);
-    (frame.sources ??= []).push(clone(source));
+    retainFrameIntent(source, "sources");
   }
   // New material checkpoint evidence resolves only the prior technical suspension.
   // Native Stop/permission barriers were checked above and are never cleared here.
-  if (loop.halt?.code === "recovery") { delete loop.halt; delete loop.outcome; }
+  if (timeoutRenewal) (loop.retired ??= []).push(clone(ref));
+  if (loop.halt?.code === "recovery" || timeoutRenewal) { delete loop.halt; delete loop.outcome; }
   // Essential admission of the restoration intention precedes modifying dispatch.
   return save().then(() => null);
 }
@@ -1780,19 +2239,7 @@ function workerValue(result, descriptor, task, statusRef, observed) {
       !["resume", "fresh"].includes(opinion.mode) || typeof opinion.reason !== "string" || [...opinion.reason].length > 200))
     throw rejectReport("Worker returned an invalid continuation opinion (mode resume/fresh, reason at most 200 characters).");
   value.continuation = opinion === undefined ? { mode: "fresh", reason: "" } : clone(opinion);
-  const bounded = content => {
-    let result = "", remaining = 2048;
-    for (const point of typeof content === "string" ? content.toWellFormed() : "") {
-      const size = utf8Bytes(point);
-      if (size > remaining) break;
-      result += point; remaining -= size;
-    }
-    return result;
-  };
-  value.knowledge = {
-    findings: Array.isArray(value.knowledge?.findings) ? value.knowledge.findings.filter(text).slice(0, 8).map(bounded) : [],
-    handoff: bounded(value.knowledge?.handoff),
-  };
+  value.knowledge = normalizedWorkerKnowledge(value.knowledge);
   // Candidate and checkpoint authority comes from the root, never the worker.
   delete value.checkpointReceipt;
   delete value.restoreReceipt;
@@ -1835,7 +2282,7 @@ function workerValue(result, descriptor, task, statusRef, observed) {
     value.remaining = [checksCurrent ? "Worker has not reported completion." : "Resolve workflow gate failures."];
   value.usefulProgress = !receipt?.stalled;
   value.revival = value.status === "continue" ? value.diagnosis : null;
-  const review = descriptor.taskReview?.synthesis?.projection;
+  const review = reviewProjection(descriptor.taskReview?.synthesis);
   if (review?.notes) value.diagnosis = `${value.diagnosis.slice(0, 200)}\nNon-blocking inherited notes: ${review.notes.path}`.slice(0, 360);
   if (review && !review.admitted) {
     value.remaining = review.remaining?.length ? review.remaining : review.blocking.length
@@ -1844,7 +2291,7 @@ function workerValue(result, descriptor, task, statusRef, observed) {
     value.revival = review.revival || value.diagnosis;
     value.usefulProgress = !invocation.taskFrame.reviewRepair?.exhausted;
   }
-  const repair = invocation.taskFrame.reviewRepair;
+  const repair = taskReviewRepair();
   if (repair?.exhausted) {
     value.usefulProgress = false;
     if (!review && repair.blocking.length) {
@@ -1856,8 +2303,7 @@ function workerValue(result, descriptor, task, statusRef, observed) {
 }
 
 function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural) {
-  const intents = invocation.taskFrame.reviewIntents ??= [];
-  if (!intents.some(intent => intent.key === descriptor.key)) intents.push(clone(descriptor.checkpoint));
+  retainFrameIntent(descriptor.checkpoint, "reviewIntents");
   let parsed;
   // A report that breaks the result contract is a rejected attempt, not a root
   // halt. Its original stays in the native record; nothing from it is admitted.
@@ -1885,7 +2331,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
       receipt: value.restoreReceipt ?? null, producer: descriptor.restore.producer } } : {}),
     status: value.status, workDone: excerpt(value.workDone), diagnosis: excerpt(value.diagnosis),
     ...(descriptor.taskReview?.synthesis ? { taskReview: clone(descriptor.taskReview) } : {}),
-    knowledge: clone(value.knowledge), gateFailures: value.diagnosis.slice(0, 4096),
+    knowledge: { key: descriptor.key }, gateFailures: retainedText(value.diagnosis, { units: 4096, bytes: 12288 }),
     remaining: value.remaining.slice(0, 4).map(excerpt), remainingCount: value.remaining.length,
     checks: { current: parsed.checksCurrent, count: parsed.checks.length,
       passed: parsed.checks.filter(check => check.result === "passed").length,
@@ -1899,6 +2345,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   descriptor.revival = { ...(descriptor.revival ?? { decision: "fresh", code: peak === null ? "missing-peak" : "fresh-dispatch" }),
     opinion: value?.continuation.mode ?? "fresh", reason: value?.continuation.reason ?? "", peak };
   descriptor.capturedPaths = observed?.capturedPaths ?? 0;
+  if (!parsed.rejection) (invocation.taskFrame.workerKnowledge ??= {})[descriptor.key] = clone(value.knowledge);
   projected.revival = clone(descriptor.revival);
   if (recoveryRef) projected.ref = { ...projected.ref, ...descriptor.launch,
     recovery: { ref: recoveryRef, field: "structuredOutput.workerResult" } };
@@ -1917,6 +2364,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   // A superseded pending attempt no longer has a task-owned full result.
   loop.results = loop.results.map(entry => !entry.ref && entry.taskId === projected.taskId &&
     entry.attempt === taskState.last?.attempt ? taskState.last : entry);
+  loop.results = loop.results.map(entry => entry.sealed ? sealedResult(entry) : entry);
   taskState.last = projected.status === "complete" ? null : projected;
   if (projected.status === "complete") {
     loop.settlementGate = clone(descriptor.gate.receipt);
@@ -1941,14 +2389,35 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
 // budget relaunch is a new top-level run without the old run's child receipts.
 // Retain the exact received writer result until admission so reentry seals and
 // admits it instead of rolling back finished journaled work. Admission consumes it.
-const RECEIVED_RESULT_LIMIT = 65536;
+// Recovery cache only: larger native results still follow normal admission.
+// HUMAN #2885: 24 KiB is >5x the measured current-schema worker maximum.
+const RECEIVED_RESULT_LIMIT = 24 * 1024;
+function normalizedWorkerKnowledge(knowledge) {
+  const bounded = content => retainedText(content, { bytes: 2048 });
+  return { findings: Array.isArray(knowledge?.findings) ? knowledge.findings.filter(text).slice(0, 8).map(bounded) : [],
+    handoff: bounded(knowledge?.handoff) };
+}
+function workerKnowledge(result) {
+  const reference = result?.knowledge;
+  if (!reference?.key) return reference;
+  // New projections cite their keyed owner; frozen older bodies remain inline.
+  const knowledge = frameProjection("workerKnowledge", reference.key);
+  if (!knowledge) throw new Error(`Missing worker knowledge projection: ${reference.key}.`);
+  return knowledge;
+}
+function frameProjection(collection, projectionKey) {
+  const frames = [invocation.taskFrame, invocation.sealPending?.record?.body?.frame,
+    ...(invocation.intentions ?? []).filter(entry => entry.operation === "ledger" && entry.input.record.kind === "unit")
+      .map(entry => entry.input.record.body.frame)];
+  return frames.find(frame => frame?.[collection]?.[projectionKey])?.[collection][projectionKey];
+}
 function retainReceived(result) {
   if (barrier(result) || !result?.ok || !result.structuredOutput || !text(result.runId)) return;
   const received = clone({ ok: true, agent: result.agent, key: result.key, runId: result.runId,
-    structuredOutput: result.structuredOutput,
+    structuredOutput: { ...result.structuredOutput, knowledge: normalizedWorkerKnowledge(result.structuredOutput.knowledge) },
     ...(text(result.output) && /^[\s]*\{/.test(result.output) ? { output: result.output } : {}),
     ...(Array.isArray(result.results) ? { results: result.results.map(entry => ({ agent: entry?.agent, exitCode: entry?.exitCode })) } : {}) });
-  if (utf8Bytes(JSON.stringify(received)) <= RECEIVED_RESULT_LIMIT) loop.attempt.received = received;
+  if (prettyBytes({ [key]: { loop: { attempt: { received } } } }) <= RECEIVED_RESULT_LIMIT) loop.attempt.received = received;
 }
 // A positive barrier or another producer keeps the existing route; only the
 // same settled launch, without its payload in this observation, is completed.
@@ -1957,7 +2426,12 @@ function receivedResult(observed, ref) {
   if (!received || received.runId !== ref.runId ||
       barrier(observed, ref.runId ?? ref.key) || observed?.structuredOutput ||
       (observed?.runId && observed.runId !== received.runId)) return observed;
-  return { ...clone(ref), ...clone(received) };
+  const result = { ...clone(ref), ...clone(received) };
+  if (Array.isArray(ref.results) && ref.results.length === received.results?.length &&
+      received.results.every((entry, index) => entry.agent === ref.agent &&
+        (ref.results[index].agent === undefined || ref.results[index].agent === entry.agent)))
+    result.results = ref.results.map((entry, index) => ({ ...clone(entry), ...clone(received.results[index]) }));
+  return result;
 }
 function sealerKey(attemptKey, retry) {
   return `${attemptKey}.seal${retry ? `.r${retry}` : ""}`;
@@ -1996,20 +2470,26 @@ function verifyAttempt(descriptor, task, value, reuse) {
   const pending = descriptor.gate ??= { key: `${descriptor.key}.gate`, stage: "intention", retry: 0 };
   if (pending.stage === "receipt") return Promise.resolve(pending.receipt);
   if (descriptor.seal) return Promise.reject(new Error("Seal intention has no durable gate receipt; recovery required."));
-  const gateTask = pending.task ??= { id: task.id,
-    gates: task.gates ?? task.checks.map(check => ({ id: check.id, command: check.command, cwd: check.cwd,
-      timeoutMs: check.timeoutMs ?? 1800000 })), metric: task.metric ?? null,
-    progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
+  const gateTask = pending.task ??= gateTaskFor(task);
   function runGate() {
     const gateKey = `${pending.key}${pending.retry ? `.r${pending.retry}` : ""}`;
     return Promise.resolve().then(() => {
       if (!pending.dispatched || budgetRejected(gateKey)) return;
       return observeStatus(pending.ref?.runId ?? gateKey, true).then(status => {
-        const cause = barrier(status, pending.ref?.runId ?? gateKey);
+        const cause = analysisBarrier(status, pending.ref?.runId ?? gateKey);
         if (cause) throw nativeBarrier(cause, pending.ref);
+        if (pending.ref?.runId && status?.runId && pending.ref.runId !== status.runId ||
+            status?.key && ![gateKey, pending.ref?.runId].includes(status.key) ||
+            status?.agent && status.agent !== "pitako.loop-io")
+          throw new Error("Gate producer/run identity conflicts with the retained intention.");
         if (status?.ok && status.output) return status;
+        if (nativeTimeout(status)) return status;
+        if (pending.retry >= 2) throw new Error(`Gate lacks a valid terminal receipt; inspect ${gateKey}`);
+        pending.retry++; pending.dispatched = false; delete pending.ref;
+        return save().then(() => runGate()).then(receipt => ({ gateReceipt: receipt }));
       });
     }).then(observed => {
+      if (observed?.gateReceipt) return [{ gateReceipt: observed.gateReceipt }];
       if (observed) return [observed];
       // Admission exhaustion proves no child launched and preserves this key.
       pending.stage = "intention"; pending.dispatched = true;
@@ -2017,11 +2497,14 @@ function verifyAttempt(descriptor, task, value, reuse) {
         operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
         loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
         workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge, ...(reuse ? { reuse } : {}),
-      }), timeoutMs: 14400000 }]));
+      }), timeoutMs: gateOperationTimeout(gateTask) }]));
     }).then(([result]) => {
-      pending.ref = nativeReference(gateKey, result);
-      const cause = barrier(result, gateKey);
+      if (result.gateReceipt) return result.gateReceipt;
+      pending.ref = { ...pending.ref, ...nativeReference(gateKey, result) };
+      const cause = analysisBarrier(result, gateKey);
       if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref); });
+      if (nativeTimeout(result)) return haltGateTimeout(descriptor, "gate-transport", gateOperationTimeout(gateTask), result)
+        .then(() => { throw new Error(loop.halt.reason); });
       let receipt;
       if (typeof result?.output === "string") {
         const last = result.output.trim().split("\n").at(-1);
@@ -2074,7 +2557,7 @@ function acceptanceResults() {
 }
 function acceptanceBrief() {
   return `Excepted acceptance results: ${JSON.stringify(acceptanceResults().excepted)}.
-Acceptance history: ${JSON.stringify(loop.selection?.receipt?.acceptanceHistory ?? [])}.
+Acceptance history: ${JSON.stringify(loop.acceptanceHistory ?? loop.selection?.receipt?.acceptanceHistory ?? [])}.
 Inspect acceptanceHistory and report as a gap any acceptance replacement that narrows, filters or relaxes a command and cites no HUMAN post ID that is current in this execute topic.
 An excepted failure covered by a current HUMAN is reported, not a gap or repair task.`;
 }
@@ -2109,11 +2592,11 @@ function validGateReceipt(receipt, task, status) {
         (receipt.metric.error === null || text(receipt.metric.error)) : receipt.metric === null);
   } catch (_) { return false; }
 }
-function closeAttempt(descriptor, task, value) {
-  const savedReceipt = descriptor.close?.stage === "receipt";
-  const gateTask = descriptor.gate?.task ?? { id: task.id, gates: task.gates ?? task.checks.map(check => ({ id: check.id,
-    command: check.command, cwd: check.cwd, timeoutMs: check.timeoutMs ?? 1800000 })),
-    metric: task.metric ?? null, progress: loop.metricSeries ?? task.progress ?? { nonImproving: 0, last5: [] } };
+// Separate construction from dispatch so capacity can measure the exact frozen
+// transport without performing checkpoint or restoration effects.
+function closeAttemptInput(descriptor, task, value) {
+  const gateKey = descriptor.gate?.key ?? `${descriptor.key}.gate`;
+  const gateTask = descriptor.close?.input?.gate?.task ?? descriptor.gate?.task ?? gateTaskFor(task);
   const next = checkpointIntent(task.id, descriptor.number + 1,
     `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`);
   const admitted = next.progress.admitted[task.id] ??= [];
@@ -2123,17 +2606,26 @@ function closeAttempt(descriptor, task, value) {
   const nextBaselines = descriptor.close?.input?.nextBaseline ?? { sealed, observed: next };
   const seal = { v: 1, intent: descriptor.checkpoint,
     ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
-      const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+      const source = frameIntent(sourceKey);
       if (!source) throw new Error("Missing authenticated restoration source intent.");
       return source;
     }) } : {}) };
-  return groupedIO("close", { operation: "close",
+  return { operation: "close",
     gate: { root: config.root, specId: config.id, invocation: config.invocation,
-      loop: loop.number, attempt: descriptor.number, key: `${descriptor.key}.gate`, task: gateTask,
+      loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
       workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge },
-    seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines }, descriptor).then(transport => {
+    seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines };
+}
+function closeAttempt(descriptor, task, value) {
+  const savedReceipt = descriptor.close?.stage === "receipt";
+  const input = closeAttemptInput(descriptor, task, value);
+  const gateTask = input.gate.task;
+  const nextBaselines = input.nextBaseline;
+  const gateKey = input.gate.key;
+  return groupedIO("close", input, descriptor).then(transport => {
     const gate = groupedStep(transport, "gate"), selected = groupedStep(transport, "seal");
-    if (!validGateReceipt(gate.receipt, gateTask, value.status) ||
+    const view = transport.projection.view ?? (descriptor.gate?.stage === "receipt" ? invocation.currentView : null);
+    if (!validGateReceipt({ ...gate.receipt, view }, gateTask, value.status) ||
         gate.contextPeak !== null && (!Number.isSafeInteger(gate.contextPeak) || gate.contextPeak < 0) ||
         transport.projection.contextPeak !== gate.contextPeak)
       throw new Error("Close lacks a valid gate receipt.");
@@ -2144,7 +2636,7 @@ function closeAttempt(descriptor, task, value) {
         !same(candidate(selected.after), candidate(gate.receipt.after)))
       throw new Error("Close seal selection differs from workflow evidence.");
     receiptReference(selected.gate);
-    descriptor.gate = { key: `${descriptor.key}.gate`, stage: "receipt", ref: clone(descriptor.close.ref),
+    descriptor.gate = { key: gateKey, stage: "receipt", ref: clone(descriptor.close.ref),
       receipt: { ...gate.receipt, contextPeak: transport.projection.contextPeak } };
     const requests = groupedStep(transport, "nextRequests"), baseline = groupedStep(transport, "nextBaseline");
     const earlier = groupedStep(transport, "requests");
@@ -2163,8 +2655,9 @@ function closeAttempt(descriptor, task, value) {
     }
     currentCandidate = candidate(gate.receipt.after);
     loop.metricSeries = clone(gate.receipt.progress);
-    invocation.currentView = clone(gate.receipt.view);
-    invocation.boardTopicId = gate.receipt.view.topicId;
+    invocation.currentView = clone(view);
+    invocation.boardTopicId = invocation.currentView.topicId;
+    delete transport.projection.view;
     return observeGroupedRequests(transport, true, requests).then(() => {
       descriptor.foldedNextBaseline = variant ? admitBaseline(nextBaselines[variant], baseline) : null;
       return save();
@@ -2176,9 +2669,10 @@ const taskReviewFinding = object({
   evidence: string,
 });
 taskReviewFinding.properties.predatesTask = { type: "boolean" };
+const TASK_REVIEW_FINDINGS_MAX = 8;
 const taskReviewAnswer = object({
   verdict: string, score: { type: "integer", minimum: 0, maximum: 10 },
-  findings: { type: "array", items: taskReviewFinding },
+  findings: { type: "array", maxItems: TASK_REVIEW_FINDINGS_MAX, items: taskReviewFinding },
 });
 const taskReviewSchema = object({
   completeness: taskReviewAnswer, correctness: taskReviewAnswer, scope: taskReviewAnswer,
@@ -2193,7 +2687,7 @@ function taskReviewProjection(value, reference, carried) {
   for (const name of questions) {
     const answer = value?.[name];
     if (!Number.isInteger(answer?.score) || answer.score < 0 || answer.score > 10 ||
-        !text(answer.verdict) || !Array.isArray(answer.findings) ||
+        !text(answer.verdict) || !Array.isArray(answer.findings) || answer.findings.length > TASK_REVIEW_FINDINGS_MAX ||
         answer.score < 10 && !answer.findings.length) throw new Error("Invalid anchored task review answer.");
     scores[name] = answer.score;
     for (const finding of answer.findings) {
@@ -2201,16 +2695,30 @@ function taskReviewProjection(value, reference, carried) {
           typeof finding.introducedByDelta !== "boolean" || typeof finding.affectsTask !== "boolean")
         throw new Error("Invalid task review finding.");
       (finding.introducedByDelta || finding.affectsTask || carried && finding.predatesTask !== true
-        ? blocking : notes).push(finding.summary.slice(0, 256));
+        ? blocking : notes).push(retainedText(finding.summary, { units: 256, bytes: 768 }));
     }
   }
   if (typeof value.conflict !== "boolean") throw new Error("Invalid task review conflict.");
   return { scores, admitted: Object.values(scores).every(score => score >= 9) && !blocking.length && !value.conflict,
     blocking, conflict: value.conflict, notes: notes.length ? reference : null,
     ...(Array.isArray(value.remaining) && value.remaining.every(text)
-      ? { remaining: value.remaining.slice(0, 4).map(item => item.slice(0, 256)) } : {}),
-    ...(text(value.diagnosis) ? { diagnosis: value.diagnosis.slice(0, 360) } : {}),
-    ...(text(value.revival) ? { revival: value.revival.slice(0, 360) } : {}) };
+      ? { remaining: value.remaining.slice(0, 4).map(item => retainedText(item, { units: 256, bytes: 768 })) } : {}),
+    ...(text(value.diagnosis) ? { diagnosis: excerpt(value.diagnosis) } : {}),
+    ...(text(value.revival) ? { revival: excerpt(value.revival) } : {}) };
+}
+function reviewProjection(reference) {
+  if (!reference) return undefined;
+  // Retained pre-deduplication intentions and ledger bodies keep their original bytes.
+  const projection = reference.projection ?? frameProjection("reviewProjections", reference.key);
+  if (!projection) throw new Error(`Missing task review projection: ${reference.key}.`);
+  return projection;
+}
+function taskReviewRepair() {
+  const repair = invocation.taskFrame?.reviewRepair;
+  if (!repair || repair.blocking) return repair;
+  const verdict = reviewProjection(repair.source);
+  return { ...repair, blocking: verdict.blocking, remaining: verdict.remaining ?? verdict.blocking,
+    diagnosis: verdict.diagnosis ?? "", revival: verdict.revival ?? "" };
 }
 function reviewTask(descriptor, task) {
   const review = descriptor.taskReview ??= {};
@@ -2230,7 +2738,8 @@ function reviewTask(descriptor, task) {
       }), Promise.resolve()));
   })() : Promise.resolve();
   descriptor.delta ??= { key: `${descriptor.key}.delta`, retry: 0, stage: "intention" };
-  const intents = [...new Map([...(invocation.taskFrame.reviewIntents ?? []), ...(invocation.taskFrame.sources ?? []), descriptor.checkpoint]
+  const intents = [...new Map([...(invocation.taskFrame.reviewIntents ?? []).map(frameIntent),
+    ...(invocation.taskFrame.sources ?? []).map(frameIntent), descriptor.checkpoint]
     .map(intent => [intent.key, intent])).values()].sort((a, b) => a.attempt - b.attempt);
   return access.then(() => loopIO("delta", { operation: "taskDelta", root: config.root, invocation: config.invocation,
     intents }, descriptor)).then(delta => {
@@ -2266,6 +2775,8 @@ correctness against achieving the result without introducing failures; scope aga
 specRefs and the spec Scope/Exclusions. Scope limits edit locations, not required outcomes.
 Distinguish correctness from sufficiency; verify every required task outcome against current evidence.
 For each question give a verdict, score 0-10, and concrete source-evidenced findings.
+Return at most ${TASK_REVIEW_FINDINGS_MAX} findings per question. Above that cap, consolidate related findings
+without dropping blocking outcomes or their evidence; cite complete originals for supporting detail.
 Anchors: 10 = fully satisfied, no finding; 9 = satisfied with minor concrete non-blocking findings;
 7-8 = material unmet outcome; 4-6 = major defects; 0-3 = absent or fundamentally wrong.
 Every score below 10 requires a concrete finding. Every finding states introducedByDelta,
@@ -2274,12 +2785,12 @@ Inherited-only findings never block: prove they predate the task and do not affe
 Uncertain provenance blocks; carried task defects affecting its result block regardless of origin.
 For inherited findings set predatesTask true only with concrete evidence they predate the task;
 otherwise set it false. On rejection provide remaining, diagnosis and revival for the repair.
-Prior blocking findings and synthesis original: ${JSON.stringify(invocation.taskFrame.reviewRepair ?? null)}.
+Prior blocking findings and synthesis original: ${JSON.stringify(taskReviewRepair() ?? null)}.
 When repairing, review the whole slot delta and verify every prior blocking finding is closed.
 Report conflict when expectedResult requires a spec exclusion. No unrelated improvements.
 Finish with structured_output.`;
     return ["reviewer", "synthesis"].reduce((previous, stage) => previous.then(() => {
-      const childKey = `${descriptor.key}.task-${stage}`;
+      const childKey = `${generationKey(descriptor.key, `task-${stage}`)}.task-${stage}`;
       if (review[stage]) return;
       const prior = stage === "synthesis" ? review.reviewer : null;
       return analysisDispatch([{ key: childKey, agent: "pitako.reviewer", context: "fresh",
@@ -2303,14 +2814,13 @@ Admit only if all three scores >=9 and no introduced or task-outcome finding blo
         if (!path || !text(result.runId)) throw new Error("Task review original was not published.");
         const body = clone(result.structuredOutput);
         const reference = { key: childKey, runId: result.runId, path, digest: canonicalDigest(body) };
-        review[stage] = { ...reference, projection: taskReviewProjection(body, reference, carried) };
-        if (stage === "synthesis" && !review[stage].projection.admitted) {
-          const verdict = review[stage].projection;
+        const projection = taskReviewProjection(body, reference, carried);
+        (invocation.taskFrame.reviewProjections ??= {})[childKey] = projection;
+        review[stage] = reference;
+        if (stage === "synthesis" && !projection.admitted) {
           const repair = invocation.taskFrame.reviewRepair;
-          invocation.taskFrame.reviewRepair = { ...repair, source: reference, blocking: verdict.blocking,
-            remaining: verdict.remaining ?? verdict.blocking, diagnosis: verdict.diagnosis ?? "",
-            revival: verdict.revival ?? "",
-            exhausted: !!repair?.attempt || verdict.conflict };
+          invocation.taskFrame.reviewRepair = { ...(repair?.attempt ? { attempt: repair.attempt } : {}), source: reference,
+            exhausted: !!repair?.attempt || projection.conflict };
         }
         return save();
       });
@@ -2320,6 +2830,8 @@ Admit only if all three scores >=9 and no introduced or task-outcome finding blo
 // Only the active root can turn the settled result and its saved gates into a seal.
 function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   if (loop.attempt.stage === "result") throw new Error("Duplicate attempt admission rejected.");
+  // Replay must check the observed native reference before any close or review.
+  if (descriptor.referenceCapacity) nativeReference(descriptor.key, result);
   let structural;
   try { structural = workerValue(result, descriptor, task, statusRef); } catch (error) {
     if (!error?.reportRejection) throw error;
@@ -2348,7 +2860,7 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   const definitions = task.gates ?? task.checks;
   const passed = receipt && !receipt.mutated && receipt.gates.length === definitions.length &&
     definitions.every(gate => receipt.gates.some(result => result.id === gate.id && result.status === "pass"));
-  const admittedReview = descriptor.taskReview?.synthesis?.projection;
+  const admittedReview = reviewProjection(descriptor.taskReview?.synthesis);
   const repair = invocation.taskFrame.reviewRepair;
   if (repair?.attempt && (structural.rejection || structural.value.status !== "complete" ||
       !passed || admittedReview?.admitted === false)) repair.exhausted = true;
@@ -2369,7 +2881,7 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
     : save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
     task: JSON.stringify({ v: 1, intent, kind,
       ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
-        const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+        const source = frameIntent(sourceKey);
         if (!source) throw new Error("Missing authenticated restoration source intent.");
         return source;
       }) } : {}) }), cwd: config.root, context: "fresh", output: false, outputMode: "inline",
@@ -2477,16 +2989,31 @@ function archiveProjection(value) {
   return JSON.parse(JSON.stringify(value, (name, child) =>
     ["halt", "interruption", "interruptions", "currentBarrier", "hostHalt", "failedHostObservation"].includes(name) ? undefined : child));
 }
-function prepareSeal(projected) {
-  invocation.sealPending = { expected: clone(invocation.ledger), record: { kind: "unit", loop: loop.number,
+function sealRecord(projected) {
+  const frame = clone(invocation.taskFrame);
+  const pending = [invocation.sealPending?.record,
+    ...(invocation.intentions ?? []).filter(entry => entry.operation === "ledger").map(entry => entry.input.record)];
+  for (const collection of ["reviewProjections", "workerKnowledge"]) {
+    const sources = pending.filter(record => record?.kind === "unit" && record.body.taskId === projected.taskId)
+      .map(record => record.body.frame?.[collection]).filter(Boolean);
+    if (frame[collection]) sources.push(frame[collection]);
+    if (sources.length) frame[collection] = Object.assign({}, ...sources);
+  }
+  return { kind: "unit", loop: loop.number,
     body: archiveProjection({ taskId: projected.taskId, attempt: projected.attempt, result: clone(projected),
       // `result` is this attempt. An earlier result confirmed by its own seal is
       // already that unit record's result, so it is cited; an unsealed one is archived here.
       results: clone(loopResults().filter(item => item.taskId === projected.taskId && item.attempt !== projected.attempt)
         .map(item => item.checkpoint?.confirmation ? { taskId: item.taskId, attempt: item.attempt, status: item.status,
           sealed: { key: item.ref.key, digest: item.checkpoint.confirmation.digest } } : item)),
-      frame: clone(invocation.taskFrame), recoveries: clone(loop.recoveries),
-      checkpoint: clone(invocation.lastConfirmed) }) } };
+      frame, recoveries: clone(loop.recoveries),
+      checkpoint: clone(invocation.lastConfirmed) }) };
+}
+function prepareSeal(projected) {
+  invocation.sealPending = { expected: clone(invocation.ledger), record: sealRecord(projected) };
+  // The frozen unit owns these bodies until admission; live consumers cite it.
+  delete invocation.taskFrame.reviewProjections;
+  delete invocation.taskFrame.workerKnowledge;
 }
 function loopResults(strict = true) {
   return loop.results.map(entry => {
@@ -2499,6 +3026,92 @@ function loopResults(strict = true) {
     }
     return result;
   });
+}
+function reportResult(result) {
+  const fields = ["taskId", "attempt", "status", "ref", "workDone", "remaining", "remainingCount",
+    "diagnosis", "candidate", "checks"];
+  return {
+    ...Object.fromEntries(fields.filter(field => result[field] !== undefined).map(field => [field, result[field]])),
+    ...(result.taskReview ? { taskReview: Object.fromEntries(["reviewer", "synthesis"]
+      .filter(stage => result.taskReview[stage])
+      .map(stage => [stage, Object.fromEntries(["key", "runId", "path", "digest"]
+        .map(field => [field, result.taskReview[stage][field]]))])) } : {}),
+  };
+}
+function sealedResult(result) {
+  return { ...reportResult(result), checkpoint: result.checkpoint, sealed: result.sealed };
+}
+// Only a verified ledger admission makes the dropped result fields durable.
+function compactSealedAttempts(body) {
+  // Published projections remain in that unit record; only live verdict/repair inputs stay here.
+  const live = [invocation.taskFrame?.reviewRepair?.source?.key,
+    ...Object.values(loop.attempt?.taskReview ?? {}).map(ref => ref?.key)];
+  const liveKnowledge = [loop.attempt?.result?.knowledge?.key,
+    ...Object.values(invocation.tasks).map(task => task.last?.knowledge?.key)];
+  if (invocation.taskFrame) {
+    for (const [collection, keys] of [["reviewProjections", live], ["workerKnowledge", liveKnowledge]]) {
+      const projections = invocation.taskFrame[collection] ??= {};
+      for (const [projectionKey, projection] of Object.entries(body.frame?.[collection] ?? {})) {
+        if (keys.includes(projectionKey)) projections[projectionKey] ??= clone(projection);
+        else delete projections[projectionKey];
+      }
+    }
+  }
+  // Frozen archives rebuild these exact result bytes until loop-ledger admission.
+  if (loop.archivePending || loop.archiveQueued) return;
+  const sealed = [body.result, ...(body.results ?? [])];
+  loop.results = loopResults().map((entry, index) => {
+    const published = sealed.find(result => result.taskId === entry.taskId && result.attempt === entry.attempt);
+    const digest = published?.sealed?.digest ?? published?.checkpoint?.confirmation?.digest;
+    if (!digest || !entry.checkpoint?.confirmation) return loop.results[index];
+    return entry.taskId === loop.attempt?.taskId && entry.attempt === loop.attempt?.number
+      ? loop.results[index] : sealedResult({ ...entry, sealed: { key: entry.ref.key, digest } });
+  });
+}
+function compactArchivedLoop() {
+  const pick = (value, fields) => Object.fromEntries(fields.filter(field => value?.[field] !== undefined)
+    .map(field => [field, value[field]]));
+  const attempt = loop.attempt;
+  // Closed does not mean disposable: failed workers and pause results still feed inspection.
+  const inspecting = loop.phase === "implementation" &&
+    (attempt?.checkpoint || attempt?.restore?.checkpoint || attempt?.restore?.sourceKeys) &&
+    (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status));
+  const results = loopResults().map(result => ({
+    ...reportResult(result),
+    ...(inspecting && result.checkpoint ? { checkpoint: result.checkpoint } : {}),
+  }));
+  const retained = pick(loop, ["number", "kind", "phase", "outcome", "startedAt", "endedAt", "archived",
+    "cursor", "manifest", "task", "review", "compliance", "closing", "halt", "resolutions", "invalidated",
+    "usage", "usageSummary", "metricSeries", "nextAdvance", "retired", "analysisGenerations"]);
+  retained.results = results;
+  if (loop.plan) retained.plan = pick(loop.plan, ["stage", "ref", "rejection"]);
+  if (loop.prepare) retained.prepare = pick(loop.prepare, ["key", "stage", "receipt"]);
+  if (loop.settlement) retained.settlement = pick(loop.settlement, ["applied"]);
+  if (attempt) {
+    retained.attempt = pick(attempt, ["key", "taskId", "stage", "launch", "number", "revival", "capturedPaths"]);
+    if (attempt.gate) retained.attempt.gate = {
+      ...pick(attempt.gate, ["key", "stage"]),
+      ...(attempt.gate.receipt ? { receipt: pick(attempt.gate.receipt, ["gates"]) } : {}),
+    };
+    if (attempt.delta) retained.attempt.delta = pick(attempt.delta, ["key", "stage"]);
+    if (attempt.result) retained.attempt.result = pick(attempt.result, ["status"]);
+    if (inspecting) {
+      if (attempt.checkpoint) retained.attempt.checkpoint = attempt.checkpoint;
+      if (attempt.restore) retained.attempt.restore = {
+        ...pick(attempt.restore, ["checkpoint", "sourceKeys"]),
+        ...(attempt.restore.authority?.confirmedUnit !== undefined
+          ? { authority: { confirmedUnit: attempt.restore.authority.confirmedUnit } } : {}),
+      };
+      if (attempt.result) retained.attempt.result = pick(attempt.result, ["status", "checkpoint"]);
+    }
+  } else if (attempt === null) retained.attempt = null;
+  // Resolve report pointers before removing the task-owned bodies.
+  for (const task of Object.values(invocation.tasks)) {
+    for (const field of ["last", "completed"])
+      if (task[field]) task[field] = pick(task[field], ["taskId", "attempt"]);
+  }
+  Object.keys(loop).forEach(field => delete loop[field]);
+  Object.assign(loop, retained);
 }
 function bodyIdentity(body) {
   const encoded = JSON.stringify(body);
@@ -2532,7 +3145,7 @@ function frozenLoopRecord(number, archive) {
 function loopArchive(frozen) {
   const body = {};
   for (const field of ["number", "cursor", "manifest", "plan", "attempt", "results",
-    "recoveries", "analysisCalls", "review", "compliance", "candidate", "resolutions", "usage"]) {
+    "recoveries", "analysisCalls", "review", "compliance", "candidate", "resolutions", "usage", "retired", "analysisGenerations"]) {
     const value = field === "results" ? loopResults()
       : frozen && ["usage", "resolutions"].includes(field) ? frozen[field] : loop[field];
     if (value !== undefined) body[field] = archiveProjection(value);
@@ -2618,8 +3231,6 @@ function archiveSeal(pending = invocation.sealPending) {
       record: { kind: pending.record.kind, loop: pending.record.loop }, intentionKey: sealKey };
   } else {
     invocation.sealPending = null;
-    loop.results = loop.results.filter(entry => !entry.ref ||
-      same(invocation.tasks[entry.taskId]?.last, entry) || same(entry.ref, invocation.lastConfirmed.resultRef));
     const cited = JSON.stringify(loop.resolutions ?? []);
     loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
     if (pending.record.body.result.status === "complete") {
@@ -2690,8 +3301,7 @@ function legacyArchiveSeal(pending = invocation.sealPending) {
           throw error;
         });
       }
-      loop.results = loop.results.filter(entry => !entry.ref ||
-        same(invocation.tasks[entry.taskId]?.last, entry) || same(entry.ref, invocation.lastConfirmed.resultRef));
+      compactSealedAttempts(pending.record.body);
       const cited = JSON.stringify(loop.resolutions ?? []);
       loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
       if (pending.record.body.result.status === "complete") {
@@ -2771,6 +3381,7 @@ function loopReport(status, reason) {
     type: "execution-loop", invocation: config.invocation, loop: loop.number, maxLoops: maxCycles(),
     status: exhausted ? "partial" : status, reason, phase: loop.phase, candidate: loop.closing?.candidate ?? last?.candidate ?? null,
     boardTopicId: invocation?.boardTopicId ?? null,
+    timeouts: timeoutReport(),
     cancelledScope: cancelledScope(), originalProblem: originalProblem(),
     halt: loop.halt ?? null, history: { summaries: invocation.loopSummaries, ...historyReference() },
     elapsedMs: (loop.endedAt ?? now) - loop.startedAt, totalElapsedMs: now - invocation.startedAt,
@@ -2813,15 +3424,20 @@ function action(status, reason) {
   const required = status !== "complete";
   const exhausted = !persistenceFailed && !loop?.halt && status === "partial" &&
     invocation?.consumedLoops >= maxCycles();
+  const coordinatorHalt = !persistenceFailed && !hostHalt &&
+    !retainedResolutions().some(item => item.currentBarrier) &&
+    reason === loop?.halt?.reason && ["timeout", "state-capacity"].includes(loop?.halt?.code);
   return {
     actor: !required ? "none" : persistenceFailed ? "persistence operator" : exhausted ? "human"
       : hostHalt ? "native run operator"
+      : coordinatorHalt ? "foreground"
       : loop?.halt?.code === "recovery" ? "evidence owner"
       : loop?.halt?.code === "semantic-block" ? "task owner"
       : loop?.halt ? "native run operator" : "active root",
     operation: !required ? "close" : persistenceFailed ? "restore essential persistence; no dispatch authorized"
       : hostHalt ? "reconcile the retained host observation through bounded read-only reconstruction under native policy; observed barriers still govern effects"
       : exhausted ? "authorize a new invocation"
+      : coordinatorHalt ? loop.halt.reason
       : loop?.halt ? "resolve the concrete retained impediment; no replacement dispatch"
       : "perform the next existing phase under native authority",
     reason, references: [hostHalt?.ref, resolution?.currentBarrier?.ref, loop?.halt?.ref, loop?.recoveries?.at(-1)?.ref,
@@ -2852,6 +3468,34 @@ function finishBudgetExhaustion() {
   return save().then(() => finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
     "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.", true));
 }
+function blockWorkerReferenceCapacity(error) {
+  // The oversized reference remains in native storage. Only its frozen worker
+  // key and bounded byte counts enter mission state; the worker is not retried.
+  const halt = { status: "blocked", code: "state-capacity", reason: String(error.message),
+    referenceCapacity: clone(error.workerReferenceCapacity) };
+  return finishStateCapacity(halt);
+}
+function finishStateCapacity(halt = loop.halt) {
+  // Persist the disposition before publication; replay drains the same intentions.
+  loop.halt = halt;
+  return save().then(() => invocation.sealPending ? archiveSeal() : undefined).then(() =>
+    invocation.intentions?.length ? groupedIO("finishDrain", { operation: "drain" }, invocation).then(() => {
+      invocation.finishDrain.receipt = receiptReference(invocation.finishDrain.receipt);
+      delete invocation.finishDrain.input;
+    }) : undefined).then(() => {
+    loop.halt = halt;
+    return save();
+  }).then(() => finish("blocked", halt.reason, true)).catch(error => {
+    // Associated capacity-drain replay can observe a barrier before admission.
+    if (!error?.nativeBarrier || persistenceFailed) throw error;
+    if (loop.attempt) loop.attempt.interruption ??= clone(halt);
+    loop.halt = { code: "native-barrier",
+      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+      cause: error.nativeBarrier, reason: String(error.message),
+      ref: clone(error.nativeReference ?? loop.halt?.ref ?? invocation.finishDrain?.ref ?? { key }) };
+    return save().then(() => { throw error; });
+  });
+}
 function finish(status, reason, drained = false) {
   // Early blocks before admission validation promise no dispatch: retained intentions stay unchanged.
   if (!drained && admissionValidated && status !== "budget-exhausted" && !persistenceFailed && (!loop?.halt || ["semantic-block", "needs-decision"].includes(loop.halt.code)) &&
@@ -2880,6 +3524,7 @@ function finish(status, reason, drained = false) {
     status, heading: exceptions.length ? "Execution complete with exceptions" : `Execution ${status}`,
     ...(exceptions.length ? { exceptions } : {}), reason, invocation: config.invocation,
     missionId: config.missionId, missionPath: config.missionPath, boardTopicId: invocation?.boardTopicId ?? null,
+    timeouts: timeoutReport(),
     loopsConsumed: invocation?.consumedLoops ?? 0, maxLoops: maxCycles(),
     elapsedMs: Number.isFinite(invocation?.startedAt) ? Date.now() - invocation.startedAt : null, tokens: metrics(),
     phase: loop?.phase ?? "admission", candidate: loop?.closing?.candidate ?? currentCandidate ?? null,
@@ -2891,6 +3536,10 @@ function finish(status, reason, drained = false) {
   };
 }
 try {
+  if (config.timeouts !== undefined && (!config.timeouts || typeof config.timeouts !== "object" ||
+      Array.isArray(config.timeouts) || Object.entries(config.timeouts).some(([name, ms]) =>
+        !["reviewerMs", "workerMs", "gateFloorMs"].includes(name) || !Number.isSafeInteger(ms) || ms < 1 || ms > 86400000)))
+    return finish("blocked", "Expected timeouts {reviewerMs?, workerMs?, gateFloorMs?}: safe integers in 1..86400000, no unknown keys.");
   if ((config.unblock !== undefined || config.resolution !== undefined) &&
       (config.unblock !== true || !config.resolution ||
         Object.keys(config.resolution).sort().join(",") !== "loop,text" ||
@@ -2899,7 +3548,7 @@ try {
     return finish("blocked", "--unblock requires current human resolution: {loop, text}.");
   if (!text(config.missionId) || !text(config.missionPath) || !text(config.invocation))
     return finish("blocked", "Existing native missionId and actually returned missionPath are required.");
-  invocation = await state.get(key);
+  invocation = expandWorkerReferences(await state.get(key));
   // Incompatible retained state fails before any resume or dispatch.
   if (!Number.isSafeInteger(config.stateVersion)) return finish("blocked", "Missing resolved execute state contract version.");
   if (invocation && invocation.version !== config.stateVersion)
@@ -2930,18 +3579,43 @@ try {
   if (legacy && (legacy.version !== invocation?.version || !same(legacy.association, invocation?.association) ||
       legacy.association.invocation !== config.invocation))
     return finish("blocked", "Native mission already belongs to another immutable invocation; no replacement writer dispatched.");
+  if (loop?.halt?.code === "state-capacity") return await (invocation.sealPending || invocation.intentions?.length
+    ? finishStateCapacity() : finish("blocked", loop.halt.reason, true));
+  if (invocation?.association) await updateTimeouts();
   if (!config.unblock && loop?.halt?.code === "repeat-acceptance")
     return finish(loop.halt.status, loop.halt.reason);
+  let admissionObservation;
+  const resolvedHost = hostHalt && !["queued", "running", "pending"].includes(hostHalt.observedState) &&
+    (invocation.hostReconstruction?.stage === "admitted" && same(invocation.hostReconstruction.source, hostHalt) &&
+        !hostHalt.observedBarrier && hostHalt.status !== "cancelled" && !["stopped", "interrupted"].includes(hostHalt.observedState) ||
+      retainedResolutions().some(item => ["accepted", "applied"].includes(item.stage) &&
+        !item.failedHostObservation && same(item.hostHalt, hostHalt)));
+  // Operational input never clears a retained native/human/host barrier.
+  if (loop?.halt?.code === "timeout" && (!hostHalt || resolvedHost) &&
+      !retainedResolutions().some(item => item.currentBarrier)) {
+    if (resolvedHost) hostHalt = undefined;
+    if (["gate-transport", "final-acceptance"].includes(loop.halt.class)
+      ? effectiveTimeouts().gateFloorMs > 0 : (loop.halt.class === "worker"
+        ? effectiveTimeouts().workerMs : effectiveTimeouts().reviewerMs) > loop.halt.launchedMs) {
+      // Verify resolve's retained originals before retirement changes their projection.
+      admissionObservation = await host(config.inspections[0]);
+      if (text(admissionObservation.error))
+        throw new Error([admissionObservation.error, admissionObservation.next].filter(Boolean).join(" "));
+      const captured = capture(admissionObservation);
+      if (loop.halt.class === "worker") checkpointObservation = captured.metadata.checkpointObservation;
+    }
+    const workerRenewal = loop.halt.class === "worker";
+    await renewAnalysisTimeout();
+    await renewGateTimeout();
+    await renewWorkerTimeout();
+    if (loop.halt?.code === "timeout") return finish(loop.halt.status, loop.halt.reason);
+    if (workerRenewal) admissionObservation = undefined;
+  }
   if (!config.unblock && invocation?.lastBudgetProgress) {
     if (loop?.halt) return finish(loop.halt.status, loop.halt.reason);
     const blockedResolution = retainedResolutions().find(item => item.currentBarrier);
     if (blockedResolution) return finish(["stopped", "interrupted"].includes(blockedResolution.currentBarrier.cause) ? "cancelled" : "blocked",
       `Current continuation encountered a native barrier: ${blockedResolution.currentBarrier.cause}; this input does not authorize another interruption.`);
-    const resolvedHost = hostHalt && !["queued", "running", "pending"].includes(hostHalt.observedState) &&
-      (invocation.hostReconstruction?.stage === "admitted" && same(invocation.hostReconstruction.source, hostHalt) &&
-          !hostHalt.observedBarrier && hostHalt.status !== "cancelled" && !["stopped", "interrupted"].includes(hostHalt.observedState) ||
-        retainedResolutions().some(item => ["accepted", "applied"].includes(item.stage) &&
-          !item.failedHostObservation && same(item.hostHalt, hostHalt)));
     if (hostHalt && !resolvedHost) return finish(hostHalt.status, hostHalt.reason);
   }
   const sealBarrier = invocation?.sealPending && loop?.halt?.code === "native-barrier" &&
@@ -3021,7 +3695,7 @@ try {
     hostHalt = undefined;
   }
   if (hostHalt) return finish("blocked", hostHalt.reason);
-  const current = await host(config.inspections[0]);
+  const current = admissionObservation ?? await host(config.inspections[0]);
   if (text(current.error)) throw new Error([current.error, current.next].filter(Boolean).join(" "));
   const captured = capture(current);
   let metadata = captured.metadata;
@@ -3067,6 +3741,7 @@ try {
       ...(requestState?.hostReconstruction ? { hostReconstruction: requestState.hostReconstruction } : {}),
     };
     if (metadata.root !== config.root) throw new Error("Designated worktree mismatch.");
+    await updateTimeouts();
     await save();
   } else {
     replay = true;
@@ -3266,7 +3941,10 @@ try {
   }
   while (true) {
     if (loop?.outcome === "gaps" && !loop.archived) await archiveGaps();
-    if (loop?.outcome && invocation.intentions?.length && invocation.consumedLoops < maxCycles()) {
+    // Reconcile transition requests even when their prepare was already saved.
+    if (loop?.outcome && (invocation.intentions?.length || invocation.pendingCancellations?.length ||
+        loop.cancellationInput || loop.nextAdvance && !invocation.preparedNext) &&
+        invocation.consumedLoops < maxCycles()) {
       await advanceLoop("nextAdvance", loop.number + 1);
       if (loop.halt) return finish(loop.halt.status, loop.halt.reason);
     }
@@ -3401,7 +4079,10 @@ Publish one selection with the native output binding then END. Native permission
       loop.task = applied.selected;
       if (loop.kind === "final") {
         // One retained copy: the selection receipt's copy only bridges this admission.
-        loop.acceptance = applied.acceptance; loop.completedTasks = applied.completedTasks;
+        loop.acceptance = applied.acceptance; loop.acceptanceHistory = applied.acceptanceHistory;
+        loop.completedTasks = applied.completedTasks;
+        delete loop.selection.receipt.acceptance;
+        delete loop.selection.receipt.acceptanceHistory;
         delete loop.selection.receipt.completedTasks;
       }
       loop.metricSeries = clone(applied.selected?.progress ?? { nonImproving: 0, last5: [] });
@@ -3470,13 +4151,13 @@ Publish one selection with the native output binding then END. Native permission
           let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
             confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
           if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
-            const source = pauseSource ?? { checkpoint: clone(invocation.taskFrame.sources.at(-1)),
+            const source = pauseSource ?? { checkpoint: clone(frameIntent(invocation.taskFrame.sources.at(-1))),
               confirmation: clone(loop.attempt.restore.authority.confirmedPause) };
             pauseSource = source;
           }
           if (pauseSource && !invocation.taskFrame.restorationKeys.includes(loop.attempt.checkpoint.key)) {
             invocation.taskFrame.restorationKeys.unshift(loop.attempt.checkpoint.key);
-            (invocation.taskFrame.sources ??= []).unshift(clone(loop.attempt.checkpoint));
+            retainFrameIntent(loop.attempt.checkpoint, "sources", true);
           }
           const source = loop.attempt;
           const repair = invocation.taskFrame.reviewRepair;
@@ -3487,6 +4168,7 @@ Publish one selection with the native output binding then END. Native permission
               halt: loop.halt, revivalContextPeak: invocation.revivalContextPeak }, peak), peak };
           if (repair) Object.assign(revival, { decision: "fresh", code: "task-review-repair" });
           loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
+            timeoutMs: effectiveTimeouts().workerMs,
             revival, ...(revival.decision === "resume" && !repair ? { resume: source.launch.runId,
               bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
               boardPostIds: source.boardPostIds ?? [] } : {}),
@@ -3522,6 +4204,7 @@ Publish one selection with the native output binding then END. Native permission
           continue;
         } else if (!loop.attempt) {
           loop.attempt = { taskId: task.id, index: loop.cursor, number: 1,
+            timeoutMs: effectiveTimeouts().workerMs,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a1`, stage: "intention", continuationRef: null };
           await save();
         }
@@ -3554,12 +4237,17 @@ Publish one selection with the native output binding then END. Native permission
         if (loop.attempt.restore) {
           const restoredFrom = await observeStatus(loop.attempt.restore.producer.runId ?? loop.attempt.restore.producer.key, true);
           assertFallbackProducer(restoredFrom, loop.attempt.restore.producer);
+          if (loop.attempt.timeoutGeneration) {
+            const cause = analysisBarrier(restoredFrom, loop.attempt.restore.producer.runId);
+            if (cause) throw nativeBarrier(cause, loop.attempt.restore.producer);
+          }
 
           // Persist before launch; replay observes this exact key, never replaces it.
           delete loop.attempt.restore.undispatched;
           await save();
         }
         // Hook identity must be durable while the worker is running, not only after it settles.
+        await observeWorkerStateCapacity();
         loop.attempt.bindingKey ??= loop.attempt.key;
         const posts = invocation.currentView?.posts ?? [];
         const newPosts = posts.filter(post => !(loop.attempt.boardPostIds ?? []).includes(post.id));
@@ -3567,9 +4255,15 @@ Publish one selection with the native output binding then END. Native permission
         delete loop.attempt.undispatched;
         loop.attempt.stage = "launched";
         await save();
+        const capacity = workerStateCapacity();
+        if (capacity.total > 262144) return await finishStateCapacity({
+          status: "blocked", code: "state-capacity", capacity,
+          reason: `Worker state capacity U + S + K + R = ${capacity.total} > 262144 bytes ` +
+            `(U=${capacity.U}, S=${capacity.S}, K=${JSON.stringify(capacity.K)}, R=${capacity.R}); use a new mission.`,
+        });
         const descriptor = clone(loop.attempt);
         if (descriptor.restore) descriptor.restore.checkpoint = descriptor.restore.sourceKeys.map(sourceKey => {
-          const source = invocation.taskFrame.sources.find(item => item.key === sourceKey);
+          const source = frameIntent(sourceKey);
           if (!source) throw new Error("Missing authenticated restoration source intent.");
           return clone(source);
         });
@@ -3588,12 +4282,12 @@ Read relevant full results and check current assumptions; do not automatically r
 COMPLETE SELECTED TASK:\n${JSON.stringify(task)}
 TASK CONTINUATION (data):
 ${JSON.stringify({ metricSeries: loop.metricSeries ?? task.progress ?? null,
-  handoff: invocation.tasks[task.id]?.last?.knowledge?.handoff ?? "",
+  handoff: workerKnowledge(invocation.tasks[task.id]?.last)?.handoff ?? "",
   board: invocation.currentView ?? null,
   gateFailures: invocation.tasks[task.id]?.last?.gateFailures ?? null,
   previousResult: descriptor.continuationRef?.outputReference ?? descriptor.continuationRef?.outputArtifactPath ?? null })}
 TASK REVIEW REPAIR (blocking findings and synthesis original; read that original in full):
-${JSON.stringify(invocation.taskFrame.reviewRepair ?? null)}
+${JSON.stringify(taskReviewRepair() ?? null)}
 No other agents of this execution run concurrently. resource_snapshot is enough for host load;
 do not ask the supervisor about concurrency. Current DECISIONs are binding working rules:
 no reconfirmation is needed and they cannot expand scope. Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
@@ -3661,19 +4355,32 @@ Return structured_output after all owned journaled writes settle.`,
         if (descriptor.resume && rejectedResume(result)) {
           const rejection = { ref: nativeReference(descriptor.key, result), reason: excerpt(result.error ?? result.output) };
           // A refused child has no writes, but its authenticated baseline still belongs to the slot.
-          const intents = invocation.taskFrame.reviewIntents ??= [];
-          if (!intents.some(intent => intent.key === descriptor.key)) intents.push(clone(descriptor.checkpoint));
+          retainFrameIntent(descriptor.checkpoint, "reviewIntents");
           loop.results.push({ ...projection(descriptor.key, result), taskId: task.id, attempt: descriptor.number,
             status: "rejected", revival: { ...descriptor.revival, decision: "fresh", code: "resume-rejected" },
             diagnosis: rejection.reason });
           loop.attempt = { taskId: task.id, index: loop.cursor, number: descriptor.number + 1,
+            timeoutMs: effectiveTimeouts().workerMs,
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${descriptor.number + 1}`,
             stage: "intention", undispatched: true, continuationRef: descriptor.continuationRef,
             revival: { ...descriptor.revival, decision: "fresh", code: "resume-rejected" }, resumeRejection: rejection };
           await save();
           continue;
         }
-        loop.attempt.launch = nativeReference(descriptor.key, result);
+        const launch = nativeReference(descriptor.key, result);
+        launch.launchedMs = descriptor.timeoutMs;
+        if (nativeTimeout(result)) {
+          if (result.key && ![descriptor.key, result.runId].includes(result.key) ||
+              result.agent && result.agent !== "pitako.worker" ||
+              result.results?.some(entry => entry.agent && entry.agent !== "pitako.worker"))
+            throw new Error("Worker timeout producer identity conflicts with frozen attempt.");
+          if (result.terminalOutcome) launch.terminalOutcome = clone(result.terminalOutcome);
+          launch.results = result.results?.map(entry => Object.fromEntries(
+            ["agent", "timedOut", "terminalOutcome", "exitCode", "state", "structuredOutputPath", "savedOutputPath"]
+              .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
+        }
+        assertWorkerReferenceCapacity(launch, result);
+        loop.attempt.launch = launch;
         if (descriptor.resume && !result?.ok && !result?.runId && !barrier(result)) {
           await save();
           throw new Error("Resume failed without a definitive no-child refusal; replacement is not authorized.");
@@ -3731,10 +4438,10 @@ Return structured_output after all owned journaled writes settle.`,
       }
       if (!Array.isArray(loop.acceptance) || !loop.acceptance.length)
         throw new Error("Final phase requires non-empty acceptance commands from the backlog receipt.");
-      const acceptanceTask = { id: "final-acceptance", gates: loop.acceptance.map(command => ({ ...command,
-        timeoutMs: command.timeoutMs ?? 1800000 })), metric: null };
       const finalAttempt = loop.finalAttempt ??= { key: `${key}.l${loop.number}.acceptance`, number: 1 };
-      const exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
+      let acceptanceTask = finalAttempt.gate?.task ?? { id: "final-acceptance",
+        gates: effectiveGates(loop.acceptance), metric: null };
+      let exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
       const previous = invocation.lastFinalAcceptance;
       const reuse = !finalAttempt.freshAuthorized && previous?.loop < loop.number && same(previous.exec, exec) ? previous : undefined;
       let receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} }, reuse);
@@ -3743,6 +4450,9 @@ Return structured_output after all owned journaled writes settle.`,
         invocation.freshAcceptanceAuthorized = false;
         finalAttempt.freshAuthorized = true;
         finalAttempt.gate = { key: `${finalAttempt.key}.fresh.gate`, stage: "intention", retry: 0 };
+        acceptanceTask = { id: "final-acceptance", gates: effectiveGates(loop.acceptance), metric: null };
+        finalAttempt.gate.task = gateTaskFor(acceptanceTask);
+        exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
         await save();
         receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} });
       }
@@ -3760,6 +4470,12 @@ Return structured_output after all owned journaled writes settle.`,
       recordOriginalProblem(acceptanceTask, receipt, finalAttempt);
       const environment = acceptanceResults().blocking.filter(gate => ["timeout", "error"].includes(gate.status));
       if (environment.length) {
+        const failures = acceptanceResults().blocking.filter(gate => gate.status !== "pass" || gate.exit !== 0);
+        if (!receipt.mutated && failures.every(gate => gate.status === "timeout")) {
+          const launchedMs = Math.max(...failures.map(gate => acceptanceTask.gates.find(command => command.id === gate.id).timeoutMs));
+          await haltGateTimeout(finalAttempt, "final-acceptance", launchedMs);
+          return finish("partial", loop.halt.reason);
+        }
         loop.halt = { status: "blocked", code: "environment", reason: `Final acceptance environment failure: ${environment.map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; ")}` };
         await save(); return finish("blocked", loop.halt.reason);
       }
@@ -3813,13 +4529,14 @@ No own writer is active. Do not run checks or repair. Only clear screening permi
         target: { kind: "solution", reference: JSON.stringify(loop.candidate),
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
-      }, reviewRuns, { prefix: `${key}.l${loop.number}.review.`, mode: "execute",
+      }, reviewRuns, { prefix: reviewPrefix(), mode: "execute",
         models: invocation.reviewModels,
-        decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate },
+        decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate,
+          generation: loop.analysisGenerations?.["final-review"] ?? 1 },
         access: { missionPath: config.missionPath, namespace: `execute-${config.invocation}` },
       });
-      if (reviewBudgetError) throw reviewBudgetError;
       if (persistenceFailed) throw new Error(persistenceReason);
+      if (reviewBudgetError && loop.halt?.code !== "timeout") throw reviewBudgetError;
       // A second failed observation must not erase the original lookup refs.
       const reviewRefs = new Map((loop.review?.references ?? []).map(ref => [ref.key, ref]));
       reviewed.references.forEach(ref => reviewRefs.set(ref.key, {
@@ -3837,6 +4554,7 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       const reviewBarrier = reviewed.references.map(ref => barrier(ref)).find(Boolean);
       if (reviewBarrier) throw nativeBarrier(reviewBarrier);
       if (reviewed.nativeBarrier) throw nativeBarrier(reviewed.nativeBarrier);
+      if (loop.halt?.code === "timeout") return finish(loop.halt.status, loop.halt.reason);
       if (reviewed.status !== "completed" || reviewed.screening?.verdict === "blocked") {
         const reason = reviewed.screening?.reason ?? reviewed.error ?? "Adversarial review blocked; no compliance or repair launched.";
         loop.halt = reviewed.nativeFailure
@@ -3852,7 +4570,7 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       await save();
     }
     if (["compliance", "closing"].includes(loop.phase) && loop.review?.status === "completed") {
-      const reviewKey = `review-${key}`, retained = await state.get(reviewKey);
+      const reviewKey = reviewStateKey(), retained = await state.get(reviewKey);
       if (retained?.decision?.reference?.loop === loop.number && retained.originals.some(original => !original.sha256)) {
         const originals = retained.originals.map(original => ({ ...original,
           path: findingOutput(loop.review.references.find(ref => ref.key === original.key)).path,
@@ -3874,8 +4592,8 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       if (loop.kind !== "final" || !currentAcceptance() || loop.review?.verdict !== "clear")
         throw new Error("Final compliance requires current acceptance and clear review on the same candidate.");
       await reconcileAnalysis();
-      const completedReview = await state.get(`review-${key}`);
-      const complianceKey = `${key}.l${loop.number}.compliance`;
+      const completedReview = await state.get(reviewStateKey());
+      const complianceKey = `${generationKey(`${key}.l${loop.number}`, "compliance")}.compliance`;
       const result = await collect(complianceKey, "pitako.reviewer",
         { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
 INDIVIDUAL READ-ONLY WHOLE-SPEC COMPLIANCE ANALYSIS. You are ONE fresh analyst, not a council,
@@ -4097,6 +4815,10 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
 } catch (error) {
   let reason = String(error?.message ?? error);
+  if (error?.workerReferenceCapacity && admissionValidated && !persistenceFailed) {
+    try { return await blockWorkerReferenceCapacity(error); }
+    catch (blockedError) { error = blockedError; reason = String(blockedError?.message ?? blockedError); }
+  }
   if (canSaveBudgetExhaustion(error)) {
     try {
       return await finishBudgetExhaustion();

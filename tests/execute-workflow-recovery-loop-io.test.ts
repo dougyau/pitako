@@ -38,7 +38,8 @@ test.each(["close", "drain"])("interrupted grouped %s resumes the retained inten
   expect(host.launches.slice(count).some(call => call.key === `${retained.loop.halt.ref.key}.r1`)).toBe(true);
   expect(host.launches.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
   expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
-  expect(host.current().tasks.change1.completed.status).toBe("complete");
+  expect(host.current().tasks.change1.completed).toEqual({ taskId: "change1", attempt: 1 });
+  expect(result.loopReport.work).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 1, status: "complete" }));
   expect(host.current().intentions).toEqual([]);
 });
 
@@ -189,7 +190,8 @@ test("a cut after grouped sealing reuses the receipt without another close or wo
   expect(result.status, result.reason).toBe("partial");
   expect(host.launches.slice(count).every(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toBe(true);
   expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
-  expect(host.current().tasks.change1.completed.status).toBe("complete");
+  expect(host.current().tasks.change1.completed).toEqual({ taskId: "change1", attempt: 1 });
+  expect(result.loopReport.work).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 1, status: "complete" }));
 });
 
 test.each(["pitako.checkpoint-sealer", "pitako.execution-ledger"])("retained legacy %s references still reconcile", async agent => {
