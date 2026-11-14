@@ -10,20 +10,6 @@ const composition = realCheckoutCompositionFixture();
 const scripts = composition.scripts;
 const { fixture } = executeControllerFixture(composition.fake);
 
-test("a reviewed task uses standalone gate and seal with one trailing drain", async () => {
-  const host = fixture();
-  host.setLimit(1);
-  const output = await host.execute();
-  expect(output.status, output.reason + "\n" + host.launches.map(call => call.key).join("\n")).toBe("partial");
-  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
-    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "gate", "taskDelta",
-      "pitako.reviewer", "pitako.reviewer", "pitako.request-observer", "pitako.checkpoint-sealer", "drain"]);
-  const drain = JSON.parse(host.launches.at(-1)!.task);
-  expect(drain.intentions.map((entry: any) => entry.operation === "ledger" ? entry.input.record.kind : "settlement"))
-    .toEqual(["unit", "settlement", "loop"]);
-  expect(host.current().intentions).toEqual([]);
-});
-
 test("an incomplete attempt keeps grouped close and a folded baseline before reviewed completion", async () => {
   const host = fixture();
   host.setLimit(1);
@@ -38,9 +24,6 @@ test("an incomplete attempt keeps grouped close and a folded baseline before rev
   });
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
-  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent))
-    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker", "close", "pitako.worker",
-      "gate", "taskDelta", "pitako.reviewer", "pitako.reviewer", "pitako.request-observer", "drain", "pitako.checkpoint-sealer", "drain"]);
   const workersCalls = host.launches.filter(call => call.agent === "pitako.worker");
   expect(workersCalls[1]!.task).toContain('"attempt":2');
   const second = host.snapshots.find(state => state.loop?.attempt?.number === 2 && state.loop.attempt.checkpoint);
@@ -61,7 +44,6 @@ test("an observed no-journal pause keeps the previous unit in its next baseline"
   const second = host.snapshots.find(state => state.loop?.number === 2 && state.loop.attempt?.number === 2 && state.loop.attempt.checkpoint);
   expect(second!.loop.attempt.checkpoint.progress.admitted.change2).toEqual(["continue"]);
   expect(second!.loop.attempt.checkpoint.progress.previous).toMatchObject({ taskId: "change1", attempt: 1 });
-  expect(host.launches).toHaveLength(23);
   // Measured zero controller processes + one shared runtime, plus two.
   expectProcessBudget([host.processes(), composition.processes()], 3);
 });
@@ -173,12 +155,6 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
   expect(output.reason).toContain("1 authorized loops consumed");
-  expect(host.launches.map(call => call.agent === "pitako.loop-io" ? JSON.parse(call.task).operation : call.agent),
-    host.launches.map(call => call.key).join("\n"))
-    .toEqual(["advance", "pitako.execution-director", "selection", "pitako.worker",
-      ...(continuation ? ["close", "pitako.worker"] : []),
-      "gate", "taskDelta", "pitako.reviewer", "pitako.reviewer", "pitako.request-observer",
-      ...(continuation ? ["drain"] : []), "pitako.checkpoint-sealer", "drain"]);
   expect(host.records().map((record: any) => record.kind)).toEqual(continuation ? ["spec", "unit", "unit", "loop"] : ["spec", "unit", "loop"]);
   expect(host.current().intentions).toEqual([]);
 }));

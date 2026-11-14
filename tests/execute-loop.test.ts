@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -10,6 +10,7 @@ import { openBoard, viewEntry, BINDING_BAND_BYTES, GATE_RESERVE, viewBudget } fr
 import { recordContextPeak, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
+import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
 
 const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
 
@@ -407,44 +408,69 @@ test("SIGTERM to the real loop-io gate kills its background grandchild", async (
   const f = fixture(), t = task(), pidFile = path.join(f.root, "child.pid");
   t.gates = [{ id: "stop", command: "sleep 100 & child=$!; printf '%s %s\\n' \"$$\" \"$child\" > child.pid; wait", cwd: ".", timeoutMs: 30000 }];
   let shellPid = 0, grandchildPid = 0;
+  const readPids = () => {
+    try {
+      const pids = readFileSync(pidFile, "utf8").trim();
+      if (!/^\d+ \d+$/.test(pids)) return false;
+      [shellPid, grandchildPid] = pids.split(" ").map(Number) as [number, number];
+      return true;
+    } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+    return false;
+  };
+  const settled = (pid: number) => {
+    try { return readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[0] === "Z"; }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; return true; }
+  };
+  // Match the production external-cli runner's process.execPath, avoiding a second
+  // runtime's TypeScript startup. Node loading remains covered by the stdin cases.
+  const child = spawn(process.execPath, ["--preload", gitFakeBootstrap, path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs")], {
+    cwd: f.root, env: { ...process.env }, stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "", stderr = "";
+  child.stdout.on("data", data => { stdout += data; });
+  child.stderr.on("data", data => { stderr += data; });
+  const closed = new Promise<number | null>(resolve => child.on("close", resolve));
+  const diagnostics = () => `root=${f.root}, exit=${child.exitCode}, signal=${child.signalCode}, stdout=${stdout}, stderr=${stderr}`;
   let readyTimer: ReturnType<typeof setTimeout>;
-  let watcher: ReturnType<typeof watch>;
+  let watcher: ReturnType<typeof watch> | undefined;
   const ready = new Promise<void>((resolve, reject) => {
-    readyTimer = setTimeout(() => reject(new Error("Gate did not record its child pid")), 3000);
+    readyTimer = setTimeout(() => reject(new Error(`Gate did not record its child pid: ${diagnostics()}`)), 3000);
     watcher = watch(f.root, () => {
-      try {
-        const pids = readFileSync(pidFile, "utf8").trim();
-        if (!/^\d+ \d+$/.test(pids)) return;
-        [shellPid, grandchildPid] = pids.split(" ").map(Number) as [number, number];
-        resolve();
-      } catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") reject(error); }
+      try { if (readPids()) resolve(); } catch (error) { reject(error); }
     });
     watcher.on("error", reject);
+    child.on("error", reject);
   });
-  const child = spawn("node", [path.resolve(import.meta.dir, "../skills/execute/loop-io.mjs")], { cwd: f.root, stdio: ["pipe", "ignore", "pipe"] });
-  let stderr = "";
-  child.stderr.on("data", data => { stderr += data; });
-  const closed = new Promise<number | null>((resolve, reject) => {
-    child.on("error", reject); child.on("close", resolve);
-  });
-  child.stdin.end(JSON.stringify({ operation: "gate", ...attempt(f, { task: t }) }));
+  child.stdin.on("error", () => {}); // Early exit is reported with producer output below.
   try {
-    await Promise.race([ready, closed.then(code => { throw new Error(`loop-io exited before readiness: ${code}: ${stderr}`); })]);
+    child.stdin.end(JSON.stringify({ operation: "gate", ...attempt(f, { task: t }) }));
+    await Promise.race([ready, closed.then(() => { throw new Error(`loop-io exited before readiness: ${diagnostics()}`); })]);
     expect(grandchildPid).toBeGreaterThan(0);
     expect(child.kill("SIGTERM")).toBe(true);
     await closed;
-    let state = "";
-    try { state = readFileSync(`/proc/${grandchildPid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!; }
-    catch (error) { expect((error as NodeJS.ErrnoException).code).toBe("ENOENT"); }
-    expect(["", "Z"]).toContain(state);
+    expect(settled(grandchildPid)).toBe(true);
   } finally {
-    clearTimeout(readyTimer!); watcher!.close();
+    clearTimeout(readyTimer!); watcher?.close();
     child.kill("SIGTERM");
     await closed;
-    // Keep a failing forwarding assertion from leaking the test-owned command group.
-    if (shellPid) {
-      try { process.kill(-shellPid, "SIGKILL"); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+    let released = false;
+    try {
+      readPids(); // A readiness failure can race with the command's pid publication.
+      // Keep a failing forwarding assertion from leaking the test-owned command group.
+      if (shellPid) {
+        try { process.kill(-shellPid, "SIGKILL"); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
+        released = settled(shellPid) && settled(grandchildPid);
+      } else {
+        // After producer close, an absent command log proves runCommand never
+        // reached spawn (it opens this log first). Otherwise retain the root.
+        released = !existsSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1.gate/0.log"));
+      }
+    } finally {
+      if (!released) {
+        roots.splice(roots.indexOf(f.root), 1);
+        console.error(`Command release unconfirmed; retained diagnostic root: ${diagnostics()}`);
+      }
     }
   }
 });

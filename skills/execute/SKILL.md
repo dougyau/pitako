@@ -231,7 +231,7 @@ Choose a stable safe invocation ID for this explicit authorization; technical
 recovery keeps the same ID, mission, immutable snapshot and worktree, never
 renews consumed slots. A wake, timeout or Stop is not a new human invocation.
 
-Launch exactly ONE named background workflow (pi-subagents 0.83.0 / Pi 1.4.0):
+Launch exactly ONE named background workflow (pi-subagents 0.87.0 / Pi 1.4.0):
 
 ```js
 subagent({
@@ -255,6 +255,113 @@ Use status/mission.show only for exceptional diagnosis. Attend indispensable
 human decisions and Stop, then present native progress and the full result
 (read its exact native artifact if preview truncates). No extra model or final
 validation turn is required.
+
+## Coordinator timeouts (v9)
+
+The coordinator is the foreground session launching/relaunching `pitako.execute`,
+not the per-loop director. Execute-owned analysis dispatch defaults to
+`REVIEWER_TIMEOUT_MS = 14400000` (four hours): task reviewer/synthesis, inherited
+demand observation, compliance and final review, including resumed synthesis.
+Workers also default to four hours per attempt. This does not change standalone
+`/review` or `pre-pr`, reviewer profiles, director/inspector/access-verifier
+deadlines or non-close loop-io deadlines.
+
+Supply optional `args.timeouts` on launch, relaunch or human unblock:
+`{reviewerMs?, workerMs?, gateFloorMs?}`. Values are safe integer milliseconds in
+`1..86400000`; unknown keys, fractions and other invalid values are rejected in
+resource resolution, the launch hook and the script guard before state reads or
+dispatch. There are no timeout/capacity settings files.
+
+For example, the same launch with six-hour reviewer/worker limits and a one-hour
+gate floor is:
+
+```js
+subagent({
+  workflow: "pitako.execute", async: true, cwd: "<designated-absolute-root>",
+  args: {
+    id: "<spec-id>", root: "<same-root>", invocation: "<stable-invocation-id>",
+    missionId: "<explicit-native-mission-id>", missionPath: "<actual-returned-mission-path>",
+    timeouts: { reviewerMs: 21600000, workerMs: 21600000, gateFloorMs: 3600000 }
+  },
+  options: { missionId: "<explicit-native-mission-id>" }
+})
+```
+
+Use one launch, not both examples. Relaunch preserves the same immutable
+association, complete sources, amendments and consumed budget. Overrides are
+operational config only, never context, admission binding, association or host
+request. Given fields replace saved values; omitted fields remain sticky across
+relaunches; `timeouts: {}` resets all to defaults. An omitted `timeouts` preserves
+the current values. An essential save records `invocation.timeouts = {values,
+since: {loop, attempt}}` before dispatch. Loop/final reports show effective values
+and `since` (null before any override). Each intention freezes its effective
+timeout: a change affects only subsequently created intentions, not a running
+child or replay of an existing one.
+
+Per-command gates still default to `check.timeoutMs ?? 1800000` (30 minutes),
+including director overrides. The coordinator floor applies
+`max(command.timeoutMs ?? 1800000, gateFloorMs ?? 0)` to task gates and final
+acceptance, without changing backlog definitions/digests. Raising the floor
+prevents cross-loop acceptance reuse when effective command definitions differ.
+Gate-operation and close totals are **always** derived from the frozen gate task,
+even without overrides:
+`min(2147483647, max(14400000, sum(effective command timeouts) +
+(metric ? 1800000 : 0) + 3600000))`.
+Commands/metric run sequentially. The one-hour overhead is unmeasured; raising a
+floor does not necessarily fix a close timeout caused by overhead.
+
+### Timeout halt and operational renewal
+
+A native timeout (`results[].timedOut` or `terminalOutcome.reason === "timeout"`)
+without Stop/interruption/denial or another barrier yields `timeout`, status
+`partial`, with class, key and `launchedMs`. Relaunch the same invocation with
+the named field strictly greater than `launchedMs`: `reviewerMs` for analysis,
+`workerMs` for the restoring worker, `gateFloorMs` for gate transport/final
+acceptance. For gate transport the newly derived total must also exceed
+`launchedMs`. Equal/smaller values dispatch nothing. Follow the retained halt's
+action; if the required increase exceeds the input cap, it cannot be supplied.
+
+Renewal requires exact terminal, barrier-free native producer evidence. Before
+dispatch, an essential save retires the old reference and increments generation.
+Only the timed-out step is renewed with `.gN` keys; final review renews the whole
+read-only phase and its access receipts. Gate generations re-freeze under the
+current floor; close transport retains its `.rN` retry route. Workers use a fresh
+`a{n+1}` attempt. Each step permits at most three generations, including the
+initial one; at the cap use a new invocation, not a fourth generation.
+Final acceptance qualifies only when every blocking failure is a timeout;
+an `error` remains an environment halt.
+
+A restoring worker is renewed operationally only when that exact writer timed
+out, is terminal without a barrier and `workerMs` is strictly greater than its
+saved launch value. Other no-evidence worker recovery still requires current
+human renewal. Native terminal status is the existing retry standard, not proof
+of subprocess quiescence; timeout/Stop races and tool-deadline evidence remain
+limits. Never infer settlement from the timeout alone.
+
+Timeout input is not HUMAN authority or invocation cancellation. It never
+answers a needs-decision question, substitutes for `--unblock` human text, clears
+Stop, native denial, currentBarrier, state-capacity, spawn budget or other
+barriers, or renews consumed slots. No installed-copy hotfix is changed by this
+contract.
+
+### Whole-file state capacity
+
+Before **each worker dispatch**, a fresh loop-io stat accounts for the entire
+pretty-printed native mission state (including unrelated keys). If
+`U + S + sum(K) + R > 262144`, no writer launches: execute saves a
+`state-capacity` halt, drains pending seals and returns `blocked` with the
+accounting and **use a new mission**. An identical rerun stays blocked.
+U is unrelated state, S is execute's framed retained state, K itemizes known
+seal/close/gate/native-reference reservations, and R is the maximal-fixture
+residual reserve. This is not a native spawn-capacity halt. Timeout overrides
+cannot clear it. There is no added capacity check before the director, at
+admission or for final loops without a worker, nor a guarantee of unlimited
+attempts or loops fitting one mission.
+
+Preserve the old mission's evidence and sealed work when arranging an authorized
+new mission. The in-flight sealed task may not have backlog settlement and may
+be selected again; do not treat a capacity block as task completion, discard
+history or silently create a fresh authorization.
 
 ## Native root process continuation
 
@@ -283,8 +390,12 @@ dispatch. The root uses ordinary frozen-source/digest/association admission and
 reconciles saved intentions, seals and retries; no admitted work or loop slot is
 repeated. Only keys proven unlaunched by the native admission rejection may launch.
 Native status of a settled child carries no structured result, so the root keeps
-each received writer result in its state until admission. A relaunch seals and
-admits that result; it never restores a unit whose result was already received.
+a received-result recovery cache when it fits the 24 KiB retained limit. Full
+results remain in native artifacts. Larger results still follow normal admission
+without blocking or changing that path; only crash-before-admission recovery
+needs the existing original-result/checkpoint route when no cache survives.
+A relaunch seals and admits an available received result; it never restores an
+already admitted complete unit.
 
 The root saves an O(1) progress marker (latest admitted seal, ledger count/head, backlog digest
 and last closed loop) at each `budget-exhausted` end. Repeated exhaustion without
@@ -305,7 +416,8 @@ snapshot/source associations, admitted definitions/order, limit and consumed
 slots. A native successor process is not another execution invocation. Let its
 root reconcile saved state and pending operations; do not supervise tasks from
 the foreground or relaunch the registered resource as a replacement root except
-for the explicit `budget-exhausted` result above.
+for the explicit `budget-exhausted` result above or an eligible `timeout` halt
+under the coordinator contract above.
 
 If management reports the root already resumed, follow the EXACT successor run
 reference actually returned or retained by that public operation. Observe that
@@ -328,7 +440,8 @@ human answer to the retained question/impediment in the same invocation. Keep it
 original loop and durable answer, do not repeat the completed director, reuse an
 old answer for a later question or spend the same slot twice. `--unblock` does
 not make an ineligible terminal native root resumable. Except for the explicit
-`budget-exhausted` top-level relaunch above, a retained native launch
+`budget-exhausted` top-level relaunch or an eligible `timeout` halt under the
+coordinator contract above, a retained native launch
 must still be resumed through a supported public operation; no helper supervisor,
 polling daemon or replacement root is introduced.
 
@@ -357,7 +470,7 @@ Mission state stores the digest and selected task, not a copy of the file.
 checks the digest, applies changes and validates selection. Only the workflow
 marks tasks done after a gate-backed unit seal, with review admission required
 for file-writing tasks. The worker is the only product
-writer. Sequential fresh workers use four-hour attempts, reads:false and
+writer. Sequential fresh workers default to four-hour attempts, reads:false and
 progress:false, no private diaries and no next-task selection. Their todo steps
 are display only, projected from the child session file, not evidence.
 
@@ -448,8 +561,17 @@ disk by reference/digest. The stdout JSON has a 61,440-byte (60 KiB) hard cap:
 overflow fails closed with a bounded error, never truncation. The sandbox has no
 file API; the workflow validates the projection and stores `{path, digest}` plus
 its existing compact projections. Each later loop-io launch verifies the on-disk
-digests of receipts it references before reuse. Admitted prepare/selection views
-remain digest-only; full receipt data is not copied into mission state.
+digests of receipts it references before reuse. This is not universally
+digest-only storage: admission temporarily retains validated compact projections.
+Advance reduces the grouped receipt to `{path, digest}` and removes its input
+before saving currentView/preparedNext; preparedNext and loop.prepare omit view.
+The current view and selected apply projection remain available to the sandbox.
+Prepare and nested drain apply projections omit duplicated acceptance/history;
+nested applies omit view and non-final task gate receipts omit view (the fresh
+Board view travels outside the retained gate). Selection apply retains the
+acceptance/history copy, also held on the final loop for its
+prompts; final-attempt gate view is retained. Full on-disk receipts are unchanged
+and digest-verified, never reconstructed from previews.
 
 ### Worker results and continuation
 
@@ -604,9 +726,13 @@ Review and compliance receive current HUMAN rulings, excepted acceptance results
 and acceptanceHistory (at most eight entries), as well as done/obsolete reasons
 and current DECISIONs. Review/compliance gaps become new tasks with origin
 final-phase and a finding reference; the next director selects among them.
-Timeout/error on a blocking command halts blocked/environment with its log
-reference, not a new task. No blind retries, deadline inflation, arbitrary attempt
-quotas or weakened verification.
+For unmutated final acceptance where every blocking failure is a timeout, halt
+`timeout` with status `partial` and log references; the coordinator may relaunch
+the same invocation with `gateFloorMs` strictly greater than `launchedMs` under
+the timeout contract above. Other blocking-command timeout/error cases, including
+any `error`, halt `blocked`/`environment` with log references, not a new task.
+No blind retries, deadline inflation outside the coordinator timeout contract,
+arbitrary attempt quotas or weakened verification.
 
 #### Human-authorized acceptance exceptions
 
@@ -696,6 +822,11 @@ Checks and both analyses concern the SAME final candidate including WIP, with
 no own writer active during analyses. A genuine proposed close uses one fixed
 native observation to compare current candidate identity. Drift invalidates
 affected evidence.
+Test only strictly necessary observable behavior, not implementation details or
+assumptions (calibration constants, internal sequences, impossible fixtures or
+test-only bypass scaffolding). Prefer fixing or deleting tests over adding them.
+Reviewers treat unnecessary or implementation-detail tests as findings.
+
 Before examining the solution, load and apply `verify-behavior`. Derive material
 outcomes from the authorized request, accepted decisions and complete specs, not
 the task plan, diff or tests. Distinguish correctness from sufficiency: identify
@@ -865,12 +996,18 @@ original full structuredOutput, not previews. Cache at most the identical active
 plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
 descriptor/progress persistence failure blocks unsafe dispatch.
 Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. Execute state uses one contract version (v8). Older
+archived then discarded. Execute state uses one contract version (v9). Older
 retained state fails before any resume or dispatch: "created by an incompatible
-Pitako contract vN; start a new mission". Nothing is migrated.
+Pitako contract vN; start a new mission". Version-8 state, including a paused
+invocation, cannot resume. Nothing is migrated.
 Keep current task/control progress and usage totals, not a closed-loop array.
-Full completed results live once per task; completed attempts reference them,
-while pending tasks retain the last result for continuation. Closing and gaps
+Sealed results retain report-equivalent fields and evidence references; unsealed
+results stay whole. Checkpoint intents are stored once by key in taskFrame,
+with reviewIntents/sources as key lists. After ledger admission, admitDrain
+compacts the archived loop to allow-listed control/report fields and the minimal
+gate/delta/settlement/checkpoint markers needed for identical reader output;
+the final-close archive is not compacted there. Full bodies remain in published
+ledger loop records and digest-verified receipts. Closing and gaps
 record bytes are rebuilt from immutable source fields, freezing mutable usage and
 resolution inputs (and cancelled scope for gaps). Archive each seal before discarding, and every consumed loop
 including gaps. Seals run inside grouped close with no extra dispatch; fused

@@ -68,7 +68,7 @@ test.each(["reviewer", "synthesis"])("saved %s projection replays with body-free
   });
   const first = await host.execute();
   expect(first.status, first.reason).toBe("budget-exhausted");
-  expect(host.current().loop.attempt.taskReview[stage].projection.admitted).toBe(true);
+  expect(host.current().taskFrame.reviewProjections[host.current().loop.attempt.taskReview[stage].key].admitted).toBe(true);
   host.setStatus(ref => {
     const result = copy(host.native.get(ref)!);
     if (reviewChildren(ref)) {

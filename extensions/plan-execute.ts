@@ -5,7 +5,7 @@ import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subage
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
 import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId, validateSpec } from "./spec-plans.ts";
 import { boundRetainedAnalyses } from "./execute-retained.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath, compactWorkerReferences, expandWorkerReferences } from "./execute-state.ts";
 import { isExecuteReviewModel } from "./execute-settings.ts";
 import { reviewModels } from "./review-settings.ts";
 import { packageRoot } from "./stack.ts";
@@ -41,6 +41,13 @@ function validateResolution(args: Readonly<Record<string, unknown>>): void {
       typeof value.text !== "string" || !value.text.trim() || value.text.includes("\0"))
     throw new Error("--unblock requires current human resolution: {loop, text}; loop 0 denotes a pre-admission request.");
 }
+function validateTimeouts(value: unknown): void {
+  if (value === undefined) return;
+  if (!value || typeof value !== "object" || Array.isArray(value) ||
+      Object.entries(value).some(([key, ms]) => !["reviewerMs", "workerMs", "gateFloorMs"].includes(key) ||
+        !Number.isSafeInteger(ms) || (ms as number) < 1 || (ms as number) > 86400000))
+    throw new Error("Expected timeouts {reviewerMs?, workerMs?, gateFloorMs?}: safe integers in 1..86400000, no unknown keys.");
+}
 export function executionResource(platform: NodeJS.Platform = process.platform) {
   // Pi resolves a relative agent dir in the host, not the designated child's cwd.
   const agentDir = path.resolve(getAgentDir());
@@ -51,7 +58,8 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
     validateResolution(args);
-    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "amendments", "invocation", "missionId", "missionPath", "unblock", "resolution"].includes(key))) throw new Error("Unknown execution argument.");
+    validateTimeouts(args.timeouts);
+    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "amendments", "invocation", "missionId", "missionPath", "unblock", "resolution", "timeouts"].includes(key))) throw new Error("Unknown execution argument.");
     if (!isMissionId(args.missionId)) throw new Error("Expected an existing native missionId data pointer.");
     if (typeof args.missionPath !== "string" || !path.isAbsolute(args.missionPath) || args.missionPath.includes("\0"))
       throw new Error("Expected the actual absolute missionPath returned by native mission.create or mission.show.");
@@ -82,8 +90,9 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
       // Derived from the same bytes the root binds at admission; advisory only.
       originalProblem: validateSpec(preliminary.content, args.id),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"), stateVersion: EXECUTE_STATE_VERSION,
+      ...(args.timeouts !== undefined ? { timeouts: args.timeouts } : {}),
       ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
-    return { script: `${canonicalScript}\nconst config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
+    return { script: `${compactWorkerReferences.toString()}\n${expandWorkerReferences.toString()}\n${canonicalScript}\nconst config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
       hostCommands: inspections };
   } };
 }
@@ -153,12 +162,12 @@ const RUNTIME_AGENTS: RuntimeAgent[] = [
 export default function planExecute(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName !== "subagent") return;
-    const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; unblock?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
+    const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; unblock?: unknown; timeouts?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
     const name = typeof input.workflow === "string" ? input.workflow.trim() : undefined;
     if (!name || !NAMED_WORKFLOWS.includes(name)) return;
     const options = input.options;
     if (name === "pitako.execute") {
-      try { validateResolution(input.args ?? {}); }
+      try { validateResolution(input.args ?? {}); validateTimeouts(input.args?.timeouts); }
       catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
     }
     if (options?.mission !== undefined || !isMissionId(input.args?.missionId) || input.args.missionId !== options?.missionId)

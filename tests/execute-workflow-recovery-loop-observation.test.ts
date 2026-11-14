@@ -4,7 +4,7 @@ import path from "node:path";
 import { readReviewOriginal, readBacklog } from "../skills/execute/loop.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { applyCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
-import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
+import { expandWorkerReferences, EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
@@ -44,6 +44,9 @@ describe("workflow-owned execute controller", () => {
     const host = fixture(); host.setLimit(1);
     await host.execute();
     const retained = host.current();
+    const selected = host.snapshots.find(value => value.loop?.selection?.receipt);
+    retained.loop.selection = copy(selected.loop.selection);
+    retained.loop.taskBacklogDigest = selected.loop.taskBacklogDigest;
     retained.loop.attempt = copy(host.snapshots.find(value =>
       value.loop?.attempt?.key.endsWith(".t1.a1") && value.loop.attempt.stage === "launched").loop.attempt);
     retained.loop.phase = "implementation"; retained.loop.cursor = 0;
@@ -97,7 +100,7 @@ describe("workflow-owned execute controller", () => {
       }
       if (request.key === "invoke-human-1.l2.t1.a2") {
         const restore = host.current().loop.attempt.restore;
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
         const restored = restoreCheckpoint(sources, restore.authority);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         const value = host.worker(request);
@@ -134,7 +137,7 @@ describe("workflow-owned execute controller", () => {
       if (request.key === "invoke-human-1.l2.t1.a3") {
         const restore = host.current().loop.attempt.restore;
         expect(restore.authority.confirmedUnit).toMatchObject({ taskId: "change1", position: { loop: 1 } });
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
         const restored = restoreCheckpoint(sources, restore.authority);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         return host.result(request, { ...host.worker(request), restoreReceipt: { ...restored, restoredRef } });
@@ -184,7 +187,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.emits.some(item => item.type === "execution-progress" && ["blocked", "cancelled"].includes(item.status))).toBe(false);
       expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
       expect(host.current()).not.toHaveProperty("snapshot");
-      expect(host.current().tasks.change1.completed.prerequisiteResults).toEqual([]);
+      expect(host.calls.find(call => call.agent === "pitako.worker")!.task).toContain("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\n[]");
     });
 
   test("v6 exhausted publication retries preserve all pending data and reentry publishes the same record", async () => {
@@ -246,7 +249,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (kind !== "pause" || !request.key.endsWith(".t1.a2")) return normal();
       const restore = host.current().loop.attempt.restore;
-      const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+      const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
       restoreCheckpoint(sources, restore.authority);
       return normal();
     });
@@ -325,7 +328,7 @@ describe("workflow-owned execute controller", () => {
       usefulContinuation: true, checkpoint: { confirmation: { kind: "pause", position: { cursor: 0 } } },
     });
     const loop = resolvedLoop(host.current());
-    expect(loop.results[0]).toMatchObject({ taskId: "change1", attempt: 2, status: "complete" });
+    expect(loop.results.at(-1)).toMatchObject({ taskId: "change1", attempt: 2, status: "complete" });
     expect(loop.cursor).toBe(1);
     expect(loop.halt).toBeUndefined();
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
@@ -381,8 +384,9 @@ describe("workflow-owned execute controller", () => {
     }) : normal());
     let retained: any;
     cutAt(host, value => {
-      if (value.loop?.attempt?.result?.status !== "continue") return false;
-      retained = copy(value);
+      const expanded = expandWorkerReferences(value);
+      if (expanded.loop?.attempt?.result?.status !== "continue") return false;
+      retained = copy(expanded);
       return true;
     });
     expect((await host.execute()).status).toBe("partial");
@@ -467,7 +471,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().lastConfirmed).toEqual(point);
       expect(host.history()[1].attempt.restore).toEqual(pending);
     }
-    expect(host.calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual([...yieldedCalls.filter((call: any) => call.agent !== "pitako.request-observer").map((call: any) => call.key), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2"]);
+    expect(host.calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual([...yieldedCalls.filter((call: any) => call.agent !== "pitako.request-observer").map((call: any) => call.key), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2.capacity-1", "invoke-human-1.l2.t1.a2"]);
   });
 
   // Human input cannot restore a confirmed pause while its producer currently
@@ -676,7 +680,7 @@ describe("workflow-owned execute controller", () => {
       else {
         expect(host.records().flatMap((record: any) => record.body.recoveries ?? [])[0]).toMatchObject({ stage: "observed", disposition: "recovered" });
         expect(host.calls.slice(calls).filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-        expect(host.current().tasks.change1.completed.status).toBe("complete");
+        expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       }
     });
 
@@ -697,7 +701,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().hostReconstruction).toMatchObject({ source: original, stage: "admitted" });
       expect(host.current().resolutions).toBeUndefined();
       expect(host.history()).toHaveLength(1);
-      expect(host.current().tasks.change1.completed.status).toBe("complete");
+      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       const completed = host.calls.length;
       expect(await host.execute()).toMatchObject({ status: "partial" });
       expect(host.calls).toHaveLength(completed);
@@ -723,7 +727,7 @@ describe("workflow-owned execute controller", () => {
           candidate: host.observedCandidate(), source: host.current().association.source,
           digest: host.current().association.digest } });
       expect(host.history()).toHaveLength(1);
-      expect(host.current().tasks.change1.completed.status).toBe("complete");
+      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       expect(host.current().association.maxCycles).toBe(1);
       expect(host.current().resolutions).toBeUndefined();
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
@@ -794,7 +798,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().hostReconstruction.stage).toBe("failed");
     } else {
       expect(replay.status).toBe("partial");
-      expect(host.current().tasks.change1.completed.status).toBe("complete");
+      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     }
   });
 
@@ -819,7 +823,7 @@ describe("workflow-owned execute controller", () => {
       const retained = loops ? host.history().at(-1).resolutions[0] : host.current().resolutions[0];
       expect(retained).toMatchObject({ text: input.resolution.text, hostHalt: original });
       expect(host.history()).toHaveLength(1);
-      expect(host.current().tasks.change1.completed.status).toBe("complete");
+      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       const complete = host.calls.length;
       expect((await host.execute(input)).status).toBe("partial");
       expect(host.calls).toHaveLength(complete);
@@ -841,7 +845,7 @@ describe("workflow-owned execute controller", () => {
     expect(output.status).toBe(observedState === "stopped" ? "partial" : "blocked");
     expect(host.current().hostHalt).toEqual(original);
     expect(host.current().resolutions[0].hostHalt).toEqual(original);
-    if (observedState === "stopped") expect(host.current().tasks.change1.completed.status).toBe("complete");
+    if (observedState === "stopped") expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     if (observedState === "pending") {
       expect(host.hostCalls).toHaveLength(calls);
       expect(host.calls).toHaveLength(0);
@@ -866,7 +870,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(0);
     expect(host.current().resolutions).toHaveLength(1);
     expect(host.current().resolutions[0]).toMatchObject({ stage: "applied", hostHalt: original });
-    expect(host.current().tasks.change1.completed.status).toBe("complete");
+    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     expect(host.current().hostHalt).toEqual(original);
   });
 
@@ -896,7 +900,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().resolutions).toHaveLength(1);
       expect(host.current().resolutions[0]).toMatchObject({ hostHalt: original, failedHostObservation: later });
       expect(host.history()).toHaveLength(1);
-      expect(host.current().tasks.change1.completed.status).toBe("complete");
+      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       expect(host.calls).toHaveLength(writers);
       expect((await host.execute()).status).toBe("partial");
       expect(host.calls).toHaveLength(writers);
@@ -964,11 +968,11 @@ describe("workflow-owned execute controller", () => {
       const output = await host.execute(cut === "intention" ? input : {});
       expect(output).toMatchObject({ status: "partial", loopsConsumed: 4, maxLoops: 4 });
       const record = host.history()[2];
-      expect(record.plan).toEqual(original.plan);
+      expect(host.records().find((entry: any) => entry.kind === "loop" && entry.loop === 3).body.plan).toEqual(original.plan);
       expect(record.resolutions).toHaveLength(1);
       expect(record.resolutions[0]).toMatchObject({ ...input.resolution, stage: "applied", halt: original.halt });
       for (const id of ["change1", "change2"]) expect(host.current().tasks[id]).toEqual(completed[id]);
-      expect(host.current().tasks.change3.completed.status).toBe("complete");
+      expect(host.records().find((entry: any) => entry.kind === "unit" && entry.body.taskId === "change3").body.result.status).toBe("complete");
       expect(readBacklog(host.root, "spec").backlog?.tasks.find(task => task.id === "change4")?.status).toBe("pending");
       expect(host.calls.slice(prior).every(call => call.agent === "pitako.execution-inspector" ||
         call.key.startsWith("invoke-human-1.l4.") || call.key === "invoke-human-1.l3.gaps" ||
@@ -1023,7 +1027,7 @@ describe("workflow-owned execute controller", () => {
         if (request.key === "invoke-human-1.l1.t1.a2") {
           if (mode === "current-stop") return { ...normal(), ok: false, stopped: true };
           const restore = host.current().loop.attempt.restore;
-          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
           const restored = restoreCheckpoint(sources, restore.authority);
           return host.result(request, { ...host.worker(request), restoreReceipt: {
             ...restored, restoredRef: restored.partialRef.replace(/restore\.json$/, "restored.json") } });
@@ -1038,7 +1042,7 @@ describe("workflow-owned execute controller", () => {
       if (mode === "permission") expect(host.calls).toHaveLength(count);
       else {
         expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a2")).toHaveLength(1);
-        if (mode !== "current-stop") expect(host.current().tasks.change1.completed.status).toBe("complete");
+        if (mode !== "current-stop") expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
       }
       const after = host.calls.length;
       await host.executeNative();
@@ -1339,7 +1343,7 @@ describe("workflow-owned execute controller", () => {
     });
     const outcome = await host.execute();
     expect(outcome.status, outcome.reason).toBe("partial");
-    expect(host.history()[0].plan).toMatchObject({ stage: "rejected",
+    expect(host.records().find((record: any) => record.kind === "loop").body.plan).toMatchObject({ stage: "rejected",
       rejection: { diagnostic: "Selected task must be pending" }, recoverySource: { comparison: "equal-full-json" } });
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(2);
     expect(recoverySubjects).toMatchObject([
@@ -1807,7 +1811,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.current().loop.resolutions.at(-1).stage).toBe("applied");
       if (mode === "continue" || mode === "successor-cut") {
         expect(outcome.status, outcome.reason).toBe("partial");
-        expect(host.current().tasks.change1.completed).toMatchObject({ attempt: 2, status: "complete" });
+        expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2 });
         return;
       }
       // The answer applies once: a later block halts again and needs new input.
@@ -1825,14 +1829,13 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a1") {
         host.worker(request);
-        applyCheckpoint(host.current().loop.attempt.checkpoint, [{ path: "src/change1.ts",
+        applyCheckpoint(expandWorkerReferences(host.current()).loop.attempt.checkpoint, [{ path: "src/change1.ts",
           image: { bytes: Buffer.from("partial owned work").toString("base64"), mode: 0o644 } }]);
         return { ok: false, output: "", error: "Writer disappeared" };
       }
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const restore = host.current().loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) =>
-          host.current().taskFrame.sources.find((entry: any) => entry.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]), restore.authority);
         return block(request);
       }
       return normal();
@@ -1933,7 +1936,7 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect((await host.execute()).status).toBe("partial");
-    expect(host.current().tasks.change1.completed.status).toBe("complete");
+    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     const worker = host.calls.find(call => call.agent === "pitako.worker")!;
     expect(worker.label).toBe("Fix recovery");
     expect(worker.label).not.toContain("with complete evidence");
@@ -2039,14 +2042,21 @@ describe("workflow-owned execute controller", () => {
         return result;
       });
       const output = await host.executeNative();
-      expect(output.status).toBe("blocked");
+      expect(output.status).toBe(fault === "nested-timeout" ? "partial" : "blocked");
       expect(host.calls.filter(request => request.key.includes(".review."))).toHaveLength(1);
       expect(host.calls.some(request => request.key.endsWith(".compliance"))).toBe(false);
       const manifest = host.storage.get("review-invoke-human-1");
       const original = { ...manifest.originalDefaults, ...manifest.originals[0] };
-      expect(original.sufficient).toBe(false);
+      const call = host.current().loop.analysisCalls.find((call: any) => call.key.endsWith("review.director-prepare"));
+      if (["failed-outcome", "nested-running"].includes(fault)) expect(call.barrier).toBeTruthy();
+      else if (fault === "nested-timeout") {
+        expect(call.timeout).toBe(true);
+        expect(host.current().loop.halt).toMatchObject({ code: "timeout", class: "final-review",
+          key: call.key, launchedMs: 14400000 });
+      } else expect(original.sufficient).toBe(false);
       expect(original.failedOriginal).toBeUndefined();
-      const reference = resolvedLoop(host.current()).review.references[0];
+      const rootRefusal = ["failed-outcome", "nested-running", "nested-timeout"].includes(fault);
+      const reference = rootRefusal ? call.ref : resolvedLoop(host.current()).review.references[0];
       const actual = observed!.results![0]!;
       const witness = publicationWitness(reference.results[0], actual);
       expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
@@ -2055,9 +2065,11 @@ describe("workflow-owned execute controller", () => {
         expect(witness[field]).toEqual((actual as any)[field]);
       if (fault === "failed-state") expect(reference.state).toBe("failed");
       const prior = copy(reference), count = host.calls.length;
-      expect((await host.executeNative()).status).toBe("blocked");
+      expect((await host.executeNative()).status).toBe(fault === "nested-timeout" ? "partial" : "blocked");
       expect(host.calls).toHaveLength(count);
-      expect(resolvedLoop(host.current()).review.references[0]).toEqual(prior);
+      expect(rootRefusal
+        ? host.current().loop.analysisCalls.find((entry: any) => entry.key === call.key).ref
+        : resolvedLoop(host.current()).review.references[0]).toEqual(prior);
     });
 
   test.each(["different-path", "no-reference"])("integrated review retains distinct or missing publication references: %s", async mode => {
@@ -2197,7 +2209,8 @@ describe("workflow-owned execute controller", () => {
     expect(workers[1]!.task).not.toContain("FROZEN ATTEMPT");
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
     expect(host.history()[0].manifest).toEqual(["change1"]);
-    expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2, prerequisiteResults: [] });
+    expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2 });
+    expect(workers[1]!.task).toContain("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\n[]");
     expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["pause", "unit"]);
     expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   });
@@ -2281,7 +2294,7 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect((await host.execute()).status).toBe("partial");
-    expect(host.history()[0].results).toEqual([expect.objectContaining({ status: "rejected",
+    expect(host.records().find((record: any) => record.kind === "loop").body.results).toEqual([expect.objectContaining({ status: "rejected",
       rejection: "Worker returned an invalid work/status/remaining contract." })]);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
     expect(host.calls.some(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
@@ -2644,7 +2657,7 @@ describe("workflow-owned execute controller", () => {
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
       expect(host.calls.filter(call => call.key === "invoke-human-1.l1.director")).toHaveLength(1);
       expect(output.status).toBe("complete");
-      if (mode === "absent-binding") expect(host.history()[0].plan.recoverySource.binding).toBe("absent");
+      if (mode === "absent-binding") expect(host.records().find((record: any) => record.kind === "loop").body.plan.recoverySource.binding).toBe("absent");
     }
     if (mode.startsWith("direct-")) expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
   });
@@ -2677,7 +2690,7 @@ describe("workflow-owned execute controller", () => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const restore = host.current().loop.attempt.restore;
         expect(restore.producer.key).toBe("invoke-human-1.l1.t1.a1");
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
         restoreCheckpoint(sources, restore.authority);
       }
       return normal();
@@ -2689,7 +2702,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
     expect(host.calls.some(call => call.resume)).toBe(false);
-    expect(host.current().tasks.change1.completed.status).toBe("complete");
+    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
     expect(host.history()).toHaveLength(1);
   });
@@ -2764,7 +2777,7 @@ describe("workflow-owned execute controller", () => {
         if (request.key === "invoke-human-1.l1.t1.a2") {
           const restore = host.current().loop.attempt.restore;
           expect(restore.producer.key).toBe("invoke-human-1.l1.t1.a1");
-          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
           restoreCheckpoint(sources, restore.authority);
         }
         return normal();
@@ -2924,7 +2937,7 @@ describe("workflow-owned execute controller", () => {
         host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       }
       return normal();
     });
@@ -2962,7 +2975,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
         const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       }
       return (phase === "plan" ? request.phase === "recovery" && request.task.includes(`\n\nEXCEPTIONAL READ-ONLY ${kind}`) : request.key === "invoke-human-1.l1.t1.a2")
         ? { ...normal(), ok: false, [signal]: true } : normal();
@@ -3004,7 +3017,7 @@ describe("workflow-owned execute controller", () => {
       atLaunch.push(copy(host.current().loop));
       if (restoring) return { ...host.result(request, null), ok: false, [signal]: true };
       const saved = host.current(), restore = saved.loop.attempt.restore;
-      restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+      restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       return normal();
     });
     const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key.split(".").at(-1));
@@ -3060,7 +3073,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       }
       return normal();
     });
@@ -3089,7 +3102,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       }
       return normal();
     });
@@ -3281,7 +3294,7 @@ describe("workflow-owned execute controller", () => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true, taskCount: mode === "review-stop" ? 0 : 1 }); host.setRespond((request, normal) => {
       if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
         const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.sources.find((source: any) => source.key === key)), restore.authority);
+        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
       }
       if (mode === "review-stop" && request.key.endsWith("director-prepare")) return { ...normal(), ok: false, stopped: true, error: "Observed Stop" };
       if (request.agent === "pitako.worker" && request.key.includes(".l1.")) {
@@ -3296,78 +3309,6 @@ describe("workflow-owned execute controller", () => {
     else expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
   });
 
-  test("full-file native 256 KiB envelope includes other keys, maximum multibyte/escaped spec, long metadata, huge allowed reports and three slots", async () => {
-    const unit = '\\"é界';
-    const content = unit.repeat(Math.floor(MAX_SPEC_BYTES / Buffer.byteLength(unit))) + "x".repeat(MAX_SPEC_BYTES % Buffer.byteLength(unit));
-    expect(Buffer.byteLength(content)).toBe(39936);
-    const host = fixture(content, { metadataPadding: 7000, findings: true, taskCount: 0 });
-    const inlineOriginals = observeInlineReviewOriginals(host);
-    host.storage.set("other-owned-history", { content: "h".repeat(90000) });
-    const essentialBytes: number[] = [];
-    const originalSet = host.state.set;
-    host.state.set = async (key, value) => {
-      if (!(value as any)?.activePlan)
-        essentialBytes.push(Buffer.byteLength(JSON.stringify({ ...Object.fromEntries(host.storage), [key]: value }, null, 2)));
-      await originalSet(key, value);
-    };
-    host.setRespond((request, normal) => {
-      const result = normal();
-      if (request.phase?.startsWith("review-")) {
-        // This capacity case publishes only the actual original. The default
-        // double's extra /native optional paths are not real publications here;
-        // dedicated adapter cases below/above retain every supplied witness.
-        const saved = result.results![0]!.savedOutputPath!;
-        result.outputReference = saved;
-        delete result.outputArtifactPath; delete result.outputPathMapping; delete result.artifactPaths;
-        delete result.results![0]!.structuredOutputPath;
-      }
-      // The selection contract has no conversational sharedContext cache.
-      if (request.agent === "pitako.worker") {
-        result.structuredOutput.work = "w".repeat(300000);
-        result.structuredOutput.knowledge = { findings: ["d".repeat(300000)], handoff: "o".repeat(300000) };
-      }
-      return request.key.endsWith(".compliance") ? gaps(result) : result;
-    });
-    const output = await host.execute(); expect(output).toMatchObject({ status: "partial", loopsConsumed: 3 });
-    expect(host.optionalCacheFailures()).toBe(0);
-    expect(host.snapshots.every(value => !value.activePlan)).toBe(true);
-    const serialized = JSON.stringify(Object.fromEntries(host.storage), null, 2);
-    expect(Buffer.byteLength(serialized)).toBeLessThanOrEqual(MISSION_STATE_MAX_BYTES);
-    expect(serialized).not.toContain("w".repeat(1000)); expect(serialized).not.toContain("d".repeat(1000)); expect(serialized).not.toContain("o".repeat(1000));
-    expect(host.current().association.digest).toBe(digest(content)); expect(host.storage.get("other-owned-history").content).toHaveLength(90000);
-    expect(host.hostCalls).toEqual(["inspect-initial"]); expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(2);
-    expect(host.history().map((loop: any) => loop.number)).toEqual([1, 2, 3]);
-    expect(Math.max(...essentialBytes)).toBeLessThanOrEqual(MISSION_STATE_MAX_BYTES);
-    // One review slot per execute invocation: archived loops never re-enter review.
-    expect([...host.storage.keys()].filter(key => key.startsWith("review-"))).toEqual(["review-invoke-human-1"]);
-    for (const loop of host.history().slice(-1)) {
-      const manifest = host.storage.get("review-invoke-human-1");
-      expect(manifest.decision).toEqual({ reference: { stateKey: "invoke-human-1", loop: loop.number } });
-      expect(manifest.query).toBe(JSON.stringify(loop.candidate));
-      expect(manifest.revision).toBe(1);
-      expect(manifest.originals).toHaveLength(6);
-      for (const retained of manifest.originals) {
-        expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
-        const original = inlineOriginals.get(retained.key);
-        expect(canonicalDigest(readReviewOriginal(retained))).toBe(original.digest);
-        expect(original).toMatchObject({ attempt: 1, terminal: "succeeded", publication: "published",
-          delivery: "complete", essentialAccess: "accessible", sufficient: true, diagnostic: "" });
-        const ref = loop.review.references.find((entry: any) => entry.key === original.key);
-        expect(ref.runId).toBe(original.runId);
-        const witness = publicationWitness(ref.results[0], host.native.get(ref.runId)!.results![0]);
-        const exact = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
-        expect(original.association).toEqual({ namespace: manifest.namespace, query: manifest.query, revision: manifest.revision,
-          phase: host.calls.find(call => call.key === original.key)!.phase!.replace("review-", ""),
-          producer: original.key.includes(".director-") ? "director" : original.key.split(".review.independent-")[1],
-          key: original.key, attempt: original.attempt });
-        expect(original.digest).toBe(canonicalDigest(exact));
-        expect(original.id).toBe(`${original.association.key}.v1.a1`);
-        expect(ref.outputReference).toBe(witness.savedOutputPath);
-        expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
-          bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });
-      }
-    }
-  });
 
   test.each(["before-director", "before-worker", "after-result"])("essential state failure %s halts new dispatch and retains frozen snapshot/descriptor/history", async phase => {
     const host = fixture(); host.storage.set("history", { retained: true });
@@ -3432,7 +3373,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
   // Restoration uses real owned preimages; native resume is not a second writer route.
   const restoreSelectedTask = (host: ReturnType<typeof fixture>) => {
     const restore = host.current().loop.attempt.restore;
-    const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.sources.find((source: any) => source.key === key));
+    const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
     restoreCheckpoint(sources, restore.authority);
   };
 
@@ -3475,7 +3416,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
     fx.setFailSave();
     const continued = await fx.executeNative();
     expect(continued.status, continued.reason).toBe("partial");
-    expect(fx.current().tasks.change1.completed.status).toBe("complete");
+    expect(resolvedLoop(fx.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     expect(fx.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
       .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
     expect(fx.calls.some(call => call.resume)).toBe(false);
@@ -3518,7 +3459,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
     fx.setStatus(ref => ref.endsWith(".t1.a2") ? copy(successor!) : copy(fx.native.get(ref) ?? { ok: true, results: [] }));
     const continued = await fx.executeNative();
     expect(continued.status, continued.reason).toBe("partial");
-    expect(fx.current().tasks.change1.completed.status).toBe("complete");
+    expect(resolvedLoop(fx.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
     expect(fx.calls.filter(call => call.key.endsWith(".t1.a2"))).toHaveLength(1);
     expect(fx.calls.some(call => call.resume)).toBe(false);
     expect(fx.history()).toHaveLength(1);

@@ -175,6 +175,9 @@ actual error/test and trace causality before choosing repair, focused analysis,
 fixture/stability simplification or justified test retirement. Preserve required
 spec guarantees and recommend out-of-scope edits instead of making them. Do not
 hide flakes with green retries or fix timeouts by inflating deadlines.
+Test only strictly necessary observable behavior, not implementation details or
+assumptions (calibration constants, internal sequences, impossible fixtures or
+test-only bypass scaffolding). Prefer fixing or deleting tests over adding them.
 Before adding a test, identify the observable behavior, its real requirement or
 demonstrated defect, existing coverage and the distinct signal it would add.
 A hypothetical possibility alone is insufficient. Prefer updating an existing

@@ -162,6 +162,18 @@ This review runs between passing task gates and sealing for complete
 file-writing tasks. Rejection permits one same-slot repair and re-review; unit
 requires admission. It does not change final-phase full review or compliance.
 
+Execute timeout adjustments are **launch arguments**, not Pi settings:
+`args.timeouts = {reviewerMs?, workerMs?, gateFloorMs?}` accepts only safe integer
+milliseconds in `1..86400000`, rejecting unknown keys. Reviewer/worker defaults
+are four hours; the gate floor defaults to zero, leaving the per-command
+30-minute default and director overrides intact. Omitted fields keep saved
+values across relaunches; `{}` resets defaults. Effective values and their
+loop/attempt `since` appear in reports; existing intentions keep frozen values.
+See the [executable example and halt actions](../skills/execute/SKILL.md#coordinator-timeouts-v9)
+for derived gate/close totals, strictly-greater timeout renewal and state-capacity
+blocks. These arguments never supply human resolution or bypass native barriers.
+Standalone `/review` and `pre-pr` timeouts are unchanged.
+
 Full review in standalone `/review` and `/execute` final acceptance uses exactly
 two angles: `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`,
 or `decision-fidelity` for `plan` (including specs), plus one director-selected

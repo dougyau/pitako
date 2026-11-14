@@ -195,8 +195,12 @@ test.each([
       if (input.intent.taskId === "change1") {
         expect(input.kind).toBe(expected);
         expect(host.current().loop.attempt).toMatchObject({ stage: "launched",
-          ...(status === "complete" ? { taskReview: { synthesis: { projection: { admitted: true } } } }
+          ...(status === "complete" ? { taskReview: { synthesis: { key: expect.any(String) } } }
             : { close: { dispatched: true } }) });
+        if (status === "complete") {
+          const synthesis = host.current().loop.attempt.taskReview.synthesis;
+          expect(JSON.parse(readFileSync(synthesis.path, "utf8")).correctness.score).toBeGreaterThanOrEqual(9);
+        }
         expect(host.current().loop.attempt).not.toHaveProperty("result");
       }
     }
@@ -205,7 +209,9 @@ test.each([
   });
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial"); // One slot completes the task, not the separate final phase.
-  const receipt = host.history()[0].results.find((entry: any) => entry.taskId === "change1").checkpoint.confirmation;
+  const unit = host.records().find((record: any) => record.kind === "unit" && record.body.taskId === "change1");
+  expect(unit, output.reason).toBeDefined();
+  const receipt = unit.body.result.checkpoint.confirmation;
   expect(receipt.kind).toBe(expected);
 });
 
@@ -308,7 +314,7 @@ test.each([false, true])("missing implementation result restores before the next
   expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key), output.reason)
     .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
-  expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2,
+  expect(host.records().find((record: any) => record.kind === "unit" && record.body.attempt === 2).body.result).toMatchObject({ status: "complete", attempt: 2,
     checks: { current: true }, checkpoint: { confirmation: { kind: "unit" } } });
   const partial = JSON.parse(JSON.parse(readFileSync(restored.partialRef, "utf8")).data).partial;
   expect(partial[0].image).toEqual(written ? {
@@ -537,7 +543,7 @@ test("controller admits a late-discovered path in the original worker attempt", 
   });
   expect((await host.execute()).status).toBe("partial");
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
-  expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 1,
+  expect(host.records().find((record: any) => record.kind === "unit").body.result).toMatchObject({ status: "complete", attempt: 1,
     checkpoint: { confirmation: { kind: "unit" } } });
   expect(readFileSync(path.join(host.root, "late.ts"), "utf8")).toBe("late discovery");
 });

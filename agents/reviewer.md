@@ -163,6 +163,10 @@ correction regression, or grave risk such as data loss or a security flaw.
 Keep other new observations non-blocking. If the supplied evidence cannot bound
 the affected guarantees, state the gap rather than claiming closure.
 
+Test only strictly necessary observable behavior, not implementation details or
+assumptions (calibration constants, internal sequences, impossible fixtures or
+test-only bypass scaffolding). Prefer fixing or deleting tests over adding them.
+Treat unnecessary or implementation-detail tests as findings.
 For each proposed test, identify the observable behavior, its real requirement
 or demonstrated defect, existing coverage and distinct useful signal. Prefer
 updating an existing test over adding one. A hypothetical possibility alone does

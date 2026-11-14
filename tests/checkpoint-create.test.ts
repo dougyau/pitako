@@ -208,10 +208,10 @@ test.each(["valid", "cross-loop", "cross-loop-intervening", "cross-loop-admitted
     expect(existsSync(path.join(checkpointDirectory(pending), "manifest.json"))).toBe(false);
   });
 
-test.each(["missing", "malformed", "metadata-only", "association", "progress", "attempt", "stopped", "v4", "v5"])(
+test.each(["missing", "malformed", "metadata-only", "association", "progress", "attempt", "stopped", "v4", "v5", "v8"])(
   "invalid durable writer context cannot publish: %s", async mode => {
     const f = fixture();
-    if (mode === "v4" || mode === "v5") (f.record as any).version = Number(mode.slice(1));
+    if (/^v\d+$/.test(mode)) (f.record as any).version = Number(mode.slice(1));
     if (mode === "association") f.record.association = { ...f.record.association, invocation: "other" };
     if (mode === "progress") f.loop.attempt.checkpoint.progress!.consumedLoops = 2;
     if (mode === "attempt") f.loop.attempt.key = "other";
@@ -225,7 +225,7 @@ test.each(["missing", "malformed", "metadata-only", "association", "progress", "
     }
     const result = await f.call("pre", paths);
     expect(result).toMatchObject({ ok: false, status: "failed" });
-    if (mode === "v4" || mode === "v5") expect(JSON.stringify(result)).toContain(`created by an incompatible Pitako contract ${mode}; start a new mission`);
+    if (/^v\d+$/.test(mode)) expect(JSON.stringify(result)).toContain(`created by an incompatible Pitako contract ${mode}; start a new mission`);
     expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   });

@@ -101,6 +101,13 @@ test("controller resumes a new keyed attempt without bindings and sends only del
     expect(resumed.task).toContain(label);
   expect(resumed.task).toContain("New useful fact");
   expect(resumed.task).not.toContain("Already loaded");
+  for (const state of host.snapshots) {
+    const attempt = state.loop?.attempt;
+    if (attempt?.gate?.receipt && attempt.close?.admitted) {
+      expect(attempt.gate.receipt).not.toHaveProperty("view");
+      expect(attempt.close.receipt.projection).not.toHaveProperty("view");
+    }
+  }
   for (const repeated of ["COMPLETE IMMUTABLE SPECS", "COMPLETE SELECTED TASK", '"goal":', "PRE-WRITE CHECKPOINT INTENTION"])
     expect(resumed.task).not.toContain(repeated);
   const attempt = lastAttempt(host);
@@ -112,6 +119,20 @@ test("controller resumes a new keyed attempt without bindings and sends only del
   const manifest = JSON.parse(JSON.parse(readFileSync(path.join(directory, "manifest.json"), "utf8")).data);
   expect(manifest.intent.key).toBe(resumed.key);
   expect(host.emits.some(row => row.schema === "pitako.execute-todo" && row.tasks.some((task: any) => task.subject.includes("↻") && task.subject.includes("paths 1")))).toBe(true);
+});
+
+test("close replay keeps fresh Board delivery after its transient view is transferred", async () => {
+  const host = continuingHost({ realCheckout: true });
+  host.setFailSave(state => state.loop?.attempt?.gate?.stage === "receipt" &&
+    !!state.loop.attempt.close && !state.loop.attempt.close.receipt.projection.view);
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  host.setFailSave();
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("complete");
+  const resumed = host.calls.filter(request => request.resume && request.key.includes(".t1."));
+  expect(resumed).toHaveLength(1);
+  expect(resumed[0]!.task).toContain("New useful fact");
+  expect(host.calls.filter(request => request.key === "invoke-human-1.l1.t1.a1.gate")).toHaveLength(1);
 });
 
 test("explicit rejected resume records refusal and dispatches a fresh new key/binding", async () => {

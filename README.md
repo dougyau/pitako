@@ -222,8 +222,16 @@ admission before binding, reliable original restoration plus a human addendum
 after binding, or supported native inspection for native barriers. No generic
 `--unblock`, forced hash replacement or terminal-root resume is offered.
 
-Workers retain normal tools and defaults; execute alone disables private
-read/progress diaries and applies four hours per implementation attempt.
+Workers retain normal tools; execute alone disables private read/progress diaries
+and defaults to four hours per implementation attempt and execute reviewer child.
+The foreground coordinator can pass sticky `args.timeouts` overrides; existing
+intentions keep frozen deadlines. A barrier-free `timeout` halt requires a
+strictly greater value on relaunch of the same invocation (three generations
+maximum). A `state-capacity` halt instead requires a new mission; it cannot be
+cleared by a timeout override. These operational arguments are not HUMAN unblock
+authority. See the [v9 coordinator contract](skills/execute/SKILL.md#coordinator-timeouts-v9)
+for validation, reset, gate floors, derived totals and recovery limits.
+Version-8 execute state, including paused invocations, is rejected, not migrated.
 Material review/compliance gaps go to the next loop, not a hidden repair loop.
 Completion requires full-spec fulfillment, current checks and no material gaps
 on the same candidate including WIP. The admitted loops without fulfillment are partial.

@@ -11,6 +11,18 @@ const { viewBudget } = await import("../../extensions/board/store.ts");
 const { captureBaseline, checkpointTaskDelta, readCheckpointTaskBytes, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
 const { checkoutEvidence } = await import("../../extensions/spec-plans.ts");
 const { prepare, apply, gate, currentHumanPostIds, readBacklog, reviewOriginals } = await import("./loop.ts");
+const { executionStatePath } = await import("../../extensions/execute-state.ts");
+
+export function stateCapacity(input) {
+  const whole = JSON.parse(readFileSync(safePath(executionStatePath(input)), "utf8"));
+  const key = `invoke-${input.invocation}`;
+  if (!whole[key] || whole[key].association.missionId !== input.missionId ||
+      whole[key].association.missionPath !== input.missionPath)
+    throw new Error("State capacity observation association mismatch");
+  const bytes = value => Buffer.byteLength(JSON.stringify(value, null, 2));
+  const total = bytes(whole), execute = bytes({ [key]: whole[key] });
+  return { total, execute, unrelated: total - execute };
+}
 
 function stepKey(value) {
   if (typeof value !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) || value.includes(".."))
@@ -50,10 +62,19 @@ export function receiptTransport(reference) {
   const compact = JSON.parse(JSON.stringify(projection));
   for (const step of compact.steps) {
     if (step.operation === "drain") step.result = receiptTransport(step.result);
+    if (step.operation === "prepare" || step.operation === "apply" && compact.operation !== "selection") {
+      delete step.result.acceptance;
+      delete step.result.acceptanceHistory;
+    }
+    if (step.operation === "apply" && compact.operation !== "selection") delete step.result.view;
     if (step.operation === "apply" && (compact.operation !== "selection" || step.result.selected !== null))
       delete step.result.completedTasks;
     if (step.operation === "gate") {
       for (const gate of step.result.receipt.gates) gate.tail = "";
+      // Transfer the fresh Board observation once, outside the retained gate.
+      compact.view = step.result.receipt.view;
+      // Final acceptance uses the standalone gate operation, not a task close.
+      delete step.result.receipt.view;
     }
     if (compact.operation === "close" && step.operation === "requests" &&
         compact.steps.some(step => step.operation === "nextRequests")) {
@@ -293,7 +314,7 @@ export function taskDelta({ root, invocation, intents }) {
 }
 
 async function runOperation(operation, input) {
-  const operations = { prepare, apply, gate, reviewOriginals, baseline: captureBaseline, taskDelta };
+  const operations = { prepare, apply, gate, reviewOriginals, baseline: captureBaseline, taskDelta, stateCapacity };
   if (!Object.hasOwn(operations, operation)) throw new Error("Expected loop-io prepare, apply, gate, reviewOriginals, baseline, taskDelta or drain");
   if (operation === "apply") input.currentHumanIds = await currentHumanPostIds(input);
   const value = await operations[operation](input);

@@ -465,7 +465,8 @@ describe("checkpoint-first modifying recovery", () => {
       expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual([target, "invoke-human-1.l1.t1.a2"]);
       const partial = JSON.parse(JSON.parse(readFileSync(restored!.partialRef, "utf8")).data).partial;
       expect(partial[0].image.bytes).toBe(Buffer.from("interrupted owned bytes").toString("base64"));
-      expect(host.history()[0].results[0]).toMatchObject({ status: "complete", attempt: 2,
+      expect(host.records().find((record: any) => record.kind === "unit" && record.body.attempt === 2).body.result)
+        .toMatchObject({ status: "complete", attempt: 2,
         checkpoint: { confirmation: { kind: "unit" } } });
       const count = host.calls.length;
       expect((await host.executeNative()).status).toBe("complete");
@@ -477,7 +478,7 @@ describe("checkpoint-first modifying recovery", () => {
     host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
         const state = host.current();
-        expect(() => restoreCheckpoint(state.taskFrame.sources[0], state.loop.attempt.restore.authority)).toThrow();
+        expect(() => restoreCheckpoint(state.taskFrame.intents[state.taskFrame.sources[0]], state.loop.attempt.restore.authority)).toThrow();
         expect(existsSync(path.join(host.root, ".pi/subagents/checkpoints", request.key, "manifest.json"))).toBe(false);
         throw new Error("Cannot restore corrupt or incomplete checkpoint; no capture or edits performed");
       }

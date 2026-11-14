@@ -548,6 +548,7 @@ describe("review scripted workflow", () => {
     expect(independent[2]!.request.skill).toEqual(["verify-behavior", "ponytail-review", "blast-radius"]);
     expect(independent[1]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
     for (const { request } of host.calls) {
+      expect(request).not.toHaveProperty("timeoutMs");
       expect(request.skill ?? []).not.toContain("scope-discipline");
       expect(request.task).not.toContain("Read and apply scope-discipline");
       expect(request.model).toBe(keyModel(request.phase, request.output));

@@ -59,13 +59,29 @@ test.each(["reviewer", "synthesis"])("retains execute-owned task-%s originals", 
 	expect(f.load()).toEqual([{ key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
 }));
 
+test.each(["task-reviewer", "task-synthesis", "demand-observation", "compliance", "review.director-synthesis"])(
+	"retained access follows generation keys for %s and ignores retired producers", role => fixture(f => {
+		const state = JSON.parse(readFileSync(f.statePath, "utf8"));
+		const key = `invoke-human-1.l1.${role.startsWith("task-") ? "t1.a1." : ""}g2.${role}`;
+		const ref = { ...f.ref, key };
+		state["invoke-human-1"].loop = { number: 1,
+			phase: role === "demand-observation" ? "director" : role.startsWith("task-") ? "implementation" : "review",
+			analysisGenerations: { "final-review": 2, "demand-observation": 2 },
+			analysisCalls: [{ key, ref }], retired: [{ ...f.ref, runId: "missing-retired-producer" }] };
+		writeFileSync(f.statePath, JSON.stringify(state));
+		const native = JSON.parse(readFileSync(path.join(f.native, "status.json"), "utf8"));
+		native.workflowKey = key;
+		writeFileSync(path.join(f.native, "status.json"), JSON.stringify(native));
+		expect(f.load()).toEqual([{ key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+	}));
+
 test.each(["settled", "foreign", "changed", "missing", "stopped", "conflicting-native"])(
 	"bound replay verifies settled task review growth without admitting %s originals", mode => fixture(f => {
 		const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
 		const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
 		invocation.admissionBinding = binding;
 		Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
-		const key = "invoke-human-1.l1.t1.a1.task-reviewer", ref = { ...f.ref, key };
+		const key = "invoke-human-1.l1.t1.a1.g2.task-reviewer", ref = { ...f.ref, key };
 		invocation.loop = { number: 1, phase: "implementation", analysisCalls: [{ key, ref }],
 			attempt: { taskReview: { reviewer: { key, runId: mode === "foreign" ? "foreign" : f.ref.runId,
 				path: f.file, digest: canonicalDigest(f.original) } } } };
@@ -157,15 +173,16 @@ test("corrupt native state is not treated as a fresh invocation", () => fixture(
 }));
 
 
-test.each(["eligible", "legacy", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
+test.each(["eligible", "legacy", "v8", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
 	const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
 	const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
-	Object.assign(invocation, { version: mode === "legacy" ? 5 : EXECUTE_STATE_VERSION, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
+	Object.assign(invocation, { version: mode === "legacy" ? 5 : mode === "v8" ? 8 : EXECUTE_STATE_VERSION, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
 	Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
 	writeFileSync(f.statePath, JSON.stringify(state));
 	const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,
 		{ missionId: "mission-1", missionPath: f.mission, invocation: "human-1", sourceRefs: mode === "sources" ? [{ path: "/changed", digest: "f".repeat(64) }] : [] });
 	if (mode === "legacy") expect(load).toThrow("Retained execution created by an incompatible Pitako contract v5; start a new mission.");
+	else if (mode === "v8") expect(load).toThrow("Retained execution created by an incompatible Pitako contract v8; start a new mission.");
 	else if (mode !== "eligible") {
 		expect(load).toThrow("Retained recovery binding differs or predates bound admission");
 		expect(load).toThrow("without redispatch or automatic recapture");

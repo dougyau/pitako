@@ -104,6 +104,11 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   }
   if (request.agent === "pitako.loop-io") {
     const input = JSON.parse(request.task);
+    if (input.operation === "stateCapacity") return (async () => {
+      const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
+      return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+        output: JSON.stringify(runtime.stateCapacity(input)), results: [{ exitCode: 0 }] };
+    })();
     if (input.operation === "taskDelta" && process.cwd() !== metadata.root && metadata.runDeterministic)
       return metadata.runDeterministic(key, request, metadata, checkout);
     if (["advance", "selection", "close", "drain"].includes(input.operation)) return (async () => {

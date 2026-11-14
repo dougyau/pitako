@@ -166,6 +166,13 @@ async function groupedFixture(operation: "advance" | "close") {
 
 async function groupedState(f: Awaited<ReturnType<typeof groupedFixture>>, output: string) {
   const result = receipt(output);
+  const projection = JSON.parse(output).projection;
+  const nestedApply = projection.steps[0].result.projection.steps.find((step: any) => step.operation === "apply").result;
+  for (const field of ["acceptance", "acceptanceHistory", "view"])
+    expect(nestedApply).not.toHaveProperty(field);
+  const diskApply = receipt(JSON.stringify(result.steps[0].result)).steps.find((step: any) => step.operation === "apply").result;
+  for (const field of ["acceptance", "acceptanceHistory"])
+    expect(diskApply).toHaveProperty(field);
   expect(result.steps.map((step: any) => step.operation)).toEqual(result.operation === "advance"
     ? ["drain", "prepare", "requests"] : ["drain", "requests", "gate", "seal"]);
   expect(result.steps.find((step: any) => step.operation === "requests").result).toMatchObject({
@@ -176,11 +183,18 @@ async function groupedState(f: Awaited<ReturnType<typeof groupedFixture>>, outpu
     ? ["Existing gate finding", "Grouped finding", "Grouped handoff"] : ["Existing gate finding"]);
   if (result.operation === "advance") {
     const prepared = result.steps[1].result;
+    for (const field of ["acceptance", "acceptanceHistory"]) {
+      expect(prepared).toHaveProperty(field);
+      expect(projection.steps[1].result).not.toHaveProperty(field);
+    }
     expect(prepared.viewDigest).toBe(canonicalDigest(prepared.view));
     expect(prepared.viewBytes).toBe(Buffer.byteLength(canonicalJSON(prepared.view)));
     return { state, operations: result.steps.map((step: any) => step.operation) };
   }
   const gate = result.steps[2].result, seal = result.steps[3].result;
+  expect(gate.receipt).toHaveProperty("view");
+  expect(projection.view).toEqual(gate.receipt.view);
+  expect(projection.steps[2].result.receipt).not.toHaveProperty("view");
   expect(gate.receipt).not.toHaveProperty("contextPeak");
   expect(result.contextPeak).toBe(12000);
   expect(seal).toMatchObject({ kind: "unit", workerStatus: "complete", mutated: false, receipt: { outcome: "sealed", kind: "unit" } });
@@ -347,6 +361,18 @@ test("a later launch verifies referenced receipt bytes before any effects", asyn
   expect(JSON.parse(next.stdout).reason).toContain("receipt digest mismatch");
 });
 
+test("advance replay rejects changed prepared backlog evidence", async () => {
+  const f = await groupedFixture("advance");
+  const interrupted = await launch(f, f.request, { phase: "afterStep", key: "advance.prepare" });
+  expect(interrupted.exit).toBe(1);
+  const current = readBacklog(f.root, "example");
+  current.backlog!.acceptance[0]!.command = "false";
+  writeFileSync(current.path, JSON.stringify(current.backlog));
+  const resumed = await launch(f, { ...f.request, key: "advance.r1" });
+  expect(resumed.exit).toBe(1);
+  expect(JSON.parse(resumed.stdout).reason).toMatch(/backlog-conflict|integrity/);
+});
+
 test("oversize admission projections fail closed with a bounded JSON error, never truncation", async () => {
   const f = await groupedFixture("advance");
   const current = readBacklog(f.root, "example");
@@ -382,6 +408,9 @@ test("a finished long backlog crosses the final-phase selection as a bounded pro
   expect(output.exit, output.stdout + output.stderr).toBe(0);
   expect(Buffer.byteLength(output.stdout)).toBeLessThan(61440);
   const applied = receipt(output.stdout).steps.find((step: any) => step.operation === "apply").result;
+  const projected = JSON.parse(output.stdout).projection.steps.find((step: any) => step.operation === "apply").result;
+  for (const field of ["acceptance", "acceptanceHistory", "view"])
+    expect(projected[field]).toEqual(applied[field]);
   expect(applied.selected).toBeNull();
   const { tasks, omitted } = applied.completedTasks;
   expect(tasks.length).toBeGreaterThan(0);
