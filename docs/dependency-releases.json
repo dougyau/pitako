@@ -1,10 +1,10 @@
 {
   "@ast-grep/cli": {
-    "version": "0.51.0",
-    "registry": "https://registry.npmjs.org/@ast-grep/cli/0.51.0",
-    "tarball": "https://registry.npmjs.org/@ast-grep/cli/-/cli-0.51.0.tgz",
-    "integrity": "sha512-sIZEt4L4iQJRM2QDKQnbltQxddIsxzt9nmguw3/X7eP3cFwBopsZtFRvaEVht/3/6C1xe3Opn/pbsxSFVJDvpA==",
-    "gitHead": "48b54b3120b70fa9e8cbb40a03bf3bfebe6bf50a",
+    "version": "0.51.3",
+    "registry": "https://registry.npmjs.org/@ast-grep/cli/0.51.3",
+    "tarball": "https://registry.npmjs.org/@ast-grep/cli/-/cli-0.51.3.tgz",
+    "integrity": "sha512-fjdWDDZcTCiUYt0yrHoZNmCRAP8QHKp++xKSLr0PrMqvk/m3v+543IWVvnJ5IcY9Lp0Z7bKSjP2/APZeypT/1g==",
+    "gitHead": "22d84c44939dd93a128d2b29fd860563d86d4d92",
     "license": "MIT"
   },
   "@colbymchenry/codegraph": {
@@ -55,43 +55,43 @@
     "license": "MIT"
   },
   "pi-blackhole": {
-    "version": "0.5.17",
-    "registry": "https://registry.npmjs.org/pi-blackhole/0.5.17",
-    "tarball": "https://registry.npmjs.org/pi-blackhole/-/pi-blackhole-0.5.17.tgz",
-    "integrity": "sha512-DgnIkh/Xy+ugz6VR79wMpQG+i2OnflvUMiQc2tur2FC7GIr7kG4CSMOuNVQUXqu7Hz0VndPDCRFsb6Lz5QpTXw==",
-    "gitHead": "c0e282ae1938eaf8eb9faae6e473e3a1027b5c1f",
+    "version": "0.5.18",
+    "registry": "https://registry.npmjs.org/pi-blackhole/0.5.18",
+    "tarball": "https://registry.npmjs.org/pi-blackhole/-/pi-blackhole-0.5.18.tgz",
+    "integrity": "sha512-+jvRzBfwmhzWgPEh/wpJO+9Iroouv6LL+0O02VcvlIWhBcnLUXCshJ50N0Oi0dAudj7ILbGL/5G8tdrc/rqDxA==",
+    "gitHead": "90dc1aad8bd2e996efbb75fc9909de68e04d12d0",
     "license": "MIT"
   },
   "pi-codex-tools": {
-    "version": "0.4.1",
-    "registry": "https://registry.npmjs.org/pi-codex-tools/0.4.1",
-    "tarball": "https://registry.npmjs.org/pi-codex-tools/-/pi-codex-tools-0.4.1.tgz",
-    "integrity": "sha512-iFdA7ciRydfWftFBRrEt/H/YddQPuzHzriZqWPe7sXcqYQw1XqPw3PAc61goIUG34wawzk0UAdRv3/QyJjtMQg==",
-    "gitHead": "91fd55fdfd7c5516ac8d08267f34b49f1b37d050",
+    "version": "0.4.2",
+    "registry": "https://registry.npmjs.org/pi-codex-tools/0.4.2",
+    "tarball": "https://registry.npmjs.org/pi-codex-tools/-/pi-codex-tools-0.4.2.tgz",
+    "integrity": "sha512-AmUjAPnbLdnOc2uIv5oX3r65/QokkR4upxFoKRkbyyGItUWorPeJwvRiGr4szbbaWWv4rmAzy5EFIUWdEtu2+Q==",
+    "gitHead": "6a108b8ae5de243fdfa6cb60fa49df411c0e5c75",
     "license": "Apache-2.0"
   },
   "pi-markdown-preview": {
-    "version": "0.26.2",
-    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.26.2",
-    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.26.2.tgz",
-    "integrity": "sha512-b6YR1E0Dpdi3VQwvJbqMjPTHaYtEG6dKHLsTyGzLmSrOa+pWjyQV5Rg7tYoZHXVoalsE+MT4i4awYlYPUIe7xg==",
-    "gitHead": "49cef33514aedb64928457cc7b97a7bc3d7aa8d7",
+    "version": "0.27.0",
+    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.27.0",
+    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.27.0.tgz",
+    "integrity": "sha512-zSjSX7sGUHblMJzAuZqk8WXCB7fxFHoby8kNtZsGeb3ili3mFx4oapKVWQ5lZ0oEUjN843+2EpItlOO1TFUkZQ==",
+    "gitHead": "78940f364b8ac293c29d9fd9524bb98542815c88",
     "license": "MIT"
   },
   "pi-subagents": {
-    "version": "0.87.0",
-    "registry": "https://registry.npmjs.org/pi-subagents/0.87.0",
-    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.87.0.tgz",
-    "integrity": "sha512-+XjSB0xEUqrvodRh3bSQGj5/DqCfI/bLlYb0PYfBPFR757S/oOGTWA6uAAOsg3SqAu2ZYyH04Up2Zbi6q4OPMA==",
-    "gitHead": "52e68e9ef0e563d5c97b28519f9999f1b5fbbbea",
+    "version": "0.88.1",
+    "registry": "https://registry.npmjs.org/pi-subagents/0.88.1",
+    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.88.1.tgz",
+    "integrity": "sha512-Yrt0kBT+ChgnmcVzBu2004lwuwmRTHdr1jGUdLd9X7+TAdpLaCILCRFHQhnM9u4fnyOPDLE8wASnedp0nuXc9g==",
+    "gitHead": "83cf25f86b6a70ab917a7e198d0153bc32309f29",
     "license": "MIT"
   },
   "pi-web-access": {
-    "version": "0.46.0",
-    "registry": "https://registry.npmjs.org/pi-web-access/0.46.0",
-    "tarball": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.46.0.tgz",
-    "integrity": "sha512-UfeJKU0TPmQU/3hmfAC5Ot/e5Ib0uHkg2+VHM7Ae4kVilLZf7ocGqHFzBzOkYuGLZ87LobzkrhwTAq8lO/N7cQ==",
-    "gitHead": "4af1a7f7757d450ba0afefe2d98737384dc9a9b4",
+    "version": "0.48.0",
+    "registry": "https://registry.npmjs.org/pi-web-access/0.48.0",
+    "tarball": "https://registry.npmjs.org/pi-web-access/-/pi-web-access-0.48.0.tgz",
+    "integrity": "sha512-9+B5e2kLtN0qYs2LZ6D8yOI9TbjQTnf4AKON/Qy2nseE//fH71u60Icul6Ua7Pp7R5Ro1oPJpiDqdUut730UOg==",
+    "gitHead": "896d75bec55e316726db287a870eb166c4e3f40c",
     "license": "MIT"
   },
   "@earendil-works/pi-agent-core": {
@@ -176,11 +176,11 @@
     "license": "MIT"
   },
   "diff": {
-    "version": "8.0.4",
-    "registry": "https://registry.npmjs.org/diff/8.0.4",
-    "tarball": "https://registry.npmjs.org/diff/-/diff-8.0.4.tgz",
-    "integrity": "sha512-DPi0FmjiSU5EvQV0++GFDOJ9ASQUVFh5kD+OzOnYdi7n3Wpm9hWWGfB/O2blfHcMVTL5WkQXSnRiK9makhrcnw==",
-    "gitHead": "2d42fc673b9c20689e98c60c34dc81b03162c5c9",
+    "version": "9.0.0",
+    "registry": "https://registry.npmjs.org/diff/9.0.0",
+    "tarball": "https://registry.npmjs.org/diff/-/diff-9.0.0.tgz",
+    "integrity": "sha512-svtcdpS8CgJyqAjEQIXdb3OjhFVVYjzGAPO8WGCmRbrml64SPw/jJD4GoE98aR7r25A0XcgrK3F02yw9R/vhQw==",
+    "gitHead": "db0b12ace208da7fd741cf96d97f009347a9eaa8",
     "license": "BSD-3-Clause"
   },
   "smol-toml": {
