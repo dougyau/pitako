@@ -1,6 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { herdrSetupNotice } from "./herdr.ts";
+import { hostDisplayNote } from "./host-display.ts";
 import planExecute from "./plan-execute.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { applyProfile, MUTATING_TOOLS, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
@@ -53,9 +54,10 @@ export default function pitako(pi: ExtensionAPI): void {
     });
     if (action.set !== undefined) pi.setSessionName(action.set);
     if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
-    const note = profileNote(effectiveProfile(ctx.sessionManager));
-    if (event.systemPrompt.includes(note)) return;
-    return { systemPrompt: event.systemPrompt ? `${event.systemPrompt}\n\n${note}` : note };
+    const notes = [profileNote(effectiveProfile(ctx.sessionManager)), hostDisplayNote(ctx.mode, process.env)]
+      .filter((note): note is string => note !== undefined && !event.systemPrompt.includes(note));
+    if (notes.length === 0) return;
+    return { systemPrompt: [event.systemPrompt, ...notes].filter(Boolean).join("\n\n") };
   });
 
   pi.registerCommand("pitako", {
