@@ -17,6 +17,7 @@ import {
 } from "../extensions/catalog.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import pitako from "../extensions/index.ts";
+import { T3_DISPLAY_NOTE, T3_EXTENSION_ENV } from "../extensions/host-display.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
@@ -54,6 +55,45 @@ describe("engineering-layer composition", () => {
       expect(handlers.get("before_agent_start")!({ systemPrompt: result.systemPrompt }, ctx)).toBeUndefined();
     } finally {
       handlers.get("session_shutdown")!({}, ctx);
+    }
+  });
+
+  test("T3 RPC sessions get HTML and Mermaid display guidance; TUI and other RPC clients do not", () => {
+    const handlers = new Map<string, (event: any, ctx: any) => any>();
+    pitako({
+      on(event: string, handler: (event: any, ctx: any) => any) { handlers.set(event, handler); },
+      registerFlag() {}, registerCommand() {},
+      getFlag() { return undefined; },
+      getAllTools() { return []; }, getActiveTools() { return []; }, setActiveTools() {},
+      getSessionName() { return "T3"; },
+    } as unknown as ExtensionAPI);
+    const ctx = (mode: string) => ({
+      cwd: packageRoot(), hasUI: false, mode,
+      sessionManager: { getSessionId() { return "t3-display"; }, getEntries() { return []; } },
+    });
+    const prompt = (mode: string) =>
+      handlers.get("before_agent_start")!({ systemPrompt: "Pi base", messageType: "user", prompt: "Explain" }, ctx(mode)).systemPrompt as string;
+    const previous = { t3: process.env[T3_EXTENSION_ENV], child: process.env.PI_SUBAGENT_CHILD };
+    handlers.get("session_start")!({}, ctx("rpc"));
+    try {
+      delete process.env.PI_SUBAGENT_CHILD;
+      delete process.env[T3_EXTENSION_ENV];
+      expect(prompt("rpc")).not.toContain(T3_DISPLAY_NOTE);
+      process.env[T3_EXTENSION_ENV] = "/tmp/pi-t3-mcp-extension.ts";
+      const t3 = prompt("rpc");
+      expect(t3).toBe(`Pi base\n\n${profileNote("coding")}\n\n${T3_DISPLAY_NOTE}`);
+      expect(t3).toContain("fenced ```mermaid block, never as ASCII art");
+      expect(t3).toContain("Write formatted output as HTML instead of Markdown");
+      expect(handlers.get("before_agent_start")!({ systemPrompt: t3 }, ctx("rpc"))).toBeUndefined();
+      expect(prompt("tui")).not.toContain(T3_DISPLAY_NOTE);
+      process.env.PI_SUBAGENT_CHILD = "1";
+      expect(prompt("rpc")).not.toContain(T3_DISPLAY_NOTE);
+    } finally {
+      for (const [name, value] of [[T3_EXTENSION_ENV, previous.t3], ["PI_SUBAGENT_CHILD", previous.child]] as const) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+      handlers.get("session_shutdown")!({}, ctx("rpc"));
     }
   });
 
