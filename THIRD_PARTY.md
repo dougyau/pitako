@@ -9,16 +9,16 @@ Pitako composes Pi packages and vendors selected MIT skills. It does not ship BS
 | [@dietrichgebert/ponytail](https://github.com/DietrichGebert/ponytail) 5.3.3 | MIT | Skills `ponytail` and `ponytail-review`. The Pi extension is installed but not loaded. |
 | [@juicesharp/rpiv-config](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-config) 2.15.0 | MIT | Exact-pinned, bundled configuration dependency of the vendored TODO fork. |
 | [@juicesharp/rpiv-ask-user-question](https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-ask-user-question) 2.15.0 | MIT | Structured questions through `ask_user_question`. Bundled unchanged with its LICENSE. |
-| [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.27.0 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
+| [pi-markdown-preview](https://github.com/omaclaren/pi-markdown-preview) 0.27.1 | MIT | Markdown and LaTeX previews and artifact export. Bundled unchanged with its LICENSE. |
 | [pi-web-access](https://github.com/nicobailon/pi-web-access) 0.48.0 (Nico Bailon) | MIT | Web search, page extraction, and source checking. Bundled into the Pitako package tarball. |
-| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.88.1 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
-| [pi-blackhole](https://github.com/k0valik/pi-blackhole) 0.5.18 | MIT | Automatic deterministic compaction, session observational memory, and `recall`. Bundled unchanged with its LICENSE. |
+| [pi-subagents](https://github.com/nicobailon/pi-subagents) 0.90.0 (Nico Bailon) | MIT | Native delegation, scripted workflows and missions through the published extension. Bundled unchanged with its LICENSE; Pitako's former managed runtime stays retired. |
+| [pi-blackhole](https://github.com/k0valik/pi-blackhole) 0.5.19 | MIT | Automatic deterministic compaction, session observational memory, and `recall`. Bundled unchanged with its LICENSE. |
 | [pi-lsp-client](https://github.com/code-yeongyu/pi-lsp-client) | MIT | LSP tools |
 | [typescript-language-server](https://github.com/typescript-language-server/typescript-language-server) 5.3.0 | Apache-2.0 | TypeScript and JavaScript LSP server installed as an npm dependency. |
 | [typescript](https://github.com/microsoft/TypeScript) 5.9.3 | Apache-2.0 | Classic `tsserver.js` for the LSP server. The gate retains TypeScript 7.0.2 through the `typescript-compiler` development alias. |
 | [pyright](https://github.com/microsoft/pyright) 1.1.414 | MIT | Python LSP server installed as an npm dependency. |
 | [intelephense](https://github.com/bmewburn/intelephense-docs) 1.18.5 | Proprietary, `LICENSE.txt` | PHP LSP server downloaded as an npm dependency, not redistributed in Pitako's tarball. Premium features require a licence. |
-| [@nicknisi/pi-ast-grep](https://github.com/nicknisi/pi-extensions/tree/main/packages/ast-grep) 0.3.4 (Nick Nisi) | MIT | Syntax search and preview-first rewrites through Pitako's ast-grep CLI dependency. Bundled unchanged with its `LICENSE` and `THIRD_PARTY_NOTICES.md`. |
+| [@nicknisi/pi-ast-grep](https://github.com/nicknisi/pi-extensions/tree/main/packages/ast-grep) 0.3.10 (Nick Nisi) | MIT | Syntax search and preview-first rewrites through Pitako's ast-grep CLI dependency. Bundled unchanged with its `LICENSE` and `THIRD_PARTY_NOTICES.md`. |
 | [@ast-grep/cli](https://github.com/ast-grep/ast-grep) 0.51.3 | MIT | ast-grep CLI with platform-specific optional binaries. Bundled into the Pitako package tarball. |
 | [pi-codex-tools](https://github.com/jvm/pi-mono/tree/main/packages/pi-codex-tools) 0.4.2 | Apache-2.0; OpenAI Codex attribution | Official extension registers `apply_patch` and invokes upstream install telemetry. Bundled unchanged. |
 | [@vndv/pi-codegraph](https://github.com/vndv/pi-codegraph) | MIT | CodeGraph tools |

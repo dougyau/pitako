@@ -8,11 +8,11 @@
     "license": "MIT"
   },
   "@colbymchenry/codegraph": {
-    "version": "1.6.2",
-    "registry": "https://registry.npmjs.org/@colbymchenry/codegraph/1.6.2",
-    "tarball": "https://registry.npmjs.org/@colbymchenry/codegraph/-/codegraph-1.6.2.tgz",
-    "integrity": "sha512-hODH/mGnCf3IUMs6rzktv/zbecJIKJfdZAYHZ9mqecb0G7ZkHaA8CZafDVnswANFEL1YFcG+lfAwc5SIXzUH6Q==",
-    "gitHead": "6560052a6f856855d3f71eee838fd66ccfa4285d",
+    "version": "1.6.4",
+    "registry": "https://registry.npmjs.org/@colbymchenry/codegraph/1.6.4",
+    "tarball": "https://registry.npmjs.org/@colbymchenry/codegraph/-/codegraph-1.6.4.tgz",
+    "integrity": "sha512-Vn4rKe3wTDi8jV3Ni3nUtCX17X3y+hv5rBGkOrO1dtE9ICj3eByVbHM/A9CmR68Cjl8QiGRoOhn7phnS1hyjZg==",
+    "gitHead": "461a5d87a873a4932997cd9a49042ab30e45a675",
     "license": "MIT"
   },
   "@dietrichgebert/ponytail": {
@@ -40,10 +40,10 @@
     "license": "MIT"
   },
   "@nicknisi/pi-ast-grep": {
-    "version": "0.3.4",
-    "registry": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/0.3.4",
-    "tarball": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/-/pi-ast-grep-0.3.4.tgz",
-    "integrity": "sha512-r2N+GT8PTLbYmcHKPyEZFuzg5qMcVbIDNJ3/U9vstGkGewTLlQptDRpyjlESA/qaMi4ISA6m6Rh8WG0SCV4ljg==",
+    "version": "0.3.10",
+    "registry": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/0.3.10",
+    "tarball": "https://registry.npmjs.org/@nicknisi/pi-ast-grep/-/pi-ast-grep-0.3.10.tgz",
+    "integrity": "sha512-S0OLnKp3yDrSR2QXmwvPyYtuPl8cYNnxtYxEscjHFYKAf7PgjmjA7/VbX6LfxKOBav3AEF4n2iwIsdZCAAhs8g==",
     "license": "MIT"
   },
   "@vndv/pi-codegraph": {
@@ -55,11 +55,11 @@
     "license": "MIT"
   },
   "pi-blackhole": {
-    "version": "0.5.18",
-    "registry": "https://registry.npmjs.org/pi-blackhole/0.5.18",
-    "tarball": "https://registry.npmjs.org/pi-blackhole/-/pi-blackhole-0.5.18.tgz",
-    "integrity": "sha512-+jvRzBfwmhzWgPEh/wpJO+9Iroouv6LL+0O02VcvlIWhBcnLUXCshJ50N0Oi0dAudj7ILbGL/5G8tdrc/rqDxA==",
-    "gitHead": "90dc1aad8bd2e996efbb75fc9909de68e04d12d0",
+    "version": "0.5.19",
+    "registry": "https://registry.npmjs.org/pi-blackhole/0.5.19",
+    "tarball": "https://registry.npmjs.org/pi-blackhole/-/pi-blackhole-0.5.19.tgz",
+    "integrity": "sha512-higTGzS5JBkSRCcj+30ZHvR8xyaRWGZnENv6Q6l9JVml4bk36lFmGvsyNlLGYxbj62nBVR1dLLNIoo6g9ShXBg==",
+    "gitHead": "db2fcaebbe8a19376ea46f0dbef7aa218edd10ba",
     "license": "MIT"
   },
   "pi-codex-tools": {
@@ -71,19 +71,19 @@
     "license": "Apache-2.0"
   },
   "pi-markdown-preview": {
-    "version": "0.27.0",
-    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.27.0",
-    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.27.0.tgz",
-    "integrity": "sha512-zSjSX7sGUHblMJzAuZqk8WXCB7fxFHoby8kNtZsGeb3ili3mFx4oapKVWQ5lZ0oEUjN843+2EpItlOO1TFUkZQ==",
-    "gitHead": "78940f364b8ac293c29d9fd9524bb98542815c88",
+    "version": "0.27.1",
+    "registry": "https://registry.npmjs.org/pi-markdown-preview/0.27.1",
+    "tarball": "https://registry.npmjs.org/pi-markdown-preview/-/pi-markdown-preview-0.27.1.tgz",
+    "integrity": "sha512-i9bNQDBpdtVqd/XGmCn3JSgMLylMieE8SKAvkIAxP7zfX8+5yVVlOnRxnEqELKIcrSeSpZ2I1xEee0mHFWenvQ==",
+    "gitHead": "9f17cf966fe2e546ea58b90be4d26a028d5a52b3",
     "license": "MIT"
   },
   "pi-subagents": {
-    "version": "0.88.1",
-    "registry": "https://registry.npmjs.org/pi-subagents/0.88.1",
-    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.88.1.tgz",
-    "integrity": "sha512-Yrt0kBT+ChgnmcVzBu2004lwuwmRTHdr1jGUdLd9X7+TAdpLaCILCRFHQhnM9u4fnyOPDLE8wASnedp0nuXc9g==",
-    "gitHead": "83cf25f86b6a70ab917a7e198d0153bc32309f29",
+    "version": "0.90.0",
+    "registry": "https://registry.npmjs.org/pi-subagents/0.90.0",
+    "tarball": "https://registry.npmjs.org/pi-subagents/-/pi-subagents-0.90.0.tgz",
+    "integrity": "sha512-C8fc4uXluFCiE9GhTlepSeYPOCZ44v4DfUMa8KTy7DS/6YKGay+ap96d7BzenlkUlM17dnlLUtbB5DlDJOMJ5Q==",
+    "gitHead": "f8248a7d0851df3dec8313764bd0be89d261003d",
     "license": "MIT"
   },
   "pi-web-access": {
