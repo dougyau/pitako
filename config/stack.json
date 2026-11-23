@@ -47,7 +47,7 @@
     },
     {
       "id": "@nicknisi/pi-ast-grep",
-      "spec": "@nicknisi/pi-ast-grep@0.3.4",
+      "spec": "@nicknisi/pi-ast-grep@0.3.10",
       "entry": "node_modules/@nicknisi/pi-ast-grep/index.ts",
       "bins": ["ast-grep"],
       "tools": ["ast_search", "ast_rewrite"]
@@ -125,7 +125,7 @@
     },
     {
       "id": "pi-subagents",
-      "spec": "pi-subagents@0.88.1",
+      "spec": "pi-subagents@0.90.0",
       "entry": "node_modules/pi-subagents/bundle/index.js",
       "tools": ["subagent", "subagents_enable", "bg_wait", "subagent_supervisor", "contact_supervisor"]
     },
@@ -137,7 +137,7 @@
     },
     {
       "id": "pi-markdown-preview",
-      "spec": "pi-markdown-preview@0.27.0",
+      "spec": "pi-markdown-preview@0.27.1",
       "entry": "node_modules/pi-markdown-preview/index.ts",
       "tools": ["preview_export"]
     },
@@ -149,7 +149,7 @@
     },
     {
       "id": "pi-blackhole",
-      "spec": "pi-blackhole@0.5.18",
+      "spec": "pi-blackhole@0.5.19",
       "entry": "node_modules/pi-blackhole/dist/index.js",
       "tools": ["recall"]
     }
