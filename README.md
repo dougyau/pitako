@@ -115,7 +115,13 @@ native inline renderer.
 session observational memory, without a Pitako adapter. Its background memory
 workers make billed model calls when configured. Upstream defaults disable
 fallback to the session model. Configure it through `/blackhole settings`;
-Pitako does not change your settings or add it to child profiles.
+Pitako does not change your settings or add it to child profiles. T3 Code drops
+status colors, so under T3 Pitako hides blackhole's gauge bar unless you set
+`PI_BLACKHOLE_STATUSBAR` yourself.
+
+Pitako's status line shows running `/execute`, review and architecture workflows,
+for example `execute · loop 2/30 · tareas 3/7 · change1`. It stays empty when
+nothing runs. An ending you watched stays until your next prompt.
 
 Load specialized skills only when they apply. The default collection includes
 Ponytail, Caveman, investigation, architecture, review, verification, and

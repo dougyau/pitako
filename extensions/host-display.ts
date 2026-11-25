@@ -19,3 +19,9 @@ export function hostDisplayNote(mode: ExtensionContext["mode"] | undefined, env:
   if (mode !== "rpc" || env.PI_SUBAGENT_CHILD === "1" || !env[T3_EXTENSION_ENV]) return undefined;
   return T3_DISPLAY_NOTE;
 }
+
+// T3 strips status colors, which leaves pi-blackhole's gauge bars unreadable. blackhole reads
+// this variable when it first loads its config, after every extension factory has run.
+export function hideBlackholeStatusUnderT3(env: NodeJS.ProcessEnv): void {
+  if (env[T3_EXTENSION_ENV] && env.PI_SUBAGENT_CHILD !== "1") env.PI_BLACKHOLE_STATUSBAR ??= "false";
+}

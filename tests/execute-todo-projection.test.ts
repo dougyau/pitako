@@ -12,6 +12,7 @@ import { getState, getSyncSequences, evictSession, replaceState } from "../vendo
 import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
 import type { Task } from "../vendor/rpiv-todo/tool/types.ts";
 import { readTodoRecords, type TodoRecordKind } from "../extensions/pitako-store.ts";
+import { executeProgress, progressStatusLine, workflowProgress } from "../extensions/progress-status.ts";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
 const todoRows = (root: string, kind: TodoRecordKind = "request") =>
@@ -265,6 +266,33 @@ function runtimeFixture() {
       try { expect(existsSync(path.join(foreground,".pi"))).toBe(false); }
       finally { fake.dispose(); rmSync(root,{recursive:true,force:true}); }}};
 }
+
+describe("progress status line",()=>{
+  test.each([
+    [snapshot(),"execute · loop 1/3 · tareas 0/1 · t1"],
+    [snapshot({active:{taskId:"t1",attempt:2,workflowKey:"w"},tasks:[{id:"t0",subject:"Done",status:"completed",blockedBy:[]},{id:"tx",subject:"Dropped",status:"cancelled",blockedBy:[]},snapshot().tasks[0]!]}),"execute · loop 1/3 · tareas 1/2 · t1 (intento 2)"],
+    [snapshot({tasks:[],active:null,phases:[{name:"plan",subject:"Plan",status:"in_progress"}]}),"execute · loop 1/3 · plan"],
+    [snapshot({active:null,phases:[{name:"plan",subject:"Plan",status:"completed"},{name:"compliance",subject:"C",status:"in_progress"}]}),"execute · loop 1/3 · tareas 0/1 · compliance"],
+    [snapshot({outcome:"gaps"}),"execute · loop 1/3 · con huecos"],
+    [{...snapshot(),halted:true} as ExecuteTodoSnapshot,"execute · loop 1/3 · detenido"],
+  ])("execute %#",(value,line)=>expect(executeProgress(value)).toBe(line));
+
+  const review=(steps:unknown[])=>({workflow:{resource:{name:"pitako.review"}},steps});
+  const architecture=(steps:unknown[])=>({workflow:{resource:{name:"pitako.architecture"}},steps});
+  test.each([
+    [review([{status:"running",phase:"review-prepare"}]),"review · preparando"],
+    [review([{status:"completed",phase:"review-prepare"},{status:"completed",phase:"review-independent"},{status:"completed",phase:"review-independent"},{status:"running"}]),"review · ángulos 2/2"],
+    [review([{status:"completed",phase:"review-independent"},{status:"running",phase:"review-synthesis"}]),"review · síntesis"],
+    [architecture([{status:"completed",phase:"architecture-perspective",label:"Round 2 Skeptic"},{status:"running",phase:"architecture-evaluate",label:"Round 2 architecture evaluation"},{status:"running",label:"ledger-3"}]),"architecture · ronda 2 · evaluación"],
+    [architecture([{status:"running",label:"ledger-observe-1"}]),"architecture"],
+    [{workflow:{resource:{name:"other"}},steps:[]},undefined],
+  ])("workflow %#",(run,line)=>expect(workflowProgress(run)).toBe(line));
+
+  test("joins at most two runs and counts the rest",()=>{
+    expect(progressStatusLine([])).toBeUndefined();
+    expect(progressStatusLine(["a","b","c","d"])).toBe("a | b | +2");
+  });
+});
 
 describe("execute todo registration and reconciliation",()=>{
   test("reload defers historical runs until RPC is ready without warnings or TODO writes",async()=>{
@@ -752,8 +780,11 @@ describe("execute todo registration and reconciliation",()=>{
   test("a halted run cancels its open rows with the reason, and its replacement run neither inherits nor duplicates them",async()=>{
     const f=runtimeFixture();
     try {
+      Object.assign(f.ctx,{hasUI:true});
+      const statuses=()=>(f.ctx.ui.setStatus as any).mock.calls.map((call:unknown[])=>call);
       await f.fire("session_start");
       expect(visible(getState(f.sid).tasks).filter(t=>t.owner==="worker:run:t1:1")).toHaveLength(2);
+      expect(statuses()).toEqual([["pitako","execute · loop 1/3 · tareas 0/1 · t1"]]);
       const main=path.join(f.root,"main","status.json");
       writeFileSync(main,JSON.stringify({...JSON.parse(readFileSync(main,"utf8")),state:"complete",startedAt:1,
         workflow:{emits:[snapshot()],value:{status:"blocked",reason:"Fallback lacks evidence."}}}));
@@ -763,15 +794,45 @@ describe("execute todo registration and reconciliation",()=>{
       expect(halted.find(t=>t.metadata?.key==="exec:run:task:1:t1")).toMatchObject({status:"cancelled",subject:"Build · blocked: Fallback lacks evidence."});
       expect(halted.filter(t=>t.owner==="worker:run:t1:1").map(t=>t.status)).toEqual(["cancelled","cancelled"]);
       expect(halted.some(t=>t.status==="in_progress")).toBe(false);
+      expect(statuses().at(-1)).toEqual(["pitako","execute · loop 1/3 · detenido"]);
       f.addRun("relaunch",snapshot({active:{taskId:"t1",attempt:2,workflowKey:"work.t1.a2"}}),{},{startedAt:2});
       f.setRuns([{id:"relaunch"},{id:"run"}]);
       await f.fire("tool_result",{toolName:"subagent"});
       const rows=visible(getState(f.sid).tasks);
       expect(rows.map(t=>[t.owner,t.subject,t.status])).toEqual([
         ["execute:relaunch","Loop 1/3 · Plan","completed"],["execute:relaunch","Build","in_progress"]]);
+      expect(statuses().at(-1)).toEqual(["pitako","execute · loop 1/3 · tareas 0/1 · t1 (intento 2)"]);
       expect(todoRows(f.root)).toEqual([]);
       const count=f.captured.entries.length;
       await f.fire("session_start");expect(f.captured.entries).toHaveLength(count);
+      expect(f.warnings()).toEqual([]);
+    } finally {await f.close();}
+  });
+
+  test("the status line follows live workflows, keeps a watched ending until the next prompt, and clears on shutdown",async()=>{
+    const f=runtimeFixture();
+    try {
+      Object.assign(f.ctx,{hasUI:true});
+      const statuses=()=>(f.ctx.ui.setStatus as any).mock.calls.map((call:unknown[])=>call[1]);
+      const angle=(status:string)=>({status,phase:"review-independent",label:"Independent review"});
+      const review=f.addRun("review",snapshot(),{emits:[],resource:{name:"pitako.review"}},
+        {state:"running",steps:[{status:"completed",phase:"review-prepare"},angle("completed"),angle("running")]});
+      f.setRuns([{id:"run"},{id:"review"}]);
+      await f.fire("session_start");
+      expect(statuses()).toEqual(["execute · loop 1/3 · tareas 0/1 · t1 | review · ángulos 1/2"]);
+      f.writeMain(snapshot({seq:2,tasks:[{...snapshot().tasks[0],status:"completed"}],active:null,outcome:"complete"}));
+      await f.fire("tool_result",{toolName:"subagent"});
+      expect(statuses().at(-1)).toBe("review · ángulos 1/2 | execute · loop 1/3 · completo");
+      await f.fire("before_agent_start");
+      await f.fire("tool_result",{toolName:"todo"});
+      expect(statuses().at(-1)).toBe("review · ángulos 1/2");
+      writeFileSync(path.join(review,"status.json"),JSON.stringify({runId:"review",state:"complete",workflow:{emits:[],resource:{name:"pitako.review"}}}));
+      await f.fire("tool_result",{toolName:"subagent"});
+      expect(statuses().at(-1)).toBeUndefined();
+      const count=statuses().length;
+      await f.fire("session_start");
+      // A finished invocation seen only at startup is history, not news.
+      expect(statuses()).toHaveLength(count);
       expect(f.warnings()).toEqual([]);
     } finally {await f.close();}
   });
