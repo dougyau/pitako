@@ -8,6 +8,7 @@ import { executeStore } from "../skills/execute/ledger.mjs";
 import { readExecuteIntentContext } from "../extensions/execute-intent.ts";
 import { canonicalDigest, canonicalJSON } from "../extensions/canonical.mjs";
 import { checkoutEvidence } from "../extensions/spec-plans.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const composition = realCheckoutCompositionFixture();
 const scripts = composition.scripts;
@@ -33,7 +34,7 @@ test("an incomplete attempt keeps grouped close and a folded baseline before rev
   const { intent } = readExecuteIntentContext(host.root, second);
   expect(intent.progress!.admitted.change1).toEqual(["continue"]);
   expect(intent.progress!.previous).toBeNull();
-  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io")) {
+  for (const call of host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io")) {
     const input = JSON.parse(call.task), gate = input.operation === "close" ? input.gate : input.operation === "gate" ? input : null;
     if (!gate?.checkpoint) continue;
     expect(gate).not.toHaveProperty("knowledge");
@@ -66,7 +67,7 @@ test.each(["step-order", "seal-kind", "after-candidate", "baseline-variant", "re
     ? host.result(request, { status: "complete", work: "Confirmed no file changes", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const response = await normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close") {
       const transport = JSON.parse(response.output!);
       const steps = transport.projection.steps;
       if (damage === "step-order") [steps[1], steps[2]] = [steps[2], steps[1]];
@@ -86,7 +87,7 @@ test.each(["step-order", "seal-kind", "after-candidate", "baseline-variant", "re
 
 test("capacity and positive activity prevent grouped redispatch", async () => {
   const capacity = fixture();
-  capacity.setLaunchRespond((request, normal) => request.agent === "pitako.loop-io"
+  capacity.setLaunchRespond((request, normal) => pitakoAgentFamily(request.agent) === "loop-io"
     ? { ok: false, key: request.key, error: "Active async run capacity exhausted: 1/1 used.", output: "", results: [] }
     : normal());
   const exhausted = await capacity.execute();
@@ -100,14 +101,14 @@ test("capacity and positive activity prevent grouped redispatch", async () => {
     ? host.result(request, { status: "complete", work: "Confirmed no file changes", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const response = await normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close")
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close")
       response.output = "missing transport receipt";
     return response;
   });
   host.setStatus(ref => ref.includes(".close") ? { ok: true, state: "running", runId: ref }
     : host.native.get(ref) ?? { ok: true, state: "unknown" });
   expect((await host.execute()).status).toBe("blocked");
-  expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close")).toHaveLength(1);
+  expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "close")).toHaveLength(1);
 });
 
 async function groupedScenario(continuation: boolean, uninterrupted?: { root: string; launches: any[] }) {
@@ -140,9 +141,9 @@ async function groupedScenario(continuation: boolean, uninterrupted?: { root: st
   let replayedClose = false;
   host.setLaunchRespond(async (request, normal) => {
     if (request.agent === "pitako.checkpoint-sealer" ||
-        request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+        pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta")
       return scripts.runDeterministic(request.key, request, { ...metadata, inlineSealer: true }, undefined);
-    if (request.agent !== "pitako.loop-io") return normal();
+    if (pitakoAgentFamily(request.agent) !== "loop-io") return normal();
     const input = JSON.parse(request.task), dbPath = path.join(host.root, ".pi/board.db");
     if (!["advance", "selection", "close", "drain"].includes(input.operation)) return normal();
     const originalClose = request.key === `${closeKey}.r1` ? host.native.get(closeKey) : null;
@@ -222,8 +223,8 @@ async function groupedScenario(continuation: boolean, uninterrupted?: { root: st
     expect(normalize(resumed.slice(1), host.root))
       .toBe(normalize(uninterrupted.launches.slice(originalIndex + 1), uninterrupted.root));
     expect(host.launches).toHaveLength(uninterrupted.launches.length + 1);
-    expect(host.launches.filter(call => call.agent && ["pitako.worker", "pitako.reviewer"].includes(call.agent)).map(call => call.key))
-      .toEqual(uninterrupted.launches.filter(call => call.agent && ["pitako.worker", "pitako.reviewer"].includes(call.agent)).map(call => call.key));
+    expect(host.launches.filter(call => ["worker", "reviewer"].includes(pitakoAgentFamily(call.agent) ?? "")).map(call => call.key))
+      .toEqual(uninterrupted.launches.filter(call => ["worker", "reviewer"].includes(pitakoAgentFamily(call.agent) ?? "")).map(call => call.key));
   }
   expect(output.status, output.reason).toBe("partial");
   expect(output.reason).toContain("1 authorized loops consumed");

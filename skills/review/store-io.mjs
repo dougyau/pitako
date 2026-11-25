@@ -8,6 +8,7 @@ import {provePathReceipt, readAccessReceipt} from "../../extensions/access-recei
 import {readRequest, safePath, validateMissionPath} from "../../extensions/hash-ledger.mjs";
 import {reviewCursorContract, reviewCursorScript} from "./cursor.mjs";
 import {reviewSynthesisScript} from "./synthesis.mjs";
+import {pitakoAgentFamily} from "../agent-names.mjs";
 
 const {PitakoStore, StoreError} = await import("../../extensions/pitako-store.ts");
 const {key: cursorKey, validate, witness, barrier, verifierRetry} = reviewCursorContract();
@@ -38,7 +39,7 @@ function journalEntries(run) {
 
 function reusableSettlements(mission, cursor, root) {
   const observePrefix = `${cursor.prefix}store-review.observe.r`;
-  const observers = mission.workflowChildren.filter(child => child.agent === "pitako.store-io" && child.status === "running" &&
+  const observers = mission.workflowChildren.filter(child => pitakoAgentFamily(child.agent) === "review-store" && child.status === "running" &&
     typeof child.key === "string" && child.key.startsWith(observePrefix) && /^\d+$/.test(child.key.slice(observePrefix.length)));
   const settlements = new Map(), seen = new Set();
   if (observers.length !== 1) return settlements;
@@ -97,9 +98,12 @@ function nativeResults(mission, refs, root) {
           if (rejected) throw new Error(error || "Native dispatch rejected.");
           return {ok, ...(error ? {error} : {})};
         }
-        const producer = resume ? "pitako.reviewer" : agent;
+        const family = resume ? "reviewer" : pitakoAgentFamily(agent);
         const matches = mission.workflowChildren.filter(child => child.key === key && child.runId === ref.runId &&
-          child.agent === producer && ["completed", "failed", "stopped"].includes(child.status));
+          ["completed", "failed", "stopped"].includes(child.status));
+        const producerAgent = matches[0]?.agent;
+        if (!family || pitakoAgentFamily(producerAgent) !== family || matches.some(child => child.agent !== producerAgent))
+          throw integrity(`conflicting native producer for ${key}.`);
         const witnesses = [];
         for (const child of matches) {
           const entries = journalFor(child.workflowRunId);
@@ -107,13 +111,20 @@ function nativeResults(mission, refs, root) {
             entry.runId === ref.runId && hash(entry.fingerprint));
           for (const {fingerprint} of starts)
             for (const entry of entries)
-              if (entry.type === "settle" && entry.key === key && entry.fingerprint === fingerprint && entry.result?.runId === ref.runId)
-                witnesses.push(witness(producer === "pitako.access-verifier"
-                  ? {...entry.result, agent: entry.result.agent ?? producer} : entry.result));
+              if (entry.type === "settle" && entry.key === key && entry.fingerprint === fingerprint && entry.result?.runId === ref.runId) {
+                const result = witness(family === "originals-verifier"
+                  ? {...entry.result, agent: entry.result.agent ?? producerAgent} : entry.result);
+                // The reducer preserves wrong-family reviewer deliveries as failed evidence.
+                // A same-family substitution would otherwise look like a valid delivery.
+                if ([result, ...(result.results ?? [])].some(item => item.agent !== undefined &&
+                    item.agent !== producerAgent && (family !== "reviewer" || pitakoAgentFamily(item.agent) === family)))
+                  throw integrity(`conflicting native settlement identity for ${key}.`);
+                witnesses.push(result);
+              }
         }
         if (!witnesses.length || witnesses.some(result => canonicalDigest(result) !== ref.digest))
           throw integrity(`original ${key} does not match its key/runId/digest.`);
-        if (producer === "pitako.access-verifier" && witnesses[0].ok && !barrier(witnesses[0])) {
+        if (family === "originals-verifier" && witnesses[0].ok && !barrier(witnesses[0])) {
           const request = JSON.parse(task), observed = JSON.parse(witnesses[0].output);
           if (!reviewVerifierStoreFailure(witnesses[0], observed)) access.set(request.gate, {request, observed});
         }
@@ -202,7 +213,7 @@ export function observeReview(request, cwd = process.cwd()) {
   const gate = `${cursor.prefix}synthesis`, verifierBase = `${cursor.prefix}verify-synthesis`;
   const retryOf = key => verifierRetry(key, verifierBase);
   const isVerifier = key => retryOf(key) >= 0;
-  const agentFor = key => isVerifier(key) ? "pitako.access-verifier" : "pitako.reviewer";
+  const familyFor = key => isVerifier(key) ? "originals-verifier" : "reviewer";
   const candidates = mission.workflowChildren.filter(child => typeof child.key === "string" && child.key.startsWith(cursor.prefix) &&
     (/^(director-prepare|director-synthesis|independent-[A-Za-z0-9][A-Za-z0-9_-]{0,28}-r[12])$/.test(child.key.slice(cursor.prefix.length)) ||
       isVerifier(child.key)));
@@ -214,14 +225,15 @@ export function observeReview(request, cwd = process.cwd()) {
     if (!namedReview(status, id, root) || !status.workflow.emits?.some(entry => entry?.reviewScope === cursor.scopeId)) continue;
     scopedRuns.push(run);
     for (const child of candidates.filter(child => child.workflowRunId === id)) {
-      const {key, runId} = child;
+      const {key, runId, agent} = child;
       const ref = confirmed.get(key);
       if (ref && ref.runId !== runId) throw integrity(`conflicting native producers for ${key}.`);
-      if (starts.has(key) && starts.get(key) !== runId) throw integrity(`conflicting native producers for ${key}.`);
-      starts.set(key, runId);
+      const started = starts.get(key);
+      if (started && (started.runId !== runId || started.agent !== agent)) throw integrity(`conflicting native producers for ${key}.`);
+      starts.set(key, {runId, agent});
       if (!terminal.has(child.status)) { open.add(key); continue; }
-      const entry = selected.get(key) ?? {key, runId, statuses: new Set(), fingerprints: new Set(), settlements: []};
-      if (!runId || child.agent !== agentFor(key))
+      const entry = selected.get(key) ?? {key, runId, agent: child.agent, statuses: new Set(), fingerprints: new Set(), settlements: []};
+      if (!runId || pitakoAgentFamily(child.agent) !== familyFor(key))
         throw integrity(`invalid native producer for ${key}.`);
       entry.statuses.add(child.status);
       selected.set(key, entry);
@@ -236,13 +248,13 @@ export function observeReview(request, cwd = process.cwd()) {
       if (record.type === "start" && record.runId === entry.runId) entry.fingerprints.add(record.fingerprint);
       if (record.type === "settle" && record.result?.runId === entry.runId) {
         const verifier = isVerifier(entry.key);
-        const result = witness(verifier ? {...record.result, agent: record.result.agent ?? "pitako.access-verifier"} : record.result);
+        const result = witness(verifier ? {...record.result, agent: record.result.agent ?? entry.agent} : record.result);
         entry.settlements.push({fingerprint: record.fingerprint, result});
       }
     }
   }
   const retryable = new Set();
-  const settlements = [...selected.values()].map(({key, runId, statuses, fingerprints, settlements}) => {
+  const settlements = [...selected.values()].map(({key, runId, agent, statuses, fingerprints, settlements}) => {
     const result = settlements[0]?.result;
     const controlled = result && barrier(result);
     if (!result || typeof result.ok !== "boolean" || result.key !== key ||
@@ -252,7 +264,7 @@ export function observeReview(request, cwd = process.cwd()) {
       throw integrity(`unproved native settlement for ${key}.`);
     if ([result, ...(result.results ?? [])].some(item => [item.key, item.nativeKey, item.workflowKey].some(value => value !== undefined && value !== key) ||
         item.runId !== undefined && item.runId !== runId ||
-        item.agent !== undefined && item.agent !== agentFor(key)))
+        item.agent !== undefined && item.agent !== agent))
       throw integrity(`conflicting native settlement identity for ${key}.`);
     if (result.structuredOutput !== undefined) for (const file of result.results ?? []) {
       if (!file.savedOutputPath || file.outputSaveError) continue;
@@ -297,7 +309,7 @@ export function observeReview(request, cwd = process.cwd()) {
       const entry = reused.get(key);
       if (!result.ok || !entry?.result?.ok || !selected.get(key).fingerprints.has(entry.fingerprint) ||
           canonicalDigest(witness(isVerifier(key)
-            ? {...entry.result, agent: entry.result.agent ?? "pitako.access-verifier"} : entry.result)) !== digest) return [];
+            ? {...entry.result, agent: entry.result.agent ?? selected.get(key).agent} : entry.result)) !== digest) return [];
       const ref = {key, runId: result.runId, digest};
       return [{index, ref, savings: Buffer.byteLength(JSON.stringify(settlements[index])) - Buffer.byteLength(JSON.stringify(ref))}];
     });

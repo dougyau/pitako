@@ -10,6 +10,7 @@ import { canonicalDigest, canonicalJSON, sha256 } from "../../extensions/canonic
 import { accessReceiptKey, checkReceipt } from "../../extensions/access-receipts.mjs";
 import { observeRequests } from "./observe.mjs";
 import { reviewAnalysisConforms, reviewSynthesisContract } from "../review/synthesis.mjs";
+import { pitakoAgentFamily } from "../agent-names.mjs";
 const { viewBudget } = await import("../../extensions/board/store.ts");
 const { PitakoStore, StoreError } = await import("../../extensions/pitako-store.ts");
 const { captureBaseline, checkpointTaskDelta, readCheckpointTaskBytes, sealCheckpointRequest, observeTaskReviewSeal } = await import("../../extensions/execute-checkpoint.ts");
@@ -219,12 +220,12 @@ function nativeFinalDrain(admission, input) {
   const child = children[0];
   const dirs = child?.artifactPaths?.filter(file => typeof file === "string" && path.isAbsolute(file) &&
     path.basename(file) === producer.runId) ?? [];
-  if (mission.id !== association.missionId || children.length !== 1 || child.agent !== "pitako.loop-io" || dirs.length !== 1 ||
+  if (mission.id !== association.missionId || children.length !== 1 || pitakoAgentFamily(child.agent) !== "loop-io" || dirs.length !== 1 ||
       !/^[0-9a-f-]{36}$/.test(child.workflowRunId))
     throw new Error("Final drain native producer identity mismatch.");
   const status = JSON.parse(readFileSync(safePath(path.join(dirs[0], "status.json")), "utf8"));
   if (status.runId !== producer.runId || status.workflowKey !== producer.key || status.cwd !== input.root ||
-      status.parentWorkflowRunId !== child.workflowRunId || status.steps?.[0]?.agent !== child.agent)
+      status.parentWorkflowRunId !== child.workflowRunId || status.steps?.length !== 1 || status.steps[0].agent !== child.agent)
     throw new Error("Final drain native status identity mismatch.");
   const settled = readNativeSettlement(path.join(path.dirname(dirs[0]), child.workflowRunId, "workflow-children.jsonl"),
     producer.key, producer.runId, child.agent);
@@ -277,15 +278,15 @@ function boundNativeProducer(association, fail) {
     const child = children[0];
     const dirs = child?.artifactPaths?.filter(file => typeof file === "string" && path.isAbsolute(file) &&
       path.basename(file) === child.runId) ?? [];
-    if (children.length !== 1 || child.agent !== agent || dirs.length !== 1 ||
+    if (children.length !== 1 || pitakoAgentFamily(child.agent) !== pitakoAgentFamily(agent) || dirs.length !== 1 ||
         !/^[0-9a-f-]{36}$/.test(child.workflowRunId))
       throw fail(`missing or ambiguous native producer ${subject}`);
     const status = JSON.parse(readFileSync(safePath(path.join(dirs[0], "status.json")), "utf8"));
     const journal = path.join(path.dirname(dirs[0]), child.workflowRunId, "workflow-children.jsonl");
-    const result = readNativeSettlement(journal, subject, child.runId, agent);
+    const result = readNativeSettlement(journal, subject, child.runId, child.agent);
     if (status.runId !== child.runId || status.cwd !== association.root || status.workflowKey !== subject ||
         status.parentWorkflowRunId !== child.workflowRunId || status.steps?.length !== 1 ||
-        status.steps[0].agent !== agent || result.results?.length !== 1)
+        status.steps[0].agent !== child.agent || result.results?.length !== 1)
       throw fail(`native identity mismatch for ${subject}`);
     return { child, status, result, journal };
   };
@@ -989,7 +990,7 @@ function replayAnalysisOriginals(input, saved, loop, role) {
   if (mission.id !== association.missionId || !Array.isArray(mission.workflowChildren))
     throw new Error("Early analysis replay mission identity mismatch.");
   const producers = mission.workflowChildren.filter(child =>
-    typeof child.key === "string" && isKey(child.key) && child.agent === "pitako.reviewer");
+    typeof child.key === "string" && isKey(child.key) && pitakoAgentFamily(child.agent) === "reviewer");
   if (new Set(producers.map(item => item.key)).size !== producers.length ||
       producers.length > (role === "demand" ? 1 : 5) ||
       refs.some(ref => !ref || Object.keys(ref).sort().join(",") !== "digest,key,runId" ||
@@ -1029,7 +1030,7 @@ function replayRenewedReviewAccess(input, prefix, analyses) {
   for (let retry = 0; ; retry++) {
     const key = base + (retry ? `.store.r${retry}` : "");
     if (!children.some(child => child.key === key)) break;
-    const { result, status } = native(key, "pitako.access-verifier");
+    const { result, status } = native(key, "pitako.originals-verifier");
     if (!result.ok || settledBarrier(result) || status.state !== "complete" || status.steps[0].exitCode !== 0 ||
         [result, ...result.results].some(entry => entry.error || entry.timedOut || entry.terminalOutcome ||
           entry.exitCode !== undefined && entry.exitCode !== 0))
@@ -1163,7 +1164,8 @@ function replayFinalGate(input, store, scope, anchor) {
     selectionReference, ...(analyses ? { analyses } : {}), ...(reviewAccess ? { reviewAccess } : {}) } };
 }
 
-export function publishFinalReview(input, observe = checkoutEvidence) {
+// A replay status observation is a verification precondition, not part of the durable request.
+export function publishFinalReview({ observedSynthesisAgent, ...input }, observe = checkoutEvidence) {
   const fail = reason => new Error(`Final review publication integrity failure: ${reason}`);
   const { root, invocation, key, storeId, scope, expectedHead, refs } = input;
   const base = key.replace(/\.reviewOriginals$/, "");
@@ -1209,6 +1211,8 @@ export function publishFinalReview(input, observe = checkoutEvidence) {
   for (const ref of refs.originals) {
     if (!ref.key.startsWith(reviewPrefix) || !ref.runId) throw fail("unbound reviewer");
     const { result, status } = native(ref.key, "pitako.reviewer", ref.runId);
+    if (ref === synthesisRef && observedSynthesisAgent !== undefined && result.agent !== observedSynthesisAgent)
+      throw new Error("Final review replay producer integrity mismatch.");
     const original = readNativeOriginal(root, { association }, ref, "pitako.reviewer", false);
     const digest = canonicalDigest(original.value);
     if (!result.ok || result.terminalOutcome || result.results[0].exitCode !== 0 ||
@@ -1223,7 +1227,7 @@ export function publishFinalReview(input, observe = checkoutEvidence) {
     // distinct native witnesses. Do not substitute one for the other.
     const fields = (source, names) => Object.fromEntries(names.filter(name => source[name] !== undefined)
       .map(name => [name, source[name]]));
-    const reference = { key, runId, agent: "pitako.reviewer",
+    const reference = { key, runId, agent: result.agent,
       ...fields(result, ["model", "outputReference", "metadataSaveError"]),
       results: [{ savedOutputPath: path,
         ...fields(result.results[0], ["outputReference", "structuredOutputPath", "metadataSaveError"]) }] };
@@ -1563,7 +1567,8 @@ export function resolveStoredGroupedInput(operation, input) {
         // Synthesis is already bound to its exact key, run, path and bytes by the review archive seed.
         if (!synthesis) {
           const verified = readNativeOriginal(input.root, { association: admission.association }, original, "pitako.reviewer");
-          if (verified.reference.path !== original.path || canonicalDigest(verified.value) !== original.digest)
+          if (verified.agent !== body.compliance.ref.agent ||
+              verified.reference.path !== original.path || canonicalDigest(verified.value) !== original.digest)
             throw new Error("compliance producer/path/digest mismatch");
         }
         for (const review of body.integratedReview?.originals ?? []) {
@@ -1615,7 +1620,7 @@ export function resolveStoredGroupedInput(operation, input) {
       const originals = reviews.map(review => {
         const original = readNativeOriginal(input.root, request.checkpoint, review, "pitako.reviewer");
         return { reference: { ...review, path: original.reference.path, digest: canonicalDigest(original.value) },
-          body: original.value };
+          agent: original.agent, body: original.value };
       });
       const execution = prefix.P.prompt.execution;
       const continuation = [execution?.continuation, execution?.foldedContinuation]
@@ -1802,7 +1807,12 @@ export function resolveStoredGroupedInput(operation, input) {
             !/^[a-f0-9]{64}$/.test(timeout.digest))
           throw new StoreError("store-corrupt", "Invalid gate timeout original reference");
         let original;
-        try { original = readNativeSettlement(timeout.path, timeout.key, timeout.runId, "pitako.loop-io"); }
+        try {
+          const { native } = boundNativeProducer(admission.association, message => new Error(message));
+          const { result, journal } = native(timeout.key, "pitako.loop-io", timeout.runId);
+          if (journal !== timeout.path) throw new Error("Native settlement path mismatch.");
+          original = result;
+        }
         catch (error) { throw new StoreError("store-corrupt", `Gate timeout original unavailable: ${error.message}`); }
         const generation = Number(timeout.key.match(/\.g([23])\.gate(?:\.r\d+)?$/)?.[1] ?? 1);
         const originalKey = `${worker.key}${generation > 1 ? `.g${generation}` : ""}.gate`;

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 
@@ -8,7 +9,7 @@ test("only loop-io requests carry the fixed idle control, including transport an
   const failed = new Set<string>();
   let workers = 0;
   host.setLaunchRespond(async (request, normal) => {
-    if (request.agent === "pitako.loop-io" && ["advance", "close"].includes(JSON.parse(request.task).operation) &&
+    if (pitakoAgentFamily(request.agent) === "loop-io" && ["advance", "close"].includes(JSON.parse(request.task).operation) &&
         !failed.has(JSON.parse(request.task).operation)) {
       failed.add(JSON.parse(request.task).operation);
       return { ...await normal(), output: "invalid transport receipt" };
@@ -26,7 +27,7 @@ test("only loop-io requests carry the fixed idle control, including transport an
   });
   const outcome = await host.executeNative();
   expect(outcome.status, outcome.reason).toBe("complete");
-  const io = host.launches.filter(call => call.agent === "pitako.loop-io");
+  const io = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io");
   expect(io.map(call => call.key)).toEqual(expect.arrayContaining([
     "invoke-human-1.l1.advance.r1", "invoke-human-1.l1.selectionIO.d1", "invoke-human-1.l1.t1.a1.close.r1",
   ]));

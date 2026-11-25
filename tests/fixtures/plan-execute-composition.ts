@@ -90,7 +90,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   if (request.agent === "pitako.request-observer") return { key, ok: true, agent: request.agent,
     runId: nativeRunId, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
       invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
-  if (request.agent === "pitako.access-verifier") {
+  if (request.agent === "pitako.originals-verifier") {
     // Keep integrated review's verifier and publication on the same native mission.
     const input = JSON.parse(request.task), path = require("node:path"), fs = require("node:fs");
     const missionPath = metadata.association?.missionPath ?? (fs.existsSync(input.missionPath)
@@ -104,7 +104,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
     })();
   }
-  if (request.agent === "pitako.loop-io") {
+  if (/^pitako\.loop-/.test(request.agent ?? "")) {
     const input = JSON.parse(request.task);
     if (input.operation === "baseline" || input.operation === "reviewOriginals" && input.invocation) return (async () => {
       if (process.cwd() !== metadata.root && metadata.runDeterministic)
@@ -347,7 +347,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   }
   const agent = request.agent ?? (key.includes(".review.") ? "pitako.reviewer" : undefined);
   if (agent === "pitako.worker" || metadata.association &&
-      (agent === "pitako.reviewer" || agent === "pitako.execution-inspector" ||
+      (/^pitako\.(?:reviewer|review-director|review-angle|task-review|task-synthesis|compliance|demand-observer)$/.test(agent ?? "") || agent === "pitako.execution-inspector" ||
         agent === "pitako.execution-director" && metadata.publishDirector)) {
     const fs = require("node:fs"), path = require("node:path");
     const intent = agent !== "pitako.worker" ? { association: metadata.association } : request.extensionBindings?.["pitako.checkpoint/1"] ??

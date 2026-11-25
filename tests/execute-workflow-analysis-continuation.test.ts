@@ -210,7 +210,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.phase?.startsWith("review-")) Object.assign(result.results![0]!, {
-        workflowKey: request.key, runId: result.runId, agent: "pitako.reviewer",
+        workflowKey: request.key, runId: result.runId,
         state: "complete",
       });
       return result;
@@ -233,7 +233,7 @@ describe("workflow-owned execute controller", () => {
     expect(replay.status).toBe(mode === "intact" ? "complete" : "blocked");
     expect(host.launches.slice(count).map(call => [call.agent, call.key])).toEqual(mode === "intact" ? [
       ["pitako.checkout-observer", "invoke-human-1.l1.checkout"],
-      ["pitako.loop-io", "invoke-human-1.l1.finishDrain"],
+      ["pitako.loop-drain", "invoke-human-1.l1.finishDrain"],
     ] : []);
     if (mode === "intact") {
       expect(host.history().at(-1).review.references).toEqual(originals);
@@ -241,7 +241,7 @@ describe("workflow-owned execute controller", () => {
         const witness = ref.results[0], actual = host.native.get(ref.runId)!.results![0];
         expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
         expect(witness.outputReference).toEqual(actual.outputReference);
-        expect(ref).toMatchObject({ key: actual.workflowKey, runId: actual.runId, agent: "pitako.reviewer" });
+        expect(ref).toMatchObject({ key: actual.workflowKey, runId: actual.runId, agent: host.native.get(ref.runId)!.agent });
         expect(witness.structuredOutputPath).toBe(actual.structuredOutputPath);
         expect(witness).not.toHaveProperty("terminalOutcome");
       }
@@ -440,7 +440,8 @@ describe("checkpoint-first modifying recovery", () => {
         expect(host.launches.filter(call => call.key === baselineKey)).toHaveLength(1);
         const [recovery] = host.launches.slice(launched);
         expect(recovery.key).toMatch(/\.r1$/);
-        expect(recovery.agent).toBe("pitako.loop-io");
+        expect(recovery.agent).toBe(cut === "new-checkpoint" ? "pitako.loop-baseline"
+          : mode === "missing" ? "pitako.loop-close" : "pitako.loop-selection");
         const cursor = host.current();
         const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
         const { records } = store.readRecords(scope, cursor.head);

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { executeControllerFixture, gaps } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const snapshots = (host: ReturnType<typeof fixture>) => host.emits.filter(value => value.schema === "pitako.execute-todo");
@@ -15,7 +16,7 @@ function marking(host: ReturnType<typeof fixture>, verifies: Record<string, numb
       for (const gate of result.structuredOutput.acceptance ?? [])
         if (verifies[gate.id]) gate.verifies = verifies[gate.id];
     }
-    if (request.agent === "pitako.loop-io") {
+    if (pitakoAgentFamily(request.agent) === "loop-io") {
       const input = JSON.parse(request.task);
       if (input.operation === "gate" && failing.includes(input.task?.id)) {
         const receipt = JSON.parse(result.output!);
@@ -102,7 +103,7 @@ test("a missing receipt or a gate without designation cannot verify a criterion"
       const result = normal();
       if (missing && request.agent === "pitako.execution-director")
         result.structuredOutput.changes[0].task.gates[0].verifies = [1];
-      if (missing && request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate")
+      if (missing && pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate")
         result.output = "No complete receipt";
       return result;
     });

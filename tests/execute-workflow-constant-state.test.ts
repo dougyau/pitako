@@ -5,6 +5,7 @@ import { executeControllerFixture, copy, gaps, source } from "./fixtures/execute
 import { readBacklog } from "../skills/execute/loop.ts";
 import { digest } from "../extensions/spec-plans.ts";
 import { EXECUTE_CURSOR_KEY, EXECUTE_CURSOR_MAX_BYTES, validateExecuteCursor } from "../extensions/execute-cursor.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 const { executeStore, canonicalJSON, executeProjection, fullExecuteProjection } = await import("../skills/execute/ledger.mjs");
 
 const { fixture } = executeControllerFixture();
@@ -199,14 +200,26 @@ test.each([4, 5])("native closing references ring rejects only last three loops 
 const checkoutDefects = ["producer", "publication", "exit", "save", "results", "stdout", "json",
   "keys", "root", "commonDir", "closeReference"];
 test.each([...[true, false].flatMap(committed =>
-  ["none", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
+  ["none", "legacy-compliance", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
     "compliance-unsettled", "compliance-no-journal", "compliance-truncated", "review-body", "review-missing"]
     .map(mutation => ({ committed, mutation }))),
+  ...["wrong-family-step", "same-family-step", "same-family-settlement", "nested-agent", "failed-then-ok", "different-usage"]
+    .map(mutation => ({ committed: false, mutation })),
   { committed: true, mutation: "closing-unsettled" },
   ...checkoutDefects.map(defect => ({ committed: false, mutation: `checkout-${defect}` }))])(
   "closing rebuilds identical bytes after a save cut; %j", async ({ committed, mutation }) => {
   const host = fixture(undefined, { taskCount: 0 });
   host.setLimit(1);
+  const legacy = mutation === "legacy-compliance";
+  const conflictingStep = mutation.endsWith("-step");
+  const conflictingSettlement = mutation === "same-family-settlement";
+  const nestedAgent = mutation === "nested-agent";
+  const duplicateSettlement = ["failed-then-ok", "different-usage"].includes(mutation);
+  if (legacy) host.setLaunchRespond((request, normal) => {
+    // Emulate an old host recording this child under the original name.
+    if (request.key.endsWith(".compliance")) request.agent = "pitako.reviewer";
+    return normal();
+  });
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.execution-director") Object.assign(result.structuredOutput, { select: null, changes: [] });
@@ -258,7 +271,8 @@ test.each([...[true, false].flatMap(committed =>
   if (mutation === "compliance-body") writeFileSync(compliance.results![0]!.structuredOutputPath!,
     JSON.stringify({ ...compliance.structuredOutput, reason: "Changed during closing" }));
   if (mutation === "compliance-missing") unlinkSync(compliance.results![0]!.structuredOutputPath!);
-  if (["none", "compliance-producer", "compliance-settlement"].includes(mutation) || missingUsage) {
+  if (["none", "compliance-producer", "compliance-settlement"].includes(mutation) ||
+      conflictingStep || conflictingSettlement || nestedAgent || duplicateSettlement || missingUsage) {
     const missionPath = store.read(scope).P.prompt.admission!.association.missionPath;
     const mission = JSON.parse(readFileSync(missionPath, "utf8"));
     const child = mission.workflowChildren.find((child: any) => child.key === host.current().action.key);
@@ -268,12 +282,29 @@ test.each([...[true, false].flatMap(committed =>
     expect(status.steps[0]).not.toHaveProperty("usage");
     if (mutation === "compliance-producer")
       writeFileSync(statusFile, JSON.stringify({ ...status, workflowKey: "another-compliance" }));
-    if (mutation === "compliance-settlement" || missingUsage) {
+    if (conflictingStep) {
+      status.steps[0].agent = mutation === "same-family-step" ? "pitako.task-review" : "pitako.worker";
+      writeFileSync(statusFile, JSON.stringify(status));
+    }
+    if (mutation === "compliance-settlement" || conflictingSettlement || nestedAgent || duplicateSettlement || missingUsage) {
       const journal = path.join(path.dirname(directory), status.parentWorkflowRunId, "workflow-children.jsonl");
       const lines = readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
       for (const line of lines) if (line.type === "settle" && line.key === host.current().action.key) {
         if (mutation === "compliance-settlement")
           line.result.structuredOutput = { ...line.result.structuredOutput, reason: "Conflicting settlement" };
+        if (conflictingSettlement) line.result.agent = "pitako.task-review";
+        if (nestedAgent) line.result.results[0].agent = "pitako.task-review";
+      }
+      if (duplicateSettlement) {
+        const index = lines.findIndex(line => line.type === "settle" && line.key === child.key);
+        expect(index).toBeGreaterThanOrEqual(0);
+        const earlier = copy(lines[index]);
+        if (mutation === "different-usage") earlier.result.results[0].usage.input += 1;
+        else {
+          earlier.result.ok = false;
+          earlier.result.results[0].exitCode = 1;
+        }
+        lines.splice(index, 0, earlier);
       }
       if (mutation === "compliance-no-journal") unlinkSync(journal);
       else {
@@ -311,7 +342,7 @@ test.each([...[true, false].flatMap(committed =>
     // The observer may have committed, but invalid terminal evidence cannot advance the root.
     expect(store.read(scope).records.filter(row => row.kind === "ledger")
       .flatMap((row: any) => row.body.entries)).toHaveLength(2);
-  } else if (mutation !== "none" && !missingUsage) {
+  } else if (mutation !== "none" && !legacy && !missingUsage) {
     expect(output.status).toBe("blocked");
     expect(output.reason).toContain("integrity");
     expect(store.read(scope).records).toEqual(beforeReplay);
@@ -319,24 +350,25 @@ test.each([...[true, false].flatMap(committed =>
     expect(output.status, output.reason).toBe("complete");
     expect(host.records()).toHaveLength(2);
     const archive = host.records().find((row: any) => row.kind === "loop")!.body;
+    expect(archive.compliance.ref.agent).toBe(legacy ? "pitako.reviewer" : "pitako.compliance");
     expect(archive.usage).toContainEqual({ id: `${compliance.runId}:0`,
       tokens: missingUsage && !committed ? null : 20 });
   }
   // Board topic 208 HUMAN #3415(f): one recovery read, no model or publication replay.
   const added = host.launches.slice(launches);
   if (committed) {
-    expect(added.map(call => call.agent)).toEqual(["pitako.loop-io"]);
+    expect(added.map(call => call.agent)).toEqual(["pitako.loop-advance"]);
     expect(added[0].key).toMatch(/\.r\d+$/);
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toEqual([request]);
     expect(canonicalJSON(store.read(scope).records.find(row => row.seq === published!.seq))).toBe(original!);
   } else {
-    expect(added.map(call => call.agent)).toEqual(mutation === "none" || missingUsage
-      ? ["pitako.checkout-observer", "pitako.loop-io"] : ["pitako.checkout-observer"]);
+    expect(added.map(call => call.agent)).toEqual(mutation === "none" || legacy || missingUsage
+      ? ["pitako.checkout-observer", "pitako.loop-drain"] : ["pitako.checkout-observer"]);
     expect(added[0].key).toBe("invoke-human-1.l1.checkout");
     expect(added[0].task).toBe(expectedRequest);
     expect(added.some(call => /\.r\d+$/.test(call.key))).toBe(false);
   }
-  expect(added.some(call => call.agent === "pitako.reviewer")).toBe(false);
+  expect(added.some(call => pitakoAgentFamily(call.agent) === "reviewer")).toBe(false);
   for (const cursor of host.snapshots) {
     validateExecuteCursor(EXECUTE_CURSOR_KEY, cursor);
     expect(Buffer.byteLength(JSON.stringify({ [EXECUTE_CURSOR_KEY]: cursor }, null, 2)))
@@ -357,7 +389,7 @@ test("admission amendments reach every phase without the director copying them i
   expect(admitted.amendments).toEqual(amendments);
   expect(host.current()).not.toHaveProperty("amendments");
   // The model-free access verifier receives only originals to compare, not model context.
-  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key) && call.agent !== "pitako.access-verifier");
+  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key) && call.agent !== "pitako.originals-verifier");
   for (const pattern of [/\.director$/, /\.t\d+\.a\d+$/, /\.compliance$/, /\.review\./])
     expect(phases.some(call => pattern.test(call.key))).toBe(true);
   for (const call of phases) expect(call.task, call.key).toContain(JSON.stringify(amendments));
@@ -392,7 +424,7 @@ test("selection keeps Board views in the store and delivers them without retaini
   }
   let settlements = 0;
   // Settlement is drained with the grouped transport, not retained inline.
-  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io")) {
+  for (const call of host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io")) {
     const input = JSON.parse(call.task);
     const keys = new Set((input.intentions ?? []).filter((entry: any) => entry.operation === "apply").map((entry: any) => entry.key));
     const output = host.native.get(call.key)?.output;
@@ -421,7 +453,7 @@ test.each(["cancellation", "finalGaps"])("%s projections discard their unused vi
   });
   expect((await host.execute()).status).toBe("partial");
   // Read the published drain, not the removed inline v9 receipt slot.
-  const receipts = host.launches.filter(call => call.agent === "pitako.loop-io").flatMap(call => {
+  const receipts = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io").flatMap(call => {
     const output = host.native.get(call.key)?.output;
     if (!output) return [];
     const transport = JSON.parse(output).projection;
@@ -461,7 +493,7 @@ test("a final review with production-sized originals and native metadata retains
     `/native/sessions/--long-session-directory-name-for-a-production-sized-run--/subagent-artifacts/${key}/debug-${index}.jsonl`);
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (!request.key.includes(".review.") || request.agent !== "pitako.reviewer") return result;
+    if (!request.key.includes(".review.") || pitakoAgentFamily(request.agent) !== "reviewer") return result;
     const acceptance = { status: "not-required", evidenceStatus: "not-required", explicit: false,
       effectiveAcceptance: { level: "none", explicit: false, inferredReason: ["declared read-only acceptance role"],
         criteria: [], evidence: [], verify: [], stopRules: [] },

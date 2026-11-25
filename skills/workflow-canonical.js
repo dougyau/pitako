@@ -1,4 +1,4 @@
-// Trusted sandbox source: prepend in full to workflow scripts; no imports or host globals.
+// Trusted sandbox prelude: prepend in full to workflow scripts; no imports or host globals.
 function canonicalJSON(value) {
   if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
   if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
@@ -41,4 +41,34 @@ function canonicalDigest(value) {
     [a,b,c,d,e,f,g,j].forEach((n,i) => { h[i]=(h[i]+n)|0; });
   }
   return h.map(n => (n>>>0).toString(16).padStart(8,"0")).join("");
+}
+
+// Hosts such as T3 show only a child's native agent name, so launches use role names.
+// Checks compare families: one shared name never proved more than the family.
+const PITAKO_REVIEWER_AGENTS = ["pitako.review-director", "pitako.review-angle", "pitako.task-review",
+  "pitako.task-synthesis", "pitako.compliance", "pitako.demand-observer"];
+const PITAKO_LOOP_OPERATIONS = ["advance", "selection", "close", "drain", "gate", "baseline", "taskDelta",
+  "reviewOriginals", "verifySelection", "verifyTimeout"];
+function pitakoReviewerAgent(key) {
+  if (typeof key !== "string") return undefined;
+  // Synthesis resumes the prepare session, so both carry the director's name.
+  if (/director-(?:prepare|synthesis)$/.test(key)) return "pitako.review-director";
+  if (/independent-[A-Za-z0-9][A-Za-z0-9_-]{0,28}-r[12]$/.test(key)) return "pitako.review-angle";
+  if (/\.task-reviewer$/.test(key)) return "pitako.task-review";
+  if (/\.task-synthesis$/.test(key)) return "pitako.task-synthesis";
+  if (/\.compliance$/.test(key)) return "pitako.compliance";
+  if (/\.demand-observation$/.test(key)) return "pitako.demand-observer";
+  return undefined;
+}
+function pitakoLoopAgent(operation) {
+  if (!PITAKO_LOOP_OPERATIONS.includes(operation)) throw new Error(`Unknown loop-io operation ${operation}.`);
+  return `pitako.loop-${operation.replace(/[A-Z]/g, letter => `-${letter.toLowerCase()}`)}`;
+}
+function pitakoAgentFamily(agent) {
+  if (typeof agent !== "string") return undefined;
+  if (PITAKO_REVIEWER_AGENTS.includes(agent)) return "reviewer";
+  if (PITAKO_LOOP_OPERATIONS.some(operation => pitakoLoopAgent(operation) === agent)) return "loop-io";
+  if (agent === "pitako.access-verifier") return "originals-verifier";
+  if (agent === "pitako.store-io") return "review-store";
+  return agent.startsWith("pitako.") ? agent.slice("pitako.".length) : undefined;
 }

@@ -3,6 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { executeRevivalContextPeak } from "../extensions/execute-settings.ts";
 import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const source = readFileSync(new URL("../skills/execute/workflow.js", import.meta.url), "utf8");
 const decideRevival = new Function("const text = value => typeof value === 'string' && value.trim().length > 0;\n" +
@@ -74,10 +75,10 @@ function continuingHost(options: { realCheckout?: boolean; reject?: boolean; mis
         status: "continue", remaining: ["Finish work"], continuation: { mode: "resume", reason: "Retain context" },
       } : {}) });
     }
-    if (options.drift && request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "baseline" && workers === 1)
+    if (options.drift && pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "baseline" && workers === 1)
       host.changeCheckout();
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate") {
       const receipt = JSON.parse(result.output!);
       if (!options.missingPeak) receipt.contextPeak = 100;
       if (gates++ === 0) receipt.view.posts = [{ id: 2, type: "FINDING", content: "Already loaded" }, { id: 7, type: "FINDING", content: "New useful fact" }];

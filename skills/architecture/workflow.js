@@ -625,7 +625,7 @@ const verifiedRequests = new WeakSet();
 const STDIN_LIMIT = 1024 * 1024;
 function utf8Bytes(value) { return encodeURIComponent(value).replace(/%[0-9A-F]{2}|[^%]/g, "x").length; }
 const accessExplanation = (cause, original, file) => `Original ${original.id} (key ${original.key}, path ${file ?? "none"}) is ${cause === "verifier-failed" ? "unverified" : "unavailable"}: ${cause}. Action: ${cause === "verifier-failed"
-  ? "Verification did not run; the original was not judged unavailable. Inspect the pitako.access-verifier run and resolve its failure, then relaunch this consultation."
+  ? "Verification did not run; the original was not judged unavailable. Inspect the pitako.originals-verifier run and resolve its failure, then relaunch this consultation."
   : "Native publication failed, so no original can be verified."}`;
 function verifyAccess(requests) {
   const pending = requests.filter(request => !verifiedRequests.has(request));
@@ -655,7 +655,7 @@ function verifyAccess(requests) {
   if (utf8Bytes(task) > STDIN_LIMIT)
     return Promise.reject(new Error(`Access verifier request for ${gate} exceeds ${STDIN_LIMIT} bytes; nothing was dispatched or truncated.`));
   if (persistenceError) return Promise.reject(persistenceError);
-  const verify = (retry, busyAttempts) => track(runs.all([{ key: `verify-${gate}${retry ? `.r${retry}` : ""}`, agent: "pitako.access-verifier", context: "fresh", task,
+  const verify = (retry, busyAttempts) => track(runs.all([{ key: `verify-${gate}${retry ? `.r${retry}` : ""}`, agent: "pitako.originals-verifier", context: "fresh", task,
     output: false, outputMode: "inline", outputSchema: false }])).then(([result]) => {
     let observed;
     if (typeof result?.output === "string" && utf8Bytes(result.output) <= 61440)
@@ -663,7 +663,7 @@ function verifyAccess(requests) {
     const children = [result, ...(result?.results ?? [])].filter(Boolean);
     const storeMemo = first.key.startsWith("memo-") && items.some(item => item.store);
     const accessRef = observed?.receipt?.store;
-    const validNative = result?.ok && (result.agent === undefined || result.agent === "pitako.access-verifier") &&
+    const validNative = result?.ok && (result.agent === undefined || pitakoAgentFamily(result.agent) === "originals-verifier") &&
       !children.some(item => item.error || item.stopped || item.interrupted || item.timedOut || item.detached ||
         (item.exitCode !== undefined && item.exitCode !== 0));
     const storeTransport = validNative && observed?.v === 1 &&

@@ -62,16 +62,21 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
 
 // The real provider is excluded; only its synchronous registration boundary is modeled.
 function observerRegistrationEvents() {
+  const scripts = Object.fromEntries(
+    ["advance", "selection", "close", "drain", "gate", "baseline", "task-delta", "review-originals", "verify-selection", "verify-timeout"]
+      .map(operation => [`pitako.loop-${operation}`, ["skills/execute/loop-io.mjs"]]));
+  Object.assign(scripts, {
+    "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
+    "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"], "pitako.review-store": ["skills/review/store-io.mjs"],
+    "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
+    "pitako.originals-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"],
+  });
   const active = new Set<string>();
   return {
     emit(event: string, request: RuntimeAgentRegistrationRequest) {
       expect(event).toBe(RUNTIME_AGENT_REGISTER_EVENT);
       expect(request.version).toBe(1);
-      const script = { "pitako.loop-io": ["skills/execute/loop-io.mjs"], "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
-        "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
-        "pitako.store-io": ["skills/review/store-io.mjs"],
-        "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
-        "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
+      const script = scripts[request.name];
       expect(script).toBeDefined();
       expect(request.definition).toMatchObject({
         tools: [], allowNestedSubagents: false, systemPromptMode: "replace",
@@ -86,6 +91,7 @@ function observerRegistrationEvents() {
         expect(active.delete(request.name)).toBe(true);
       } } };
     },
+    assertRegistered() { expect([...active].sort()).toEqual(Object.keys(scripts).sort()); },
     assertDisposed() { expect(active.size).toBe(0); },
   };
 }
@@ -160,6 +166,7 @@ function profileHarness(profileFlag?: string, external?: () => Promise<void>) {
       const handler = handlers.get("session_start");
       if (!handler) throw new Error("session_start was not registered");
       await handler({}, context);
+      events.assertRegistered();
     },
     async selectProfile(value: string) {
       if (!profileCommand) throw new Error("pitako command was not registered");

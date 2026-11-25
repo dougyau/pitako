@@ -4,6 +4,7 @@ import path from "node:path";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { executeStore } from "../skills/execute/ledger.mjs";
 import { copy, cutAt, executeControllerFixture, nativeRunId, type Result } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const phases = [
@@ -310,6 +311,6 @@ test("grouped close retries retain their frozen task and derived total despite a
   const committed = closes[0]!.body as { request: { gate: { task: unknown } } };
   expect(committed.request.gate.task).toEqual(JSON.parse(original.task).gate.task);
   expect(host.launches.filter(call => call.key === closeKey)).toHaveLength(1);
-  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  for (const call of host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     !["gate", "close"].includes(JSON.parse(call.task).operation))) expect(call).not.toHaveProperty("timeoutMs");
 });

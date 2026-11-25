@@ -72,7 +72,8 @@ function setup(root: string) {
 }
 test("reads full originals from a saved v10 cursor without reader writes", () => fixture(f => {
 	const state = readFileSync(f.statePath), database = readFileSync(f.store.file);
-	expect(f.load()).toEqual([{ key: f.child.key, runId: f.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+	expect(f.load()).toEqual([{ key: f.child.key, runId: f.runId, agent: f.child.agent,
+		ok: true, state: "complete", structuredOutput: f.original }]);
 	expect(readFileSync(f.statePath)).toEqual(state); expect(readFileSync(f.store.file)).toEqual(database);
 	expect(f.bound()!.originals).toHaveLength(1);
 }));

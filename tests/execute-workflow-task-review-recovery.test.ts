@@ -5,6 +5,7 @@ import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/share
 import { copy, executeControllerFixture, type Result } from "./fixtures/execute-workflow.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { executeScope, executeStore } from "../skills/execute/ledger.mjs";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const reviewChildren = (key: string) => /\.task-(reviewer|synthesis)$/.test(key);
@@ -53,8 +54,9 @@ test.each(["reviewer", "synthesis"])("%s model failures block without gaps, retr
   }
 });
 
-test.each(["reviewer", "synthesis"].flatMap(stage => ["Stop", "permission"].map(cause => [stage, cause])))(
-  "%s native %s remains cancelled and cannot settle done", async (stage, cause) => {
+test.each([...["reviewer", "synthesis"].flatMap(stage => ["Stop", "permission"].map(cause => ({ stage, cause, conflict: false }))),
+  { stage: "reviewer", cause: "Stop", conflict: true }])(
+  "$stage native $cause cannot settle done (observed agent conflict=$conflict)", async ({ stage, cause, conflict }) => {
   const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => request.key.endsWith(`.task-${stage}`)
     ? cause === "Stop" ? { ...(stage === "reviewer" ? normal() : budget(request.key)),
@@ -68,20 +70,36 @@ test.each(["reviewer", "synthesis"].flatMap(stage => ["Stop", "permission"].map(
   noUnit(host);
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("pending");
   const before = host.launches.length;
+  if (stage === "reviewer" && cause === "Stop") {
+    const ref = output.loopReport.halt.ref;
+    expect(ref.agent).toBe("pitako.reviewer"); // Stable retained digest, not the launch name.
+    expect(host.native.get(ref.runId)!.agent).toBe("pitako.task-review");
+    if (conflict) host.setStatus(target => {
+      const native = copy(host.native.get(target)!);
+      return target === ref.runId ? { ...native, agent: "pitako.reviewer" } : native;
+    });
+  }
   const resumed = await host.execute();
-  expect(resumed.status, resumed.reason).toBe("cancelled");
-  expect(resumed.reason).toBe(output.reason);
-  expect(resumed.loopReport.halt).toEqual(output.loopReport.halt);
+  if (conflict) {
+    expect(resumed.status, resumed.reason).toBe("blocked");
+    expect(resumed.reason).toContain("Retained interruption producer integrity mismatch");
+  } else {
+    expect(resumed.status, resumed.reason).toBe("cancelled");
+    expect(resumed.reason).toBe(output.reason);
+    expect(resumed.loopReport.halt).toEqual(output.loopReport.halt);
+  }
   expect(host.launches).toHaveLength(before);
 });
 
 const stages = ["gate", "delta", "reviewer", "verdict", "sealer", "repair"] as const;
 test.each(["reviewer", "synthesis"])("saved %s projection replays with body-free settled native status", async stage => {
   const host = fixture(); host.setLimit(1);
+  const legacy = stage === "synthesis";
   const next = stage === "reviewer" ? ".task-synthesis" : ".seal";
   let denied = false;
   host.setLaunchRespond((request, normal) => {
     if (!denied && request.key.endsWith(next)) { denied = true; return budget(request.key); }
+    if (legacy && reviewChildren(request.key)) request.agent = "pitako.reviewer";
     return normal();
   });
   const first = await host.execute();
@@ -102,6 +120,12 @@ test.each(["reviewer", "synthesis"])("saved %s projection replays with body-free
   expect(output.status, output.reason).toBe("partial");
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   expect(host.records()).toContainEqual(expect.objectContaining({ kind: "unit" }));
+  expect(host.records().find((record: { kind: string }) => record.kind === "loop")?.body.analysisCalls)
+    .toEqual(["reviewer", "synthesis"].map(child => {
+      const key = `invoke-human-1.l1.t1.a1.task-${child}`;
+      const agent = legacy ? "pitako.reviewer" : child === "reviewer" ? "pitako.task-review" : "pitako.task-synthesis";
+      return { key, stage: "receipt", ref: { key, agent, runId: host.native.get(key)!.runId } };
+    }));
   for (const child of ["reviewer", "synthesis"])
     expect(host.calls.filter(call => call.key.endsWith(`.task-${child}`))).toHaveLength(1);
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind))
@@ -285,7 +309,7 @@ test.each(["disk-digest", "native-digest", "missing"])("replayed review original
   host.setFailSave();
   host.setStatus(ref => {
     const result = copy(host.native.get(ref) ?? { ok: false, state: "unknown" });
-    if (result.agent === "pitako.reviewer") { delete result.structuredOutput; result.state = "complete"; }
+    if (pitakoAgentFamily(result.agent) === "reviewer") { delete result.structuredOutput; result.state = "complete"; }
     return result;
   });
   if (defect === "missing") rmSync(path);

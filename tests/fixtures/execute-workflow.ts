@@ -29,6 +29,7 @@ import { DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } from "../../extensions/
 import { verifyGate } from "../../extensions/access-receipts.mjs";
 import { MISSION_STATE_MAX_BYTES } from "../../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { runWorkflowScript, type WorkflowScriptChildResult } from "../../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
+import { pitakoAgentFamily, pitakoReviewerAgent } from "../../skills/agent-names.mjs";
 
 const executeSource = readFileSync(new URL("../../skills/execute/workflow.js", import.meta.url), "utf8");
 const reviewSource = readFileSync(new URL("../../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" +
@@ -237,11 +238,11 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       mkdirSync(path.dirname(structuredOutputPath), { recursive: true });
       writeFileSync(structuredOutputPath, JSON.stringify(value));
     }
-    return { ok: true, agent: request.agent ?? "pitako.reviewer", runId: nativeRunId(request.key), output: "Output saved to: /not-the-binding/preview.md",
+    return { ok: true, agent: request.agent ?? pitakoReviewerAgent(request.key) ?? "pitako.reviewer", runId: nativeRunId(request.key), output: "Output saved to: /not-the-binding/preview.md",
       ...(request.model ? { model: request.model } : {}),
       outputReference: `/native/output/${request.key}.json`, outputArtifactPath: `/native/binding/${request.key}.json`,
       outputPathMapping: { requestedPath: String(request.output), savedPath: `/native/remapped/${request.key}.json` },
-      artifactPaths: [`/native/debug/${request.key}/`], results: [{ index: 0, agent: request.agent ?? "pitako.reviewer",
+      artifactPaths: [`/native/debug/${request.key}/`], results: [{ index: 0, agent: request.agent ?? pitakoReviewerAgent(request.key) ?? "pitako.reviewer",
         task: request.task, exitCode: 0, ...(savedOutputPath ? { savedOutputPath, outputReference: { path: savedOutputPath, bytes: Buffer.byteLength(JSON.stringify(value)), lines: 1, message: "Saved" } } : {}), structuredOutputPath,
         usage: { input: 10, output: 5, cacheRead: 3, cacheWrite: 2, cost: 0, turns: 1 } }], structuredOutput: value };
   }
@@ -261,7 +262,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
     }
-    if (request.agent === "pitako.access-verifier") {
+    if (request.agent === "pitako.originals-verifier") {
       // Controlled boundary: the real verifier over actual published originals; the
       // fixture mission record lives in the owned root instead of /native.
       const input = JSON.parse(request.task);
@@ -270,7 +271,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       return { ok: true, key: request.key, agent: request.agent, runId: `native-${request.key}`, output: JSON.stringify(observed),
         results: [{ exitCode: 0 }] } as Result;
     }
-    if (request.agent === "pitako.loop-io") {
+    if (pitakoAgentFamily(request.agent) === "loop-io") {
       let input = JSON.parse(request.task);
       const storedInput = ["gate", "baseline"].includes(input.operation) && input.refs;
       if (storedInput) {
@@ -568,7 +569,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
   async function operation(request: Request, grouped = false) {
     calls.push(copy(request));
     const response = responder ? await responder(request, () => normal(request, grouped)) : normal(request, grouped);
-    if (request.agent === "pitako.loop-io" && response.ok && !grouped && /\.acceptance(?:\.g[23])?\.gate(?:\.r\d+)?$/.test(request.key)) {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && response.ok && !grouped && /\.acceptance(?:\.g[23])?\.gate(?:\.r\d+)?$/.test(request.key)) {
       const { operation, ...input } = JSON.parse(request.task);
       if (operation === "gate" && input.task?.id === "final-acceptance") {
         const receipt = JSON.parse(response.output!);
@@ -595,7 +596,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       const id = `${key}.${name}`;
       let result = groupSteps.get(id);
       if (!result) {
-        const cachedGate = call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate"
+        const cachedGate = pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "gate"
           ? native.get(call.key) : undefined;
         const response = cachedGate?.ok ? copy(cachedGate) : await operation(call, true);
         if (!response.ok || response.results?.[0]?.exitCode !== 0) throw response;
@@ -857,18 +858,18 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
   const runs = {
     all: async (requests: Request[]) => Promise.all(requests.map(async request => {
       launches.push(copy(request)); clock += 10;
-      const grouped = request.agent === "pitako.loop-io" && ["advance", "selection", "close", "drain"].includes(JSON.parse(request.task).operation);
+      const grouped = pitakoAgentFamily(request.agent) === "loop-io" && ["advance", "selection", "close", "drain"].includes(JSON.parse(request.task).operation);
       const run = () => {
         const prior = admittedCloses.get(request.key);
         if (prior && prior !== JSON.stringify(request)) throw new Error("Native close key/params mismatch");
-        return ["pitako.loop-io", "pitako.request-observer", "pitako.checkout-observer", "pitako.checkpoint-sealer"].includes(request.agent ?? "")
+        return ["loop-io", "request-observer", "checkout-observer", "checkpoint-sealer"].includes(pitakoAgentFamily(request.agent) ?? "")
           ? withExecuteStore(root, config.invocation, () => grouped ? compound(request) : operation(request),
             executeEpoch(config.invocation, request.key))
           : operation(request);
       };
       const response: Result = launchResponder ? await launchResponder(request, run) : await run();
-      if (request.agent === "pitako.access-verifier" && response.reused) return response;
-      if (request.agent === "pitako.loop-io" && response.runId === `native-${request.key}`)
+      if (request.agent === "pitako.originals-verifier" && response.reused) return response;
+      if (pitakoAgentFamily(request.agent) === "loop-io" && response.runId === `native-${request.key}`)
         response.runId = nativeRunId(request.key);
       if (grouped && JSON.parse(request.task).operation === "close" && response.ok)
         admittedCloses.set(request.key, JSON.stringify(request));
@@ -902,16 +903,16 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
           (response.ok && response.structuredOutput || response.stopped ||
             response.results?.some(result => result.timedOut) || response.terminalOutcome?.reason === "timeout" ||
             /^Blocked by pi-subagents permission rule:/.test(response.error ?? "")) ||
-          request.agent === "pitako.loop-io" && response.runId) {
+          pitakoAgentFamily(request.agent) === "loop-io" && response.runId) {
         const asyncDir = path.join(root, request.agent === "pitako.worker" ? ".pi/native-originals" : ".pi/native-review", response.runId!);
         mkdirSync(asyncDir, { recursive: true });
         const file = response.results?.[0]?.savedOutputPath ?? response.results?.[0]?.structuredOutputPath;
         const workflowDir = path.join(path.dirname(asyncDir), parentWorkflowRunId);
-        const producerAgent = request.agent ?? (request.key.includes(".review.") ? "pitako.reviewer" : undefined);
+        const producerAgent = request.agent ?? (request.key.includes(".review.") ? pitakoReviewerAgent(request.key) ?? "pitako.reviewer" : undefined);
         mkdirSync(workflowDir, { recursive: true });
         appendFileSync(path.join(workflowDir, "workflow-children.jsonl"),
           JSON.stringify({ type: "settle", key: request.key, fingerprint: canonicalDigest(request),
-            result: request.agent === "pitako.loop-io" && /\.finishDrain(?:\.v\d+)?(?:\.r\d+)?$/.test(request.key) ? { ...response,
+            result: pitakoAgentFamily(request.agent) === "loop-io" && /\.finishDrain(?:\.v\d+)?(?:\.r\d+)?$/.test(request.key) ? { ...response,
               results: response.results?.map((result: NonNullable<Result["results"]>[number]) =>
                 ({ ...result, task: request.task })) } : response }) + "\n");
         if (request.agent !== "pitako.worker" || !response.ok) {

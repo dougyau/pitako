@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { executeControllerFixture, cutAt, source } from "./fixtures/execute-workflow.ts";
 import { executeStore } from "../skills/execute/ledger.mjs";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const tip = (host: ReturnType<typeof fixture>) => {
@@ -170,7 +171,7 @@ describe("fused loop ledger publication", () => {
     expect(archives(host).map(record => record.kind)).toEqual(["spec", "unit", "loop"]);
     expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
       .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"]);
-    const drains = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+    const drains = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "drain");
     expect(drains.map(call => call.key)).toEqual(failure === "state-save" ? [drainKey] : [drainKey, `${drainKey}.r1`]);
     expect(new Set(drains.map(call => call.task)).size).toBe(1);
   });
@@ -253,7 +254,7 @@ describe("fused loop ledger publication", () => {
     expect(host.current().halt).toMatchObject({ stage: expect.any(String), digest: expect.stringMatching(/^[0-9a-f]{64}$/) });
   });
 
-  const isPrepare = (request: any) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "prepare";
+  const isPrepare = (request: any) => pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "prepare";
   const overflow = (request: any, normal: () => any): any => isPrepare(request) ? { ...normal(), ok: false,
     output: JSON.stringify({ error: "loop-io", reason: "HUMAN + DECISION overflow: ask the human to consolidate", viewOverflow: true }) } : normal();
   test.each([false, true])("pre-director view overflow is terminal even if the Board view changes (overflow persists: %s)", async persists => {
@@ -287,7 +288,7 @@ describe("fused loop ledger publication", () => {
     expect(stopped.status).toBe("cancelled");
     const calls = host.calls.length, launches = host.launches.length, cursor = structuredClone(host.current());
     const held = await host.execute();
-    expect(held.status).toBe("cancelled");
+    expect(held.status, held.reason).toBe("cancelled");
     const cause = (reason: string) => reason.replace(/^Execution cancelled: /, "");
     expect(cause(held.reason)).toBe(cause(stopped.reason));
     expect(host.calls).toHaveLength(calls);

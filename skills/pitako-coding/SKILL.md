@@ -153,9 +153,9 @@ profiles first and pass the specific question, scope, and evidence. If oracle
 is unavailable, report the blocker. Architect is not a general escalation role.
 
 The `architecture` and `review` skills initiate their existing scripted
-workflows. Scripts own dispatch; `pitako.architect` and `pitako.reviewer` perform
-read-only reasoning without delegation. Advice and review completion are not
-authorization, passing checks, or acceptance.
+workflows. Scripts own dispatch; `pitako.architect`, `pitako.review-director`
+and `pitako.review-angle` perform read-only reasoning without delegation.
+Advice and review completion are not authorization, passing checks, or acceptance.
 
 The former AgentInstance, Team, Head, table, routing, and bridge runtime is
 retired. Its model policies and execution guarantees do not transfer to

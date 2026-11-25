@@ -107,7 +107,7 @@ function essentials(request: Request): Original[] {
 // The real model-free verifier at the controlled launch boundary.
 function verifierResult(key: string, request: Request): Result & { output: string } {
   const input = JSON.parse(request.task);
-  return { ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output: JSON.stringify(verifyGate(input, ledgerCwd(input.missionPath))),
+  return { ok: true, agent: "pitako.originals-verifier", runId: `native-${key}`, output: JSON.stringify(verifyGate(input, ledgerCwd(input.missionPath))),
     results: [{ exitCode: 0 }] };
 }
 function originalValue(original: Original): Record<string, unknown> {
@@ -297,7 +297,7 @@ function fixture(
         if (!output.error && retainLedgerOriginals) settleNative(key, request, result);
         return result;
       }
-      if (request.agent === "pitako.access-verifier") {
+      if (request.agent === "pitako.originals-verifier") {
         verifications.push({key, request});
         return beforeVerify?.(key, request) ?? verifierResult(key, request);
       }
@@ -326,7 +326,7 @@ function fixture(
       });
     },
     all(requests: Request[]): Promise<Result[]> {
-      if (requests.every(request => !["pitako.access-verifier", "pitako.architecture-ledger"].includes(request.agent ?? ""))) batches.push(requests);
+      if (requests.every(request => !["pitako.originals-verifier", "pitako.architecture-ledger"].includes(request.agent ?? ""))) batches.push(requests);
       return Promise.all(requests.map(request => launch(request.key!, request)));
     },
     steer(key: string, message: string, options: unknown) {
@@ -2550,7 +2550,7 @@ describe("architecture deterministic access receipts", () => {
       expect(verifier.exitCode, verifier.stderr.toString()).toBe(0);
       const output = verifier.stdout.toString();
       expect(JSON.parse(output)).toMatchObject({v: 1, code: "store-corrupt", recovery: {quarantine: expect.any(String)}});
-      settlement = {ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output, results: [{exitCode: 0}], task};
+      settlement = {ok: true, agent: "pitako.originals-verifier", runId: `native-${key}`, output, results: [{exitCode: 0}], task};
       return settlement;
     };
 

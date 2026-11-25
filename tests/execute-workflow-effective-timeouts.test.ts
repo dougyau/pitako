@@ -4,6 +4,7 @@ import path from "node:path";
 import { executeStore } from "../skills/execute/ledger.mjs";
 import { executeControllerFixture, gaps } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 
@@ -30,10 +31,10 @@ test("overrides reach workers, all analyses and task/final gates without rewriti
   expect(output.status, output.reason).toBe("complete");
   for (const request of host.launches.filter(request => request.agent === "pitako.worker"))
     expect(request.timeoutMs).toBe(21000000);
-  const analysis = host.launches.filter(request => /\.task-(reviewer|synthesis)$|\.review\.|\.compliance$/.test(request.key) && request.agent !== "pitako.access-verifier");
+  const analysis = host.launches.filter(request => /\.task-(reviewer|synthesis)$|\.review\.|\.compliance$/.test(request.key) && request.agent !== "pitako.originals-verifier");
   expect(analysis.length).toBeGreaterThan(5);
   for (const request of analysis) expect(request.timeoutMs).toBe(20000000);
-  const gates = host.launches.filter(request => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate");
+  const gates = host.launches.filter(request => pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate");
   expect(gates).toHaveLength(2);
   for (const request of gates) {
     const cursor = host.snapshots.find(value => value.action?.opKey === request.key);
@@ -81,7 +82,7 @@ test.each([
     };
     host.setRespond(respond);
     const output = await host.execute();
-    const request = host.launches.find(request => request.agent === "pitako.loop-io" &&
+    const request = host.launches.find(request => pitakoAgentFamily(request.agent) === "loop-io" &&
       JSON.parse(request.task).operation === (continuing ? "close" : "gate"));
     expect(request, output.reason).toBeDefined();
     expect(request!.timeoutMs).toBe(expected);
@@ -133,7 +134,7 @@ test.each(["worker", "gate", "close", "analysis", "final"])("raising values afte
   }
   expect(output.timeouts.values.workerMs, output.reason).toBe(26000000);
   if (phase !== "final" && phase !== "close") {
-    const later = launched.filter(request => request.agent === "pitako.loop-io" &&
+    const later = launched.filter(request => pitakoAgentFamily(request.agent) === "loop-io" &&
       JSON.parse(request.task).operation === "gate" && request.key.endsWith(".acceptance.gate"));
     expect(later.length).toBeGreaterThan(0);
     expect(JSON.parse(later[0]!.task).task.gates[0].timeoutMs).toBe(27000000);

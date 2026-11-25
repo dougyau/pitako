@@ -11,6 +11,7 @@ import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
 import { openSqliteSync } from "../extensions/board/sqlite.ts";
 import { resolveStoredGroupedInput } from "../skills/execute/loop-io.mjs";
 import { readExecuteTimeoutProjection } from "../extensions/execute-progress.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture: createFixture } = executeControllerFixture();
 function fixture(options: Parameters<typeof createFixture>[1] = {}) {
@@ -122,7 +123,7 @@ test.each(["fresh-version", "version", "replaced", "busy", "running", "stopped",
     let quarantine: string | undefined;
     let intercepted = false, before: any;
     host.setLaunchRespond(async (request, normal) => {
-      if (intercepted || request.agent !== "pitako.loop-io" ||
+      if (intercepted || pitakoAgentFamily(request.agent) !== "loop-io" ||
           JSON.parse(request.task).operation !== (fresh ? "advance" : defect === "drain-version" ? "drain" : "gate")) return normal();
       intercepted = true;
       before = copy(host.current());
@@ -228,7 +229,7 @@ test.each([
       ...(recovered && nativeState === "wrong-agent" ? { agent: "pitako.reviewer" } : {}),
       ...(recovered && nativeState === "wrong-run" ? { runId: randomUUID() } : {}) }));
     host.setLaunchRespond(async (request, normal) => {
-      if (recovered || request.agent !== "pitako.loop-io") return normal();
+      if (recovered || pitakoAgentFamily(request.agent) !== "loop-io") return normal();
       recovered = true;
       const child = Bun.spawn([process.execPath, "--preload", gitFakeBootstrap, path.resolve("skills/execute/loop-io.mjs")], {
         cwd: host.root, env: process.env, stdin: "pipe", stdout: "pipe", stderr: "pipe",
@@ -272,7 +273,7 @@ test.each([
       expect(firstSave?.cursor, output.reason).toMatchObject({ epoch: 1,
         budget: { consumedLoops: loop, maxCycles: cursor.budget.maxCycles } });
       expect(host.launches.slice(beforeReplay, firstSave!.count).map(({ key, agent }) => ({ key, agent })))
-        .toEqual([{ key: `${key}.r1`, agent: "pitako.loop-io" }]);
+        .toEqual([{ key: `${key}.r1`, agent: "pitako.loop-advance" }]);
       expect(output.reason).not.toMatch(/replay.differs|new mission|ask a human/i);
       expect(epochRecords().find(row => row.seq === committed!.seq)).toEqual(committed);
       expect(host.launches.slice(beforeReplay).some(call => call.key === `invoke-human-1.e1.l${loop}.director`)).toBe(true);
@@ -417,7 +418,7 @@ test.each([false, true])("superseded root ends without saving or effects (worker
   }
   let before: unknown, saves = -1, intercepted = false;
   host.setLaunchRespond(async (request, normal) => {
-    if (request.agent !== "pitako.loop-io" ||
+    if (pitakoAgentFamily(request.agent) !== "loop-io" ||
         !["gate", "close"].includes(JSON.parse(request.task).operation)) return normal();
     intercepted = true;
     before = copy(host.current()); saves = host.snapshots.length;
@@ -453,7 +454,7 @@ test("the active root repairs a cursor clobbered between commit and save without
   let clobbered = false;
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (!clobbered && request.agent === "pitako.loop-io" &&
+    if (!clobbered && pitakoAgentFamily(request.agent) === "loop-io" &&
         JSON.parse(request.task).operation === "gate") {
       expect(JSON.parse(result.output!).head.seq).toBeGreaterThan(host.current().head.seq);
       host.storage.set("pitako-execute", { invocation: "clobbered" });
@@ -553,7 +554,7 @@ test.each(["close", "drain", "checkout"] as const)("a stopped %s holds with exac
         stopped: true, results: [] };
     }
     const result = await normal();
-    if (!stopped && request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === operation) {
+    if (!stopped && pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === operation) {
       stopped = true;
       return { ...result, ok: false, stopped: true };
     }
@@ -831,7 +832,7 @@ async function settledDirectorSelection(mode: "uninterrupted" | "cut" | "missing
       const demands = host.launches.filter(call => call.key.endsWith(".demand-observation"));
       expect(demands.map(call => call.key), result.reason).toEqual([demand, renewedDemand]);
       expect(demands[1]).toMatchObject({
-        agent: "pitako.reviewer", task: demands[0]!.task, timeoutMs: demands[0]!.timeoutMs! + 1 });
+        agent: "pitako.demand-observer", task: demands[0]!.task, timeoutMs: demands[0]!.timeoutMs! + 1 });
       if (mode === "uninterrupted") expect(host.launches[count]).toEqual(demands[1]!);
     }
     if (mode !== "uninterrupted") {
@@ -853,7 +854,7 @@ async function settledDirectorSelection(mode: "uninterrupted" | "cut" | "missing
       }
       result = await host.execute();
       expect(host.statusCalls).toContain(cursor.action.runId);
-      expect(host.launches.slice(count)[0]).toMatchObject({ agent: "pitako.loop-io", key: `${selection}.r1` });
+      expect(host.launches.slice(count)[0]).toMatchObject({ agent: "pitako.loop-selection", key: `${selection}.r1` });
       if (mode !== "cut") {
         expect(result.status).toBe("blocked");
         expect(result.reason).toMatch(/Director selection integrity failure: .* (missing|mismatch)/);
@@ -992,7 +993,7 @@ test.each(["running", "permission", "capacity", "wrong-run", "wrong-agent"])(
     const host = fixture(); host.setLimit(1);
     host.setLaunchRespond(async (request, normal) => {
       const result = await normal();
-      return request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close"
+      return pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close"
         ? { ...result, ok: false, stopped: true } : result;
     });
     expect((await host.execute()).status).toBe("cancelled");
@@ -1014,7 +1015,7 @@ test("a retained grouped permission denial cannot be erased by relaunch", async 
   const host = fixture(); host.setLimit(1);
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    return request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close"
+    return pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close"
       ? { ...result, ok: false, error: "Blocked by pi-subagents permission rule: 'run' is denied." } : result;
   });
   expect((await host.execute()).status).toBe("blocked");
@@ -1028,7 +1029,7 @@ test.each(["running", "permission", "capacity"])("a lost grouped dispatch receip
   const host = fixture(); host.setLimit(1);
   let closeKey = "";
   host.setLaunchRespond((request, normal) => {
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close") {
       closeKey = request.key;
       throw Error("Native transport disappeared");
     }
@@ -1049,7 +1050,7 @@ test.each(["structured", "management"])("pending grouped seal observes its exact
   const host = fixture(); host.setLimit(1);
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    return request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close"
+    return pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close"
       ? { ...result, stopped: true } : result;
   });
   expect((await host.execute()).status).toBe("cancelled");
@@ -1070,7 +1071,7 @@ test.each(["close", "drain"])("an interrupted %s retry observes the in-flight re
   let operationKey = "";
   let retryRunning = false;
   host.setLaunchRespond((request, normal) => {
-    if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== operation) return normal();
+    if (pitakoAgentFamily(request.agent) !== "loop-io" || JSON.parse(request.task).operation !== operation) return normal();
     operationKey ||= request.key;
     if (request.key === operationKey) return {
       ...host.result(request, {}), ok: false, key: request.key,
@@ -1119,7 +1120,7 @@ function cutAfterGroupedClose(host: ReturnType<typeof fixture>) {
   let key = "";
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (!key && request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && result.ok) key = request.key;
+    if (!key && pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close" && result.ok) key = request.key;
     return result;
   });
   host.setFailSave(() => !!key);
@@ -1143,9 +1144,9 @@ test("a cut after grouped sealing reuses the receipt without another close or wo
   const result = await host.execute();
   expect(result.status, result.reason).toBe("partial");
   const [reconstruction, ...resumed] = host.launches.slice(count);
-  expect(reconstruction).toMatchObject({ agent: "pitako.loop-io", key: `${closeKey()}.r1` });
+  expect(reconstruction).toMatchObject({ agent: "pitako.loop-close", key: `${closeKey()}.r1` });
   expect(JSON.parse(reconstruction!.task).refs.committed).toBe(true);
-  expect(resumed.every(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toBe(true);
+  expect(resumed.every(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "drain")).toBe(true);
   expect(committedClose(host, closeKey())).toEqual(sealed);
   expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");

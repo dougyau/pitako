@@ -14,8 +14,9 @@ The caller interprets the report and retains authority over any further action.
 1. Enable `subagent` with `subagents_enable({})` if needed. Read its
    `workflows/scripted-workflows` and `tool-reference/retained-children` guides.
 2. Inspect profiles with `subagent({ action: "list" })`. Confirm that
-   `pitako.reviewer` is available and suitable for read-only review without
-    delegation. It supplies CodeGraph, read-only LSP, verify-behavior, and ponytail-review.
+   `pitako.review-director` and `pitako.review-angle` are available for read-only
+   review without delegation. They use the same profile body as the manual
+   `pitako.reviewer`, with CodeGraph, read-only LSP, verify-behavior, and ponytail-review.
     Execute's integrated review preserves the reviewer's declared profile skills
     (including Ponytail) alongside its workflow-specific scope-discipline addition.
     Its protocol snapshot belongs to the enclosing execute loop, not a separate
@@ -45,8 +46,8 @@ coverage instead of claiming closure.
 
 When `/execute` embeds this review library, the bounded review cursor lives in
 `pitako-execute`, not in a separate review key. Execute passes its in-memory loop
-and records original references through the existing `reviewOriginals` loop-io
-call. Final review and compliance receive the same committed blocking acceptance
+and records original references through `pitako.loop-review-originals`.
+Final review and compliance receive the same committed blocking acceptance
 reference and digest, bounded check summaries (not output bodies), and candidate
 and mutation status, even if no task ran. An absent receipt is explicit, and
 relaunch does not substitute evidence from a different candidate.
@@ -62,7 +63,7 @@ restarted. Use native replay after `runtime-replaced` or `owner-exited` so
 successful child admissions can be reused. Native Stop and permission refusals
 still apply.
 
-On the normal path, `pitako.store-io` runs once at the end, using the
+On the normal path, `pitako.review-store` runs once at the end, using the
 bounded save intention and verifying original native settlements by key,
 run ID and digest. It does not rerun a producer or gate. A lost cursor save
 replays the store operation at the same key; a missing or contradictory
@@ -119,11 +120,12 @@ The director selects exactly one additional risk angle whose id must differ
 from the fixed angle.
 
 1. **Independent mirrored review.** Each angle is reviewed by both model slots,
-   `r1` and `r2`, giving four fresh read-only `pitako.reviewer` children.
+   `r1` and `r2`, giving four fresh read-only `pitako.review-angle` children.
    Fresh reviewers see no peer conclusions. Each may
    return zero findings. verify-behavior and ponytail-review are common; additional skills are chosen
    from the script's bounded list by risk. Apply ponytail-review to correctness, safety, useful tests and simplicity; require reachable cases and evidence, not speculative guards.
-2. **Synthesis.** Directly after the four reviews, the director deduplicates and records a reasoned disposition
+2. **Synthesis.** Directly after the four reviews, the `pitako.review-director`
+   prepare session resumes to deduplicate and record a reasoned disposition
    for every finding: include, discard, or uncertain. Evidence decides, not votes.
    Each finding and final disposition also has a `classification`:
    `scoped-defect`, `related-improvement`, `out-of-scope`, or `uncertain`.
@@ -164,7 +166,7 @@ finding bodies into a second table. Reasons, coverage, uncertainty and contrary
 narrative outside findings remain recoverable; every finding gets a disposition.
 Essential-original references explain why the exact original is needed. Before
 the synthesis phase the workflow dispatches the
-model-free `pitako.access-verifier` once over the phase's required originals. It
+model-free `pitako.originals-verifier` once over the phase's required originals. It
 compares the canonical JSON digest of each published file with the admitted
 digest and writes a no-clobber receipt in the cwd store
 (`access:review-<scopeId>` for standalone review).

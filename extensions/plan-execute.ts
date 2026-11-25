@@ -16,6 +16,7 @@ import { packageRoot } from "./stack.ts";
 import { closingCompliance, closingArchive } from "../skills/execute/closing.mjs";
 import { readTaskGateWire } from "../skills/execute/loop.ts";
 import { reviewSynthesisScript } from "../skills/review/synthesis.mjs";
+import { PITAKO_LOOP_OPERATIONS, pitakoLoopAgent } from "../skills/agent-names.mjs";
 import { reviewCursorContract, reviewCursorScript } from "../skills/review/cursor.mjs";
 import { architectureNativeSource } from "../skills/architecture/native.mjs";
 import { planConflictReason, checkpointMismatchReason, settledBarrier, inspectorConflictReason, viewOverflowReason, checkpointWitnessIssue, nativeReference } from "../skills/execute/halt-evidence.mjs";
@@ -207,9 +208,11 @@ export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS, _root = 
 const NAMED_WORKFLOWS = ["pitako.execute", ...Object.keys(ANALYSIS_WORKFLOWS)];
 type RuntimeAgent = { name: string; description: string; systemPrompt: string; args: string[] };
 const RUNTIME_AGENTS: RuntimeAgent[] = [
-  { name: "pitako.loop-io", description: "Deterministic execute backlog, Board memory and command gates; no model execution.",
+  // One loop-io runner, named per operation so hosts can show what each child does.
+  ...PITAKO_LOOP_OPERATIONS.map(operation => ({ name: pitakoLoopAgent(operation),
+    description: `Deterministic execute loop ${operation} (backlog, Board memory and command gates); no model execution.`,
     systemPrompt: "Fixed loop I/O; stdin is a JSON prepare, apply or gate request. Gates require a settled worker.",
-    args: ["skills/execute/loop-io.mjs"] },
+    args: ["skills/execute/loop-io.mjs"] })),
   { name: "pitako.checkout-observer", description: "Deterministic actual-cwd checkout evidence; no model or prompt execution.",
     systemPrompt: "Fixed actual-cwd observer and ledger publisher; stdin is a JSON {expected, body} request, never a workspace selector.",
     args: ["skills/execute/observe.mjs"] },
@@ -217,13 +220,13 @@ const RUNTIME_AGENTS: RuntimeAgent[] = [
     systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", args: ["skills/execute/ledger.mjs"] },
   { name: "pitako.architecture-ledger", description: "Deterministic hash-chained architecture ledger publication; no model execution.",
     systemPrompt: "Fixed architecture store writer and observer; stdin is a JSON ledger request for the actual cwd.", args: ["skills/architecture/ledger.mjs"] },
-  { name: "pitako.store-io", description: "Deterministic standalone review recovery observation and final save; no model execution.",
+  { name: "pitako.review-store", description: "Deterministic standalone review recovery observation and final save; no model execution.",
     systemPrompt: "Fixed standalone review I/O; stdin is a JSON observe-review or save-review request for the actual cwd.", args: ["skills/review/store-io.mjs"] },
   { name: "pitako.request-observer", description: "Deterministic main-session execute request reader; no model execution.",
     systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.", args: ["skills/execute/observe.mjs", "--requests"] },
   { name: "pitako.checkpoint-sealer", description: "Deterministic checkpoint journal verification and seal metadata publication; no model execution.",
     systemPrompt: "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.", args: ["skills/execute/checkpoint.mjs", "--seal-stdin"] },
-  { name: "pitako.access-verifier", description: "Deterministic access receipt verification of published originals; no model execution.",
+  { name: "pitako.originals-verifier", description: "Deterministic access receipt verification of published originals; no model execution.",
     systemPrompt: "Fixed access verifier; stdin is a JSON {missionPath, namespace, gate, items} request.", args: ["extensions/access-receipts.mjs", "--verify-stdin"] },
 ];
 export default function planExecute(pi: ExtensionAPI): void {

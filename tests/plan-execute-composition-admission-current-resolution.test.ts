@@ -32,6 +32,7 @@ import { profileNote } from "../extensions/profile.ts";
 import { DEFAULT_SKILL_NAMES } from "../extensions/catalog.ts";
 import { checkoutEvidence, digest, MAX_SPEC_BYTES, preliminarySpec, SPEC_SECTIONS, validateSpec } from "../extensions/spec-plans.ts";
 import { controlledWorkflow, planExecute, checkout, synchronousHostRelease, read, assignmentSpec, missionFiles, resourceWithAgentDir, childResponse, realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { PITAKO_LOOP_OPERATIONS, pitakoAgentFamily, pitakoLoopAgent } from "../skills/agent-names.mjs";
 
 const composition = realCheckoutCompositionFixture();
 const { execFileSync } = composition;
@@ -432,7 +433,7 @@ describe("plan/execute packaged composition", () => {
       const storage = new Map<string, any>(), calls: string[] = [];
       const observed = await runWorkflowScript({ script: admission.script,
         state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, value); } },
-        launch: async (key, request) => { if (request.agent === "pitako.loop-io") return childResponse(key, request, { ...deterministicScripts, root, loopOperations }, checkout); calls.push(key); throw Error("Controlled stop at first director"); },
+        launch: async (key, request) => { if (pitakoAgentFamily(request.agent) === "loop-io") return childResponse(key, request, { ...deterministicScripts, root, loopOperations }, checkout); calls.push(key); throw Error("Controlled stop at first director"); },
         status: async () => { throw Error("No recovery expected"); },
         host: async key => {
           // Dedicated Windows/POSIX cases own real CLI transport; reuse the owned
@@ -700,7 +701,7 @@ describe("plan/execute packaged composition", () => {
     expect(observed.unrelated).toEqual({owner:"another workflow",payload:"é中😀".repeat(64)});
     for (const phase of ["director", "worker", "review", "compliance"]) {
       const prompts = observed.prompts.filter((entry: any) => phase === "compliance" ? entry.key.endsWith(".compliance") :
-        phase === "review" ? entry.agent === "pitako.reviewer" && !entry.key.endsWith(".compliance") :
+        phase === "review" ? pitakoAgentFamily(entry.agent) === "reviewer" && !entry.key.endsWith(".compliance") :
         entry.agent === `pitako.${phase === "director" ? "execution-director" : "worker"}`);
       expect(prompts.length).toBeGreaterThan(0);
       for (const prompt of prompts) for (const ref of amendments) {
@@ -1226,7 +1227,7 @@ describe("plan/execute packaged composition", () => {
       } },
       launch: async (key, request) => {
         if (key.endsWith(".director")) expect(request.task).toContain(JSON.stringify(selected.source));
-        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && request.agent !== "pitako.loop-io" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.access-verifier") expect(request.task).toContain(content);
+        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && pitakoAgentFamily(request.agent) !== "loop-io" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.originals-verifier") expect(request.task).toContain(content);
         if (request.agent === "pitako.worker") captureCheckpoint(readExecuteIntentContext(root, storage.get("pitako-execute")).intent, ["owned"]);
         const response = await childResponse(key, request, { ...metadata, loopOperations }, actualCheckout, 3);
         if (key.endsWith(".compliance")) response.structuredOutput.requirements.slice(1).forEach((entry: any) => { entry.status = "fulfilled"; });
@@ -1449,7 +1450,7 @@ describe("plan/execute packaged composition", () => {
         expect(request.cwd).toBe(root); expect(request.outputSchema).toBeDefined();
         if (request.agent === "pitako.worker") captureCheckpoint(readExecuteIntentContext(root, storage.get("pitako-execute")).intent, ["owned"]);
         const response = await childResponse(key, request, { ...metadata, loopOperations }, candidate);
-        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && request.agent !== "pitako.loop-io" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.access-verifier") {
+        if (!request.resume && request.agent !== "pitako.checkout-observer" && request.agent !== "pitako.execution-ledger" && pitakoAgentFamily(request.agent) !== "loop-io" && request.agent !== "pitako.request-observer" && request.agent !== "pitako.checkpoint-sealer" && request.agent !== "pitako.originals-verifier") {
           expect(request.task, key).toContain(amendmentPath);
           expect(request.task, key).toContain(digest(amendmentBody));
           expect(request.task, key).toContain("Current human delivered A1 before plan publication");
@@ -1465,7 +1466,7 @@ describe("plan/execute packaged composition", () => {
       },
     });
     expect(result.value).toMatchObject({ status: "complete", loopsConsumed: 2, actionRequired: "none" });
-    expect(calls.filter(call => call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.loop-io" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
+    expect(calls.filter(call => call.agent !== "pitako.execution-ledger" && pitakoAgentFamily(call.agent) !== "loop-io" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.originals-verifier").map(call => call.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.t1.a1",
       "invoke-human-1.l1.t1.a1.task-reviewer", "invoke-human-1.l1.t1.a1.task-synthesis", "invoke-human-1.l2.director",
       "invoke-human-1.l2.review.director-prepare", "invoke-human-1.l2.review.independent-evidence-contract-r1", "invoke-human-1.l2.review.independent-evidence-contract-r2",
       "invoke-human-1.l2.review.independent-a-r1", "invoke-human-1.l2.review.independent-a-r2",
@@ -1489,7 +1490,7 @@ describe("plan/execute packaged composition", () => {
       return [agent.name.replace("pitako.", ""), buildEffectiveSystemPrompt({ agent, resolvedSkills: resolved, cwd: root })];
     }));
     const priorContexts = new Map<string, string>();
-    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.loop-io" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier")) {
+    for (const call of calls.filter(call => call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && pitakoAgentFamily(call.agent) !== "loop-io" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.originals-verifier")) {
       const role = (call.agent ?? "pitako.reviewer").replace("pitako.", "");
       const assembled = [read("AGENTS.md"), bodies.get(role),
         call.resume ? priorContexts.get(call.resume) : "", call.task].join("\n");
@@ -1844,7 +1845,7 @@ describe("packaged workflow caller examples", () => {
       const result = await runWorkflowScript({ script: resolved.script,
         state: { get: key => storage.get(key), set: (key, value) => { storage.set(key, structuredClone(value)); } },
         launch: async (key, request) => {
-          if (request.agent === "pitako.architecture-ledger" || request.agent === "pitako.access-verifier") {
+          if (request.agent === "pitako.architecture-ledger" || request.agent === "pitako.originals-verifier") {
             deterministicKeys.push(key);
             const operation = request.agent === "pitako.architecture-ledger" ? appendLedger : verifyGate;
             return { key, ok: true, agent: request.agent, runId: `runtime-${++sequence}`,
@@ -1979,13 +1980,13 @@ describe("packaged workflow caller examples", () => {
         set: (key, value) => writeFileSync(statePath, JSON.stringify({...JSON.parse(readFileSync(statePath, "utf8")), [key]: value})) },
       launch: async (key, request) => {
         launches.push(request);
-        if (request.agent === "pitako.store-io" && typeof request.task === "string")
+        if (request.agent === "pitako.review-store" && typeof request.task === "string")
           return {key, ok: true, output: JSON.stringify(await saveReview(JSON.parse(request.task), store)), artifactPaths: []};
         return { key, ok: false, output: "", artifactPaths: [], error: "Controlled terminal failure, no original delivered" };
       },
       status: async () => { throw Error("Status preview is not an original"); } });
     expect((result.value as any).status).toBe("blocked");
-    expect(launches.map(request => request.agent)).toEqual(["pitako.reviewer", "pitako.store-io"]);
+    expect(launches.map(request => request.agent)).toEqual(["pitako.review-director", "pitako.review-store"]);
     expect(launches[0].task.split("\n")[0]).toBe(launches[0].label);
     expect(launches[0].label).toContain(input.args.workDescription);
     expect(launches[0].task).toContain(input.args.brief);
@@ -2118,7 +2119,7 @@ describe("compact admission and preliminary capture", () => {
       status: async () => { throw Error("No prior native producer expected"); },
       launch: async (key: string, request: any) => {
         calls.push(key);
-        if (request.agent === "pitako.loop-io")
+        if (pitakoAgentFamily(request.agent) === "loop-io")
           return childResponse(key, request, { ...deterministicScripts, root, commonDir: selected.commonDir,
             selected: { source: selected.source, digest: selected.digest } }, initial.checkout);
         return { key, ok: false, stopped: true, artifactPaths: [] };
@@ -2190,34 +2191,37 @@ describe("deterministic observer", () => {
     const first = { sessionManager: { getSessionId: () => randomUUID() } };
     try {
       hooks.get("session_start")!({}, first); otherHooks.get("session_start")!({}, first);
-      expect(requests[0].name).toBe("pitako.loop-io");
-      expect(requests[0].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
-        args: [path.resolve("skills/execute/loop-io.mjs")], promptDelivery: "stdin" });
-      expect(requests[0].definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
-        inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
-      const definition = requests[1].definition;
-      expect(requests[1].name).toBe("pitako.checkout-observer");
+      const loops = PITAKO_LOOP_OPERATIONS.length;
+      expect(requests.slice(0, loops).map(request => request.name)).toEqual(PITAKO_LOOP_OPERATIONS.map(pitakoLoopAgent));
+      for (const request of requests.slice(0, loops)) {
+        expect(request.definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+          args: [path.resolve("skills/execute/loop-io.mjs")], promptDelivery: "stdin" });
+        expect(request.definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
+          inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
+      }
+      const definition = requests[loops + 0].definition;
+      expect(requests[loops + 0].name).toBe("pitako.checkout-observer");
       expect(definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/execute/observe.mjs")], promptDelivery: "stdin" });
       expect(path.isAbsolute(definition.runner.command)).toBe(true);
       expect(definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
       expect(definition.model).toBeUndefined(); expect(definition.extensions).toBeUndefined();
-      const ledger = requests[2];
+      const ledger = requests[loops + 1];
       expect(ledger.name).toBe("pitako.execution-ledger");
       expect(ledger.definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/execute/ledger.mjs")], promptDelivery: "stdin" });
       expect(ledger.definition).toMatchObject({ tools: [], allowNestedSubagents: false, defaultContext: "fresh",
         inheritProjectContext: false, inheritGlobalContext: false, inheritSkills: false, defaultAsync: false });
       expect(ledger.definition.model).toBeUndefined(); expect(ledger.definition.outputSchema).toBeUndefined();
-      expect(requests[3].name).toBe("pitako.architecture-ledger");
-      expect(requests[3].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+      expect(requests[loops + 2].name).toBe("pitako.architecture-ledger");
+      expect(requests[loops + 2].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/architecture/ledger.mjs")], promptDelivery: "stdin" });
-      expect(requests[4].name).toBe("pitako.store-io");
-      expect(requests[4].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+      expect(requests[loops + 3].name).toBe("pitako.review-store");
+      expect(requests[loops + 3].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/review/store-io.mjs")], promptDelivery: "stdin" });
-      expect(requests[5].name).toBe("pitako.request-observer");
-      expect(requests[5].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+      expect(requests[loops + 4].name).toBe("pitako.request-observer");
+      expect(requests[loops + 4].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("skills/execute/observe.mjs"), "--requests"], promptDelivery: "stdin" });
       // Reproduce the native async launch: inferred acceptance is appended to the task, then framed.
       for (const { definition: agent } of requests) {
@@ -2229,18 +2233,18 @@ describe("deterministic observer", () => {
         const { readRequest } = await import(path.resolve("skills/execute/ledger.mjs"));
         expect(readRequest(buildExternalCliPrompt(agent.systemPrompt, prompt ? `${task}\n${prompt}` : task))).toEqual(request);
       }
-      expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[1].name, definition })).toThrow();
+      expect(() => registerAgent({ pi: pi as unknown as ExtensionAPI, name: requests[loops + 0].name, definition })).toThrow();
       expect(disposed).toBe(0);
-      expect(requests.map(request => request.name)).toEqual(["pitako.loop-io", "pitako.checkout-observer", "pitako.execution-ledger", "pitako.architecture-ledger",
-        "pitako.store-io", "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.access-verifier"]);
-      expect(requests[7].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
+      expect(requests.map(request => request.name)).toEqual([...PITAKO_LOOP_OPERATIONS.map(pitakoLoopAgent), "pitako.checkout-observer", "pitako.execution-ledger", "pitako.architecture-ledger",
+        "pitako.review-store", "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.originals-verifier"]);
+      expect(requests[loops + 6].definition.runner).toEqual({ type: "external-cli", command: process.execPath,
         args: [path.resolve("extensions/access-receipts.mjs"), "--verify-stdin"], promptDelivery: "stdin" });
       hooks.get("session_start")!({}, first);
-      expect(disposed).toBe(8); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(loops + 7); expect(otherDisposed).toBe(0);
       hooks.get("session_shutdown")!(); hooks.get("session_shutdown")!();
-      expect(disposed).toBe(16); expect(otherDisposed).toBe(0);
+      expect(disposed).toBe(2 * (loops + 7)); expect(otherDisposed).toBe(0);
     } finally { hooks.get("session_shutdown")!(); otherHooks.get("session_shutdown")!(); }
-    expect(otherDisposed).toBe(8);
+    expect(otherDisposed).toBe(PITAKO_LOOP_OPERATIONS.length + 7);
   });
 
   test("deterministic agents report conflicts and native rejection without fallback or replacement", () => {

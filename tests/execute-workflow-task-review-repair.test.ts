@@ -3,6 +3,7 @@ import { existsSync, rmSync, writeFileSync } from "node:fs";
 import { readBacklog } from "../skills/execute/loop.ts";
 import { digest } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, executeField, executeString, type Result } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 const { executeStore, canonicalJSON, executeProjection, fullExecuteProjection } = await import("../skills/execute/ledger.mjs");
 const { resolveStoredGroupedInput } = await import("../skills/execute/loop-io.mjs");
 
@@ -33,7 +34,7 @@ test.each(["admit", "reject", "gate-failure", "incomplete", "conflict", "stalled
           result.structuredOutput.remaining = ["Still incomplete"];
         }
       }
-      if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate") {
+      if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate") {
         const receipt = JSON.parse(result.output!);
         if (workers === 2 && outcome === "gate-failure") {
           receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1;
@@ -237,8 +238,8 @@ test.each(["reviewer-intention", "synthesis-intention", "reviewer-receipt", "syn
     .toHaveLength(admitted(uninterrupted).length + (sequential ? 2 : 1));
   expect(host.launches.filter(call => /\.(?:review-context-recovery|review-recovery)\.r1$/.test(call.key)))
     .toHaveLength(sequential ? 2 : 1);
-  expect(host.launches.filter(call => call.agent !== "pitako.loop-io").map(call => call.key))
-    .toEqual(uninterrupted.launches.filter(call => call.agent !== "pitako.loop-io").map(call => call.key));
+  expect(host.launches.filter(call => pitakoAgentFamily(call.agent) !== "loop-io").map(call => call.key))
+    .toEqual(uninterrupted.launches.filter(call => pitakoAgentFamily(call.agent) !== "loop-io").map(call => call.key));
   if (sequential) {
     const tip = store.read(scope).head;
     for (const stage of ["reviewer", "synthesis"]) {
@@ -254,7 +255,7 @@ test.each(["reviewer-intention", "synthesis-intention", "reviewer-receipt", "syn
     }
   }
   const modelRequests = (value: typeof host) => JSON.stringify(value.launches.filter(call =>
-    ["pitako.worker", "pitako.reviewer", "pitako.execution-director"].includes(call.agent ?? "")))
+    ["worker", "reviewer", "execution-director"].includes(pitakoAgentFamily(call.agent) ?? "")))
     .replaceAll(value.root, "<root>")
     .replaceAll(value.current().storeId, "<store>")
     .replace(/(digest\\":\\")[a-f0-9]{64}(?=\\",\\"lines\\")/g, "$1<store-record-digest>")

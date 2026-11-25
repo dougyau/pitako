@@ -4,7 +4,7 @@ The [architecture skill](../skills/architecture/SKILL.md) creates or shows a nat
 mission and launches the named resource `pitako.architecture` (raw script paths
 fail). `skills/architecture/workflow.js` owns dispatch and uses the packaged
 `pitako.architect` profile for the director and perspective members. Each
-consuming gate first runs the model-free `pitako.access-verifier`; consumers then
+consuming gate first runs the model-free `pitako.originals-verifier`; consumers then
 receive verified references `{ id, path, digest }` for native originals or
 `{ id, store, digest }` for caller context. They read store records using
 `pitako_store`. A

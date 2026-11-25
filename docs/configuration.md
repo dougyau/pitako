@@ -153,7 +153,8 @@ model list. Admission reads global agent `settings.json` (under
 `PI_CODING_AGENT_DIR`, normally `~/.pi/agent`) then project `.pi/settings.json`;
 project values override global values. Invalid values fail admission. Both
 effective models are frozen for the invocation and replay, and are always sent
-explicitly to the two read-only `pitako.reviewer` children, without substitution.
+explicitly to the read-only `pitako.task-review` and `pitako.task-synthesis`
+children, respectively, without substitution.
 Unknown or failing models halt blocked with the key, model and native error;
 fix the setting and start a new invocation. There is no retry or fallback model.
 Native barriers cancel and spawn-budget rejection uses the existing relaunch.
@@ -177,8 +178,8 @@ Full review in standalone `/review` and `/execute` final acceptance uses exactly
 two angles: `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`,
 or `decision-fidelity` for `plan` (including specs), plus one director-selected
 risk angle with a different id. Both model slots review each angle independently
-(four read-only `pitako.reviewer` children), followed directly by the unchanged
-synthesis. There are no critique or defense phases.
+(four read-only `pitako.review-angle` children), followed directly by synthesis
+resuming the `pitako.review-director` prepare session. There are no critique or defense phases.
 
 Full-review model settings use a separate namespace:
 
@@ -194,10 +195,14 @@ These are exact `provider/id[:thinking]` strings, with global agent
 Invalid values are rejected with the file and key; there is no fallback.
 Standalone `/review` reads these settings through its named analysis resource
 and freezes them in the resolved script and invocation state for replay.
-`/execute` reads and freezes them at admission for its final `solution` review;
+`/execute` reads and freezes them at admission for its final `solution` review
+and sends the frozen `pitako.review.r1` model to `pitako.compliance` and
+`pitako.demand-observer` (inherited-demands observation);
 settings changes do not alter either mode's frozen selections on replay.
 Each configured value is sent unchanged as the child `model`.
 `synthesis` selects both the prepare director and final synthesis model.
+`agentOverrides["pitako.reviewer"]` does not affect workflow launches;
+`pitako.reviewer` remains available for manual delegation.
 An unknown or failing configured model stops review with the settings key,
 model, and native error; no other model is substituted.
 

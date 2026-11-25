@@ -21,7 +21,7 @@ test("execute analysis requests get four hours, including agentless resumed fina
   expect(synthesis).not.toHaveProperty("agent");
 
   // These launch paths do not pass through execute's analysis dispatcher.
-  for (const agent of ["pitako.access-verifier", "pitako.execution-director"]) {
+  for (const agent of ["pitako.originals-verifier", "pitako.execution-director"]) {
     const requests = host.calls.filter(call => call.agent === agent);
     expect(requests.length).toBeGreaterThan(0);
     for (const request of requests) expect(request).not.toHaveProperty("timeoutMs");
