@@ -2260,10 +2260,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     if (input.root !== undefined && input.root !== process.cwd())
       throw new StoreError("wrong-cwd", "Execute cursor belongs to the wrong cwd.");
     input.root = process.cwd();
-    const epoch = executeEpoch(input.invocation, input.key ?? input.intent?.key ?? input.intents?.at(-1)?.key);
-    if (input.scope !== undefined && input.scope !== executeScope(input.invocation, epoch))
+    // A repair attempt's baseline request names its invocation only through the checkpoint intent.
+    const invocation = input.invocation ?? input.intent?.association?.invocation;
+    const epoch = executeEpoch(invocation, input.key ?? input.intent?.key ?? input.intents?.at(-1)?.key);
+    if (input.scope !== undefined && input.scope !== executeScope(invocation, epoch))
       throw new Error("loop-io stored operation scope mismatch");
-    const receipt = await withExecuteStore(input.root, input.invocation, () => operation === "drain" ? drain(input) :
+    const receipt = await withExecuteStore(input.root, invocation, () => operation === "drain" ? drain(input) :
       ["advance", "selection", "close"].includes(operation) ? grouped(operation, input) : runOperation(operation, input), epoch,
       input.storeId ? { storeId: input.storeId, expectedHead: input.expectedHead } : undefined);
     const output = JSON.stringify(["drain", "advance", "selection", "close"].includes(operation) ? receiptTransport(receipt) :
