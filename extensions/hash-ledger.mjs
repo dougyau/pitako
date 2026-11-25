@@ -1,4 +1,4 @@
-import { lstatSync } from "node:fs";
+import { lstatSync, readlinkSync } from "node:fs";
 import path from "node:path";
 
 const isHash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
@@ -13,22 +13,42 @@ export function validateMissionPath(missionPath) {
     throw new Error("Access receipts require the absolute native mission record path.");
 }
 
-// Walk every component, including the final one; never resolve a symlink.
-export function safePath(file) {
+// Only root can replace a root-owned link directly under a root-owned, non-group/other-writable
+// filesystem root, such as macOS /var -> private/var and /tmp -> private/tmp.
+export function systemLink(link, stat) {
+  const parent = path.dirname(link);
+  if (parent !== path.parse(link).root || stat.uid !== 0) return false;
+  const root = lstatSync(parent);
+  return root.uid === 0 && (root.mode & 0o022) === 0;
+}
+
+// Walk every component, including the final one. Reject every symlink except a trusted system
+// link, whose target is walked again from the root under the same rules.
+export function safePath(file, trusted = systemLink) {
   const absolute = path.resolve(file);
+  let walked = absolute;
+  for (let hops = 0; ; hops++) {
+    const link = walkUntilLink(walked);
+    if (!link) return absolute;
+    if (hops >= 8 || !trusted(link.path, link.stat)) throw new Error("Ledger path traverses a symlink.");
+    walked = path.resolve(path.dirname(link.path), readlinkSync(link.path), ...link.rest);
+  }
+}
+
+function walkUntilLink(absolute) {
   let current = path.parse(absolute).root;
   const parts = absolute.slice(current.length).split(path.sep).filter(Boolean);
   for (let index = 0; index < parts.length; index++) {
     current = path.join(current, parts[index]);
     try {
       const stat = lstatSync(current);
-      if (stat.isSymbolicLink()) throw new Error("Ledger path traverses a symlink.");
+      if (stat.isSymbolicLink()) return { path: current, stat, rest: parts.slice(index + 1) };
       if (index < parts.length - 1 && !stat.isDirectory()) throw new Error("Ledger path parent is not a directory.");
     } catch (error) {
       if (error.code !== "ENOENT") throw error;
     }
   }
-  return absolute;
+  return null;
 }
 
 export function validateExpected(expected) {
