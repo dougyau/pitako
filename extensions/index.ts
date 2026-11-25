@@ -1,7 +1,7 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { skillStatusLines } from "./catalog.ts";
 import { herdrSetupNotice } from "./herdr.ts";
-import { hostDisplayNote } from "./host-display.ts";
+import { hideBlackholeStatusUnderT3, hostDisplayNote } from "./host-display.ts";
 import planExecute from "./plan-execute.ts";
 import { isProtectedEditPath } from "./paths.ts";
 import { applyProfile, MUTATING_TOOLS, effectiveProfile, parseProfile, profileNote, requestedProfile, setSessionProfile } from "./profile.ts";
@@ -15,6 +15,7 @@ const herdrNotices = host[HERDR_NOTICES_KEY] ??= new WeakMap<object, Set<string>
 
 export default function pitako(pi: ExtensionAPI): void {
   prepareRuntime(packageRoot());
+  hideBlackholeStatusUnderT3(process.env);
   planExecute(pi);
   pi.registerFlag("pitako-profile", {
     description: 'Pitako profile: "coding" (default) or "analysis"',
@@ -34,7 +35,6 @@ export default function pitako(pi: ExtensionAPI): void {
       existingUserText: firstUserText(ctx.sessionManager.getEntries()),
     });
     if (action.set !== undefined) pi.setSessionName(action.set);
-    if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
     if (ctx.hasUI && process.env.HERDR_ENV === "1" && process.env.PI_SUBAGENT_CHILD !== "1"
       && !herdrNotices.get(captured)?.has(sessionId)) {
       const notices = herdrNotices.get(captured) ?? new Set<string>();
@@ -53,7 +53,6 @@ export default function pitako(pi: ExtensionAPI): void {
       pendingPrompt: event.messageType === "user" ? event.prompt : undefined,
     });
     if (action.set !== undefined) pi.setSessionName(action.set);
-    if (ctx.hasUI) ctx.ui.setStatus("pitako", pi.getSessionName() || undefined);
     const notes = [profileNote(effectiveProfile(ctx.sessionManager)), hostDisplayNote(ctx.mode, process.env)]
       .filter((note): note is string => note !== undefined && !event.systemPrompt.includes(note));
     if (notes.length === 0) return;

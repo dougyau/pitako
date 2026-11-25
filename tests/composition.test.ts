@@ -17,7 +17,7 @@ import {
 } from "../extensions/catalog.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import pitako from "../extensions/index.ts";
-import { T3_DISPLAY_NOTE, T3_EXTENSION_ENV } from "../extensions/host-display.ts";
+import { hideBlackholeStatusUnderT3, T3_DISPLAY_NOTE, T3_EXTENSION_ENV } from "../extensions/host-display.ts";
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
@@ -98,6 +98,17 @@ describe("engineering-layer composition", () => {
       }
       handlers.get("session_shutdown")!({}, ctx("rpc"));
     }
+  });
+
+  test.each([
+    [{ [T3_EXTENSION_ENV]: "/t3.ts" }, "false"],
+    [{ [T3_EXTENSION_ENV]: "/t3.ts", PI_BLACKHOLE_STATUSBAR: "true" }, "true"],
+    [{ [T3_EXTENSION_ENV]: "/t3.ts", PI_SUBAGENT_CHILD: "1" }, undefined],
+    [{}, undefined],
+  ] as const)("T3 hides the blackhole gauge unless the user chose otherwise; %j", (initial, expected) => {
+    const env: NodeJS.ProcessEnv = { ...initial };
+    hideBlackholeStatusUnderT3(env);
+    expect(env.PI_BLACKHOLE_STATUSBAR).toBe(expected);
   });
 
   test("manifest-discovered coding router resolves the whole-assignment verification standard through native skills", () => {

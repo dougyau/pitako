@@ -8,6 +8,7 @@ import { getState, getSyncSequences } from "../vendor/rpiv-todo/state/store.ts";
 import type { TaskState } from "../vendor/rpiv-todo/state/state.ts";
 import type { SyncRow, Task, TaskStatus } from "../vendor/rpiv-todo/tool/types.ts";
 import { canonicalDigest } from "./canonical.mjs";
+import { executeProgress, progressStatusLine, workflowProgress } from "./progress-status.ts";
 import { PitakoStore, readTodoRecords, type TodoRecordKind } from "./pitako-store.ts";
 
 type DisplayRow = { subject: string; status: Exclude<TaskStatus, "deleted">; reason?: string };
@@ -224,6 +225,14 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   // Append-only worker sessions: an unchanged size means an unchanged replay.
   const replays = new Map<string,{key:string; tasks:readonly Task[]}>();
   let watchTimer: ReturnType<typeof setTimeout> | undefined;
+  // The "pitako" status line: live runs, plus endings this session watched happen.
+  let published: string | undefined;
+  const progressing = new Set<string>(), ended = new Map<string,string>();
+  function publish(ctx: ExtensionContext, items: readonly string[]) {
+    const line = progressStatusLine(items);
+    if (!ctx.hasUI || line === published) return;
+    published = line; ctx.ui.setStatus("pitako",line);
+  }
   const unsubscribe: (()=>void)[] = [];
   const pending = new Set<()=>void>();
   const warn = (error: unknown) => context?.ui.notify(`Execute todo: ${String(error)}`,"warning");
@@ -339,6 +348,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       }
       const files = new Set<string>();
       const runs = new Map<string,{run:any; prior:ExecuteTodoSnapshot|undefined}>();
+      const workflows: any[] = [];
       const predecessors = new Map<string,string[]>();
       // Load lineage before projecting: discovery order must not choose the active run.
       for (const runId of known.keys()) {
@@ -359,7 +369,11 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
           predecessors.set(runId,links);
           for (const predecessor of links) remember({runId:predecessor});
           const found = latestExecuteTodoSnapshot(run.workflow?.emits);
-          if (!found) { if (terminalRun(String(run.state))) inert.set(runId,links); continue; }
+          if (!found) {
+            if (terminalRun(String(run.state))) inert.set(runId,links);
+            else if (run.state !== "partial") workflows.push(run);
+            continue;
+          }
           if (typeof run.cwd === "string" && path.isAbsolute(run.cwd)) {
             let root = run.cwd;
             try { root = realpathSync(root); } catch { /* Retained history may refer to a removed worktree. */ }
@@ -413,6 +427,17 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       const superseded = new Set<string>();
       for (const runId of runs.keys()) for (const id of lineage(runId))
         if (id !== runId && runs.has(id)) superseded.add(id);
+      const progress: string[] = [];
+      for (const [runId,{run}] of runs) {
+        // A relaunch carries its invocation on; the predecessor's ending is no longer news.
+        if (superseded.has(runId)) { progressing.delete(runId); ended.delete(runId); continue; }
+        const snapshot = haltedView(latest.get(runId)!,run), line = executeProgress(snapshot);
+        if (!snapshot.outcome && !snapshot.halted) { progressing.add(runId); progress.push(line); }
+        // Only an ending seen in this session stays visible, until the next prompt.
+        else if (progressing.delete(runId)) ended.set(runId,line);
+      }
+      for (const run of workflows) { const line = workflowProgress(run); if (line) progress.push(line); }
+      if (epoch === generation) publish(ctx,[...progress,...ended.values()]);
       const retirements = new Map<string,Set<string>>();
       function retiredRuns(invocation: string) {
         let retired = retirements.get(invocation);
@@ -553,6 +578,8 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       try { recordDeletedExecuteTodoSummaries(context.cwd,getState(context.sessionManager.getSessionId()),invocationRoots); }
       catch (error) { warn(error); }
     }
+    if (context?.hasUI && published !== undefined) context.ui.setStatus("pitako",undefined);
+    published = undefined; progressing.clear(); ended.clear();
     context = undefined; generation++; dirty = false;
     clearTimeout(watchTimer); watchTimer = undefined;
     for (const watcher of watchers.values()) watcher.close(); watchers.clear();
@@ -566,6 +593,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   pi.on("session_shutdown",async () => { await stop(); for (const off of unsubscribe) off(); });
   pi.on("session_tree",async (_event,ctx) => { context=ctx; forget(); await refresh(); });
   pi.on("session_compact",async (_event,ctx) => { context=ctx; forget(); await refresh(); });
+  pi.on("before_agent_start",() => { if (ended.size) { ended.clear(); void refresh(); } });
   pi.on("tool_result",async (event) => {
     if (event.toolName === "todo" && context) {
       try { recordDeletedExecuteTodoSummaries(context.cwd,getState(context.sessionManager.getSessionId()),invocationRoots); }

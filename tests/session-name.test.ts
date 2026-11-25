@@ -72,7 +72,8 @@ describe("session name handlers", () => {
       try {
         await host.emit("session_start");
         expect(host.setNames).toEqual(["Repair titles"]);
-        expect(host.statuses.at(-1)).toBe("Repair titles");
+        // Hosts already show the session name; the status slot is for progress.
+        expect(host.statuses).toEqual([]);
       } finally { await host.emit("session_shutdown"); }
     }
     const custom = harness("Manual title");
