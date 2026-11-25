@@ -1,5 +1,5 @@
 import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync, type Stats } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync, type Stats } from "node:fs";
 import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,8 @@ const { safePath, systemLink } = createRequire(import.meta.url)("../extensions/h
   safePath(file: string, trusted?: Trusted): string; systemLink: Trusted;
 };
 
-const root = mkdtempSync(path.join(os.tmpdir(), "pitako-safe-path-"));
+// The physical path keeps fixture links independent of system links such as macOS /var.
+const root = realpathSync(mkdtempSync(path.join(os.tmpdir(), "pitako-safe-path-")));
 afterAll(() => rmSync(root, { recursive: true, force: true }));
 
 function fixture(name: string) {
@@ -18,8 +19,7 @@ function fixture(name: string) {
   writeFileSync(path.join(dir, "real", "runs", "status.json"), "{}");
   return dir;
 }
-// Keep trusting system links, so a temporary root under macOS /var still resolves.
-const only = (link: string): Trusted => (candidate, stat) => candidate === link || systemLink(candidate, stat);
+const only = (link: string): Trusted => candidate => candidate === link;
 
 describe("safePath", () => {
   test("returns the absolute path when no component is a symlink", () => {
