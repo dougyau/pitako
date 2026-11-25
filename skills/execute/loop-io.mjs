@@ -1164,7 +1164,8 @@ function replayFinalGate(input, store, scope, anchor) {
     selectionReference, ...(analyses ? { analyses } : {}), ...(reviewAccess ? { reviewAccess } : {}) } };
 }
 
-export function publishFinalReview(input, observe = checkoutEvidence) {
+// A replay status observation is a verification precondition, not part of the durable request.
+export function publishFinalReview({ observedSynthesisAgent, ...input }, observe = checkoutEvidence) {
   const fail = reason => new Error(`Final review publication integrity failure: ${reason}`);
   const { root, invocation, key, storeId, scope, expectedHead, refs } = input;
   const base = key.replace(/\.reviewOriginals$/, "");
@@ -1210,6 +1211,8 @@ export function publishFinalReview(input, observe = checkoutEvidence) {
   for (const ref of refs.originals) {
     if (!ref.key.startsWith(reviewPrefix) || !ref.runId) throw fail("unbound reviewer");
     const { result, status } = native(ref.key, "pitako.reviewer", ref.runId);
+    if (ref === synthesisRef && observedSynthesisAgent !== undefined && result.agent !== observedSynthesisAgent)
+      throw new Error("Final review replay producer integrity mismatch.");
     const original = readNativeOriginal(root, { association }, ref, "pitako.reviewer", false);
     const digest = canonicalDigest(original.value);
     if (!result.ok || result.terminalOutcome || result.results[0].exitCode !== 0 ||

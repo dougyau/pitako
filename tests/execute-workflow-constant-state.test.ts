@@ -203,7 +203,7 @@ test.each([...[true, false].flatMap(committed =>
   ["none", "legacy-compliance", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
     "compliance-unsettled", "compliance-no-journal", "compliance-truncated", "review-body", "review-missing"]
     .map(mutation => ({ committed, mutation }))),
-  ...["wrong-family-step", "same-family-step", "same-family-settlement", "nested-agent", "failed-then-ok"]
+  ...["wrong-family-step", "same-family-step", "same-family-settlement", "nested-agent", "failed-then-ok", "different-usage"]
     .map(mutation => ({ committed: false, mutation })),
   { committed: true, mutation: "closing-unsettled" },
   ...checkoutDefects.map(defect => ({ committed: false, mutation: `checkout-${defect}` }))])(
@@ -214,7 +214,7 @@ test.each([...[true, false].flatMap(committed =>
   const conflictingStep = mutation.endsWith("-step");
   const conflictingSettlement = mutation === "same-family-settlement";
   const nestedAgent = mutation === "nested-agent";
-  const duplicateSettlement = mutation === "failed-then-ok";
+  const duplicateSettlement = ["failed-then-ok", "different-usage"].includes(mutation);
   if (legacy) host.setLaunchRespond((request, normal) => {
     // Emulate an old host recording this child under the original name.
     if (request.key.endsWith(".compliance")) request.agent = "pitako.reviewer";
@@ -298,10 +298,13 @@ test.each([...[true, false].flatMap(committed =>
       if (duplicateSettlement) {
         const index = lines.findIndex(line => line.type === "settle" && line.key === child.key);
         expect(index).toBeGreaterThanOrEqual(0);
-        const failed = copy(lines[index]);
-        failed.result.ok = false;
-        failed.result.results[0].exitCode = 1;
-        lines.splice(index, 0, failed);
+        const earlier = copy(lines[index]);
+        if (mutation === "different-usage") earlier.result.results[0].usage.input += 1;
+        else {
+          earlier.result.ok = false;
+          earlier.result.results[0].exitCode = 1;
+        }
+        lines.splice(index, 0, earlier);
       }
       if (mutation === "compliance-no-journal") unlinkSync(journal);
       else {

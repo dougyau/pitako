@@ -231,11 +231,17 @@ export function retainedExecuteHalt(root: string, value: ExecuteCursor) {
 			checkouts.set(index, { key, runId });
 		}
 		const mission = readJson(admission.association.missionPath);
+		const analyses: { key: string; runId: string; agent: unknown }[] = [];
 		if (record(mission) && mission.id === admission.association.missionId && Array.isArray(mission.workflowChildren))
-			for (const child of mission.workflowChildren)
-				if (record(child) && child.agent === "pitako.checkout-observer" &&
-					typeof child.key === "string" && typeof child.runId === "string")
+			for (const child of mission.workflowChildren) {
+				if (!record(child) || typeof child.key !== "string" || typeof child.runId !== "string") continue;
+				if (child.agent === "pitako.checkout-observer")
 					remember(child.key, child.runId);
+				if (child.key === action.key && (action.runId === null || child.runId === action.runId))
+					analyses.push({ key: child.key, runId: child.runId, agent: child.agent });
+			}
+		const closingAnalysis = analyses.length === 1 && pitakoAgentFamily(analyses[0]?.agent) === "reviewer"
+			? analyses[0] : undefined;
 		for (const ref of cursor.inFlight)
 			if (ref.role === "checkout-observer") remember(ref.key, ref.runId);
 		let next = 0, latest = -1;
@@ -310,6 +316,7 @@ export function retainedExecuteHalt(root: string, value: ExecuteCursor) {
 		});
 		return { closingCheckout: { ref: checkout ?? null, nextKey: next ? `${checkoutKey}.r${next}` : checkoutKey,
 			settled: !!latestSettlement, ...(publisher ? { publisher } : {}) },
+			...(closingAnalysis ? { closingAnalysis } : {}),
 			...(closingBarriers.length ? { closingBarriers } : {}) };
 	}
 	if (halt?.stage === "plan-conflict" && last?.role === "execution-inspector") {

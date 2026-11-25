@@ -3883,13 +3883,19 @@ function validateClosingProjection(published, context) {
         reference.seq === published.head.seq && reference.digest === published.head.hash))
     throw new Error("Invalid closing store projection.");
 }
-function replayClosingCursor(cursor) {
+function replayClosingCursor(cursor, keyObservedAgent) {
   const checkoutKey = `${key}.l${cursor.loop.number}.checkout`;
   const synthesis = cursor.action.key.endsWith(".director-synthesis");
   let inspection;
+  function verifyClosingAnalysisAgent(agent) {
+    const { key, runId } = cursor.action;
+    const bound = inspection.haltOriginal?.closingAnalysis;
+    if (agent !== undefined && (bound?.key !== key || bound.runId !== runId || bound.agent !== agent))
+      throw new Error(`Closing producer identity changed for ${key}.`);
+  }
   function observeClosingProducer(producer, agent, classify) {
     const target = producer.runId ?? producer.key;
-    function barrierFromOriginal(cause, runId) {
+    function barrierFromOriginal(cause, runId, observedAgent) {
       if (["running", "queued", "pending", "native management activity"].includes(cause))
         throw nativeBarrier(cause, producer);
       if (!matchesCursorRequest(cursor))
@@ -3899,6 +3905,7 @@ function replayClosingCursor(cursor) {
         capture(observation);
         const witness = observation.haltOriginal?.closingBarriers?.find(item =>
           item.ref.key === producer.key && pitakoAgentFamily(item.ref.agent) === pitakoAgentFamily(agent) &&
+          (observedAgent === undefined || item.ref.agent === observedAgent) &&
           (!runId || item.ref.runId === runId) && item.cause === cause);
         if (observation.binding !== cursor.admissionBinding || !witness || !text(witness.ref.runId) ||
             !/^[a-f0-9]{64}$/.test(witness.originalDigest))
@@ -3911,10 +3918,10 @@ function replayClosingCursor(cursor) {
     return observeStatus(target, true).then(observed => {
       if (producer.runId && observed?.runId && observed.runId !== producer.runId ||
           observed?.key && ![producer.key, target, observed.runId].includes(observed.key) ||
-          observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(agent))
+          observed?.agent !== undefined && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(agent))
         throw new Error(`Closing producer identity changed for ${producer.key}.`);
       const cause = classify(observed, observed?.runId ?? target) ?? classify(observed, target);
-      return cause ? barrierFromOriginal(cause, producer.runId ?? observed?.runId) : observed;
+      return cause ? barrierFromOriginal(cause, producer.runId ?? observed?.runId, observed?.agent) : observed;
     }, error => {
       if (!error.nativeBarrier) throw error;
       return barrierFromOriginal(error.nativeBarrier, producer.runId);
@@ -3935,7 +3942,7 @@ function replayClosingCursor(cursor) {
         const producer = { ...action, runId: observed.runId };
         if (!terminalAnalysis(observed, producer))
           throw new Error(`Closing replay awaits exact terminal evidence for ${action.key}.`);
-        return replayClosingCursor({ ...cursor, action: producer });
+        return replayClosingCursor({ ...cursor, action: producer }, observed.agent);
       }
       throw new Error(`Closing replay lacks exact compliance evidence for ${action.key}.`);
     });
@@ -3945,6 +3952,7 @@ function replayClosingCursor(cursor) {
     if (inspection.error) throw new Error(inspection.error);
     if (!matchesCursorRequest(cursor)) throw new Error("Closing replay admission integrity mismatch.");
     if (!inspection.storeFailure) capture(inspection);
+    verifyClosingAnalysisAgent(keyObservedAgent);
     replayAdmissionObservation = inspection;
     const checkout = inspection.haltOriginal?.closingCheckout;
     const retained = cursor.inFlight.findLast(ref => ref.role === "checkout-observer" &&
@@ -3984,6 +3992,7 @@ function replayClosingCursor(cursor) {
       : observeClosingProducer(cursor.action, "pitako.reviewer", analysisBarrier).then(status => {
         const { key, runId } = cursor.action;
         const ref = { key, runId };
+        verifyClosingAnalysisAgent(status?.agent);
         if (status?.structuredOutput?.status !== "blocked" &&
             !config.recovery?.originals?.some(original =>
               original.key === key && original.runId === runId && original.structuredOutput?.status === "blocked"))
@@ -4974,7 +4983,7 @@ function replayFinalReview(cursor) {
     return observeStatus(request.key, true).then(publication => {
       const cause = analysisBarrier(publication, request.key);
       if (cause) throw nativeBarrier(cause, { key: request.key, runId: publication?.runId });
-      return replayLoopIO(`${request.key}.r1`, request);
+      return replayLoopIO(`${request.key}.r1`, { ...request, observedSynthesisAgent: observed?.agent });
     }).then(({ receipt }) => ({ receipt, observedAgent: observed?.agent }));
   }).then(({ receipt, observedAgent }) => {
     const { head, P } = receipt, admission = P?.prompt.admission;

@@ -3,6 +3,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { spawn } from "node:child_process";
+import { isDeepStrictEqual } from "node:util";
 import { readContextPeak, type CheckpointIntent } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence } from "../../extensions/spec-plans.ts";
 import { repositoryIdentity } from "../../extensions/board/workspace.ts";
@@ -635,7 +636,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
         const result = entry.result;
         assert(nativeSettlementMatchesAgent(result, producerAgent) && result.ok === true &&
           Array.isArray(result.results) && result.results.length === 1 && result.results[0]?.exitCode === 0 &&
-          canonicalDigest(result.structuredOutput) === digest,
+          canonicalDigest(result.structuredOutput) === digest && (!settled || isDeepStrictEqual(result, settled)),
         "Reviewer native settlement conflicts with its original");
         settled ??= entry.result;
       }

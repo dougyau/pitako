@@ -1089,8 +1089,10 @@ test.each(["missing", "changed"])("a compact review demand blocks on a %s origin
 });
 
 
-test.each(["before", "after", "conflicting-agent"])("consumed review compaction replays %s without replaying reviewers", async mode => {
-  const cut = mode === "before" ? "before" : "after";
+test.each(["before", "after", "before-conflicting-agent", "after-conflicting-agent"])(
+  "consumed review compaction replays %s without replaying reviewers", async mode => {
+  const cut = mode.startsWith("before") ? "before" : "after";
+  const conflictingAgent = mode.endsWith("conflicting-agent");
   const template = "---\npitako-spec: 1\nid: spec\nstatus: complete\n---\n" +
     SPEC_SECTIONS.map(section => `## ${section}\nAgreed ${section}.\n`).join("");
   const content = template + "\\".repeat(MAX_SPEC_BYTES - Buffer.byteLength(template));
@@ -1138,17 +1140,20 @@ test.each(["before", "after", "conflicting-agent"])("consumed review compaction 
   const before = host.launches.length, hostReads = host.hostCalls.length;
   host.setFailSave(undefined);
   if (cut === "after") await host.state.set("pitako-execute", retained);
-  if (mode === "conflicting-agent") host.setStatus(ref => {
+  const { store, scope } = executeStore(host.root, retained.invocation, false, retained.epoch);
+  const beforeHead = store.readRecords(scope).head;
+  if (conflictingAgent) host.setStatus(ref => {
     const result = host.native.get(ref);
     return ref === retained.action.runId ? { ...result!, agent: "pitako.review-angle" }
       : result ?? { ok: false, state: "unknown" };
   });
   const output = await host.execute();
-  if (mode === "conflicting-agent") {
+  if (conflictingAgent) {
     expect(output.status, output.reason).toBe("blocked");
     expect(output.reason).toContain("Final review replay producer integrity mismatch");
     expect(host.launches.slice(before).map(call => call.key)).toEqual([`${publicationKey}.r1`]);
     expect(host.current()).toEqual(retained);
+    expect(store.readRecords(scope).head).toEqual(beforeHead);
     return;
   }
   expect(output.status, output.reason).toBe("complete");

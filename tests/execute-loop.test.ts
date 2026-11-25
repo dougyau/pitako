@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test";
 import { spawn, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync, statSync, watch } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
@@ -56,6 +56,25 @@ function attempt(f: ReturnType<typeof fixture>, overrides: Partial<GateInput> & 
   }
   return input;
 }
+
+test("worker original rejects a conflicting earlier output binding in the same journal", () => {
+  const input = attempt(fixture(), { knowledge: {} });
+  const verified = readWorkerOriginal(input);
+  const directory = path.dirname(verified.reference.path);
+  const statusFile = path.join(directory, "status.json");
+  const status = JSON.parse(readFileSync(statusFile, "utf8"));
+  const parent = path.join(path.dirname(directory), "parent-workflow");
+  mkdirSync(parent);
+  writeFileSync(statusFile, JSON.stringify({ ...status, parentWorkflowRunId: "parent-workflow" }));
+  const journal = path.join(parent, "workflow-children.jsonl");
+  const result = { runId: verified.reference.runId, agent: "pitako.worker", ok: true,
+    structuredOutput: verified.value, output: JSON.stringify(verified.value), results: [{ exitCode: 0 }] };
+  const settle = (result: object) => JSON.stringify({ type: "settle", key: verified.reference.key, result }) + "\n";
+  writeFileSync(journal, settle(result) + settle(result));
+  expect(readWorkerOriginal(input)).toEqual(verified);
+  writeFileSync(journal, settle({ ...result, output: JSON.stringify({ ...verified.value, work: "Conflicting binding" }) }) + settle(result));
+  expect(() => readWorkerOriginal(input)).toThrow("native settlement conflicts with its original");
+});
 
 test("backlog schema errors name the file, preserve bytes and never repair human edits", () => {
   const { root } = fixture(); const applied = apply(initial(root)); validateBacklog(applied.backlog);

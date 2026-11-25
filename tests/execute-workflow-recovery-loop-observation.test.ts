@@ -3824,11 +3824,13 @@ describe("native closing observations", () => {
     expect(host.hostCalls).toEqual(["inspect-initial"]);
   });
 
-  test.each(["before-publication", "after-publication", "before-terminal"])("%s cut resumes the final checkout without republishing", async cut => {
+  test.each(["before-publication", "after-publication", "before-terminal", "before-publication-agent-conflict"])(
+    "%s cut reconciles the final checkout without republishing", async cut => {
     const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
     const checkoutKey = "invoke-human-1.l1.checkout", complianceKey = "invoke-human-1.l1.compliance";
+    const beforePublication = cut.startsWith("before-publication");
     const set = host.state.set;
-    if (cut === "before-publication") host.state.set = async (key, value: any) => {
+    if (beforePublication) host.state.set = async (key, value: any) => {
       await set(key, value);
       if (value.loop?.phase === "closing") throw Error("Lost acknowledgement of the closing cursor save");
     };
@@ -3841,15 +3843,30 @@ describe("native closing observations", () => {
     expect(cursor.action).toMatchObject({ kind: "launched", role: "reviewer", key: complianceKey,
       runId: host.native.get(complianceKey)!.runId });
     const checkouts = () => host.launches.filter(call => call.agent === "pitako.checkout-observer").map(call => call.key);
-    expect(checkouts()).toEqual(cut === "before-publication" ? [] : [checkoutKey]);
-    const publication = storeTipRows(host).find(row => row.kind === "ledger");
-    expect(!!publication).toBe(cut !== "before-publication");
+    expect(checkouts()).toEqual(beforePublication ? [] : [checkoutKey]);
+    const rows = storeTipRows(host);
+    const publication = rows.find(row => row.kind === "ledger");
+    expect(!!publication).toBe(!beforePublication);
     if (cut === "after-publication") expect(storedRows(host).some(row => row.digest === publication!.digest)).toBe(false);
     host.setFailSave(); host.state.set = set;
     const admissions = host.launches.length;
+    if (cut === "before-publication-agent-conflict") {
+      host.setStatus(ref => {
+        const result = host.native.get(ref);
+        return ref === cursor.action.runId ? { ...result!, agent: "pitako.task-review" }
+          : result ?? { ok: false, state: "unknown" };
+      });
+      const resumed = await host.execute();
+      expect(resumed.status, resumed.reason).toBe("blocked");
+      expect(resumed.reason).toContain(`Closing producer identity changed for ${complianceKey}`);
+      expect(host.launches.slice(admissions)).toEqual([]);
+      expect(host.current()).toEqual(cursor);
+      expect(storeTipRows(host)).toEqual(rows);
+      return;
+    }
     const resumed = await host.execute();
     expect(resumed.status, resumed.reason).toBe("complete");
-    expect(host.launches.slice(admissions).map(call => call.key)).toEqual(cut === "before-publication"
+    expect(host.launches.slice(admissions).map(call => call.key)).toEqual(beforePublication
       ? [checkoutKey, "invoke-human-1.l1.finishDrain"] : [`${complianceKey}.closing-replay.r1`]);
     expect(checkouts()).toEqual([checkoutKey]);
     if (publication) expect(storedRows(host).find(row => row.seq === publication.seq)).toEqual(publication);
@@ -3861,6 +3878,34 @@ describe("native closing observations", () => {
     expect(host.history()[0].observation.checkout).toEqual(host.history()[0].candidate);
     expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
     expect(host.current().action).toEqual({ kind: "terminal" });
+  });
+
+  test.each(["blocked", "stopped"])("closing cannot match %s compliance evidence from a different agent", async mode => {
+    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
+    const key = "invoke-human-1.l1.compliance";
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key !== key) return result;
+      if (mode === "stopped") return closedInterruptedProducer(result);
+      Object.assign(result.structuredOutput, { status: "blocked", reason: "Conflicting source obligations" });
+      return result;
+    });
+    cutAt(host, value => value.action.key === key && value.halt);
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    host.setFailSave();
+    const cursor = copy(host.current()), rows = storeTipRows(host), launches = copy(host.launches);
+    const compliance = host.native.get(key)!;
+    expect(cursor.action).toMatchObject({ key, runId: compliance.runId });
+    expect(cursor.halt).toBeNull();
+    host.setStatus(ref => ref === compliance.runId ? { ...compliance, agent: "pitako.task-review" }
+      : host.native.get(ref) ?? { ok: false, state: "unknown" });
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe(mode === "stopped" ? "cancelled" : "blocked");
+    expect(resumed.reason).toContain(mode === "stopped" ? "Closing barrier native original integrity failure"
+      : "Closing producer identity changed");
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
+    expect(host.launches).toEqual(launches);
   });
 
   test.each(["admitted", "unadmitted"])("%s closing evidence after a save cut cannot certify a changed checkout", async mode => {
