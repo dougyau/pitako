@@ -9,7 +9,8 @@ import { registeredWorktrees, workspacePaths } from "../extensions/board/workspa
 import { parsePorcelainV2 } from "../extensions/dev-tools/git/status.ts";
 import { parseWorktrees } from "../extensions/dev-tools/git/worktree.ts";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath } from "../extensions/execute-state.ts";
+import { executionStatePath } from "../extensions/execute-state.ts";
+import { committedCursor } from "./fixtures/plan-execute-checkpoint-scenario.ts";
 import { checkpointDirectory, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { createGitFake } from "./fixtures/git-fake.ts";
 
@@ -96,11 +97,7 @@ test.each([0, 1, 128])("check-ignore status %i is consumed by the write hook (fa
     source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 30, sourceRefs: [] };
   const intent: CheckpointIntent = { version: 2, association, key: "worker", taskId: "task", attempt: 1, loop: 1, cursor: 0,
     phase: "implementation", planRef: { key: "plan" }, progress: { consumedLoops: 1, admitted: {}, previous: null } };
-  const state = executionStatePath(association);
-  mkdirSync(path.dirname(state), { recursive: true });
-  writeFileSync(state, JSON.stringify({ "invoke-formats": { version: EXECUTE_STATE_VERSION, association, consumedLoops: 1, tasks: {},
-    loop: { number: 1, cursor: 0, phase: "implementation", plan: { stage: "admitted", ref: intent.planRef }, manifest: ["task"],
-      attempt: { key: "worker", bindingKey: "worker", taskId: "task", number: 1, index: 0, stage: "launched", checkpoint: intent } } } }));
+  committedCursor({ root, intent, statePath: executionStatePath(association) });
   const handlers: Record<string, Function> = {};
   const previous = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
   try {

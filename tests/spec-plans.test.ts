@@ -31,6 +31,23 @@ function fixture() {
   fake.fakeRepo(other, { paths: productPaths });
   return { base, main, mainRepo, sibling, other };
 }
+function installedResources(base: string) {
+  const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
+  // Copy only owned shipped resources; reuse declared dependencies without installing anything.
+  for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
+    "skills/execute/loop.ts", "skills/execute/loop-io.mjs", "skills/execute/observe.mjs", "skills/execute/closing.mjs", "skills/execute/halt-evidence.mjs",
+    "skills/architecture/ledger.mjs", "skills/architecture/native.mjs", "extensions/access-receipts.mjs",
+    "skills/review/store-io.mjs", "skills/review/cursor.mjs", "skills/review/synthesis.mjs", "skills/review/workflow.js", "skills/workflow-canonical.js",
+    "extensions/board/store.ts", "extensions/board/author.ts", "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
+    "extensions/execute-cursor.ts", "extensions/execute-progress.ts", "extensions/execute-intent.ts", "extensions/pitako-store.ts", "extensions/board/sqlite.ts",
+    "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
+    const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
+  }
+  mkdirSync(path.join(installed, "node_modules"), { recursive: true });
+  for (const dep of ["diff", "typescript"])
+    symlinkSync(path.resolve("node_modules", dep), path.join(installed, "node_modules", dep), "dir");
+  return installed;
+}
 function spec(id = "demo") { return `---\npitako-spec: 1\nid: ${id}\nstatus: complete\n---\n# Example\n${SPEC_SECTIONS.map(title => `## ${title}\nSubstantive agreed ${title}.`).join("\n")}\n`; }
 function put(root: string, content = spec()) {
   const target = path.join(root, ".pitako/plans/demo.md"); mkdirSync(path.dirname(target), { recursive: true }); writeFileSync(target, content); return target;
@@ -307,7 +324,7 @@ describe("spec-plan discovery and concrete input", () => {
     expect(() => discoverSpec(copied, "demo")).toThrow("not registered");
   });
 
-  test("planning root inspection works before the first commit without weakening execution evidence", () => {
+  test("planning root inspection works before the first commit without weakening execution evidence", async () => {
     const root = mkdtempSync(path.join(tmpdir(), "pitako-plan-unborn-")); roots.push(root);
     fake = gitFakeFixture();
     fake.fakeRepo(root);
@@ -315,39 +332,70 @@ describe("spec-plan discovery and concrete input", () => {
     const script = path.resolve("skills/execute/inspect.mjs");
     const result = JSON.parse(execFileSync("node", [script, root, "demo", "", "root"], { encoding: "utf8" }));
     expect(result).toEqual({ physicalRoot: root, identity: path.join(root, ".git") });
+    await expect(inspectSpec([root, "demo", ""])).rejects.toThrow("ambiguous argument 'HEAD'");
     expect(() => checkoutEvidence(root)).toThrow();
   });
 
   test("installed own resources under node_modules run the shared inspector through actual Node", () => {
     const { base, main, sibling } = fixture();
-    const installed = path.join(base, "install with ' quotes & %PATH% !", "node_modules", "pitako");
-    // Copy only owned shipped resources; no dependency install, Pi loader or provider.
-    for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
-      "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
-      "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {
-      const target = path.join(installed, file); mkdirSync(path.dirname(target), { recursive: true }); cpSync(path.resolve(file), target);
-    }
+    const installed = installedResources(base);
     const entry = path.join(installed, "skills/execute/inspect.mjs");
     const invoke = (root: string, ...extra: string[]) => JSON.parse(execFileSync("node", [entry, root, "demo", "", ...extra], {
       encoding: "utf8", stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, NODE_COMPILE_CACHE: path.join(base, "node-compile-cache") },
     }));
-    const unborn = path.join(base, "unborn");
-    fake!.fakeRepo(unborn);
-    fake!.set(unborn, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "", stderr: "fatal: ambiguous argument 'HEAD'", status: 128 });
-    expect(invoke(unborn, "root")).toEqual({ physicalRoot: unborn, identity: path.join(unborn, ".git") });
-    expect(() => invoke(unborn)).toThrow(); // Root-only planning does not weaken strict execution.
-    // Two chunks cover installed UTF-8 transport; the repo-path test below covers the larger fixture.
+    // Reserve cold Node loads for installed metadata and the UTF-8 chunk round trip.
+    // The adjacent tests cover unborn roots and repeated inspection.
     const source = put(sibling, spec() + "é中😀\n".repeat(200));
     const before = checkoutEvidence(main), selected = invoke(main);
     expect(selected.root).toBe(main); expect(selected.selected.source).toBe(source);
+    expect(selected.checkout).toEqual(before);
     expect(selected.selected.chunks).toBeGreaterThan(1);
     let content = "";
     for (let index = 0; index < selected.selected.chunks; index++) {
       const chunk = invoke(main, String(index)); expect(chunk.digest).toBe(selected.selected.digest); content += chunk.content;
     }
     expect(content).toBe(readFileSync(source, "utf8"));
-    expect(invoke(main)).toEqual(selected); expect(checkoutEvidence(main)).toEqual(before);
+    expect(checkoutEvidence(main)).toEqual(before);
+  });
+
+  test("installed own resources under node_modules answer runtime-agent requests through actual Node", () => {
+    const { base, main } = fixture();
+    const installed = installedResources(base);
+    const invoke = (entry: string, request: object, ...args: string[]) =>
+      JSON.parse(execFileSync("node", [path.join(installed, entry), ...args], {
+        cwd: main, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"],
+        input: `<System instructions>\nFixed runtime agent.\n\n<Task>\n${JSON.stringify(request)}`,
+        env: { ...process.env, NODE_COMPILE_CACHE: path.join(base, "node-compile-cache") },
+      }));
+    const missionPath = path.join(base, "mission.json");
+    expect(invoke("skills/execute/loop-io.mjs", {
+      operation: "verifySelection", invocation: "installed", key: "invoke-installed.selection",
+    })).toEqual({ ok: true });
+    expect(invoke("skills/architecture/ledger.mjs", {
+      missionPath, consultation: "installed", expected: { count: 0, head: null },
+      record: { kind: "admission", round: 0, body: {} },
+    })).toMatchObject({ count: 1, head: expect.stringMatching(/^[a-f0-9]{64}$/) });
+
+    const scopeId = "a".repeat(64);
+    const models = Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [slot, { key: `pitako.review.${slot}`, model: "provider/model" }]));
+    const cursor = { version: 10, identity: scopeId, scopeId, parentScope: null, prefix: "installed-review.",
+      models, phase: "prepare", slots: [], verifier: null, terminal: null };
+    writeFileSync(missionPath, JSON.stringify({ id: "mission", cwd: main, runs: [], workflowChildren: [] }));
+    mkdirSync(path.join(base, "mission"));
+    writeFileSync(path.join(base, "mission", "state.json"), JSON.stringify({ "pitako-review": cursor }));
+    expect(invoke("skills/review/store-io.mjs", { op: "observe-review", missionPath, cursor }))
+      .toEqual({ scopeId, settlements: [], pending: [] });
+
+    const original = path.join(base, "original.json");
+    writeFileSync(original, "{}");
+    expect(invoke("extensions/access-receipts.mjs", {
+      missionPath, namespace: "execute-installed", gate: "verify",
+      items: [{ id: "original", key: "producer", path: original, admitted: {} }],
+    }, "--verify-stdin")).toMatchObject({
+      outcome: "published", receipt: { store: { scope: "access:execute-installed", seq: 1 } },
+      items: [{ id: "original", state: "accessible" }],
+    });
   });
 
   test("read-only helper repeats idempotently, snapshots exact UTF-8 chunks, and source edits change digest", async () => {

@@ -17,7 +17,7 @@ function marking(host: ReturnType<typeof fixture>, verifies: Record<string, numb
     }
     if (request.agent === "pitako.loop-io") {
       const input = JSON.parse(request.task);
-      if (input.operation === "gate" && failing.includes(input.task.id)) {
+      if (input.operation === "gate" && failing.includes(input.task?.id)) {
         const receipt = JSON.parse(result.output!);
         receipt.gates = receipt.gates.map((gate: any) => ({ ...gate, status: "fail", exit: 1, tail: "Observed failure: 1 test" }));
         result.output = JSON.stringify(receipt);
@@ -32,7 +32,7 @@ test("every named criterion must pass before the notice reports the original pro
   const host = fixture(undefined, { readOnly: true });
   const prompts = marking(host, { "change1-check": [3], "full": [5] });
   const outcome = await host.execute({ originalProblem: { criteria: [3, 5] } });
-  expect(outcome.status).toBe("complete");
+  expect(outcome.status, outcome.reason).toBe("complete");
   expect(prompts[0]).toContain("criteria #3, #5");
   const values = snapshots(host);
   // After only #3 passed the notice is unknown and shows no row.
@@ -67,7 +67,7 @@ test("specs without a criteria anchor keep the director prompt and view unchange
     const host = fixture(undefined, { readOnly: true });
     const prompts = marking(host, { "full": [1] });
     const outcome = await host.execute(anchor === undefined ? {} : { originalProblem: anchor });
-    expect(outcome.status).toBe("complete");
+    expect(outcome.status, outcome.reason).toBe("complete");
     expect(prompts[0]).not.toContain("ORIGINAL PROBLEM");
     expect(snapshots(host).some(value => "originalProblem" in value)).toBe(false);
     expect(outcome.originalProblem.status).toBe("unknown");

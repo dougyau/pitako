@@ -40,6 +40,33 @@ load, composition, Board, session naming, and the scripted workflows are the
 main retirement regressions. Use small parallel groups when ownership changes.
 No configured-model or provider request is required.
 
+Store-core changes use `bun test tests/pitako-store.test.ts`. The file owns
+private roots/databases and Git answers, exercises Bun SQLite in-process and
+Node SQLite in awaited children, and settles lock holders before deleting roots.
+Real `BEGIN IMMEDIATE` contention uses a short injected busy policy in the test
+only; production remains three 5000 ms attempts. Do not lengthen test deadlines
+to wait through production lock exhaustion. These focused checks do not replace
+the complete procedure at the applicable phase boundary.
+
+Phase 4 focused checks use the existing gate-receipt, task-delta, todo
+projection, request observer, access-receipt and grouped loop-io fixtures.
+They inspect retained bytes, exercise no-clobber replay and missing/corrupt
+records, and settle a foreground todo writer in another process while
+loop-io owns the execute session. They do not change the full gate.
+
+Execute v10 focused checks cover the single `pitako-execute` key (including
+integrated review), the 16384-byte cursor and 61440-byte receipt limits, exact
+relaunch admissions and checkpoint intents at the saved head. The 30-loop
+constant-state test keeps its 20-second deadline. Use
+`tests/execute-workflow-ralph-loop.test.ts` for final acceptance with no task:
+review and compliance receive committed blocking check evidence, including on
+relaunch. Recovery checks retain terminal human-needed halts without new
+children on same-invocation relaunch after the first committed cursor.
+`--unblock` is not a recovery route; continuation after a human fix or ruling
+requires a new invocation and a Board HUMAN post. Execute runs the admitted task
+gates unchanged after the worker settles. The full suite belongs to final
+acceptance, not to worker attempts.
+
 Workflow fixtures use declared Git answers while keeping real files for
 byte/identity, drift and restoration assertions.
 `processes()` / `expectProcessBudget(maximum)` count direct fixture children,

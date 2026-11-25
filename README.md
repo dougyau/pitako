@@ -227,9 +227,7 @@ and defaults to four hours per implementation attempt and execute reviewer child
 The foreground coordinator can pass sticky `args.timeouts` overrides; existing
 intentions keep frozen deadlines. A barrier-free `timeout` halt requires a
 strictly greater value on relaunch of the same invocation (three generations
-maximum). A `state-capacity` halt instead requires a new mission; it cannot be
-cleared by a timeout override. These operational arguments are not HUMAN unblock
-authority. See the [v9 coordinator contract](skills/execute/SKILL.md#coordinator-timeouts-v9)
+maximum). These operational arguments cannot clear a terminal halt. See the [v10 coordinator contract](skills/execute/SKILL.md#coordinator-timeouts-v10)
 for validation, reset, gate floors, derived totals and recovery limits.
 Version-8 execute state, including paused invocations, is rejected, not migrated.
 Material review/compliance gaps go to the next loop, not a hidden repair loop.
@@ -247,18 +245,10 @@ See the [plan skill](skills/plan/SKILL.md), [execute skill](skills/execute/SKILL
 and [migration spec](docs/plan-execute-spec.md) for immutable association and
 exceptional original-full-plan recovery.
 
-`/execute <spec-id> --unblock` delivers a current human resolution to the same
-mission and invocation. Supply the actual answer to the retained question, not
-an agent suggestion or a bare flag. Preserve the original question and resolution,
-sources, snapshot, WIP and consumed slots; a resolved director decision reaches
-the next ordinary budgeted loop, not a relaunch of the completed director.
-This is not a bypass, fresh admission or generic root restart.
-Technical recovery does not require `--unblock`; supported native root continuation
-is limited to eligible interruptions, not a restoration prerequisite. Stop, permissions, activity, capacity and persistence
-remain barriers. Obsolete supervisor replay is rejected without changing
-historical records or Git. Installed
-pi-subagents 0.83.0 does not prove a running host reloaded it. No models, settings,
-capacity overrides, private execution store or replacement scheduler are added.
+Human-needed halts are terminal. After a human fix or ruling, post it as Board
+HUMAN and start a new invocation on the same worktree and backlog. A relaunch
+only verifies the saved halt; it does not advance or admit more children.
+Technical crash recovery is separate and remains subject to native policy.
 
 Bound execute writers edit with `edit`, `write` or `apply_patch`; the checkpoint
 extension's hook captures first-touch preimages and journals each call. After the worker ends, the root's model-free `pitako.checkpoint-sealer`
@@ -271,8 +261,7 @@ active sessions. Analysis and inspection remain read-only.
 Recovery is checkpoint-first from the last confirmed reconstructible file/progress
 point, with best-effort pertinent-writer status/stop. Missing historical receipts
 or inconclusive status are not activity; positive current pertinent activity is a
-conflict. A recorded Stop requires a real later human continuation request before
-effects, never an old answer. Capture affected bytes (including earlier WIP) before
+conflict. A recorded Stop is terminal for its invocation. Capture affected bytes (including earlier WIP) before
 edits and confirm progress on unit admission. Normal pause capture requires native
 control; abrupt loss/Stop uses the last confirmed point, not a post-cut backup.
 Preserve partial bytes before selective restoration, unrelated changes, confirmed
@@ -284,7 +273,7 @@ complete bytes before planning and freezes these references separately from the
 base, without renewing budget. Reentry preserves references and rechecks hashes;
 all phases receive them through the existing shared context. Human message
 ID/timestamp provenance is descriptive, not authentication. See the execute skill
-for foreground syntax; the existing resolution route stays unchanged.
+for foreground syntax.
 
 Separately delivered current human amendments remain separate from the admitted
 base snapshot/sourceRefs/association. They remain effective without replacing base

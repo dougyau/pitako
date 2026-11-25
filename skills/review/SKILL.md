@@ -15,7 +15,12 @@ The caller interprets the report and retains authority over any further action.
    `workflows/scripted-workflows` and `tool-reference/retained-children` guides.
 2. Inspect profiles with `subagent({ action: "list" })`. Confirm that
    `pitako.reviewer` is available and suitable for read-only review without
-   delegation. It supplies CodeGraph, read-only LSP, verify-behavior, and ponytail-review.
+    delegation. It supplies CodeGraph, read-only LSP, verify-behavior, and ponytail-review.
+    Execute's integrated review preserves the reviewer's declared profile skills
+    (including Ponytail) alongside its workflow-specific scope-discipline addition.
+    Its protocol snapshot belongs to the enclosing execute loop, not a separate
+    `review-*` mission key. Execute supplies that in-memory loop and owns saves,
+    original-reference conversion and replay; standalone persistence is unchanged.
    If absent, reload the installed package before dispatch; do not substitute a
    profile, create agent files, or change settings to make the pass work.
 3. Capture the target and requirements. Supply a target with `kind` (`diff`,
@@ -38,19 +43,41 @@ boundary and can inspect relevant interactions in the complete candidate.
 If prior coverage or the correction boundary is unavailable, obtain the missing
 coverage instead of claiming closure.
 
+When `/execute` embeds this review library, the bounded review cursor lives in
+`pitako-execute`, not in a separate review key. Execute passes its in-memory loop
+and records original references through the existing `reviewOriginals` loop-io
+call. Final review and compliance receive the same committed blocking acceptance
+reference and digest, bounded check summaries (not output bodies), and candidate
+and mutation status, even if no task ran. An absent receipt is explicit, and
+relaunch does not substitute evidence from a different candidate.
+Integrated review does not use the standalone final store writer below.
+
 ## Launch
 
 Launch the registered named resource `pitako.review`, never a script path: raw
-paths fail with "launch by name after mission.create". Each new review pass needs
-its own mission. Every retained standalone `terminalOutcome` refuses relaunch
-before dispatch, with persisted state unchanged. If a host abort (user Stop,
-workflow timeout or runtime crash) leaves no `terminalOutcome`, a same-args
-standalone relaunch starts a new pass only if no child original was saved yet.
-After a child original is saved (for example, after `director-prepare`), the
-relaunch dispatches a fresh `director-prepare`, then ends blocked with
-"Review original integrity conflict" and retains `terminalOutcome: "blocked"`;
-start a new mission. Native replay (`runtime-replaced` or `owner-exited`) still
-reuses frozen models and settled children.
+paths fail with "launch by name after mission.create". The one `pitako-review`
+cursor freezes the three model slots only for a matching nonterminal input.
+Different input replaces the cursor; an identical terminal pass is not
+restarted. Use native replay after `runtime-replaced` or `owner-exited` so
+successful child admissions can be reused. Native Stop and permission refusals
+still apply.
+
+On the normal path, `pitako.store-io` runs once at the end, using the
+bounded save intention and verifying original native settlements by key,
+run ID and digest. It does not rerun a producer or gate. A lost cursor save
+replays the store operation at the same key; a missing or contradictory
+settlement fails closed. If a cut leaves settlements only in the native journal,
+one read-only recovery observation returns the verified bodies if they fit. At the
+61440-byte cap it can compact successful bodies only with matching native reuse
+evidence for this relaunch. Otherwise an oversized receipt halts with
+`review-recovery-overflow` before any producer dispatch or SQLite write. The
+workflow saves the diagnostic once in the terminal `pitako-review` cursor.
+Later relaunches of the same review return it without dispatching any children
+or saving again. A retained Stop holds on further relaunches without another
+child or a final write. The native cursor save is not atomic with COMMIT. Relaunch
+refuses before dispatch
+if the terminal cursor conflicts with a surviving committed owner. Different
+review input can proceed after same-cwd store loss or replacement.
 First create the mission in the project being reviewed:
 
 ```js
@@ -138,17 +165,17 @@ narrative outside findings remain recoverable; every finding gets a disposition.
 Essential-original references explain why the exact original is needed. Before
 the synthesis phase the workflow dispatches the
 model-free `pitako.access-verifier` once over the phase's required originals. It
-compares the canonical JSON digest of each published file with the digest saved
-in review state (state keeps references, not values) and writes a no-clobber
-receipt under the mission directory (`<mission>/receipts/review/<gate>.json`).
+compares the canonical JSON digest of each published file with the admitted
+digest and writes a no-clobber receipt in the cwd store
+(`access:review-<scopeId>` for standalone review).
 A contradictory or unavailable original blocks the whole phase before dispatch
 with an explanation naming the original, key, path, expected and observed
 digests and the action to take; a verifier failure is reported as
 "verification did not run". No model creates, chooses or copies receipts, IDs,
 paths or digests; reviewers read each verified original in full by its
-`savedOutputPath`. Review state keeps a value inline only for a failed,
-unpublished original with no path. Receipts follow mission retention; check them later with the
-`access_receipt_verify` tool or `node <pitako>/extensions/access-receipts.mjs check <receipt>`.
+`savedOutputPath`. The standalone cursor never keeps report bodies. Check the receipts later
+from the designated worktree with `access_receipt_verify` using the mission
+path, namespace and gate.
 
 Retain actual `results[].savedOutputPath`, returned reference objects and text
 `outputReference` paths with producing query/revision/phase/producer/key/attempt/run.
@@ -160,12 +187,12 @@ Missing, inaccessible or contradictory essentials block dependent conclusions.
 Mandatory publication failure is not repaired by inline JSON. Optional
 observability failure alone does not invalidate required publication/access.
 Only a complete identifiable failed/partial original genuinely delivered can be
-retained exactly once in existing native state, failed/unpublished/insufficient;
+retained once in the final store record, failed/unpublished/insufficient;
 partial analysis need not be ready to preserve it. A field's presence, reference,
 preview, rejection without an object or text without a truncation marker is not
 completeness evidence. Distinguish non-delivery from unproved completeness; never
-reconstruct, republish, duplicate successful originals, truncate evidence, delete
-history or add alternate storage to evade the whole-file 256 KiB bound. Essential
+republish or duplicate successful originals, truncate evidence, or delete history
+to evade the whole-file 256 KiB bound. Essential
 save failure stops new dispatch, preserves diagnostics and settles owned work
 when native controls allow; unknown inherited settlement remains unknown.
 

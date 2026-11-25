@@ -29,6 +29,8 @@ test.each(["pitako.review", "pitako.architecture"])("%s launches only by name wi
   const args = { missionId: "native.mission-1", missionPath, consultation: "decision" };
   const call = (input: object) => handlers.get("tool_call")!({ toolName: "subagent", input: { workflow: name, cwd: root, ...input } }, { cwd: root });
   expect(call({ args, options: { missionId: args.missionId } })).toBeUndefined();
+  if (name === "pitako.review") expect(call({args, cwd: path.dirname(root), options: {missionId: args.missionId}}))
+    .toMatchObject({block: true, reason: expect.stringContaining("wrong-cwd")});
   for (const invalid of [
     { args, options: { mission: { title: "One-step" } } },
     { args, options: {} },
@@ -41,7 +43,7 @@ test("named resolution inlines data args and the mission binding; invalid bindin
   const { root, missionPath } = store();
   const review = analysisResource("pitako.review", root, root).resolve({ missionId: "native.mission-1", missionPath, brief: "B", workDescription: "W",
     target: { kind: "diff", reference: "r", material: "m" } });
-  expect(review.script).toStartWith(`const args = ${JSON.stringify({ brief: "B", workDescription: "W", target: { kind: "diff", reference: "r", material: "m" } })};\nconst pitakoAccess = ${JSON.stringify({ missionPath, namespace: "review" })};\n`);
+  expect(review.script).toStartWith(`const args = ${JSON.stringify({ brief: "B", target: { kind: "diff", material: "m", reference: "r" }, workDescription: "W" })};\nconst pitakoAccess = ${JSON.stringify({ missionPath, namespace: "review" })};\n`);
   expect(review.script).toContain('const pitakoReviewModels = {"r1":{"key":"pitako.review.r1","model":"anthropic/claude-opus-5-5:high"}');
   const architecture = analysisResource("pitako.architecture").resolve({ missionId: "native.mission-1", missionPath, consultation: "stream-parser" });
   expect(architecture.script).toContain(`const pitakoAccess = ${JSON.stringify({ missionPath, namespace: "architecture-stream-parser" })};`);
@@ -70,6 +72,7 @@ test("session registration adds the verifier and both named resources, disposing
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
   expect(disposed).toContain("pitako.access-verifier");
+  expect(disposed).toContain("pitako.store-io");
   for (const name of ["pitako.review", "pitako.architecture"])
     expect(resolveWorkflowResource(name, { missionId: "native.mission-1", missionPath, consultation: "c" }, sessionId)).toMatchObject({ ok: false });
 });

@@ -1,20 +1,30 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
 import path from "node:path";
 import { getAgentDir, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerAgentViaEvents, type RuntimeAgentRegistration } from "pi-subagents/agents";
 import { registerWorkflowResource, type WorkflowResourceRegistration } from "pi-subagents/workflow-resources";
 import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlanId, validateSpec } from "./spec-plans.ts";
 import { boundRetainedAnalyses } from "./execute-retained.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath, compactWorkerReferences, expandWorkerReferences } from "./execute-state.ts";
+import { boundEpochAdvanceReplay, boundExecuteHostHalt, boundExecuteTimeoutProjection } from "./execute-progress.ts";
+import { PitakoStore, StoreError } from "./pitako-store.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath } from "./execute-state.ts";
+import { executeCursorValidationScript } from "./execute-cursor.ts";
 import { isExecuteReviewModel } from "./execute-settings.ts";
 import { reviewModels } from "./review-settings.ts";
+import { canonicalDigest, canonicalJSON } from "./canonical.mjs";
 import { packageRoot } from "./stack.ts";
+import { closingCompliance, closingArchive } from "../skills/execute/closing.mjs";
+import { readTaskGateWire } from "../skills/execute/loop.ts";
+import { reviewSynthesisScript } from "../skills/review/synthesis.mjs";
+import { reviewCursorContract, reviewCursorScript } from "../skills/review/cursor.mjs";
+import { architectureNativeSource } from "../skills/architecture/native.mjs";
+import { planConflictReason, checkpointMismatchReason, settledBarrier, inspectorConflictReason, viewOverflowReason, checkpointWitnessIssue, nativeReference } from "../skills/execute/halt-evidence.mjs";
 
 function inspectionCommand(args: string[], platform: NodeJS.Platform): string {
-  if (platform !== "win32") return ["node", ...args].map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ");
+  if (platform !== "win32") return [process.execPath, ...args].map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ");
   // cmd expands %variables% even inside quotes. Keep every supplied path out of shell syntax.
   const encoded = Buffer.from(JSON.stringify(args)).toString("base64");
-  return `node -e "process.argv=[process.execPath,...JSON.parse(Buffer.from('${encoded}','base64').toString('utf8')),...process.argv.slice(1)];import(require('node:url').pathToFileURL(process.argv[1]).href)"`;
+  return `"${process.execPath}" -e "process.argv=[process.execPath,...JSON.parse(Buffer.from('${encoded}','base64').toString('utf8')),...process.argv.slice(1)];import(require('node:url').pathToFileURL(process.argv[1]).href)"`;
 }
 function isMissionId(value: unknown): value is string {
   return typeof value === "string" && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && !value.includes("..");
@@ -25,21 +35,23 @@ const RECORD_LINE = "Mission record path (args.missionPath): ";
  * existing record `<store>/<missionId>.json` qualifies. Native validates options.missionId,
  * never this Pitako pointer; a wrong pointer would otherwise fail only at the first worker write.
  */
-function validateMissionRecord(missionId: string, missionPath: unknown): void {
-  let id: unknown;
+function validateMissionRecord(missionId: string, missionPath: unknown): { cwd?: unknown } {
+  let record: { id?: unknown; cwd?: unknown } | null = null;
   if (typeof missionPath === "string" && path.isAbsolute(missionPath) && !missionPath.includes("\0") &&
       path.basename(missionPath) === `${missionId}.json`)
-    try { id = (JSON.parse(readFileSync(missionPath, "utf8")) as { id?: unknown } | null)?.id; } catch { id = undefined; }
-  if (id !== missionId)
+    try { record = JSON.parse(readFileSync(missionPath, "utf8")); } catch { /* invalid record */ }
+  if (record?.id !== missionId)
     throw new Error(`Expected missionPath to be the existing native mission record ${missionId}.json, shown as "${RECORD_LINE.trim()}" by mission.create or mission.show. Its "State:" path or a derived path is not the record.`);
+  return record;
 }
-function validateResolution(args: Readonly<Record<string, unknown>>): void {
-  if (args.unblock === undefined && args.resolution === undefined) return;
-  const value = args.resolution as { loop?: unknown; text?: unknown } | undefined;
-  if (args.unblock !== true || !value || Object.keys(value).sort().join(",") !== "loop,text" ||
-      !Number.isSafeInteger(value.loop) || (value.loop as number) < 0 ||
-      typeof value.text !== "string" || !value.text.trim() || value.text.includes("\0"))
-    throw new Error("--unblock requires current human resolution: {loop, text}; loop 0 denotes a pre-admission request.");
+function reviewWorktree({cwd}: {cwd?: unknown}): string {
+  if (typeof cwd !== "string" || !path.isAbsolute(cwd) || cwd.includes("\0"))
+    throw new Error("Standalone review wrong-cwd: the native mission has no designated worktree.");
+  return realpathSync(cwd);
+}
+function rejectRemovedExecuteArguments(args: Readonly<Record<string, unknown>>): void {
+  for (const key of ["unblock", "resolution"])
+    if (Object.hasOwn(args, key)) throw new Error(`Unsupported execution argument: ${key}.`);
 }
 function validateTimeouts(value: unknown): void {
   if (value === undefined) return;
@@ -53,13 +65,14 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   const agentDir = path.resolve(getAgentDir());
   // Trusted complete sources are loaded at setup, never discovered in resolve.
   const rootScript = readFileSync(path.join(packageRoot(), "skills/execute/workflow.js"), "utf8");
+  const cursorValidationScript = executeCursorValidationScript();
   const canonicalScript = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8");
   const reviewScript = readFileSync(path.join(packageRoot(), "skills/review/workflow.js"), "utf8");
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
   return { name: "pitako.execute", version: 1, resolve(args: Readonly<Record<string, unknown>>) {
-    validateResolution(args);
+    rejectRemovedExecuteArguments(args);
     validateTimeouts(args.timeouts);
-    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "amendments", "invocation", "missionId", "missionPath", "unblock", "resolution", "timeouts"].includes(key))) throw new Error("Unknown execution argument.");
+    if (Object.keys(args).some(key => !["id", "root", "source", "sourceRefs", "amendments", "invocation", "missionId", "missionPath", "timeouts"].includes(key))) throw new Error("Unknown execution argument.");
     if (!isMissionId(args.missionId)) throw new Error("Expected an existing native missionId data pointer.");
     if (typeof args.missionPath !== "string" || !path.isAbsolute(args.missionPath) || args.missionPath.includes("\0"))
       throw new Error("Expected the actual absolute missionPath returned by native mission.create or mission.show.");
@@ -79,20 +92,34 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
     const context = { missionId: args.missionId, missionPath: args.missionPath, invocation: args.invocation, sourceRefs, amendments };
     // Preliminary synchronous discovery is data capture, not native admission.
     const preliminary = preliminarySpec(root, args.id, args.source as string | undefined);
-    const recovery = boundRetainedAnalyses(preliminary.root, preliminary.commonDir, preliminary.source,
-      preliminary.digest, preliminary.binding, context);
+    let recovery, timeoutRecovery, verifiedHostHalt, initialAdvance;
+    let preliminaryStoreFailure;
+    try {
+      verifiedHostHalt = boundExecuteHostHalt(preliminary.root, context);
+      if (!verifiedHostHalt) {
+        initialAdvance = boundEpochAdvanceReplay(preliminary.root, context, preliminary);
+        recovery = boundRetainedAnalyses(preliminary.root, preliminary.commonDir, preliminary.source,
+          preliminary.digest, preliminary.binding, context);
+        timeoutRecovery = boundExecuteTimeoutProjection(preliminary.root, context);
+      }
+    } catch (error) {
+      // The native inspector reports the observation; only a deterministic writer may recover.
+      if (!(error instanceof StoreError)) throw error;
+      preliminaryStoreFailure = { code: error.code, reason: error.message };
+    }
     const input = [inspectorEntry, preliminary.root, args.id, args.source ?? ""];
     const inspections = [{ key: "inspect-initial", command: inspectionCommand([
       ...input, "admission", JSON.stringify({ ...context, admission: { sourceRefs, agentDir } }),
     ], platform) }];
     inspections.push(...[1, 2].map(retry => ({ ...inspections[0]!, key: `inspect-initial.r${retry}` })));
-    const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}),
+    const config = { root: preliminary.root, id: args.id, invocation: args.invocation, missionId: args.missionId, missionPath: args.missionPath, sourceRefs, amendments, inspections, preliminary, ...(recovery ? { recovery } : {}), ...(timeoutRecovery ? { timeoutRecovery } : {}), ...(verifiedHostHalt ? { verifiedHostHalt } : {}),
+      ...(initialAdvance ? { initialAdvance } : {}),
+      ...(preliminaryStoreFailure ? { preliminaryStoreFailure } : {}),
       // Derived from the same bytes the root binds at admission; advisory only.
       originalProblem: validateSpec(preliminary.content, args.id),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"), stateVersion: EXECUTE_STATE_VERSION,
-      ...(args.timeouts !== undefined ? { timeouts: args.timeouts } : {}),
-      ...(args.unblock === true ? { unblock: true, resolution: args.resolution } : {}) };
-    return { script: `${compactWorkerReferences.toString()}\n${expandWorkerReferences.toString()}\n${canonicalScript}\nconst config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
+      ...(args.timeouts !== undefined ? { timeouts: args.timeouts } : {}), };
+    return { script: `${closingCompliance.toString()}\n${closingArchive.toString()}\n${readTaskGateWire.toString()}\n${planConflictReason.toString()}\n${checkpointMismatchReason.toString()}\n${settledBarrier.toString()}\n${inspectorConflictReason.toString()}\n${viewOverflowReason.toString()}\n${checkpointWitnessIssue.toString()}\n${nativeReference.toString()}\n${canonicalScript}\n${cursorValidationScript}\n${reviewSynthesisScript}const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
       hostCommands: inspections };
   } };
 }
@@ -110,9 +137,10 @@ const ANALYSIS_WORKFLOWS = {
  * receipts need the resolve-time mission record path and a receipt namespace.
  * The trusted source is read at setup; args are inlined as data.
  */
-export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS, root = process.cwd(), agentDir = path.resolve(getAgentDir())) {
+export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS, _root = process.cwd(), agentDir = path.resolve(getAgentDir())) {
   const workflow = ANALYSIS_WORKFLOWS[name];
   const source = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8") + "\n" +
+    (name === "pitako.review" ? reviewSynthesisScript + reviewCursorScript : architectureNativeSource) +
     readFileSync(path.join(packageRoot(), workflow.source), "utf8");
   return { name, version: 1, resolve(args: Readonly<Record<string, unknown>>) {
     const { missionId, missionPath, ...input } = args;
@@ -123,20 +151,57 @@ export function analysisResource(name: keyof typeof ANALYSIS_WORKFLOWS, root = p
     const access = { missionPath, namespace: workflow.namespace(input) };
     let models = "";
     if (name === "pitako.review") {
+      const root = reviewWorktree(validateMissionRecord(missionId, missionPath));
+      const {key, validate} = reviewCursorContract();
       const file = executionStatePath({ missionId, missionPath });
       let retained;
-      try { retained = JSON.parse(readFileSync(file, "utf8"))["review-standalone"]; }
+      try { retained = JSON.parse(readFileSync(file, "utf8"))[key]; }
       catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
+      if (retained !== undefined) {
+        const cursor = validate(key, retained);
+        const newInput = cursor.identity !== canonicalDigest(input);
+        const scope = `review:${cursor.scopeId}`;
+        // A terminal overflow has a cursor diagnostic but no committed review.
+        const committed = typeof cursor.terminal === "string" ? null : cursor.terminal;
+        const store = new PitakoStore(root);
+        let active;
+        let unavailable = false;
+        try { active = store.readActiveReview(); }
+        catch (error) {
+          // A different input can proceed to the writer if there is no usable old store.
+          if (!(error instanceof StoreError) || error.code === "wrong-cwd" ||
+              (committed !== null && !(newInput &&
+                ["store-unavailable", "store-replaced", "store-corrupt"].includes(error.code))))
+            throw new Error(`Standalone review integrity failure: ${scope}: ${String((error as Error).message)}`);
+          unavailable = true;
+        }
+        const owner = active?.body as {missionPath?: string} | undefined;
+        if (active && owner?.missionPath === missionPath && active.scope !== scope &&
+            (committed !== null || (
+              active.scope !== `review:${cursor.parentScope}` &&
+              cursor.scopeId !== canonicalDigest({missionPath, identity: cursor.identity, prefix: cursor.prefix, priorScope: active.scope.slice(7)})
+            )))
+          throw new Error(`Standalone review integrity failure: cursor ${scope} differs from the active fence ${active.scope} at head ${active.head?.hash}.`);
+        if (committed !== null && !unavailable) {
+          const saved = store.readRecords(scope);
+          const replaced = saved.identity.storeId !== committed.storeId;
+          if (!(newInput && replaced) && (replaced || saved.head?.seq !== committed.head.seq ||
+              saved.head?.hash !== committed.head.hash ||
+              (saved.records[0]?.body as {missionPath?: string} | undefined)?.missionPath !== missionPath))
+            throw new Error(`Standalone review integrity failure: terminal cursor ${scope} does not match its stored head.`);
+        }
+      }
       // Native replay checks script bytes before the workflow can read its state.
-      const selected = retained === undefined ? reviewModels(root, agentDir) : retained.models;
+      const selected = retained?.identity === canonicalDigest(input) && retained.terminal === null
+        ? validate(key, retained).models : reviewModels(root, agentDir);
       for (const slot of ["r1", "r2", "synthesis"] as const)
         if (selected?.[slot]?.key !== `pitako.review.${slot}` || !isExecuteReviewModel(selected?.[slot]?.model))
           throw new Error(`${file}: pitako.review.${slot}: invalid frozen model selection.`);
-      models = `const pitakoReviewModels = ${JSON.stringify(selected)};\n`;
+      models = `const pitakoReviewModels = ${canonicalJSON(selected)};\n`;
     }
-    return { script: `const args = ${JSON.stringify(input)};\nconst pitakoAccess = ${JSON.stringify(access)};\n${models}${source}` };
+    return { script: `const args = ${name === "pitako.review" ? canonicalJSON(input) : JSON.stringify(input)};\nconst pitakoAccess = ${JSON.stringify(access)};\n${models}${source}` };
   } };
 }
 const NAMED_WORKFLOWS = ["pitako.execute", ...Object.keys(ANALYSIS_WORKFLOWS)];
@@ -151,7 +216,9 @@ const RUNTIME_AGENTS: RuntimeAgent[] = [
   { name: "pitako.execution-ledger", description: "Deterministic hash-chained execution ledger publication; no model execution.",
     systemPrompt: "Fixed execution ledger; stdin is a JSON publication request.", args: ["skills/execute/ledger.mjs"] },
   { name: "pitako.architecture-ledger", description: "Deterministic hash-chained architecture ledger publication; no model execution.",
-    systemPrompt: "Fixed architecture ledger; stdin is a JSON publication request or {missionPath, consultation, expected, observe:true} for read-only chain and state-size observation.", args: ["skills/architecture/ledger.mjs"] },
+    systemPrompt: "Fixed architecture store writer and observer; stdin is a JSON ledger request for the actual cwd.", args: ["skills/architecture/ledger.mjs"] },
+  { name: "pitako.store-io", description: "Deterministic standalone review recovery observation and final save; no model execution.",
+    systemPrompt: "Fixed standalone review I/O; stdin is a JSON observe-review or save-review request for the actual cwd.", args: ["skills/review/store-io.mjs"] },
   { name: "pitako.request-observer", description: "Deterministic main-session execute request reader; no model execution.",
     systemPrompt: "Fixed execute request observer; stdin is JSON {invocation, cursor}.", args: ["skills/execute/observe.mjs", "--requests"] },
   { name: "pitako.checkpoint-sealer", description: "Deterministic checkpoint journal verification and seal metadata publication; no model execution.",
@@ -162,18 +229,23 @@ const RUNTIME_AGENTS: RuntimeAgent[] = [
 export default function planExecute(pi: ExtensionAPI): void {
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName !== "subagent") return;
-    const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; unblock?: unknown; timeouts?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
+    const input = event.input as { workflow?: unknown; cwd?: unknown; args?: { missionId?: unknown; missionPath?: unknown; root?: unknown; timeouts?: unknown }; options?: { missionId?: unknown; mission?: unknown } };
     const name = typeof input.workflow === "string" ? input.workflow.trim() : undefined;
     if (!name || !NAMED_WORKFLOWS.includes(name)) return;
     const options = input.options;
     if (name === "pitako.execute") {
-      try { validateResolution(input.args ?? {}); validateTimeouts(input.args?.timeouts); }
+      try { rejectRemovedExecuteArguments(input.args ?? {}); validateTimeouts(input.args?.timeouts); }
       catch (error) { return { block: true, reason: String(error instanceof Error ? error.message : error) }; }
     }
     if (options?.mission !== undefined || !isMissionId(input.args?.missionId) || input.args.missionId !== options?.missionId)
       return { block: true, reason: `${name} requires a mission already created via mission.create, with the same native missionId in args and options. One-step mission creation is unsupported; this is data association, not approval or confinement.` };
     try {
-      validateMissionRecord(input.args.missionId, input.args.missionPath);
+      const mission = validateMissionRecord(input.args.missionId, input.args.missionPath);
+      if (name === "pitako.review") {
+        if ((input.cwd !== undefined && typeof input.cwd !== "string") ||
+            realpathSync(path.resolve(ctx.cwd, input.cwd ?? ".")) !== reviewWorktree(mission))
+          throw new Error("Standalone review wrong-cwd: use the mission's designated worktree.");
+      }
       if (name !== "pitako.execute") return;
       if (typeof input.args?.root !== "string" || (input.cwd !== undefined && typeof input.cwd !== "string")) throw new Error("Expected designated root and launch cwd.");
       // The resolver receives args only. The public tool call owns the actual launch cwd.

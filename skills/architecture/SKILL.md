@@ -102,6 +102,12 @@ still-running peers through awaited `runs.steer`, then the script collects the
 remaining results. No child uses `async: true`, which would return an admission
 receipt instead of its report.
 
+Before sending, the workflow saves `sending` against the settled challenge
+original. On reentry with settled peers, the ledger observer can adopt a
+matching native outcome. No outcome at that boundary is `unconfirmed`, not
+proof of delivery; the workflow never sends it again. A cut before `sending`
+with a verified settled target counts as missed without transport.
+
 Never exceed ten rounds, including the initial round. Honor a lower positive
 `maxRounds`. Stop earlier when further evidence is unlikely to change the
 recommendation. At the cap, preserve unresolved disagreements instead of forcing
@@ -146,8 +152,10 @@ alone do not prove mandatory publication; `runs.status` previews are not origina
 Each consuming gate first dispatches the model-free `pitako.access-verifier` once
 over the union of its required originals. The workflow computes canonical
 SHA-256 of each complete structured value at confirmation (pure JS UTF-8, sorted
-JSON keys), without a pinning child. The next consuming gate verifies that digest and writes a no-clobber receipt under
-`<mission>/receipts/architecture-<consultation>/<gate>.json`. Consumers then
+JSON keys), without a pinning child. The next consuming gate verifies that
+digest and writes a no-clobber receipt in `access:architecture-<consultation>`.
+Only the completed memo retains its original no-clobber file for store-loss
+correspondence (HUMAN #4224); it is not copied into SQLite. Consumers then
 receive verified references `{ id, path, digest }` with an instruction to read
 each path in full. No model creates, chooses or copies receipts, IDs, paths or
 digests. A contradictory or unavailable original blocks the gate before dispatch
@@ -174,52 +182,67 @@ flag does not prove complete delivery. Do not reconstruct, republish, duplicate,
 truncate or erase history to fit capacity. Distinguish non-delivery from unproved
 completeness.
 
-Contract v4 keeps all model-authored prose in published originals, never mission
-state: packets, perspective focus, memos, doubt questions/decisions/recommendations
-and humanContext are read by id from the verified director/doubts/factual files.
-The verified hash-chain ledger at
-`<missionDirectory>/ledger/architecture-<consultation>/` holds admission, replacements,
-caller context (human answers, caller evidence and retry authorization, with original
-provenance), and closed rounds. Latest caller-context `{path, digest}` references
-chain through each record's `priorActive` references: ALL earlier answers/evidence
+Contract v4 keeps model-authored prose out of mission state. Open-round packets,
+focus, doubts and human context come from verified native originals. Closed
+rounds archive the digest-checked originals in SQLite under `body.originals`;
+use a verified `{id, store, digest}` access item to read that ID within the row.
+Foreground frontier and memo references still identify the native publications.
+The verified hash-chain ledger in `arch:<consultation>` in the
+cwd-local `.pi/pitako/pitako.db` holds admission, replacements, caller context
+(human answers, caller evidence and retry authorization, with original provenance),
+and closed rounds. Read a caller-context `{store, digest}` reference via
+`pitako_store` and follow each record's `priorActive` references: ALL earlier answers/evidence
 remain ACTIVE decision context with their provenance in later prompts, not mere
 history or director paraphrases.
-State contains bounded control skeletons, per-original artifact roots and
-relative paths/digests. The reconstructed absolute path must exactly equal the
-native published savedOutputPath. Each root is derived from that original's native
-saved path; digest pins, path normalization and traversal checks protect retained
-references. Previous/closed-round live originals retain only `{id, artifactRoot, relativePath,
-digest}`. Each current association/native witness is stored once in its dispatch;
-control tuples/bitmasks expand back to the validated logical controls on reentry.
-Only insufficient/failed originals retain diagnostics. The active current decision
-is an inline JSON string (at most twice the 16 KiB native args bytes). Dependency
-masks expand to factual IDs for prompts/frontiers. Perspectives read their focus
-and packet from the director original, never state projections of model prose.
+The single `pitako-architecture` mission key contains a closed cursor, at most
+16384 UTF-8 bytes including pretty-print and the state wrapper. It retains the
+consultation and decision digest, pinned ledger head, round counts, phase,
+current slots (key, attempt, run ID, terminal marker and digest), context refs,
+and steering stages. It does not retain artifact paths, diagnostic text, rosters
+or director output. Each path is resolved from its matching native settlement
+and checked against the published digest. At round close the store record keeps
+the original references, roster, next director packet or memo, and steering
+outcomes, and the cursor clears the slots. Reentry rehydrates the open slots
+and the closed-round projection at the saved head, not an unanchored row.
+The observer verifies the active decision against its digest at that head.
+Perspectives read their focus and packet from the director original, never
+state copies of model prose.
 
 `ledgerPending` is only `{kind: "decision", expectedRevision, digest}`; the digest
 is script-computed canonical SHA-256 of the complete replacement. After an
 append/save interruption, **resubmit the identical replacement** with the same
 continuation. Matching digest completes the append idempotently, saves the new
-snapshot/anchor and clears the marker. Omitted or different replacements return
+decision digest and anchor and clears the marker. Omitted or different replacements return
 `blocked` with an error before any child, with this resubmission instruction; the marker never
 contains replacement prose.
 
-Only one active consultation per mission at a time; D8 does not reserve concurrent consultations.
-
-D8 admission is: unrelated = current `stateBytes` minus this consultation's retained
-entry (measured conservatively); unrelated + **108306 bytes (<= 112 KiB)** must be
-<= 262144. Otherwise return `blocked` with numbers and use a new mission. This
-leaves over 150 KiB for /plan's initial-context and other mission keys. The maximal
-pretty-printed skeleton is filled at every tested save point, accounting for JSON
-escaping and indentation.
-Only discuss controls retain perspectives; their packet roster is cleared before
-evaluation, so only one director roster can be populated at once. Nine diagnostic
-slots cover eight blocked/failed factual providers plus a failed evaluation.
-Pending frontier IDs are stored as a JSON-encoded list, preserving logical IDs
-without per-item pretty indentation. A native barrier stops later dispatch.
+Only one architecture scope is active per cwd at a time. A committed admission
+supersedes earlier architecture writers in that cwd and uses the same cursor
+key. A stale write adopts the committed head and its action without treating a
+different committed operation as the requested write.
+If the store is lost, its ledger writer verifies the native mission's successful
+ledger child requests and receipts against the saved chain before restoring the
+decision and caller context. Earlier answers retain their provenance and links.
+Missing or contradictory native originals stop the continuation with an
+integrity failure before further model work; they do not reset the round count.
+For a completed consultation, the original memo gate can pass after full
+restored-chain verification and proof that the intact receipt corresponds to
+the restored items. A failed proof is a terminal integrity failure.
+`checkReceipt` still rejects references to the replaced store.
+If a store-backed item becomes unavailable before its consuming gate, the
+current root stops without publishing a gate receipt or launching the consumer.
+Same-consultation relaunch rechecks the store through the existing observer and
+uses the normal gate key.
+Steering saves `sending` before transport. On reentry the existing observer
+checks native evidence: a verified unavailable route before `sending` is
+missed; `sending` without a proven outcome is unconfirmed, never resent.
+Do not register or redispatch an old sibling to steer it.
+Pending frontier IDs are rederived from the verified doubts original and
+checked against the cursor's frontier digest. A native barrier stops later
+dispatch. A ledger receipt larger than 61440 bytes is rejected, never truncated.
 
 Structural limits (JSON UTF-8 bytes, including quotes/escaping): artifact root
-384, relative original path 160, ledger path 1024, runId 96, diagnostic 512 and
+384, relative original path 160, runId 96, diagnostic 512 and
 perspective label 128 (also at most 64 characters). Doubt IDs are at most 32 ASCII
 characters; generated keys/IDs are bounded to 36/137 characters. Each round permits
 8 factual doubts, 64 combined human/experiment IDs and 8 deliberation doubts.
@@ -255,8 +278,8 @@ compact reference, not the retained control state.
 Use the same mission, consultation ID and planning mode on reentry. The native
 state keeps the phase cursor, producer intentions, terminal evidence, current
 revision, original maximum, consumed rounds and valid rounds. Missing,
-incompatible or wrong-identity continuations fail before dispatch; v3 requires a
-new consultation/mission, with no migration. Duplicate
+incompatible or wrong-identity continuations fail before dependent dispatch;
+older incompatible formats are not migrated. Duplicate
 initial admission is not a restart.
 
 For unchanged decisions, omit `currentDecision` and `replacement`; optional
@@ -404,8 +427,12 @@ revision and round, with `pending.round === control.round === rounds`, planning
 mode and stage `awaiting-human`. It precedes every write. Accepted answers are
 published as a ledger context record with per-answer provenance; state keeps only
 its digest-pinned reference, clears pending and advances to `evaluate` before
-`director-after-rN` runs exactly once. An append/save cut requires identical caller
-input to reconcile an unanchored context record; it never silently discards answers. They are actual-human decision context, NOT implementation authority
+`director-after-rN` runs exactly once. The answer commit includes a bounded,
+digest-pinned basis of its open slots and phase/stage. After an append/save cut,
+same-consultation observation may adopt the committed answers and resume
+evaluation without replacing any confirmed child. A contradictory basis or a
+native steering outcome without a retained sending stage fails closed.
+Answers are actual-human decision context, NOT implementation authority
 or final confirmation.
 
 Reject without state/counter changes or child calls: answers outside the paused

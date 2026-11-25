@@ -1,6 +1,7 @@
 import { beforeAll, expect, test } from "bun:test";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { PitakoStore } from "../extensions/pitako-store.ts";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beginHookEffect, captureBaseline, checkpointDirectory, checkpointTaskDelta, closeHookEffect, readCheckpointTaskBytes, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
@@ -40,7 +41,7 @@ function fixture() {
   function deltaCLI() {
     budget.counts.loopIO++;
     return JSON.parse(execFileSync("node", [entry], { cwd: root, encoding: "utf8",
-      input: JSON.stringify({ operation: "taskDelta", invocation: "delta", intents }) }));
+      input: JSON.stringify({ operation: "taskDelta", invocation: "delta", key: "slot.delta", intents }) }));
   }
   async function delta() {
     const observed = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(), root,
@@ -52,6 +53,15 @@ function fixture() {
   }
   return { root, intents, attempt, edit, delta, deltaCLI,
     processes: () => [budget.processes(), composition.processes()] };
+}
+
+function storedDelta(root: string, ref: any) {
+  const store = new PitakoStore(root);
+  expect(ref.store.scope).toBe("exec:delta.e0");
+  store.verifyRecord(ref.store, ref.digest);
+  const row = store.readRecords(ref.store.scope, {seq: ref.store.seq, hash: ref.digest}).records.at(-1)!;
+  expect(row.kind).toBe("task-delta");
+  return row.body as { patch: string; overflow: string[] };
 }
 
 test("slot delta retains touched paths across attempts but excludes reverted content", async () => {
@@ -68,15 +78,15 @@ test("slot delta retains touched paths across attempts but excludes reverted con
   const delta = await f.delta();
   expect(delta).toEqual({ touched: ["alpha", "product", "zeta"], netChanged: ["alpha", "zeta"], overflow: null,
     diff: expect.objectContaining({ omitted: 0 }) });
-  const bytes = readFileSync(delta.diff.path);
-  expect(delta.diff.path).toBe(path.join(f.root, ".pi/subagents/execute/delta/task-deltas", `diff-${sha256(bytes)}.patch`));
+  const bytes = Buffer.from(storedDelta(f.root, delta.diff).patch);
   expect(delta.diff.sha256).toBe(sha256(bytes));
   expect(delta.diff.bytes).toBe(bytes.length);
   expect(delta.diff.lines).toBe(bytes.toString().split("\n").length - 1);
   expect(bytes.toString()).toContain("--- /dev/null\n+++ b/alpha\n@@ -0,0 +1,1 @@\n+new\n\\ No newline at end of file\n");
   expect(bytes.toString()).toMatch(/unchanged\t-\t100[0-7]{3} -> 100[0-7]{3}/);
   expect(await f.delta()).toEqual(await f.delta());
-  expect(readdirSync(path.dirname(delta.diff.path))).toEqual([path.basename(delta.diff.path)]);
+  expect(new PitakoStore(f.root).readRecords("exec:delta.e0").records.filter(row => row.kind === "task-delta")).toHaveLength(1);
+  expect(existsSync(path.join(f.root, ".pi/subagents/execute/delta/task-deltas"))).toBe(false);
   // Measured 87: 47 parent Git + 39 IPC Git + one shared runtime; plus nine.
   expectProcessBudget(f.processes(), 96);
 });
@@ -111,13 +121,9 @@ test("more than 200 net changes publish a deterministic digest-verified overflow
   const delta = await f.delta();
   expect(delta.touched).toEqual(files);
   expect(delta.netChanged).toEqual(files.slice(0, 200));
-  expect(Object.keys(delta.overflow).sort()).toEqual(["digest", "path"]);
-  const bytes = readFileSync(delta.overflow.path, "utf8"), overflow = JSON.parse(bytes);
-  expect(sha256(bytes)).toBe(delta.overflow.digest);
-  expect(overflow.result).toEqual(files.slice(200));
-  expect(overflow.resultDigest).toBe(canonicalDigest(overflow.result));
+  expect(storedDelta(f.root, delta.overflow).overflow).toEqual(files.slice(200));
   expect(await f.delta()).toEqual(delta);
-  expect(readFileSync(delta.diff.path, "utf8")).toContain("index 205\n");
+  expect(storedDelta(f.root, delta.diff).patch).toContain("index 205\n");
   expect(Buffer.byteLength(JSON.stringify(delta))).toBeLessThan(61440);
 });
 
@@ -166,7 +172,7 @@ test("slot records and artifact select first-touch bytes against dispatch WIP ac
   const current = readCheckpointTaskBytes(f.root, delta.records);
   expect([...current].map(([file, bytes]) => [file, bytes.toString()]))
     .toEqual([["alpha", "later change"], ["product", "second change"], ["zeta", ""]]);
-  const receipt = await f.delta(), patch = readFileSync(receipt.diff.path, "utf8");
+  const receipt = await f.delta(), patch = storedDelta(f.root, receipt.diff).patch;
   expect(patch).toContain("--- a/product\n+++ b/product\n@@ -1,1 +1,1 @@\n-prior WIP\n\\ No newline at end of file\n+second change\n");
   expect(patch).toContain("-later baseline\n");
   expect(patch).toContain("+later change\n");
@@ -193,7 +199,7 @@ test("taskDelta publishes index-only evidence for a journaled gitignored path pr
     listed: false, unlistedHash: sha256("ignored content"), before: Buffer.alloc(0) }]);
   expect(readCheckpointTaskBytes(f.root, snapshot.records).get("ignored"))
     .toEqual(Buffer.alloc(0));
-  const receipt = await f.delta(), patch = readFileSync(receipt.diff.path);
+  const receipt = await f.delta(), patch = Buffer.from(storedDelta(f.root, receipt.diff).patch);
   expect(receipt).toEqual({ touched: ["ignored"], netChanged: [], overflow: null,
     diff: expect.objectContaining({ sha256: sha256(patch), omitted: 0 }) });
   expect(patch.toString()).toContain('unchanged\t-\t- -> -\t-\t-\t"ignored"\n');
@@ -218,7 +224,7 @@ test("taskDelta publishes a deletion for a baseline-visible journaled file ignor
   });
   expect(readCheckpointTaskBytes(f.root, snapshot.records).get("ignored")).toEqual(Buffer.alloc(0));
   expect(readFileSync(path.join(f.root, "ignored"), "utf8")).toBe("ignored candidate\n");
-  const receipt = await f.delta(), patch = readFileSync(receipt.diff.path);
+  const receipt = await f.delta(), patch = Buffer.from(storedDelta(f.root, receipt.diff).patch);
   expect(receipt).toEqual({ touched: [".gitignore", "ignored"], netChanged: [".gitignore", "ignored"], overflow: null,
     diff: expect.objectContaining({ sha256: sha256(patch), omitted: 0 }) });
   expect(patch.toString()).toContain("--- a/ignored\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-visible baseline\n");
@@ -233,7 +239,7 @@ test("taskDelta publishes a deletion when a journaled untracked file is replaced
   mkdirSync(path.join(f.root, "zeta"));
   // Git no longer lists the untracked file once only an empty directory remains.
   composition.fake.fakeRepo(f.root, { paths: ["product"] });
-  const receipt = await f.delta(), patch = readFileSync(receipt.diff.path);
+  const receipt = await f.delta(), patch = Buffer.from(storedDelta(f.root, receipt.diff).patch);
   expect(receipt).toEqual({ touched: ["zeta"], netChanged: ["zeta"], overflow: null,
     diff: expect.objectContaining({ sha256: sha256(patch), omitted: 0 }) });
   expect(patch.toString()).toContain("--- a/zeta\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-untracked baseline\n");

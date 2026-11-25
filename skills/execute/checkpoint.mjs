@@ -1,27 +1,23 @@
+import "./loader.mjs";
 import { readFileSync } from "node:fs";
-import { registerHooks, stripTypeScriptTypes } from "node:module";
-
-// Owned writer helper, deliberately separate from the read-only host inspector.
-const sources = new Set([
-  "../../extensions/execute-checkpoint.ts", "../../extensions/spec-plans.ts",
-  "../../extensions/git-port.ts", "../../extensions/dev-tools/core/process.ts",
-  "../../extensions/board/workspace.ts", "../../extensions/board/paths.ts",
-  "../../extensions/errors.ts",
-].map(source => new URL(source, import.meta.url).href));
-registerHooks({
-  load(url, context, nextLoad) {
-    if (!sources.has(url)) return nextLoad(url, context);
-    return { format: "module", shortCircuit: true,
-      source: stripTypeScriptTypes(readFileSync(new URL(url), "utf8"), { sourceUrl: url }) };
-  },
-});
 const { captureCheckpoint, prepareCheckpoint, completeCheckpoint, restoreCheckpoint, sealCheckpointRequest } = await import("../../extensions/execute-checkpoint.ts");
-const { readRequest } = await import("./ledger.mjs");
+const { readRequest, committedSeal, executeEpoch, withExecuteStore } = await import("./ledger.mjs");
 const [operation, requestFile] = process.argv.slice(2);
 // The registered sealer receives pi-subagents' framed external-cli stdin.
 const request = operation === "--seal-stdin" ? readRequest(readFileSync(0, "utf8")) : JSON.parse(readFileSync(requestFile, "utf8"));
 if (operation === "--seal-stdin") {
-  const output = JSON.stringify(sealCheckpointRequest(request));
+  const { StoreError } = await import("../../extensions/pitako-store.ts");
+  let receipt;
+  try {
+    receipt = sealCheckpointRequest(request);
+    await withExecuteStore(request.intent.association.root, request.intent.association.invocation,
+      () => committedSeal(request, receipt), executeEpoch(request.intent.association.invocation, request.intent.key));
+  } catch (error) {
+    if (!(error instanceof StoreError)) throw error;
+    receipt = error.code === "store-busy" ? { v: 1, kind: request.kind, outcome: error.code }
+      : { code: error.code, reason: error.message, recovery: error.recovery };
+  }
+  const output = JSON.stringify(receipt);
   if (Buffer.byteLength(output, "utf8") > 60 * 1024) throw new Error("Checkpoint sealer output exceeds 60 KiB.");
   console.log(output);
 } else if (operation === "capture") console.log(JSON.stringify(captureCheckpoint(request.intent, request.paths)));

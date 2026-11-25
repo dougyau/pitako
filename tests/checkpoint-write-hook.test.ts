@@ -8,7 +8,8 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { applyPatch } from "pi-codex-tools";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
 import { checkpointDirectory, sealCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath } from "../extensions/execute-state.ts";
+import { executionStatePath } from "../extensions/execute-state.ts";
+import { committedCursor } from "./fixtures/plan-execute-checkpoint-scenario.ts";
 
 let fake: ReturnType<typeof gitFakeFixture>;
 beforeEach(() => { fake = gitFakeFixture(); });
@@ -25,11 +26,8 @@ function fixture(bound = true) {
   writeFileSync(path.join(root, "file"), "WIP");
   const association = { root, commonDir: path.join(root, ".git"), missionId: "mission", missionPath: path.join(root, "mission.json"), invocation: "hook", source: path.join(root, "spec.md"), digest: "a".repeat(64), maxCycles: 15, sourceRefs: [] };
   const intent: CheckpointIntent = { version: 2, association, key: "worker", taskId: "task", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: { key: "plan" }, progress: { consumedLoops: 1, admitted: {}, previous: null } };
-  const attempt: any = { key: intent.key, bindingKey: intent.key, taskId: "task", number: 1, index: 0, stage: "launched", checkpoint: intent };
-  const record: any = { version: EXECUTE_STATE_VERSION, association, consumedLoops: 1, tasks: {}, loop: { number: 1, cursor: 0, phase: "implementation", plan: { stage: "admitted", ref: intent.planRef }, manifest: ["task"], attempt } };
   const state = executionStatePath(association);
-  mkdirSync(path.dirname(state), { recursive: true });
-  const persist = () => writeFileSync(state, JSON.stringify({ "invoke-hook": record })); persist();
+  const saved = committedCursor({ root, intent, statePath: state });
   const handlers: Record<string, Function> = {};
   const previous = process.env.PI_SUBAGENT_EXTENSION_BINDINGS;
   try {
@@ -40,7 +38,7 @@ function fixture(bound = true) {
   const end = (id = "call", event = "tool_result", isError = false) => handlers[event]!({ toolCallId: id, isError });
   const directory = checkpointDirectory(intent);
   const artifacts = (pattern: RegExp) => existsSync(directory) ? readdirSync(directory).filter(p => pattern.test(p)).sort().map(p => artifact(path.join(directory, p))) : [];
-  return { root, intent, record, attempt, persist, call, end, directory, artifacts };
+  return { root, intent, state, ...saved, call, end, directory, artifacts };
 }
 
 test("direct and nested writes publish first-touch bytes and durable intent before allow; sibling overlap reserves until close", async () => {
@@ -122,13 +120,23 @@ test("symlink components rejected, including components before ..", () => {
 
 test.each(["lineage", "stage", "result", "halt", "outcome", "intent", "association"])("re-read durable state on each call blocks stale/stopped state: %s", mode => {
   const f = fixture(); f.call(); f.end();
-  if (mode === "lineage") f.attempt.bindingKey = "foreign";
-  if (mode === "stage") f.attempt.stage = "intention";
-  if (mode === "result") f.attempt.result = {};
-  if (mode === "halt") f.record.loop.halt = { code: "stop" };
-  if (mode === "outcome") f.record.outcome = "stopped";
-  if (mode === "intent") f.attempt.checkpoint = { ...f.intent, cursor: 1 };
-  if (mode === "association") f.record.association = { ...f.intent.association, digest: "b".repeat(64) };
+  const { cursor } = f;
+  if (mode === "lineage") {
+    const previous = cursor.head;
+    const foreign = committedCursor({ root: f.root, intent: f.intent, statePath: f.state, bindingKey: "foreign" }).cursor;
+    // The baseline at the tip doesn't revoke the old cursor's authority until saved.
+    cursor.head = previous; f.persist();
+    expect(f.call("write", "file", "old-head")).toBeUndefined(); f.end("old-head");
+    cursor.head = foreign.head;
+    cursor.loop!.attempt!.intent = foreign.loop!.attempt!.intent;
+    cursor.action = foreign.action;
+  }
+  if (mode === "stage") cursor.loop!.attempt!.stage = "intention";
+  if (mode === "result") cursor.loop!.attempt!.stage = "result";
+  if (mode === "halt") cursor.halt = { stage: "stop", digest: "a".repeat(64) };
+  if (mode === "outcome") cursor.loop!.outcome = "stopped";
+  if (mode === "intent") cursor.loop!.attempt!.intent!.digest = "0".repeat(64);
+  if (mode === "association") cursor.associationDigest = "b".repeat(64);
   f.persist(); expect(f.call("write", "new", "next")).toHaveProperty("block", true);
   expect(f.artifacts(/^capture-/)).toHaveLength(1);
 });
@@ -136,7 +144,7 @@ test.each(["lineage", "stage", "result", "halt", "outcome", "intent", "associati
 test("revived same-lineage attempt uses its own intent, not cached first attempt", () => {
   const f = fixture(); f.call(); f.end();
   const next = { ...f.intent, key: "revived", attempt: 2 };
-  Object.assign(f.attempt, { key: next.key, number: 2, checkpoint: next }); f.persist();
+  committedCursor({ root: f.root, intent: next, statePath: f.state, bindingKey: f.intent.key });
   expect(f.call("write", "new", "next")).toBeUndefined(); f.end("next");
   const directory = checkpointDirectory(next);
   expect(artifact(path.join(directory, "hook-effect-000000.json")).intent).toEqual(next);
@@ -144,7 +152,7 @@ test("revived same-lineage attempt uses its own intent, not cached first attempt
 
 test("journal failure blocks without modifying product bytes", () => {
   const f = fixture(); mkdirSync(path.dirname(f.directory), { recursive: true }); writeFileSync(f.directory, "not a directory");
-  expect(f.call()).toHaveProperty("block", true);
+  expect(f.call()).toMatchObject({ block: true, reason: expect.stringContaining("manifest.json") });
   expect(readFileSync(path.join(f.root, "file"), "utf8")).toBe("WIP");
 });
 

@@ -3,6 +3,10 @@ import { closeSync, existsSync, fchmodSync, fsyncSync, linkSync, lstatSync, mkdi
 import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { checkoutEvidence, checkoutSnapshot, type CheckoutDigest, designatedWorkspace, gitRead, withIndexReads } from "./spec-plans.ts";
+import { EXECUTE_CURSOR_KEY } from "./execute-cursor.ts";
+import { executionStatePath } from "./execute-state.ts";
+import { verifyExecuteSealerIntents } from "./execute-intent.ts";
+import { StoreError } from "./pitako-store.ts";
 
 type Image = { bytes: string; mode: number } | null;
 export type CheckpointIntent = {
@@ -23,7 +27,7 @@ export type RestoreAuthority = {
   confirmedUnit?: ConfirmedUnit;
   confirmedPause?: { kind: "pause"; checkpointRef: string; digest: string; candidate: unknown; position: unknown; progress: unknown };
 };
-type ConfirmedUnit = { kind: "unit"; checkpointRef: string; digest: string;
+export type ConfirmedUnit = { kind: "unit"; checkpointRef: string; digest: string;
   candidate: unknown; position: unknown; progress: unknown; taskId: string; attempt: number; resultRef: unknown };
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 const equal = isDeepStrictEqual;
@@ -670,6 +674,36 @@ function admittedProgress(intent: CheckpointIntent) {
 export function sealCheckpoint(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean, restored: Manifest["files"] = []) {
   return seal(intent, kind, controlPermitsCapture, restored);
 }
+export function observeTaskReviewSeal(intent: CheckpointIntent, pending = false, restoreSources?: CheckpointIntent[]) {
+  const directory = checkpointDirectory(intent);
+  if (!existsSync(path.join(directory, "manifest.json")))
+    return pending ? null : { v: 1, outcome: "observed", candidate: checkoutEvidence(intent.association.root) };
+  const seals = ["unit", "pause"].filter(kind => existsSync(path.join(directory, `${kind}.json`)));
+  if (!seals.length && pending) return null;
+  if (seals.length !== 1) throw new Error("Task review recovery requires one settled checkpoint seal.");
+  const kind = seals[0] as "unit" | "pause", checkpointRef = path.join(directory, `${kind}.json`);
+  const point = read<{ intent: CheckpointIntent; kind: string; candidate: { head: string; fingerprint: string };
+    position: unknown; files: unknown[] }>(checkpointRef);
+  if (!equal(point.intent, intent) || point.kind !== kind)
+    throw new Error("Task review recovery checkpoint intent mismatch.");
+  const current = checkoutEvidence(intent.association.root);
+  if (!equal({ head: current.head, fingerprint: current.fingerprint },
+      { head: point.candidate.head, fingerprint: point.candidate.fingerprint }))
+    throw new Error("Task review recovery checkout differs from its settled seal.");
+  // Revalidate restoration without publishing another seal. The seal itself
+  // attests the successor's bytes, not the historical restoration.
+  const observation = restoreSources && observeOrSeal(intent, null, restoreSources);
+  const restored = observation?.outcome === "observed" && "restored" in observation ? observation.restored : undefined;
+  if (restoreSources && !restored)
+    throw new Error("Task review recovery lacks the settled restoration.");
+  return { v: 1, outcome: "sealed", kind, checkpointRef, digest: hash(readFileSync(checkpointRef, "utf8")),
+    candidate: { head: point.candidate.head, fingerprint: point.candidate.fingerprint }, position: point.position,
+    capturedPaths: point.files.length,
+    ...(restored ? { restored: Object.fromEntries(
+      (["checkpointRef", "partialRef", "restoredRef", "digest", "position", "candidate", "confirmedPause", "confirmedUnit"] as const)
+        .filter(key => restored[key] !== undefined).map(key => [key, restored[key]]),
+    ) } : {}) };
+}
 function seal(intent: CheckpointIntent, kind: "unit" | "pause", controlPermitsCapture: boolean, restored: Manifest["files"], attributedFiles?: Manifest["files"]) {
   if (controlPermitsCapture !== true) throw new Error("Native control does not permit checkpoint capture.");
   if (kind !== "unit" && kind !== "pause") throw new Error("Invalid checkpoint seal kind.");
@@ -704,18 +738,26 @@ function sealRequest(request: SealerRequest) {
       Object.keys(request).some(key => !["v", "intent", "kind", "restoreSources"].includes(key)))
     throw new Error("Invalid checkpoint sealer request.");
   const { intent, kind } = request, root = intent.association.root;
-  if (process.cwd() !== root) throw new Error("Checkpoint sealer cwd must equal intent.association.root.");
+  if (process.cwd() !== root) throw new StoreError("wrong-cwd", "Execute cursor belongs to the wrong cwd.");
+  let mission;
+  try { mission = JSON.parse(readFileSync(executionStatePath(intent.association), "utf8")); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+  verifyExecuteSealerIntents(root, mission?.[EXECUTE_CURSOR_KEY], request);
+  return observeOrSeal(intent, kind, request.restoreSources);
+}
+function observeOrSeal(intent: CheckpointIntent, kind: SealerRequest["kind"], restoreSources?: CheckpointIntent[]) {
+  const root = intent.association.root;
   const directory = checkpointDirectory(intent);
   const observed = checkoutEvidence(root);
   const candidate = { head: observed.head, fingerprint: observed.fingerprint };
   const base = { v: 1 as const, kind, candidate, capturedPaths: 0 };
   let selected = intent;
-  if (request.restoreSources) {
-    if (!request.restoreSources.length || request.restoreSources.some(source =>
+  if (restoreSources) {
+    if (!restoreSources.length || restoreSources.some(source =>
         !equal(source.association, intent.association) || source.taskId !== intent.taskId ||
         source.loop !== intent.loop || source.cursor !== intent.cursor))
       throw new Error("Checkpoint restoration sources conflict with pending unit.");
-    const published = publishedSource(request.restoreSources);
+    const published = publishedSource(restoreSources);
     selected = published ?? intent;
     if (!published && intent.progress?.previous) {
       const previous = intent.progress.previous;
@@ -734,13 +776,13 @@ function sealRequest(request: SealerRequest) {
   }
   const { manifest, steps, openPaths } = load(selected);
   base.capturedPaths = manifest.files.length;
-  if (openPaths.size && !request.restoreSources)
+  if (openPaths.size && !restoreSources)
     return { ...base, outcome: "open" as const, paths: [...openPaths].slice(0, 10) };
   let expected = new Map(manifest.files.map(file => [file.path, file.image]));
   for (const step of steps) for (const entry of step) expected.set(entry.path, entry.after);
   let restored: ReturnType<typeof restore> | undefined;
   let restoredFiles: Manifest["files"] = [];
-  if (request.restoreSources) {
+  if (restoreSources) {
     const partialRef = path.join(selectedDirectory, "restore.json");
     const partial = read<{ intent: CheckpointIntent; authority: RestoreAuthority; partial: Manifest["files"]; restored?: Manifest["files"] }>(partialRef);
     restored = read<ReturnType<typeof restore>>(path.join(selectedDirectory, "restored.json"));

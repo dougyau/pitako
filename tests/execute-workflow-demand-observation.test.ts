@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test";
 import { executeControllerFixture, gaps, cutAt, copy, candidate, type ControllerHost } from "./fixtures/execute-workflow.ts";
-import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
+import { EXECUTE_CURSOR_MAX_BYTES, validateExecuteCursor } from "../extensions/execute-cursor.ts";
 
 const { fixture } = executeControllerFixture();
 
@@ -16,9 +16,9 @@ test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer 
       return result;
     }
     if (request.key.endsWith(".demand-observation")) {
-      expect(host.current().loop.plan).toBeNull();
+      expect(host.current().action).toMatchObject({ kind: "launched", key: request.key, role: "reviewer" });
       expect(request).toMatchObject({ agent: "pitako.reviewer", context: "fresh", phase: "director",
-        skill: ["verify-behavior", "scope-discipline"] });
+        skill: ["verify-behavior", "ponytail", "ponytail-review", "rust-best-practices", "rust-review", "scope-discipline"] });
       expect(request).not.toHaveProperty("model");
       expect(request.task).toContain(`"kind":"${source}"`);
       expect(request.task).toContain(source === "compliance"
@@ -30,7 +30,8 @@ test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer 
     }
     return normal();
   });
-  expect((await host.execute()).status).toBe("complete");
+  const outcome = await host.execute();
+  expect(outcome.status, outcome.reason).toBe("complete");
   const keys = host.calls.map(call => call.key);
   expect(keys.filter(key => key.endsWith(".demand-observation"))).toEqual(["invoke-human-1.l2.demand-observation"]);
   expect(keys.indexOf("invoke-human-1.l2.demand-observation")).toBeLessThan(keys.indexOf("invoke-human-1.l2.director"));
@@ -72,9 +73,7 @@ test.each(["rejected-report", "unusable-failure", "candidate-change"])("%s gaps 
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");
   expect(host.history()[0].outcome).toBe("gaps");
   if (mode === "candidate-change") {
-    expect(host.history()[0].closing).toMatchObject({
-      sameCandidate: false, candidate: candidate(1), observation: { ok: true, checkout: candidate(1) },
-    });
+    expect(JSON.parse(host.native.get("invoke-human-1.l1.checkout")!.output!).checkout).toEqual(candidate(1));
     expect(host.emits.find(value => value.type === "execution-loop").reason)
       .toBe("Candidate changed; affected checks and analyses are stale.");
     expect(host.calls.filter(call => call.key.startsWith("invoke-human-1.l1.checkout")).map(call => call.key))
@@ -142,31 +141,34 @@ test("an intermediate continuation completed in the same loop creates no demand 
   expect(host.history()).toHaveLength(2);
 });
 
-test.each(["observation-receipt", "director-intention"])("%s cut recovers the existing producer without another observation", async cut => {
+test.each(["observation-receipt", "director-receipt"])("%s cut recovers the existing producer without another observation", async cut => {
   const host = fixture(undefined, { taskCount: 0 }), target = "invoke-human-1.l2.demand-observation";
   host.setRespond((request, normal) => {
     if (request.key === "invoke-human-1.l1.compliance") return gaps(normal());
     if (request.key === "invoke-human-1.l2.director") expect(request.task).toContain('"memo":"Advisory only"');
     return normal();
   });
+  const director = "invoke-human-1.l2.director";
   cutAt(host, value => value.loop?.number === 2 && (cut === "observation-receipt"
-    ? value.demandObservations?.some((item: any) => item.loop === 2) : value.loop.plan?.stage === "published"));
+    ? value.action.key === target && !!value.action.runId
+    : value.action.key === director && !!value.action.runId));
   const first = await host.executeNative();
   expect(first.status).toBe("partial");
   expect(first.reason).toContain("Essential persistence failed");
-  const retained = host.current().loop;
-  expect(retained.analysisCalls.find((call: any) => call.key === target)).toMatchObject({ stage: "receipt",
-    ref: { runId: `native-${target}`, outputReference: `/native/output/${target}.json` } });
-  if (cut === "observation-receipt") {
-    expect(host.current().demandObservations ?? []).toEqual([]);
-    expect(retained.plan).toBeNull();
-  } else expect(retained.plan).toMatchObject({ stage: "intention", ref: { key: "invoke-human-1.l2.director" } });
+  const observed = host.native.get(target)!;
+  expect(observed.structuredOutput.memo).toBe("Advisory only");
+  expect(host.current().action).toMatchObject({ kind: "launched", runId: null,
+    ...(cut === "observation-receipt" ? { role: "reviewer", key: target } : { role: "execution-director", key: director }) });
+  if (cut === "observation-receipt") expect(host.native.has(director)).toBe(false);
   host.setFailSave();
   const outcome = await host.executeNative();
   expect(outcome.status, JSON.stringify(outcome)).toBe("complete");
   expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
   expect(host.calls.filter(call => call.key === "invoke-human-1.l2.director")).toHaveLength(1);
-  expect(host.statusCalls).toContain(cut === "observation-receipt" ? `native-${target}` : "invoke-human-1.l2.director");
+  expect(host.statusCalls).toContain(cut === "observation-receipt" ? observed.runId! : director);
+  expect(host.launches.filter(call => call.key.endsWith(".r1")).map(call => call.key)).toEqual([
+    cut === "observation-receipt" ? "invoke-human-1.l2.advance.r1" : "invoke-human-1.l2.selectionIO.r1",
+  ]);
 });
 
 const synthesis = (number: number) => `invoke-human-1.l${number}.review.director-synthesis`;
@@ -189,8 +191,10 @@ test("closed demand sources persist once while observations keep every retained 
   // Realistic review witnesses: each child reference carries a sizeable native acceptance record.
   materialReviewGaps(host, { status: "not-required", evidenceStatus: "not-required", explicit: false, criteria: [],
     inferredReason: ["x".repeat(2000)], runtimeChecks: [], verifyRuns: [] });
-  const saves: { value: string; loop: number; bytes: number }[] = [];
-  host.setSaveObserver((value, bytes) => { if (value.loop) saves.push({ value: JSON.stringify(value), loop: value.loop.number, bytes }); });
+  host.setSaveObserver((value, bytes) => {
+    expect(() => validateExecuteCursor("pitako-execute", value)).not.toThrow();
+    expect(bytes).toBeLessThanOrEqual(EXECUTE_CURSOR_MAX_BYTES);
+  });
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
   const observations = host.calls.filter(call => call.key.endsWith(".demand-observation"));
@@ -201,18 +205,9 @@ test("closed demand sources persist once while observations keep every retained 
     expect(fresh).toContain(synthesis(number - 1));
     // The three-entry history still delivers each earlier observation with its exact causal originals.
     for (const earlier of [2, 4, 6, 8].filter(earlier => earlier < number && earlier >= number - 6)) {
-      expect(previous).toContain(`native-invoke-human-1.l${earlier}.demand-observation`);
+      expect(previous).toContain(host.native.get(`invoke-human-1.l${earlier}.demand-observation`)!.runId!);
       expect(previous).toContain(synthesis(earlier - 1));
     }
   }
-  for (const save of saves) {
-    const sources = JSON.parse(save.value).demandSources ?? [];
-    expect(new Set(sources.map((item: any) => item.loop)).size).toBe(sources.length);
-    for (const entry of sources) for (const original of entry.sources)
-      expect(save.value.split(JSON.stringify(original)).length - 1, `loop ${save.loop} copies of loop ${entry.loop}`).toBe(1);
-  }
-  const maximum = (from: number, to: number) => Math.max(...saves.filter(save => save.loop >= from && save.loop <= to).map(save => save.bytes));
-  expect(maximum(8, 9)).toBeLessThanOrEqual(maximum(6, 7) + 4096);
-  // Full v6 task definitions and the bounded demand ring fit the native envelope.
-  expect(maximum(1, 9)).toBeLessThan(MISSION_STATE_MAX_BYTES);
+  expect([...host.storage.keys()]).toEqual(["pitako-execute"]);
 });

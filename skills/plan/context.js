@@ -2,12 +2,6 @@
 if (typeof args.brief !== "string" || !args.brief.trim()) throw new Error("Provide the complete planning brief.");
 if (typeof args.workDescription !== "string" || !args.workDescription.trim() || /[\r\n]/.test(args.workDescription)) throw new Error("Provide a concrete planning workDescription.");
 const text = value => typeof value === "string" && value.trim().length > 0;
-function retainedError(error, failedOriginal) {
-  // Native failure receipts append report output; the exact failed original lives once.
-  return failedOriginal && typeof error === "string" ? error.split("\n\nOutput:\n")[0]
-    .replaceAll(JSON.stringify(failedOriginal, null, 2), "[retained failed original]")
-    .replaceAll(JSON.stringify(failedOriginal), "[retained failed original]") : error;
-}
 const fields = ["facts", "reasons", "contradictions", "limits", "questions", "sources", "essentialReasons"];
 const briefingSchema = { type: "object", additionalProperties: false, required: fields,
   properties: Object.fromEntries(fields.map(field => [field, { type: "array", items: { type: "string", minLength: 1 } }])) };
@@ -86,25 +80,12 @@ for (let index = 0; index < providers.length; index++) {
   const sufficient = !!(complete && succeeded && published && value.status === "ready" &&
     value.briefing.facts.length > 0 && value.briefing.reasons.length > 0 && value.briefing.sources.length > 0);
   const diagnostic = !complete ? "Original not delivered or completeness/association unproved." : !published ? "Mandatory original publication failed or unproved." : !succeeded ? "Provider did not complete successfully." : !sufficient ? "Provider reports dependent factual blockers or an inadequate briefing." : null;
-  const failedOriginal = complete && !published ? value : undefined;
   const original = { id: association.key, ...association, ...reference, terminal, succeeded, published: !!published,
-    sufficient, access: "unobserved", diagnostic, ...(result?.error ? { nativeError: retainedError(result.error, failedOriginal) } : {}) };
-  // Preserve only a genuinely delivered identifiable failed value, never republish it.
-  if (failedOriginal) original.failedOriginal = failedOriginal;
+    sufficient, access: "unobserved", diagnostic };
   originals.push(original);
   evidence.push({ provider: providers[index], originalId: original.id, status: sufficient ? "ready" : "blocked",
     briefing: complete && published && succeeded ? value.briefing : null, diagnostic });
 }
-// Native mission capacity/persistence failure propagates; do not retry this write.
-try {
-  await state.set("initial-context", { originals });
-} catch (error) {
-  const barriers = originals.filter(original => original.stopped || original.interrupted ||
-    original.results?.some(item => item.stopped || item.interrupted || item.timedOut) ||
-    /Blocked by pi-subagents permission rule:/.test(original.nativeError ?? ""));
-  if (barriers.length) throw new Error(`${String(error)}; observed provider control barriers: ${JSON.stringify(barriers.map(({ failedOriginal, ...original }) => original))}`);
-  throw error;
-}
 return { status: evidence.every(item => item.status === "ready") ? "ready" : "blocked", phase: "initial-context",
-  evidence, originals: originals.map(({ failedOriginal, nativeError, ...original }) => original),
+  evidence, originals,
   guidance: "Use delivered facts for independent grilling. Access to originals is unobserved: retrieve exact published references with existing read tools when essentialReasons requires it, validate content/schema/association, and block dependent conclusions if inaccessible. Ask the real human and wait for final confirmation; no report grants implementation authority." };

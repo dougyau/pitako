@@ -1,9 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
+import { PitakoStore, MAX_GATE_LOG_BYTES } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
 import { gate, type GateInput } from "../skills/execute/loop.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
@@ -28,11 +30,12 @@ function fixture(): GateInput {
       progress: { nonImproving: 0, last5: [] } } };
 }
 const directory = (input: GateInput, suffix = "") => path.join(input.root, ".pi/subagents/execute", input.invocation, `gates/worker.gate${suffix}`);
-const receiptFile = (input: GateInput, suffix = "") => path.join(directory(input, suffix), "receipt.json");
+const stored = (input: GateInput) => new PitakoStore(input.root).readRecords(`exec:${input.invocation}.e0`).records.filter(row => row.kind === "gate");
+const receipt = (input: GateInput, suffix = "") => stored(input).find(row => row.opKey === `gate:worker.gate${suffix}`)!;
 const runs = (input: GateInput) => readFileSync(path.join(input.root, "cache/runs"), "utf8");
 
 test.each(["same-key", "transport-retry"])("identical %s replay spawns neither metric nor gates and preserves receipt bytes", async mode => {
-  const input = fixture(), first = await gate(input), original = readFileSync(receiptFile(input), "utf8");
+  const input = fixture(), first = await gate(input), original = JSON.stringify(receipt(input).body);
   const saved = JSON.parse(original), { receiptDigest, ...body } = saved;
   expect(receiptDigest).toBe(canonicalDigest(body));
   expect(saved.identity).toMatchObject({ attemptKey: "worker", workerStatus: "complete", after: first.after });
@@ -41,13 +44,12 @@ test.each(["same-key", "transport-retry"])("identical %s replay spawns neither m
   const replay = await gate({ ...input, key: mode === "transport-retry" ? "worker.gate.r1" : input.key });
   expect(replay).toEqual(first);
   expect(runs(input)).toBe("metric\ngate\n");
-  expect(readFileSync(receiptFile(input), "utf8")).toBe(original);
-  expect(readdirSync(directory(input)).sort()).toEqual(["0.log", "metric.log", "receipt.json"]);
+  expect(JSON.stringify(receipt(input).body)).toBe(original);
+  expect(readdirSync(directory(input))).toEqual([]);
 });
 
 test.each(["id", "command", "cwd", "timeoutMs", "metric-command", "metric-timeout", "worker-status", "progress", "target",
-  "candidate-fingerprint", "candidate-head", "corrupt", "malformed", "whitespace",
-  "identity-attemptKey", "identity-after"] as const)("changed %s runs fresh into .rN without overwriting", async mode => {
+  "candidate-fingerprint", "candidate-head"] as const)("changed %s runs fresh into .rN without overwriting", async mode => {
   const input = fixture(), first = await gate(input);
   if (mode === "id") input.task.gates[0]!.id = "renamed";
   if (mode === "command") input.task.gates[0]!.command += "; printf changed";
@@ -63,34 +65,25 @@ test.each(["id", "command", "cwd", "timeoutMs", "metric-command", "metric-timeou
     fake.set(input.root, ["rev-parse", "HEAD"], { stdout: "2".repeat(40) + "\n", stderr: "", status: 0 });
     fake.set(input.root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: "2".repeat(40) + "\nmain\n", stderr: "", status: 0 });
   }
-  if (mode === "malformed") writeFileSync(receiptFile(input), "{");
-  if (mode === "whitespace") writeFileSync(receiptFile(input), readFileSync(receiptFile(input), "utf8") + " ");
-  if (mode === "corrupt" || mode.startsWith("identity-")) {
-    const saved = JSON.parse(readFileSync(receiptFile(input), "utf8"));
-    if (mode === "corrupt") saved.gates[0].tail = "damaged";
-    else {
-      if (mode === "identity-attemptKey") saved.identity.attemptKey = "another-worker";
-      else saved.identity.after.head = "0".repeat(40);
-      const { receiptDigest: _, ...body } = saved;
-      saved.receiptDigest = canonicalDigest(body);
-    }
-    writeFileSync(receiptFile(input), JSON.stringify(saved) + "\n");
-  }
-  const original = readFileSync(receiptFile(input), "utf8");
+  const original = JSON.stringify(receipt(input).body);
   const fresh = await gate(input);
   expect(runs(input)).toBe(mode === "worker-status" ? "metric\ngate\nmetric\n" : "metric\ngate\nmetric\ngate\n");
-  expect(readFileSync(receiptFile(input), "utf8")).toBe(original);
-  expect(JSON.parse(readFileSync(receiptFile(input, ".r1"), "utf8")).after).toMatchObject(fresh.after);
-  if (fresh.gates.length) expect(fresh.gates[0]!.logRef).not.toBe(first.gates[0]!.logRef);
+  expect(JSON.stringify(receipt(input).body)).toBe(original);
+  expect(receipt(input, ".r1").body).toMatchObject({after: fresh.after});
+  if (fresh.gates.length && mode === "command") expect(fresh.gates[0]!.logRef).not.toBe(first.gates[0]!.logRef);
   await gate(input);
   expect(runs(input)).toBe(mode === "worker-status" ? "metric\ngate\nmetric\n" : "metric\ngate\nmetric\ngate\n");
 });
 
 test("replay refreshes the Board view and bounds diagnostic tails without changing saved evidence", async () => {
   const input = fixture();
-  input.task.gates[0]!.command += "; head -c 12000 /dev/zero | tr '\\0' x";
-  const first = await gate(input), original = readFileSync(receiptFile(input), "utf8");
-  expect(readFileSync(first.gates[0]!.logRef, "utf8").length).toBeGreaterThan(12000);
+  input.task.gates[0]!.command = "printf HEAD; head -c 1250000 /dev/zero | tr '\\0' x; printf TAIL; echo gate >> cache/runs";
+  const first = await gate(input), original = JSON.stringify(receipt(input).body);
+  const blob = new PitakoStore(input.root).readBlob(first.gates[0]!.logRef);
+  expect(blob).toMatchObject({size: MAX_GATE_LOG_BYTES, originalSize: 1250008, truncated: true});
+  expect(blob.bytes).toEqual(Buffer.from("HEAD" + "x".repeat(MAX_GATE_LOG_BYTES - 8) + "TAIL"));
+  expect(new PitakoStore(input.root).readBlob(first.metric!.logRef)).toMatchObject({truncated: false, bytes: Buffer.from("3")});
+  expect(readdirSync(directory(input))).toEqual([]);
   const board = await openBoard(input.dbPath);
   try {
     board.post(repositoryIdentity(input.root), { topicId: first.view.topicId, type: "DECISION", content: "Current rule" });
@@ -100,7 +93,7 @@ test("replay refreshes the Board view and bounds diagnostic tails without changi
   expect(Buffer.byteLength(replay.gates[0]!.tail)).toBeLessThanOrEqual(2048);
   expect(Buffer.byteLength(JSON.stringify(replay) + "\n")).toBeLessThanOrEqual(8192);
   expect(runs(input)).toBe("metric\ngate\n");
-  expect(readFileSync(receiptFile(input), "utf8")).toBe(original);
+  expect(JSON.stringify(receipt(input).body)).toBe(original);
 });
 
 test("interrupted directory is retained; receipt appears only after commands settle", async () => {
@@ -108,16 +101,30 @@ test("interrupted directory is retained; receipt appears only after commands set
   mkdirSync(directory(input), { recursive: true });
   writeFileSync(path.join(directory(input), "metric.log"), "interrupted");
   input.task.metric = null;
-  input.task.gates[0]!.command = `test ! -e '${receiptFile(input, ".r1")}'; result=$?; echo gate >> cache/runs; exit $result`;
-  const receipt = await gate(input);
-  expect(receipt.gates[0]!.status).toBe("pass");
+  input.task.gates[0]!.command = "echo gate >> cache/runs";
+  const result = await gate(input);
+  expect(result.gates[0]!.status).toBe("pass");
   expect(readFileSync(path.join(directory(input), "metric.log"), "utf8")).toBe("interrupted");
   expect(readdirSync(directory(input))).toEqual(["metric.log"]);
-  expect(readdirSync(directory(input, ".r1")).sort()).toEqual(["0.log", "receipt.json"]);
-  const original = readFileSync(receiptFile(input, ".r1"), "utf8");
+  expect(readdirSync(directory(input, ".r1"))).toEqual([]);
+  const original = JSON.stringify(receipt(input, ".r1").body);
   input.task.progress.nonImproving++;
   input.task.gates[0]!.command = "echo gate >> cache/runs";
   expect((await gate(input)).gates[0]!.status).toBe("pass");
-  expect(readFileSync(receiptFile(input, ".r1"), "utf8")).toBe(original);
-  expect(JSON.parse(readFileSync(receiptFile(input, ".r2"), "utf8")).progress).toBeDefined();
+  expect(JSON.stringify(receipt(input, ".r1").body)).toBe(original);
+  expect(receipt(input, ".r2").body).toHaveProperty("progress");
+});
+
+test.each(["record", "blob"])("a damaged gate %s is not replayed or rerun", async kind => {
+  const input = fixture(), original = await gate(input), store = new PitakoStore(input.root);
+  const db = openSqliteSync(store.file);
+  try {
+    if (kind === "record") db.prepare("UPDATE records SET body='null' WHERE kind='gate'").run();
+    else db.prepare("UPDATE blobs SET originalSize=originalSize+1 WHERE digest=?").run(original.gates[0]!.logRef);
+  } finally { db.close(); }
+  // The grouped execute entry uses writer preflight; blob corruption is
+  // rechecked by the gate writer itself, not overwritten with new output.
+  await expect(gate(input)).rejects.toMatchObject({code: "store-corrupt"});
+  expect(runs(input)).toBe("metric\ngate\n");
+  expect(existsSync(directory(input, ".r1"))).toBe(false);
 });

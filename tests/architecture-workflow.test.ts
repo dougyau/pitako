@@ -1,29 +1,49 @@
-import { afterAll, describe, expect, test } from "bun:test";
-import { existsSync, statSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { appendFileSync, existsSync, statSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { runWorkflowScript, validateWorkflowScript, type WorkflowScriptChildResult } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { normalizeWorkflowArgs } from "../node_modules/pi-subagents/src/workflows/workflow-resources.js";
 import type { WorkflowTerminalOutcome } from "../node_modules/pi-subagents/src/shared/types.js";
-const { appendLedger, ledgerPath, verifyLedger } = await import(new URL("../skills/architecture/ledger.mjs", import.meta.url).href);
+const { appendLedger, verifyLedger } = await import(new URL("../skills/architecture/ledger.mjs", import.meta.url).href);
 import { canonicalJSON, canonicalDigest } from "../extensions/canonical.mjs";
-import { verifyGate } from "../extensions/access-receipts.mjs";
+import { checkReceipt, receiptLocation, verifyGate } from "../extensions/access-receipts.mjs";
+import { PitakoStore, type StoreRecordLocation } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
+import { guardEnv } from "./fixtures/git-fake-env.ts";
+import { architectureNative, architectureNativeSource } from "../skills/architecture/native.mjs";
 
-const rawSource = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
-const compactFunctions = rawSource.slice(rawSource.indexOf("function compactConsultation("), rawSource.indexOf("function retainedConsultation("));
-const nativeFlagsSource = rawSource.slice(rawSource.indexOf("const nativeFlags ="), rawSource.indexOf("const retained ="));
-const {compactConsultation, expandConsultation} = new Function("function utf8Bytes(s) {return unescape(encodeURIComponent(s)).length;}" + nativeFlagsSource + compactFunctions + ";return {compactConsultation, expandConsultation};")();
-// Callbacks/storage expose logical controls for fault injection; state files and
-// the VM boundary always use the actual compact persistence representation.
-const physical = (value: any) => value?.version === 4 && !value.originals?.some(Array.isArray) && value.cursor?.dispatches?.every((d: any) => !d.a) ? compactConsultation(value) : value;
-const logical = (value: any) => value?.version === 4 && (value.originals?.some(Array.isArray) || value.cursor?.dispatches?.some((d: any) => d.a)) ? expandConsultation(value) : value;
+const rawSource = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + architectureNativeSource + readFileSync(new URL("../skills/architecture/workflow.js", import.meta.url), "utf8");
+const cursorFunctions = rawSource.slice(rawSource.indexOf("function architectureCursorSchema("), rawSource.indexOf("function retainedConsultation("));
+const {architectureCursorSchema, architectureStateBound, compactConsultation, expandConsultation, observeSlotRefs} = new Function("canonicalJSON", "canonicalDigest",
+  `${architectureNativeSource}
+  const architectureVersion = 4, cursorVersion = 3;
+  const humanQuestion = item => ["human", "experiment"].includes(item.kind);
+  function utf8Bytes(s) {return unescape(encodeURIComponent(s)).length;}
+  ${cursorFunctions}
+  return {architectureCursorSchema, architectureStateBound, compactConsultation, expandConsultation, observeSlotRefs};`)(canonicalJSON, canonicalDigest);
+// Keep fixture inspection/fault injection at the logical boundary; mission
+// state and the VM use the real cursor and the real ledger observer.
+const closedRounds = new Map<string, unknown>();
+const physical = (value: any) => value?.version === 4 && value.originals && value.cursor?.control &&
+  value.cursor?.dispatches?.every((d: any) => d.originalId) ? compactConsultation(value, closedRounds.get(value.ledger?.head)) : value;
+const {architectureOutputSchema, confirmNativeOriginal, projectNativeOriginal} = architectureNative(canonicalDigest);
+const nativeViews = new Map<string, {result: Result; request: Request}>();
+const readModelRecords = new Map<string, {body: Record<string, unknown>; originals?: Record<string, Record<string, unknown>>}>();
 
 
 test.each(["node", "bun"])("packaged architecture preserves awaited dispatch and failure diagnostics under %s", async runtime => {
+  const storeRoot = path.join(originalsRoot, `await-${runtime}`);
+  mkdirSync(storeRoot);
+  git.fakeRepo(storeRoot);
+  git.set(storeRoot, ["rev-parse", "--git-path", "info/exclude"], { stdout: ".git/info/exclude\n", stderr: "", status: 0 });
   const child = Bun.spawn([
-    runtime, path.join(import.meta.dir, "fixtures/architecture-native-await.cjs"),
-    path.join(import.meta.dir, "../skills/architecture/workflow.js"),
-  ], { cwd: path.join(import.meta.dir, ".."), stdout: "pipe", stderr: "pipe" });
+    // Node's owned-source loader uses experimental type stripping.
+    runtime, ...(runtime === "node" ? ["--disable-warning=ExperimentalWarning"] : []),
+    path.join(import.meta.dir, "fixtures/architecture-native-await.cjs"),
+    path.join(import.meta.dir, "../skills/architecture/workflow.js"), storeRoot,
+  ], { cwd: path.join(import.meta.dir, ".."), env: guardEnv(process.env), stdout: "pipe", stderr: "pipe" });
   const [exit, stdout, stderr] = await Promise.all([
     child.exited, new Response(child.stdout).text(), new Response(child.stderr).text(),
   ]);
@@ -52,10 +72,25 @@ interface Result { ok: boolean; runId?: string; structuredOutput?: unknown; erro
   raw?: boolean; output?: string; results?: Record<string, unknown>[]; outputReference?: string; state?: "running" }
 interface Original { id: string; producer: string; key: string; revision: number; runId?: string;
   delivery: string; publication: string; sufficient: boolean; accessibility?: string; diagnostic?: string; artifactRoot?: string; relativePath?: string; savedOutputPath?: string; failedOriginal?: Record<string, unknown>;
-  outputSaveError?: string; results?: { savedOutputPath?: string }[] }
+  store?: StoreRecordLocation; digest?: string; outputSaveError?: string; results?: { savedOutputPath?: string }[] }
 const originalsRoot = mkdtempSync(path.join(tmpdir(), "pitako-architecture-originals-"));
-afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
+let git: ReturnType<typeof gitFakeFixture>;
+beforeAll(() => { git = gitFakeFixture(); });
+afterAll(() => { try { git.dispose(); } finally { rmSync(originalsRoot, { recursive: true, force: true }); } });
 let publicationSequence = 0;
+const cwdByMission = new Map<string, string>();
+const cwdByStore = new Map<string, string>();
+function ledgerCwd(missionPath: string) {
+  let cwd = cwdByMission.get(missionPath);
+  if (!cwd) {
+    cwd = missionPath + ".cwd";
+    mkdirSync(cwd);
+    git.fakeRepo(cwd);
+    git.set(cwd, ["rev-parse", "--git-path", "info/exclude"], { stdout: ".git/info/exclude\n", stderr: "", status: 0 });
+    cwdByMission.set(missionPath, cwd);
+  }
+  return cwd;
+}
 // Named-resource resolution inlines the mission binding; the raw path alone refuses to run.
 // Each run owns its mission so receipts never collide across tests.
 function boundSource() {
@@ -71,11 +106,13 @@ function essentials(request: Request): Original[] {
 }
 // The real model-free verifier at the controlled launch boundary.
 function verifierResult(key: string, request: Request): Result & { output: string } {
-  return { ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))),
+  const input = JSON.parse(request.task);
+  return { ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output: JSON.stringify(verifyGate(input, ledgerCwd(input.missionPath))),
     results: [{ exitCode: 0 }] };
 }
 function originalValue(original: Original): Record<string, unknown> {
   if (original.failedOriginal) return original.failedOriginal;
+  if (original.store) return storeOriginal(original.store, original.digest!, original.id);
   const saved = (original.relativePath ? path.join(original.artifactRoot ?? originalsRoot, original.relativePath) : undefined) ?? original.savedOutputPath ?? original.results?.find(child => child.savedOutputPath)?.savedOutputPath;
   if (!saved) throw new Error(`No publication for ${original.id}. ${original.diagnostic ?? "Original not delivered."}`);
   const value = JSON.parse(readFileSync(saved, "utf8"));
@@ -99,7 +136,7 @@ function published(result: Result, request: Request, root = originalsRoot): Resu
   const value = { ...(result.structuredOutput as object) };
   if (request.phase === "architecture-factual") Object.assign(value, { humanContext: `Brief factual frontier from ${request.key}: material facts, reasons, contrary claims, limits and sources.`, ...(result.structuredOutput as object) });
   if (request.phase === "architecture-doubts") Object.assign(value, { humanContext: "Material facts, rationale, contrary evidence and limits for the actual human frontier.", ...(result.structuredOutput as object) });
-  const savedOutputPath = path.join(root, root !== originalsRoot && typeof request.output === "string" ? request.output : `${++publicationSequence}.json`);
+  const savedOutputPath = path.join(root, `${++publicationSequence}`, typeof request.output === "string" ? request.output : "result.json");
   mkdirSync(path.dirname(savedOutputPath), {recursive: true});
   const serialized = JSON.stringify(value, null, 2);
   writeFileSync(savedOutputPath, serialized);
@@ -108,7 +145,28 @@ function published(result: Result, request: Request, root = originalsRoot): Resu
       lines: serialized.split("\n").length, message: "Read this exact original if needed" }, exitCode: result.ok ? 0 : 1 }] };
 }
 // Controlled launch boundary using the real model-free ledger, including its gap rule.
-const fixtureLedger = appendLedger;
+function fixtureLedger(request: any) {
+  const cwd = ledgerCwd(request.missionPath);
+  try {
+    const result = appendLedger(request, cwd);
+    const closed = result.closedRound ?? closedRounds.get(request.expected.head);
+    if (closed && result.head) closedRounds.set(result.head, closed);
+    cwdByStore.set(result.identity.storeId, cwd);
+    return result;
+  } catch (error: any) { return { error: "ledger-integrity", reason: error.message, code: error.code }; }
+}
+function storeOriginal(ref: StoreRecordLocation, digest: string, id?: string): Record<string, unknown> {
+  // Simulated consumers see the verified bytes of that immutable row.
+  // The real access gate independently verifies all requested items.
+  const key = `${ref.storeId}:${digest}`;
+  if (!readModelRecords.has(key)) {
+    const store = new PitakoStore(cwdByStore.get(ref.storeId)!);
+    const row = store.readRecords(ref.scope, { seq: ref.seq, hash: digest }).records.at(-1)!;
+    readModelRecords.set(key, row.body as NonNullable<ReturnType<typeof readModelRecords.get>>);
+  }
+  const {body, originals} = readModelRecords.get(key)!;
+  return (id && originals?.[id]) || body;
+}
 type NativeInput = Parameters<typeof runWorkflowScript>[0];
 function nativeScript(input: Omit<NativeInput, "launch"> & {
   launch: (...args: Parameters<NativeInput["launch"]>) => Promise<Omit<WorkflowScriptChildResult, "results"> & { results?: Record<string, unknown>[] }>;
@@ -187,13 +245,41 @@ function fixture(
   afterWrite: (value: DurableConsultation) => void = () => {},
   clock: Pick<typeof Date, "now"> = Date,
   invocationRoots = false,
+  retainLedgerOriginals = false,
 ) {
   let invocationRoot = originalsRoot;
+  let nativeRun: {runId: string; directory: string; missionPath: string} | undefined;
   const calls: { key: string; request: Request }[] = [];
   const batches: Request[][] = [];
   const steered: { key: string; message: string; options: unknown }[] = [];
   const launches = new Map<string, {fingerprint: string; result: Promise<Result>}>();
   const verifications: { key: string; request: Request }[] = [];
+  let beforeVerify: ((key: string, request: Request) => Result | undefined) | undefined;
+  let beforeLedger: ((key: string, request: Request) => Result | undefined) | undefined;
+  function settleNative(key: string, request: Request, result: Result) {
+    if (!nativeRun || !result.runId) return;
+    const { runId, directory, missionPath } = nativeRun;
+    const mission = JSON.parse(readFileSync(missionPath, "utf8"));
+    const agent = request.agent ?? "pitako.architect";
+    mission.workflowChildren.push({ workflowRunId: runId, key, runId: result.runId, agent, status: result.ok ? "completed" : "failed" });
+    writeFileSync(missionPath, JSON.stringify(mission));
+    const fingerprint = canonicalDigest(request);
+    const entries = [
+      { type: "start", key, fingerprint, runId: result.runId },
+      { type: "settle", key, fingerprint, result: { key, agent, ...result,
+        results: (result.results ?? (request.agent === "pitako.architecture-ledger" ? [{exitCode: 0}] : []))
+          .map(row => ({ agent, task: request.task, ...row })) } },
+    ];
+    appendFileSync(path.join(directory, "workflow-children.jsonl"), entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+  }
+  function steeringTrace(key: string, state: string, error?: string) {
+    if (!nativeRun) return;
+    const file = path.join(nativeRun.directory, "status.json");
+    const status = JSON.parse(readFileSync(file, "utf8"));
+    status.workflow.trace ??= [];
+    status.workflow.trace.push({ operation: "steer", key, state, ...(error ? { error } : {}) });
+    writeFileSync(file, JSON.stringify(status));
+  }
   function launch(key: string, request: Request): Promise<Result> {
     const fingerprint = canonicalJSON(request);
     const prior = launches.get(key);
@@ -201,15 +287,32 @@ function fixture(
       if (prior.fingerprint !== fingerprint) throw new Error(`Duplicate workflow key '${key}' used with incompatible launch params.`);
       return prior.result;
     }
-    const result = Promise.resolve().then(() => {
-      if (request.agent === "pitako.architecture-ledger") return {ok: true,
-        runId: `native-${key}`, agent: request.agent, output: JSON.stringify(fixtureLedger(JSON.parse(request.task)))};
+    const result = Promise.resolve().then<Result>(() => {
+      if (request.agent === "pitako.architecture-ledger") {
+        const injected = beforeLedger?.(key, request);
+        if (injected) return injected;
+        const input = JSON.parse(request.task);
+        const output = fixtureLedger(input);
+        const result = {ok: true, key, runId: `native-${key}`, agent: request.agent, output: JSON.stringify(output)};
+        if (!output.error && retainLedgerOriginals) settleNative(key, request, result);
+        return result;
+      }
       if (request.agent === "pitako.access-verifier") {
         verifications.push({key, request});
-        return verifierResult(key, request);
+        return beforeVerify?.(key, request) ?? verifierResult(key, request);
       }
       calls.push({key, request});
-      return Promise.resolve().then(() => respond(key, request)).then(result => published(result, request, invocationRoot)).catch(error => ({ok: false, error: String(error)}));
+      return Promise.resolve().then(() => respond(key, request)).catch(error => ({ok: false, error: String(error)} as Result)).then(result => {
+        const agent = request.agent ?? "pitako.architect";
+        if (result.runId && nativeViews.has(`${nativeRun!.missionPath}:${key}:${result.runId}`)) {
+          const suffix = `-${++publicationSequence}`;
+          result = {...result, runId: result.runId.slice(0, 94 - suffix.length) + suffix};
+        }
+        const projected = {key, agent, ...published(result, request, invocationRoot)};
+        nativeViews.set(`${nativeRun!.missionPath}:${key}:${projected.runId}`, {result: projected, request});
+        settleNative(key, request, projected);
+        return projected;
+      });
     });
     launches.set(key, {fingerprint, result});
     return result;
@@ -228,7 +331,14 @@ function fixture(
     },
     steer(key: string, message: string, options: unknown) {
       steered.push({ key, message, options });
-      return Promise.resolve().then(() => steer(key));
+      steeringTrace(key, "started");
+      return Promise.resolve().then(() => steer(key)).then(receipt => {
+        steeringTrace(key, receipt.state);
+        return receipt;
+      }, error => {
+        steeringTrace(key, "failed", String(error));
+        throw error;
+      });
     },
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
@@ -237,12 +347,28 @@ function fixture(
   const privateState = new Map<string, unknown>();
   const stateFile = path.join(originalsRoot, `mission-${++publicationSequence}.json`);
   const stateWrites: { bytes: number; persisted: boolean }[] = [];
+  const projections = new Map<string, any>();
 
   const execute = async (args: unknown = { currentDecision: snapshot("Choose a complete persistence design") }, storage: Map<string, unknown> = privateState) => {
     launches.clear();
     if (invocationRoots) { invocationRoot = path.join(originalsRoot, `artifacts-${++publicationSequence}`, "outputs", `run-${publicationSequence}`); mkdirSync(invocationRoot, {recursive: true}); }
     let missionPath = fixtureMissions.get(storage);
     if (!missionPath) { missionPath = path.join(originalsRoot, `fixture-${++publicationSequence}.json`); fixtureMissions.set(storage, missionPath); writeFileSync(missionPath, "{}"); }
+    {
+      const cwd = ledgerCwd(missionPath);
+      const runId = `workflow-${++publicationSequence}`, directory = path.join(originalsRoot, runId);
+      mkdirSync(directory);
+      nativeRun = { runId, directory, missionPath };
+      const mission = JSON.parse(readFileSync(missionPath, "utf8"));
+      mission.id = path.basename(missionPath, ".json");
+      mission.cwd = cwd;
+      mission.runs ??= [];
+      mission.workflowChildren ??= [];
+      mission.runs.push({ mode: "workflow", runId, asyncDir: directory });
+      writeFileSync(missionPath, JSON.stringify(mission));
+      writeFileSync(path.join(directory, "status.json"), JSON.stringify({ runId, cwd, mode: "workflow",
+        workflow: { resource: { name: "pitako.architecture", invocation: "named" } } }));
+    }
     const missionState = path.join(missionPath.slice(0, -5), "state.json");
     mkdirSync(path.dirname(missionState), { recursive: true });
     writeFileSync(missionState, JSON.stringify(Object.fromEntries([...storage].map(([k,v]) => [k,physical(v)])), null, 2));
@@ -252,32 +378,61 @@ function fixture(
     return new AsyncFunction("args", "runs", "state", "Date", fixtureSource)({ consultation: "decision", workDescription: "Choose persistence architecture", ...(args as object) }, runs, storage && {
       get: async (key: string) => physical(structuredClone(storage.get(key))),
       set: async (key: string, value: unknown) => {
+        expect(key).toBe("pitako-architecture");
         const merged = { mission: "owned-test-mission", state: { ...Object.fromEntries([...storage].map(([k,v]) => [k,physical(v)])), [key]: value } };
         const serialized = JSON.stringify(merged, null, 2);
         const write = { bytes: Buffer.byteLength(serialized, "utf8"), persisted: false };
         stateWrites.push(write);
-        expect(physical(logical(value))).toEqual(value);
-        beforeWrite(logical(value) as DurableConsultation);
-        if (write.bytes > 256 * 1024) throw new Error("Native whole mission capacity exceeded (256 KiB)");
+        const cursor = value as any;
+        const projectionKey = `${cursor.ledger.identity.storeId}:${cursor.ledger.head}`;
+        if (!projections.has(projectionKey)) {
+          const observed = fixtureLedger({ missionPath, consultation: cursor.consultation,
+            expected: {count: cursor.ledger.count, head: cursor.ledger.head}, identity: cursor.ledger.identity,
+            decisionDigest: cursor.currentDecision.digest, observe: true });
+          if (observed.error) throw new Error(observed.reason);
+          projections.set(projectionKey, observed);
+        }
+        const observed = {...projections.get(projectionKey)};
+        // Inspect just the saved settlements; reading newly changed artifacts
+        // here would make the test observer, not the consuming gate, veto work.
+        observed.native = observeSlotRefs(cursor).flatMap(({association, runId, terminal}: any) => {
+          const { key, consultation, revision, attempt } = association;
+          if (terminal === null) return [];
+          const model = nativeViews.get(`${missionPath}:${key}:${runId ?? undefined}`);
+          if (!model) return [];
+          const agent = model.request.agent ?? "pitako.architect";
+          if (association.producer === null) association.producer = agent.slice("pitako.".length);
+          const id = `${consultation}.v${revision}.${key}.a${attempt}`;
+          const {entry, barrier} = projectNativeOriginal({id, association, agent, access: true,
+            schema: architectureOutputSchema(association.phase)}, model.result);
+          const dispatch = {...association, originalId: id, boundary: "intended"};
+          confirmNativeOriginal(entry, dispatch, model.result);
+          return [{entry, dispatch, ...(barrier ? {barrier} : {})}];
+        });
+        const projection = expandConsultation(cursor, observed);
+        beforeWrite(projection);
         writeFileSync(stateFile, serialized);
         writeFileSync(missionState, serialized);
-        storage.set(key, logical(structuredClone(value)));
+        storage.set(key, structuredClone(projection));
         write.persisted = true;
-        afterWrite(logical(value) as DurableConsultation);
+        afterWrite(projection);
       },
     }, clock);
   };
-  return { execute, calls, verifications, batches, steered, storage: privateState, stateWrites, stateFile };
+  return { execute, calls, verifications, batches, steered, storage: privateState, stateWrites, stateFile,
+    set beforeVerify(value: typeof beforeVerify) { beforeVerify = value; },
+    set beforeLedger(value: typeof beforeLedger) { beforeLedger = value; } };
 }
 
 interface LedgerRecord { kind: string; round: number; body: any }
 function ledgerRecords(storage: Map<string, unknown>, consultation = "decision"): LedgerRecord[] {
-  const retained = storage.get(`architecture-${consultation}`) as { ledger: { count: number; head: string } };
-  return verifyLedger(fixtureMissions.get(storage)!, consultation, retained.ledger);
+  const retained = storage.get("pitako-architecture") as { ledger: { count: number; head: string } };
+  const missionPath = fixtureMissions.get(storage)!;
+  return verifyLedger(missionPath, consultation, { count: retained.ledger.count, head: retained.ledger.head }, ledgerCwd(missionPath));
 }
 function history(storage: Map<string, unknown>, consultation = "decision"): { originals: Original[]; cursor: DurableConsultation["cursor"] } {
-  const retained = storage.get(`architecture-${consultation}`) as Record<string, any>;
-  const archived = ledgerRecords(storage, consultation).filter(record => record.kind === "round").map(record => logical(record.body));
+  const retained = storage.get("pitako-architecture") as Record<string, any>;
+  const archived = ledgerRecords(storage, consultation).filter(record => record.kind === "round").map(record => record.body);
   return { ...retained,
     originals: [...new Map([...retained.originals, ...archived.flatMap(body => body.originals)].sort((a, b) => Number(Boolean(a.key)) - Number(Boolean(b.key))).map(item => [item.id, {
       ...item, savedOutputPath: item.relativePath ? path.join(item.artifactRoot, item.relativePath) : item.savedOutputPath,
@@ -330,11 +485,11 @@ describe("architecture dynamic perspective roles", () => {
       : { ...child(key), agent: "pitako.architect" });
     expect(await first.execute({ planning: true, currentDecision: snapshot("Whole problem") }))
       .toMatchObject({ status: "failed", rounds: 1, validRounds: 1 });
-    const retained = first.storage.get("architecture-decision") as { originals: Original[] };
+    const retained = first.storage.get("pitako-architecture") as { originals: Original[] };
     const original = retained.originals.find(item => item.key === "r1-" + id)!;
     // Diagnose insufficiency after the confirmed comparison, while the factual frontier is pending.
     original.sufficient = false;
-    first.storage.set("architecture-decision", retained);
+    first.storage.set("pitako-architecture", retained);
     const second = fixture();
     await expect(second.execute({ planning: true, continuation, factualRetry: {
       consultation: "decision", revision: 1, originalIds: [original.id],
@@ -350,7 +505,7 @@ describe("architecture dynamic perspective roles", () => {
       : { ...child(key), agent: "pitako.architect" });
     expect(await first.execute({ planning: true, currentDecision: snapshot("Whole problem") }))
       .toMatchObject({ status: "failed", rounds: 1, validRounds: 0 });
-    const original = (first.storage.get("architecture-decision") as { originals: Original[] }).originals
+    const original = (first.storage.get("pitako-architecture") as { originals: Original[] }).originals
       .find(item => item.key === "r1-" + id)!;
     expect(original).toMatchObject({ delivery: "not-delivered", publication: "unpublished" });
     const second = fixture();
@@ -433,7 +588,7 @@ describe("architecture scripted workflow", () => {
     expect(JSON.stringify(result)).not.toContain("Private report");
     expect(JSON.parse(readFileSync(result.memo!.path, "utf8")).memo).toBe(finish.memo);
     expect(result.excerpt).toBe(finish.memo);
-    expect(host.storage.get("architecture-decision")).toMatchObject({ directorRunId: "native-director-after-r1" });
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ directorRunId: "native-director-after-r1" });
   });
 
   test("enforces a ten-round maximum and preserves the director's latest native reference", async () => {
@@ -443,7 +598,7 @@ describe("architecture scripted workflow", () => {
     expect(result.rounds).toBe(10);
     expect(result.validRounds).toBe(10);
     expect(host.calls.filter(call => /^r\d+-/.test(call.key))).toHaveLength(20);
-    expect(host.storage.get("architecture-decision")).toMatchObject({ directorRunId: "native-director-after-r10" });
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ directorRunId: "native-director-after-r10" });
     expect(host.calls.find(call => call.key === "director-after-r10")?.request.resume)
       .toBe("native-director-after-r9");
     expect(host.calls.some(call => call.key.startsWith("r11-"))).toBe(false);
@@ -543,7 +698,7 @@ describe("architecture scripted workflow", () => {
     expect(result.error).toContain("simple");
     expect(result.validRounds).toBe(0);
     expect(host.calls).toHaveLength(3);
-    expect(host.storage.get("architecture-decision")).toMatchObject({ members: [{ id: "recover", runId: "native-r1-recover" }] });
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ members: [{ id: "recover", runId: "native-r1-recover" }] });
   });
 
   test("settles rolling siblings after a rejected child, without launching a replacement", async () => {
@@ -590,7 +745,7 @@ describe("architecture scripted workflow", () => {
     expect(member.task).toContain("Choose a complete persistence design");
     expect(evidenceText(member)).toContain("New recovery evidence");
     expect(member.resume).toBe("native-r1-simple");
-    expect(storage.get("architecture-decision")).toMatchObject({ members: [
+    expect(storage.get("pitako-architecture")).toMatchObject({ members: [
       { id: "simple", runId: "native-r2-simple" }, { id: "recover", runId: "native-r2-recover" },
     ] });
   });
@@ -620,7 +775,7 @@ describe("architecture scripted workflow", () => {
     expect(recovered.status).toBe("completed");
     expect(recovered.rounds).toBe(2);
     expect(recovered.validRounds).toBe(1);
-    expect(storage.get("architecture-decision")).toMatchObject({ validRounds: 1 });
+    expect(storage.get("pitako-architecture")).toMatchObject({ validRounds: 1 });
   });
 
   test("retains a prior valid comparison when a later round fails", async () => {
@@ -649,16 +804,84 @@ describe("architecture scripted workflow", () => {
     expect(host.calls).toHaveLength(1);
   });
 
-  test("preserves ordinary explicit-new-decision director reuse without retaining old members or count", async () => {
+  test.each(["retained", "native originals", "neither"])("explicit new decision checks the prior consultation using %s", async source => {
     const storage = new Map<string, unknown>();
-    const first = await fixture().execute({ currentDecision: snapshot("Old decision"), maxRounds: 1 }, storage);
-    const host = fixture();
-    const result = await host.execute({ consultation: "new-decision", currentDecision: snapshot("New complete decision"), continuation: first.continuation, newDecision: true }, storage);
+    const first = await fixture(undefined, undefined, undefined, undefined, Date, false, source === "native originals")
+      .execute({ currentDecision: snapshot("Old decision"), maxRounds: 1, evidence: "Prior caller evidence" }, storage);
+    expect(first.status).toBe("completed");
+    const prior = storage.get("pitako-architecture") as any;
+    const cwd = ledgerCwd(fixtureMissions.get(storage)!);
+    const file = new PitakoStore(cwd).file;
+    const loseStore = () => {
+      for (const suffix of ["-wal", "-shm", ""]) rmSync(file + suffix, { force: true });
+    };
+    if (source !== "retained") loseStore();
+    let cut = source === "native originals";
+    const host = fixture(undefined, undefined, () => {
+      if (cut) { cut = false; throw new Error("Lost admission cursor save"); }
+    }, undefined, Date, false, source === "native originals");
+    const transition = { consultation: "new-decision", currentDecision: snapshot("New complete decision"),
+      continuation: first.continuation, newDecision: true,
+      ...(source === "native originals" ? { evidence: "New decision evidence" } : {}) };
+    let result = await host.execute(transition, storage);
+    if (source === "neither") {
+      expect(result).toMatchObject({ status: "failed", error: "Architecture ledger integrity failure: native originals do not prove the retained ledger.",
+        rounds: 1, validRounds: 1, continuation: first.continuation });
+      expect(host.calls).toHaveLength(0);
+      expect(host.stateWrites).toHaveLength(0);
+      expect(storage.get("pitako-architecture")).toEqual(prior);
+      return;
+    }
+    if (source === "native originals") {
+      expect(result.error).toContain("Lost admission cursor save");
+      expect(host.calls).toHaveLength(0);
+      expect(storage.get("pitako-architecture")).toEqual(prior);
+      result = await host.execute(transition, storage);
+      const restored = new PitakoStore(cwd).readRecords("arch:decision");
+      expect(restored.identity.storeId).not.toBe(prior.ledger.identity.storeId);
+      expect(restored.head?.seq).toBe(prior.ledger.count);
+      expect(restored.records.map(row => row.kind)).toEqual(["admission", "context", "round"]);
+      expect(restored.records[1]?.body).toMatchObject({ body: { callerEvidence: "Prior caller evidence" } });
+    }
     expect(result.status).toBe("completed"); expect(result.rounds).toBe(1); expect(result.validRounds).toBe(1);
-    expect(storage.get("architecture-new-decision")).toMatchObject({ maxRounds: 10 });
+    expect([...storage.keys()]).toEqual(["pitako-architecture"]);
+    expect(storage.get("pitako-architecture")).toMatchObject({ maxRounds: 10 });
     expect(host.calls[0]?.request.resume).toBe("native-director-after-r1");
     expect(host.batches.find(batch => batch.length === 2)?.every(request => request.context === "fresh")).toBe(true);
-    expect(storage.get("architecture-new-decision")).toMatchObject({ currentDecision: { snapshot: JSON.stringify(snapshot("New complete decision")) } });
+    expect(ledgerRecords(storage, "new-decision")[0]?.body.currentDecision.snapshot).toEqual(snapshot("New complete decision"));
+    if (source === "native originals") {
+      // A second context record makes the memo row digest change on rebind.
+      const resume = { consultation: "new-decision", continuation: result.continuation };
+      result = await host.execute({ ...resume, evidence: "Additional decision evidence" }, storage);
+      expect(result).toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
+      const gate = host.verifications.at(-1)!;
+      const {missionPath, namespace, gate: gateId, items} = JSON.parse(gate.request.task);
+      const {receiptPath} = receiptLocation(missionPath, namespace, gateId);
+      const originalBytes = readFileSync(receiptPath);
+      const calls = host.calls.length;
+      expect(await host.execute(resume, storage)).toEqual(result);
+      expect(host.calls).toHaveLength(calls);
+      loseStore();
+      expect(await host.execute(resume, storage)).toEqual(result);
+      const replay = host.verifications.at(-1)!;
+      expect(replay.key).toBe(gate.key);
+      const oldItem = items.find((item: Original) => item.store);
+      const restoredItem = JSON.parse(replay.request.task).items.find((item: Original) => item.id === oldItem.id);
+      expect(restoredItem.store.storeId).not.toBe(oldItem.store.storeId);
+      expect(restoredItem.digest).not.toBe(oldItem.digest);
+      expect(checkReceipt({ receiptPath }, cwd)).toMatchObject({ status: "unavailable", code: "store-corrupt" });
+      expect(host.calls).toHaveLength(calls);
+      expect(readFileSync(receiptPath)).toEqual(originalBytes);
+
+      const changed = JSON.parse(originalBytes.toString("utf8"));
+      changed.items.find((item: Original) => item.store).key = "unrelated-original";
+      const changedBytes = canonicalJSON(changed) + "\n";
+      writeFileSync(receiptPath, changedBytes);
+      expect(await host.execute(resume, storage)).toMatchObject({ status: "failed", rounds: 2, validRounds: 2,
+        error: `Architecture ledger integrity failure: memo receipt correspondence failed at ${gateId}.` });
+      expect(host.calls).toHaveLength(calls);
+      expect(readFileSync(receiptPath, "utf8")).toBe(changedBytes);
+    }
   });
 
   test("reports an explicit director blocker without a fanout", async () => {
@@ -676,8 +899,8 @@ describe("architecture scripted workflow", () => {
     const result = await host.execute();
     expect(result.status).toBe("failed");
     expect(host.calls).toHaveLength(1);
-    expect(host.storage.get("architecture-decision")).toMatchObject({ directorRunId: null });
-    expect(host.storage.get("architecture-decision")).toMatchObject({ cursor: { dispatches: [
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ directorRunId: null });
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ cursor: { dispatches: [
       { key: "director-prepare", boundary: "incomplete", runId: "native-director-prepare" },
     ] } });
   });
@@ -690,7 +913,7 @@ describe("architecture scripted workflow", () => {
     expect(result.status).toBe("failed");
     expect(result.error).toContain("session unavailable");
     expect(host.calls).toHaveLength(1);
-    expect(storage.get("architecture-decision")).toMatchObject({ directorRunId: "native-director-after-r1" });
+    expect(storage.get("pitako-architecture")).toMatchObject({ directorRunId: "native-director-after-r1" });
   });
 
   test.each([
@@ -720,10 +943,11 @@ describe("architecture current complete decision", () => {
   test.each([false, true])("persists one complete replacement before all fresh/resumed producers and keeps history out of active prompts (planning=%s)", async planning => {
     const storage = new Map<string, unknown>();
     const first = await admitted(storage, planning);
-    const priorEvidence = structuredClone((storage.get("architecture-current") as { evidence: unknown[] }).evidence);
+    const priorEvidence = structuredClone((storage.get("pitako-architecture") as { evidence: unknown[] }).evidence);
     const host = fixture((key, request) => {
-      const retained = storage.get("architecture-current") as { currentDecision: unknown; decisionHistory: { snapshot: unknown }[]; evidence: unknown[] };
-      expect(retained.currentDecision).toEqual({ revision: 2, snapshot: JSON.stringify(updated()) });
+      const retained = storage.get("pitako-architecture") as { currentDecision: unknown; decisionHistory: { snapshot: unknown }[]; evidence: unknown[] };
+      expect(retained.currentDecision).toEqual({ revision: 2, digest: canonicalDigest({ revision: 2, snapshot: updated() }) });
+      expect(ledgerRecords(storage, "current").find(record => record.kind === "decision")?.body.currentDecision.snapshot).toEqual(updated());
       expect(ledgerRecords(storage, "current").find(record => record.kind === "decision")?.body.snapshot).toEqual(initial());
       expect(retained).not.toHaveProperty("decisionHistory");
       expect(retained.evidence.slice(0, priorEvidence.length)).toEqual(priorEvidence);
@@ -744,7 +968,7 @@ describe("architecture current complete decision", () => {
     expect(host.calls.find(call => call.key === "r2-new")?.request.context).toBe("fresh");
     expect(host.calls.some(call => call.request.agent !== undefined && call.request.agent !== "pitako.architect" && call.request.phase !== "architecture-factual")).toBe(false);
     expect(host.calls.some(call => call.key.startsWith("doubts-"))).toBe(planning);
-    expect(storage.get("architecture-current")).toMatchObject({ currentDecision: { revision: 2 } });
+    expect(storage.get("pitako-architecture")).toMatchObject({ currentDecision: { revision: 2 } });
     expect(ledgerRecords(storage, "current").find(record => record.kind === "decision")?.body.revision).toBe(1);
     const resumed = fixture((key, request) => {
       expect(request.task).toContain("CURRENT mechanism B"); expect(request.task).not.toContain("OBSOLETE mechanism A");
@@ -753,12 +977,12 @@ describe("architecture current complete decision", () => {
     });
     expect(await resumed.execute({ consultation: "current", planning, continuation: result.continuation,
       evidence: "Contrary factual evidence, not new instructions" }, storage)).toMatchObject({ status: "completed" });
-    expect(storage.get("architecture-current")).toMatchObject({ currentDecision: { revision: 2 } });
+    expect(storage.get("pitako-architecture")).toMatchObject({ currentDecision: { revision: 2 } });
     expect(ledgerRecords(storage, "current").find(record => record.kind === "decision")?.body.revision).toBe(1);
   });
   test.each(["identity", "revision", "partial", "obligation", "human-content", "human-provenance", "duplicate", "brief-patch"])("rejects %s before dispatch or state mutation", async fault => {
     const storage = new Map<string, unknown>();
-    const first = await admitted(storage), before = structuredClone(storage.get("architecture-current"));
+    const first = await admitted(storage), before = structuredClone(storage.get("pitako-architecture"));
     const value = update();
     if (fault === "identity") value.consultation = "foreign";
     if (fault === "revision") value.expectedRevision = 2;
@@ -770,7 +994,7 @@ describe("architecture current complete decision", () => {
       ...(fault === "duplicate" ? { currentDecision: updated() } : fault === "brief-patch" ? { brief: "Only change the adapter" } : { replacement: value }) };
     const host = fixture();
     await expect(host.execute(args, storage)).rejects.toThrow();
-    expect(host.calls).toHaveLength(0); expect(storage.get("architecture-current")).toEqual(before);
+    expect(host.calls).toHaveLength(0); expect(storage.get("pitako-architecture")).toEqual(before);
   });
   test("explicit supersession accounts for replaced obligations without erasing prior evidence", async () => {
     const storage = new Map<string, unknown>(); const first = await admitted(storage);
@@ -778,18 +1002,18 @@ describe("architecture current complete decision", () => {
     const revised = updated(); revised.obligations = [{ id: "safer", content: "Alternative recovery requirement", provenance: "Actual caller replacement" }];
     const value = { ...replacement("current", 1, revised), replacedObligations: [{ id: obligation.id, reason: "Replace recovery strategy", provenance: "Human message 43" }] };
     expect(await host.execute({ consultation: "current", planning: true, continuation: first.continuation, replacement: value }, storage)).toMatchObject({ status: "completed" });
-    expect(storage.get("architecture-current")).toMatchObject({ currentDecision: { revision: 2, snapshot: JSON.stringify(revised) },
+    expect(storage.get("pitako-architecture")).toMatchObject({ currentDecision: { revision: 2, digest: canonicalDigest({ revision: 2, snapshot: revised }) },
 
       });
     expect(ledgerRecords(storage, "current").some(record => record.kind === "round" && record.round === 1)).toBe(true);
   });
   test("failed replacement persistence dispatches nothing and does not retry the failed save", async () => {
     const storage = new Map<string, unknown>(); const first = await admitted(storage);
-    const before = structuredClone(storage.get("architecture-current")); let writes = 0;
+    const before = structuredClone(storage.get("pitako-architecture")); let writes = 0;
     const host = fixture(undefined, undefined, () => { writes++; throw new Error("Essential replacement save failed"); });
     expect(await host.execute({ consultation: "current", planning: true, continuation: first.continuation, replacement: update() }, storage))
       .toMatchObject({ status: "failed", error: expect.stringContaining("Essential replacement save failed") });
-    expect(writes).toBe(1); expect(host.calls).toHaveLength(0); expect(storage.get("architecture-current")).toEqual(before);
+    expect(writes).toBe(1); expect(host.calls).toHaveLength(0); expect(storage.get("pitako-architecture")).toEqual(before);
   });
   test.each([false, true])("rejects duplicate initial admission and missing native continuation (planning=%s)", async planning => {
     const storage = new Map<string, unknown>(); const first = await admitted(storage, planning);
@@ -807,7 +1031,9 @@ describe("architecture current complete decision", () => {
   test.each([false, true])("initial admission is durable before the first director; incompatible state and foreign continuation reject (planning=%s)", async planning => {
     const storage = new Map<string, unknown>();
     const host = fixture(key => {
-      expect(storage.get("architecture-current")).toMatchObject({ version: 4, currentDecision: { revision: 1, snapshot: JSON.stringify(initial()) } });
+      expect(storage.get("pitako-architecture")).toMatchObject({ version: 4,
+        currentDecision: { revision: 1, digest: canonicalDigest({ revision: 1, snapshot: initial() }) } });
+      expect(ledgerRecords(storage, "current")[0]?.body.currentDecision.snapshot).toEqual(initial());
       return { ...child(key), structuredOutput: { ...finish, action: "blocked" } };
     });
     expect(await host.execute({ consultation: "current", planning, currentDecision: initial() }, storage)).toMatchObject({ status: "blocked" });
@@ -841,7 +1067,7 @@ describe("planning architecture evidence and doubts", () => {
     expect(failed).toMatchObject({ status: "failed", rounds: round, validRounds: round - 1, error: expect.stringContaining("No adequate report from simple. No replacement or retry was launched.") });
     expect(host.steered.filter(item => item.message.includes(`round ${round},`))).toHaveLength(0);
     expect(host.calls.some(item => item.key === `director-doubts-r${round}`)).toBe(false);
-    const retained = storage.get("architecture-mixed") as { originals: Original[] };
+    const retained = storage.get("pitako-architecture") as { originals: Original[] };
     const failedOriginal = retained.originals.find(item => item.key === `r${round}-simple`)!;
     expect(failedOriginal).toMatchObject({ sufficient: false, runId: `native-r${round}-simple`, publication: "published" });
     expect(originalValue(failedOriginal)).toMatchObject({ status: "blocked", report: blocker });
@@ -860,7 +1086,7 @@ describe("planning architecture evidence and doubts", () => {
     expect(await resumed.execute({ evidence: "Reconcile mixed failed round", planning: true, consultation: "mixed", continuation: failed.continuation }, storage))
       .toMatchObject({ status: "blocked", rounds: round, validRounds: round - 1 });
     expect(resumed.calls).toHaveLength(1);
-    expect(storage.get("architecture-mixed")).toMatchObject({ members: perspectives.map(({id, label}) => ({ id, label, runId: `native-r${round}-${id}` })) });
+    expect(storage.get("pitako-architecture")).toMatchObject({ members: perspectives.map(({id, label}) => ({ id, label, runId: `native-r${round}-${id}` })) });
   });
   test.each([2, 10])("persists settled objections but blocks ambiguous doubts reentry at round %i", async (limit) => {
     const storage = new Map<string, unknown>();
@@ -868,7 +1094,7 @@ describe("planning architecture evidence and doubts", () => {
     const host = fixture((key, request) => {
       if (key === `director-doubts-r${limit}`) {
         // Fail before delivery to the retained director, not after it saw the reports.
-        const retained = storage.get("architecture-failure") as { originals: Original[]; rounds: number; validRounds: number };
+        const retained = storage.get("pitako-architecture") as { originals: Original[]; rounds: number; validRounds: number };
         expect(retained).toMatchObject({ rounds: limit, validRounds: limit });
         expect(originalValue(retained.originals.find(item => item.key === `r${limit}-recover`)!)).toMatchObject({ report: objection });
         throw new Error("Controlled dispatch failure before delivery");
@@ -883,7 +1109,7 @@ describe("planning architecture evidence and doubts", () => {
     await expect(resumed.execute({ evidence: "Reconcile the failed doubts delivery", planning: true, consultation: "failure", continuation: failed.continuation }, storage))
       .rejects.toThrow("Unconfirmed architecture dispatch boundary");
     expect(resumed.calls).toHaveLength(0);
-    expect(storage.get("architecture-failure")).toMatchObject({ members: expect.arrayContaining([
+    expect(storage.get("pitako-architecture")).toMatchObject({ members: expect.arrayContaining([
       expect.objectContaining({ id: "recover", runId: `native-r${limit}-recover` }),
     ]) });
   });
@@ -907,7 +1133,7 @@ describe("planning architecture evidence and doubts", () => {
     expect(keys.indexOf("director-after-r1")).toBeGreaterThan(keys.indexOf("doubts-r1-2"));
     expect(host.calls.filter(call => call.key.startsWith("doubts-")).map(call => call.request.agent))
       .toEqual(["pitako.scout", "pitako.researcher", "pitako.evidence-auditor"]);
-    expect(storage.get("architecture-same")).toMatchObject({ rounds: 2, maxRounds: 10 });
+    expect(storage.get("pitako-architecture")).toMatchObject({ rounds: 2, maxRounds: 10 });
   });
 
   test("human doubts return to foreground without asking a child to approve, then continue the same retained counter", async () => {
@@ -921,7 +1147,7 @@ describe("planning architecture evidence and doubts", () => {
     expect(first.calls.some(call => call.key.startsWith("doubts-"))).toBe(false);
     const resumed = fixture(key => key.startsWith("director-doubts-") ? { ok: true, runId: key, structuredOutput: { doubts: [] } } : child(key));
     const done = await resumed.execute({ replacement: replacement("same", 1, snapshot("Decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "same", continuation: blocked.continuation }, storage);
-    expect(done.rounds).toBe(2); expect(storage.get("architecture-same")).toMatchObject({ maxRounds: 2 });
+    expect(done.rounds).toBe(2); expect(storage.get("pitako-architecture")).toMatchObject({ maxRounds: 2 });
     const missing = fixture();
     await expect(missing.execute({ evidence: "Trivial reentry without a continuation", planning: true, consultation: "same" }, storage)).rejects.toThrow("missing explicit");
     expect(missing.calls).toHaveLength(0);
@@ -963,16 +1189,19 @@ describe("architecture foreground human frontier", () => {
   });
 
   test("reconciles human answers at ten consumed rounds without an eleventh comparison or counter reset", async () => {
-    const previous = { ledger: { count: 0, head: null }, originals: [], version: 4, consultation: "cap", currentDecision: { revision: 1, snapshot: JSON.stringify(snapshot("Original decision")) }, decisionHistory: [], rounds: 10, validRounds: 10, maxRounds: 10, directorRunId: "native-doubts-r10", members: [], cursor: { version: 3, phase: "concluded", dispatches: [], control: { version: 1, planning: true, start: 0, stage: "prepare", next: null, round: null } }, evidence: [{ round: 10, question: "Prefer scope A?" }] };
-    const storage = new Map<string, unknown>([["architecture-cap", previous]]);
+    const initial = fixture(key => key.startsWith("director-doubts-")
+      ? { ...child(key), structuredOutput: { doubts: [] } } : child(key, key === "director-after-r10" ? finish : discuss));
+    const storage = initial.storage;
+    const previous = await initial.execute({ planning: true, consultation: "cap", currentDecision: snapshot("Original decision") });
+    expect(previous).toMatchObject({ status: "completed", rounds: 10, validRounds: 10 });
     const host = fixture((key, request) => {
       expect(key).toBe("director-prepare"); expect(request.task).toContain("Actual human answered A");
       expect(request.task).toContain("finish or blocked only");
       return { ok: true, runId: "native-synthesis", structuredOutput: finish };
     });
-    const result = await host.execute({ replacement: replacement("cap", 1, snapshot("Original decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "cap", continuation: { version: 4, consultation: "cap" } }, storage);
+    const result = await host.execute({ replacement: replacement("cap", 1, snapshot("Original decision; Actual human answered A", { humanDecisions: [{ id: "scope", content: "A", provenance: "Actual foreground human answer" }] })), planning: true, consultation: "cap", continuation: previous.continuation }, storage);
     expect(result.status).toBe("completed"); expect(result.rounds).toBe(10); expect(result.validRounds).toBe(10);
-    expect(host.calls).toHaveLength(1); expect(storage.get("architecture-cap")).toMatchObject({ rounds: 10, directorRunId: "native-synthesis" });
+    expect(host.calls).toHaveLength(1); expect(storage.get("pitako-architecture")).toMatchObject({ rounds: 10, directorRunId: "native-synthesis" });
     const lower = fixture();
     await expect(lower.execute({ evidence: "Same answer", planning: true, consultation: "cap", maxRounds: 9, continuation: result.continuation }, storage)).rejects.toThrow("original maximum");
     expect(lower.calls).toHaveLength(0);
@@ -991,7 +1220,7 @@ describe("architecture foreground human frontier", () => {
     const first = await host.execute({ currentDecision: snapshot("Complete assignment"), planning: true, consultation: "large", maxRounds: 1 }, storage);
     expect(first.status).toBe("completed");
     expect(normalizeWorkflowArgs({ evidence: "x".repeat(17000) })).toMatchObject({ error: expect.stringContaining("16384") });
-    expect(JSON.stringify(storage.get("architecture-large"))).not.toContain("x".repeat(4090));
+    expect(JSON.stringify(storage.get("pitako-architecture"))).not.toContain("x".repeat(4090));
     const reentry = { evidence: "Actual human answers", planning: true, consultation: "large", continuation: first.continuation };
     expect(normalizeWorkflowArgs(reentry)).toEqual({ args: reentry });
     const resumed = fixture((key, request) => {
@@ -1063,7 +1292,7 @@ describe("architecture foreground human frontier", () => {
     });
     expect(await first.execute({ planning: true, currentDecision: snapshot("Decision"), maxRounds: 5 }))
       .toMatchObject({ status: "failed", rounds: 1, validRounds: 1 });
-    expect(first.storage.get("architecture-decision")).toMatchObject({ rounds: 1, validRounds: 1,
+    expect(first.storage.get("pitako-architecture")).toMatchObject({ rounds: 1, validRounds: 1,
       cursor: { control: { stage: "doubts", round: 1 } } });
     const resumed = fixture();
     const result = await resumed.execute({ planning: true, continuation: { version: 4, consultation: "decision" } }, first.storage);
@@ -1071,7 +1300,7 @@ describe("architecture foreground human frontier", () => {
       { id: "limits", dependsOn: ["identity"], prerequisiteFacts: [{ id: "identity", key: "doubts-r1-0" }] },
     ] } });
     expect(resumed.calls.map(call => call.key)).toEqual(["doubts-r1-0", "doubts-r1-1"]);
-    const retained = first.storage.get("architecture-decision") as DurableConsultation;
+    const retained = first.storage.get("pitako-architecture") as DurableConsultation;
     expect(retained.cursor.dispatches.filter(item => item.key === "director-doubts-r1").map(item => item.originalId))
       .toEqual(["decision.v1.director-doubts-r1.a1"]);
   });
@@ -1094,7 +1323,7 @@ describe("architecture recoverable originals", () => {
         expect(originals.every(item => /^[a-f0-9]{64}$/.test(item.digest) && item.id.startsWith("decision.v1."))).toBe(true);
         expect(new Set(originals.map(item => item.id)).size).toBe(2);
         expect(originals.map(item => originalValue(item as never).report)).toContain(contrary);
-        expect(request.task).toContain("Read each path in full with your read tools");
+        expect(request.task).toContain("Read each path or store record in full");
       }
       return child(key);
     });
@@ -1131,7 +1360,7 @@ describe("architecture recoverable originals", () => {
         expect(entry).toMatchObject({ publication: "unpublished", sufficient: false, delivery: "complete" });
         expect(entry).toMatchObject({ failedDelivery: true });
         expect(entry.failedOriginal).toBeUndefined();
-        expect(JSON.stringify(host.storage.get("architecture-decision")).split("Private report from r1-simple")).toHaveLength(1);
+        expect(JSON.stringify(host.storage.get("pitako-architecture")).split("Private report from r1-simple")).toHaveLength(1);
       }
     });
   }
@@ -1140,9 +1369,12 @@ describe("architecture recoverable originals", () => {
     let exact: Result | undefined;
     const host = fixture((key, request) => {
       const result = published(child(key), request);
-      result.outputPathMapping = { requestedPath: String(request.output), savedPath: result.outputReference! };
+      const mapped = path.join(originalsRoot, `${++publicationSequence}`, path.basename(String(request.output)));
+      mkdirSync(path.dirname(mapped));
+      writeFileSync(mapped, readFileSync(result.outputReference!));
+      result.outputPathMapping = { requestedPath: String(request.output), savedPath: mapped };
       result.results![0] = { ...result.results![0], runId: result.runId, agent: "pitako.architect", workflowKey: key,
-        outputPathMapping: result.outputPathMapping };
+        savedOutputPath: mapped, outputPathMapping: result.outputPathMapping };
       if (key === "r1-simple") exact = structuredClone(result);
       return { ...result, raw: true };
     });
@@ -1283,7 +1515,7 @@ describe("architecture recoverable originals", () => {
     expect(exact).toMatchObject({ status: "blocked" });
     expect(exact).not.toHaveProperty("delivery");
     // The failed essential save must not claim that its inline evidence was persisted.
-    const last = host.storage.get("architecture-decision") as { originals: Original[] };
+    const last = host.storage.get("pitako-architecture") as { originals: Original[] };
     expect(last.originals).toHaveLength(1);
     expect(host.calls).toHaveLength(3);
   });
@@ -1298,7 +1530,7 @@ describe("architecture recoverable originals", () => {
       expect(request.task).not.toContain("ORIGINAL CONTRACT");
       expect(request.task).not.toContain("access receipt");
       expect(request.task).not.toContain("Return access");
-      if (essentials(request).length) expect(request.task).toContain("Read each path in full with your read tools");
+      if (essentials(request).length) expect(request.task).toContain("Read each path or store record in full");
       return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: [
         { id: "local", kind: "scout", dependsOn: [], question: "Local fact?", decision: "Reuse" },
       ] } } : child(key);
@@ -1329,12 +1561,17 @@ describe("architecture recoverable originals", () => {
     const storage = new Map<string, unknown>();
     const first = await fixture().execute(undefined, storage);
     const before = structuredClone(history(storage).originals);
+    rmSync(before.find(original => original.key === "r1-simple")!.savedOutputPath!);
     const host = fixture((key, request) => {
       if (key === "director-prepare") {
         expect(request.resume).toBe("native-director-after-r1");
         const old = essentials(request);
         expect(old.map(item => item.id)).toEqual(["decision.v1.r1-simple.a1", "decision.v1.r1-recover.a1", "context-callerEvidence"]);
-        for (const item of old.filter(item => !item.id.startsWith("context-"))) expect(originalValue(item).report).toBe(`Private report from ${item.id.split(".")[2]}`);
+        for (const item of old.filter(item => !item.id.startsWith("context-"))) {
+          expect(item.store).toMatchObject({scope: "arch:decision", seq: 2});
+          expect(item).not.toHaveProperty("path");
+          expect(originalValue(item).report).toBe(`Private report from ${item.id.split(".")[2]}`);
+        }
         return { ...child(key), structuredOutput: { ...discuss, perspectives: [perspectives[0], { id: "new", label: "New whole-problem view", focus: "Reevaluate the full decision" }] } };
       }
       if (key === "r2-simple" || key === "r2-new") {
@@ -1349,7 +1586,7 @@ describe("architecture recoverable originals", () => {
     expect(await host.execute({ evidence: "New factual evidence, not a replacement", continuation: first.continuation }, storage))
       .toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
     // Consumers got verified references; retained originals keep their producer run IDs.
-    const retainedOriginals = (storage.get("architecture-decision") as {originals: Original[]}).originals;
+    const retainedOriginals = (storage.get("pitako-architecture") as {originals: Original[]}).originals;
     for (const item of before as Original[]) expect(item.runId).toBe(`native-${item.key}`);
     expect(retainedOriginals.every(item => !item.id.includes(".r1-"))).toBe(true);
     const after = history(storage).originals as Original[];
@@ -1397,16 +1634,6 @@ describe("architecture recoverable originals", () => {
     });
   }
 
-  test("admission includes unrelated whole-mission bytes and blocks before any model child", async () => {
-    const storage = new Map<string, unknown>([["unrelated-state", "u".repeat(200000)]]);
-    const before = structuredClone(storage);
-    const host = fixture();
-    expect(await host.execute(undefined, storage)).toMatchObject({ status: "blocked", rounds: 0, validRounds: 0,
-      error: expect.stringContaining("108306 bytes > 262144 bytes. Use a new mission") });
-    expect(host.calls).toHaveLength(0);
-    expect(host.stateWrites).toHaveLength(0);
-    expect(storage).toEqual(before);
-  });
 });
 
 
@@ -1423,18 +1650,23 @@ test("architecture accepts a published peer challenge without model access recei
 
 
 test.each(["context", "inline"])("architecture does not treat %s as publication on reentry", async source => {
-  const first = fixture();
+  const first = fixture(undefined, undefined, undefined, value => {
+    if (value.cursor.dispatches.some(item => item.key === "r1-simple" && item.boundary === "confirmed"))
+      throw new Error("Cut after the report settled, before round archive");
+  });
   const result = await first.execute();
+  expect(result.error).toContain("before round archive");
   const prior = history(first.storage);
   const original = prior.originals.find(item => item.key === "r1-simple")!;
-  // Compacted history retains only the digest-pinned publication, not inline/context fallbacks.
-  const compact = (first.storage.get("architecture-decision") as any).originals.find((item: Original) => item.id === original.id);
+  // An open slot hasn't reached the store archive. Extra inline context does
+  // not replace its digest-pinned native publication.
+  const compact = (first.storage.get("pitako-architecture") as any).originals.find((item: Original) => item.id === original.id);
   compact.failedOriginal = originalValue(original);
   compact.accessibility = source;
   rmSync(original.savedOutputPath!);
   const host = fixture();
-  expect(await host.execute({ continuation: result.continuation, evidence: "Consume retained originals" }, first.storage)).toMatchObject({
-    status: "failed", error: expect.stringContaining("missing-file"),
+  expect(await host.execute({ continuation: result.continuation }, first.storage)).toMatchObject({
+    status: "failed", error: expect.stringContaining("native original does not prove slot r1-simple"),
   });
   expect(host.calls).toHaveLength(0);
 });
@@ -1464,10 +1696,10 @@ describe("architecture durable dispatch boundaries", () => {
     return child(key);
   }
   test.each(["director-prepare", "r1-simple", "r1-recover", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
-    ("persists %s intention before dispatch and blocks reentry if its terminal save fails", async key => {
+    ("persists %s intention and rehydrates its native original after a failed terminal save", async key => {
       let failures = 0;
       const host = fixture((producer, request) => {
-        const retained = host.storage.get("architecture-decision") as DurableConsultation;
+        const retained = host.storage.get("pitako-architecture") as DurableConsultation;
         expect(retained.cursor.dispatches).toContainEqual(expect.objectContaining({ key: producer, boundary: "intended" }));
         if (producer.startsWith("r1-")) expect(retained.rounds).toBe(1);
         return planningChild(producer);
@@ -1482,12 +1714,15 @@ describe("architecture durable dispatch boundaries", () => {
       expect(result.error).toContain(`Controlled terminal persistence cut: ${key}`);
       expect(failures).toBe(1); // No retry from the catch or a concurrent producer.
       expect(host.calls.some(call => call.key === key)).toBe(true);
-      const saved = host.storage.get("architecture-decision") as DurableConsultation;
+      const saved = host.storage.get("pitako-architecture") as DurableConsultation;
       expect(saved.cursor.dispatches).toContainEqual(expect.objectContaining({ key, boundary: "intended" }));
       expect(result.rounds).toBe(saved.rounds); expect(result.validRounds).toBe(saved.validRounds);
-      const resumed = fixture();
-      await expect(resumed.execute({ planning: true, continuation: result.continuation }, host.storage)).rejects.toThrow("Unconfirmed architecture dispatch boundary");
-      expect(resumed.calls).toHaveLength(0);
+      const resumed = fixture(planningChild);
+      expect(await resumed.execute({ planning: true, continuation: result.continuation }, host.storage))
+        .toMatchObject({status: "completed", rounds: 1, validRounds: 1});
+      const settled = new Set(host.calls.map(call => call.key));
+      expect(resumed.calls.map(call => call.key)).toEqual(
+        ["director-prepare", "r1-simple", "r1-recover", "director-doubts-r1", "doubts-r1-0", "director-after-r1"].filter(key => !settled.has(key)));
     });
 
   test.each(["director-prepare", "r1-simple", "director-doubts-r1", "doubts-r1-0", "director-after-r1"])
@@ -1514,7 +1749,7 @@ describe("architecture durable dispatch boundaries", () => {
     const result = await host.execute({ currentDecision: snapshot("Decision"), maxRounds: 2 });
     expect(result).toMatchObject({ status: "failed", rounds: 1, validRounds: 0, error: "Controlled validity cut" });
     expect(failures).toBe(1);
-    expect(host.storage.get("architecture-decision")).toMatchObject({ rounds: 1, validRounds: 0, maxRounds: 2 });
+    expect(host.storage.get("pitako-architecture")).toMatchObject({ rounds: 1, validRounds: 0, maxRounds: 2 });
     for (const maxRounds of [1, 3, 10]) {
       const resumed = fixture();
       await expect(resumed.execute({ continuation: result.continuation, maxRounds }, host.storage)).rejects.toThrow("original maximum");
@@ -1533,8 +1768,8 @@ describe("architecture durable dispatch boundaries", () => {
     const first = fixture(); const result = await first.execute();
     for (const cursor of [undefined, { version: 1, dispatches: [] }, { version: 99, dispatches: [] }]) {
       const storage = new Map(first.storage);
-      const prior = storage.get("architecture-decision") as object;
-      storage.set("architecture-decision", { ...prior, cursor });
+      const prior = storage.get("pitako-architecture") as object;
+      storage.set("pitako-architecture", { ...prior, cursor });
       const resumed = fixture();
       await expect(resumed.execute({ continuation: result.continuation }, storage)).rejects.toThrow("created by an incompatible Pitako contract");
       expect(resumed.calls).toHaveLength(0);
@@ -1546,23 +1781,27 @@ describe("architecture durable dispatch boundaries", () => {
     for (const target of ["state", "continuation"]) {
       const storage = new Map(structuredClone([...first.storage]));
       const continuation = { ...result.continuation! };
-      if (target === "state") (storage.get("architecture-decision") as { version: number }).version = version;
+      if (target === "state") (storage.get("pitako-architecture") as { version: number }).version = version;
       else continuation.version = version;
       const resumed = fixture();
       await expect(resumed.execute({ continuation }, storage)).rejects.toThrow(
-        `created by an incompatible Pitako contract v${version}; start a new consultation/mission`);
+        `created by an incompatible Pitako contract v${version}.`);
       expect(resumed.calls).toHaveLength(0);
       expect(resumed.stateWrites).toHaveLength(0);
     }
   });
 
   test.each(["identity", "evidence", "duplicate"])("rejects a %s-corrupted confirmed cursor before dispatch", async fault => {
-    const first = fixture(); const result = await first.execute();
-    const retained = structuredClone(first.storage.get("architecture-decision")) as DurableConsultation;
+    const first = fixture(undefined, undefined, undefined, value => {
+      if (value.cursor.dispatches.some(item => item.key === "r1-simple" && item.boundary === "confirmed"))
+        throw new Error("Cut while round is still open");
+    });
+    const result = await first.execute();
+    const retained = JSON.parse(readFileSync(first.stateFile, "utf8")).state["pitako-architecture"];
     if (fault === "identity") retained.cursor.dispatches[0]!.originalId = "unrelated-original";
     if (fault === "evidence") retained.cursor.dispatches[0]!.runId = "r".repeat(97);
     if (fault === "duplicate") retained.cursor.dispatches.push({ ...retained.cursor.dispatches[0]! });
-    first.storage.set("architecture-decision", retained);
+    first.storage.set("pitako-architecture", retained);
     const resumed = fixture();
     await expect(resumed.execute({ continuation: result.continuation }, first.storage)).rejects.toThrow("cursor");
     expect(resumed.calls).toHaveLength(0);
@@ -1631,13 +1870,13 @@ describe("architecture confirmed phase advancement", () => {
       });
       try { await first.execute(decisionInput); } catch (error) { expect(String(error)).toContain("after committed"); }
       expect(cut).toBe(true);
-      const retained = first.storage.get("architecture-decision") as DurableConsultation;
+      const retained = first.storage.get("pitako-architecture") as DurableConsultation;
       const confirmedKeys = retained.cursor.dispatches.filter(item => item.boundary === "confirmed").map(item => item.key);
       const second = fixture(planningResult);
       const result = await second.execute({ planning: true, continuation }, first.storage);
       expect(result).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
       expect(second.calls.every(call => !confirmedKeys.includes(call.key))).toBe(true);
-      const final = first.storage.get("architecture-decision") as DurableConsultation;
+      const final = first.storage.get("pitako-architecture") as DurableConsultation;
       expect(history(first.storage).cursor.dispatches.filter(item => item.key.startsWith("r1-")).map(item => item.key).sort()).toEqual(["r1-recover", "r1-simple"]);
       expect(final).toMatchObject({ rounds: 1, validRounds: 1, maxRounds: 2, currentDecision: { revision: 1 } });
       const serialized = JSON.stringify(final);
@@ -1676,7 +1915,7 @@ describe("architecture selective factual retry", () => {
     const first = fixture(key => missing && key === "doubts-r1-1" ? { ok: false, runId: "terminal-missing-fact", error: "Terminal factual failure; no original delivered" } : reply(key));
     expect(await first.execute({ planning: true, currentDecision: snapshot("Complete problem"), maxRounds: 1 }))
       .toMatchObject({ status: "failed", rounds: 1, validRounds: 1 });
-    const retained = first.storage.get("architecture-decision") as { originals: Original[] };
+    const retained = first.storage.get("pitako-architecture") as { originals: Original[] };
     const original = retained.originals.find(item => item.key === "doubts-r1-1")!;
     return { first, original, retry: { consultation: "decision", revision: 1, originalIds: [original.id],
       authorization: { content: "Actual human authorizes retry of the missing factual answer", provenance: "Foreground human message 55" } } };
@@ -1692,12 +1931,12 @@ describe("architecture selective factual retry", () => {
     expect(await second.execute({ planning: true, continuation, factualRetry: retry }, first.storage))
       .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
     expect(second.calls.map(item => item.key)).toEqual(["doubts-r1-1", "director-after-r1"]);
-    const state = {...(first.storage.get("architecture-decision") as any), originals: history(first.storage).originals};
+    const state = {...(first.storage.get("pitako-architecture") as any), originals: history(first.storage).originals};
     expect(state.currentDecision.revision).toBe(1);
     expect(state.originals.filter((item: Original) => item.key === "doubts-r1-0")).toHaveLength(1);
     expect(state.originals.filter((item: Original) => item.key === "doubts-r1-1")).toHaveLength(1);
     expect(state.originals.find((item: Original) => item.id === original.id)).toBeUndefined();
-    expect(state.cursor.retries).toEqual([]);
+    expect(state.cursor.retries ?? []).toEqual([]);
     expect(ledgerRecords(first.storage).find(record => record.kind === "context")?.body.factualRetry).toEqual(retry);
   });
   test("terminal non-delivery needs explicit authorization and never becomes a fabricated essential", async () => {
@@ -1712,7 +1951,7 @@ describe("architecture selective factual retry", () => {
     expect(await second.execute({ planning: true, continuation, factualRetry: retry }, first.storage))
       .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
     expect(second.calls.map(call => call.key)).toEqual(["doubts-r1-1", "director-after-r1"]);
-    const retained = first.storage.get("architecture-decision") as { originals: Original[] };
+    const retained = first.storage.get("pitako-architecture") as { originals: Original[] };
     expect(retained.originals.find(item => item.id === original.id)).toBeUndefined();
     expect(ledgerRecords(first.storage).find(record => record.kind === "context")?.body.superseded).toContainEqual(original);
     const continued = fixture(key => ({...child(key), structuredOutput: finish}));
@@ -1731,7 +1970,7 @@ describe("architecture selective factual retry", () => {
       return { ...result, raw: true };
     });
     await first.execute({ planning: true, currentDecision: snapshot("Complete problem"), maxRounds: 1 });
-    const original = (first.storage.get("architecture-decision") as { originals: Original[] }).originals.find(item => item.key === "doubts-r1-1")!;
+    const original = (first.storage.get("pitako-architecture") as { originals: Original[] }).originals.find(item => item.key === "doubts-r1-1")!;
     const second = fixture();
     try {
       const result = await second.execute({ planning: true, continuation, factualRetry: {
@@ -1768,7 +2007,7 @@ describe("architecture selective factual retry", () => {
             .toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
           expect(third.calls.some(call => second.calls.some(prior => prior.key === call.key))).toBe(false);
         }
-        expect(first.storage.get("architecture-decision")).toMatchObject({ rounds: 1, validRounds: 1, maxRounds: 1, currentDecision: { revision: 1 } });
+        expect(first.storage.get("pitako-architecture")).toMatchObject({ rounds: 1, validRounds: 1, maxRounds: 1, currentDecision: { revision: 1 } });
       });
   }
   test("a terminal failed retry needs a new authorization targeting its own attempt", async () => {
@@ -1779,18 +2018,18 @@ describe("architecture selective factual retry", () => {
     await expect(third.execute({ planning: true, continuation, factualRetry: retry }, first.storage)).rejects.toThrow("Invalid factual retry");
     expect(third.calls).toHaveLength(0);
     for (let attempt = 3; attempt <= 5; attempt++) {
-      const state = first.storage.get("architecture-decision") as any;
+      const state = first.storage.get("pitako-architecture") as any;
       const latest = state.originals.find((item: Original) => item.key === "doubts-r1-1")!;
       const failedAgain = fixture(reply);
       expect(await failedAgain.execute({planning: true, continuation, factualRetry: {...retry, originalIds: [latest.id],
         authorization: {content: `Retry attempt ${attempt}`, provenance: "Actual human"}}}, first.storage)).toMatchObject({status: "failed", rounds: 1, validRounds: 1});
-      const retained = first.storage.get("architecture-decision") as any;
+      const retained = first.storage.get("pitako-architecture") as any;
       expect(retained.cursor.dispatches.length).toBeLessThanOrEqual(16);
       expect(retained.cursor.retries).toHaveLength(1);
       expect(retained.originals.length).toBeLessThanOrEqual(16);
       expect(failedAgain.stateWrites.every(write => write.persisted && write.bytes <= stateBound.bytes)).toBe(true);
     }
-    const state = first.storage.get("architecture-decision") as { originals: Original[] };
+    const state = first.storage.get("pitako-architecture") as { originals: Original[] };
     const latest = [...state.originals].reverse().find(item => item.key === "doubts-r1-1")!;
     const fourth = fixture();
     expect(await fourth.execute({ planning: true, continuation, factualRetry: { ...retry, originalIds: [latest.id],
@@ -1807,7 +2046,7 @@ describe("architecture selective factual retry", () => {
       if (fault === "wrong-query") input.consultation = "other";
       if (fault === "wrong-revision") input.revision = 2;
       if (fault === "sufficient-provider" || fault === "perspective") {
-        const state = first.storage.get("architecture-decision") as { originals: Original[] };
+        const state = first.storage.get("pitako-architecture") as { originals: Original[] };
         input.originalIds = [state.originals.find((item: Original) => item.key === (fault === "perspective" ? "r1-simple" : "doubts-r1-0"))!.id];
       }
       if (fault === "duplicate") input.originalIds.push(input.originalIds[0]!);
@@ -1857,17 +2096,18 @@ describe("architecture committed dispatch intentions", () => {
   test.each(["missing", "version", "planning", "round", "next", "projection"])
     ("rejects %s phase control before writing or dispatching", async fault => {
       const first = fixture(); const result = await first.execute();
-      const state = first.storage.get("architecture-decision") as { cursor: { control?: Record<string, unknown>; dispatches: { controlOutput?: unknown }[] } };
+      const state = JSON.parse(readFileSync(first.stateFile, "utf8")).state["pitako-architecture"];
       if (fault === "missing") delete state.cursor.control;
       else if (fault === "version") state.cursor.control!.version = 99;
       else if (fault === "planning") state.cursor.control!.planning = true;
       else if (fault === "round") { state.cursor.control!.round = 99; state.cursor.control!.stage = "evaluate"; }
       else if (fault === "next") { state.cursor.control!.next = { action: "finish" }; state.cursor.control!.stage = "perspectives"; }
-      else state.cursor.dispatches[0]!.controlOutput = { action: "finish" };
+      else state.cursor.control.next = "unrelated.original";
       // Exercise pending control, rather than asking to begin a post-conclusion cycle.
-      (state.cursor as unknown as { phase: string }).phase = "architecture-evaluate";
+      state.cursor.phase = "architecture-evaluate";
+      first.storage.set("pitako-architecture", state);
       const second = fixture();
-      await expect(second.execute({ continuation: result.continuation }, first.storage)).rejects.toThrow("phase control");
+      await expect(second.execute({ continuation: result.continuation }, first.storage)).rejects.toThrow(/phase control|continuation cursor/);
       expect(second.calls).toHaveLength(0); expect(second.stateWrites).toHaveLength(0);
     });
 });
@@ -1890,8 +2130,9 @@ describe("architecture rolling-round durable evidence", () => {
     expect(result).toMatchObject({ status: "failed", rounds: 2, validRounds: 1 });
     expect(cut).toBe(true);
     if (!published) {
-      const retained = first.storage.get("architecture-decision") as { originals: Original[] };
-      retained.originals.find(item => item.key === "r2-simple")!.outputSaveError = "Publication no longer valid";
+      const retained = first.storage.get("pitako-architecture") as { originals: Original[] };
+      const report = retained.originals.find(item => item.key === "r2-simple")!;
+      rmSync(path.join(report.artifactRoot!, report.relativePath!));
     }
     const resumed = fixture();
     const outcome = await resumed.execute({ continuation: result.continuation }, first.storage);
@@ -1899,25 +2140,76 @@ describe("architecture rolling-round durable evidence", () => {
       expect(outcome).toMatchObject({ status: "completed", rounds: 2, validRounds: 2 });
       expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r2"]);
     } else {
-      expect(outcome).toMatchObject({ status: "failed", rounds: 2, validRounds: 1, error: expect.stringContaining("Essential access incomplete for a delivered peer challenge") });
+      expect(outcome).toMatchObject({ status: "failed", rounds: 2, validRounds: 1, error: expect.stringContaining("native original does not prove slot r2-simple") });
       expect(resumed.calls).toHaveLength(0);
     }
     expect(resumed.steered).toHaveLength(0);
   });
 
-  test("does not repeat steering whose delivery is unconfirmed, even when both producers are terminal", async () => {
+  test.each([
+    ["before-intended", "missed"],
+    ["intended", "missed"],
+    ["sending", "unconfirmed"],
+    ["delivered", "delivered"],
+    ["delivered", "contradiction"],
+    ["delivered", "no-stage"],
+    ["transport-rejected", "integrity failure"],
+  ])("reconciles the native steering cut at %s as %s without another send", async (boundary, outcome) => {
     let cut = false;
-    const first = fixture(key => child(key, key === "director-after-r1" ? discuss : finish), undefined, undefined, value => {
+    const sibling = deferred<Result>();
+    const savedFirstPeer = deferred<void>();
+    const stop = (value: DurableConsultation, stage: string) => {
       const steering = (value.cursor as unknown as { steering?: { state: string }[] }).steering;
-      if (!cut && steering?.some(item => item.state === "intended")) {
-        cut = true; throw new Error("Committed steering intention cut");
+      const dispatches = value.cursor.dispatches;
+      const earlyCut = stage === "before-intended" &&
+        dispatches.some(item => item.key === "r2-simple" && item.boundary === "confirmed") &&
+        dispatches.some(item => item.key === "r2-recover" && item.boundary === "intended") && !steering?.length;
+      if (!cut && (earlyCut || steering?.some(item => item.state === stage))) {
+        if (earlyCut) savedFirstPeer.resolve();
+        cut = true; throw new Error("Steering cut");
       }
-    });
-    const result = await first.execute();
-    expect(cut).toBe(true); expect(first.steered).toHaveLength(0);
+    };
+    const first = fixture(key => boundary === "before-intended" && key === "r2-recover"
+      ? sibling.promise : child(key, key === "director-after-r1" ? discuss : finish),
+      key => {
+        expect(first.storage.get("pitako-architecture")).toMatchObject({cursor: {steering: [{key, state: "sending"}]}});
+        if (boundary === "before-intended") sibling.resolve(child(key));
+        if (boundary === "transport-rejected") throw new Error("Live route rejected");
+        return {state: "delivered"};
+      }, value => { if (boundary === "delivered") stop(value, boundary); },
+      value => { if (boundary !== "delivered") stop(value, boundary); }, Date, false, true);
+    const oldRoot = first.execute();
+    if (boundary === "before-intended") {
+      const observer = fixture();
+      try {
+        expect(await Promise.race([savedFirstPeer.promise.then(() => true), oldRoot.then(() => false)])).toBe(true);
+        await expect(observer.execute({ continuation: { version: 4, consultation: "decision" } }, first.storage))
+          .rejects.toThrow("Unconfirmed architecture dispatch boundary");
+        expect(observer.steered).toHaveLength(0);
+        expect(observer.calls).toHaveLength(0);
+      } finally {
+        sibling.resolve(child("r2-recover"));
+        await oldRoot;
+      }
+    }
+    const result = await oldRoot;
+    if (boundary === "transport-rejected")
+      expect(result).toMatchObject({status: "failed", error: expect.stringContaining("Live route rejected")});
+    else expect(cut).toBe(true);
+    expect(first.steered).toHaveLength(["delivered", "transport-rejected"].includes(boundary) ? 1 : 0);
+    const saved = first.storage.get("pitako-architecture") as {cursor: {steering: {state: string}[]}};
+    if (outcome === "contradiction") saved.cursor.steering[0]!.state = "failed";
+    if (outcome === "no-stage") saved.cursor.steering = [];
     const resumed = fixture();
-    await expect(resumed.execute({ continuation: result.continuation }, first.storage)).rejects.toThrow("Unconfirmed architecture steering boundary");
-    expect(resumed.calls).toHaveLength(0); expect(resumed.steered).toHaveLength(0);
+    const resolution = await resumed.execute({ continuation: result.continuation }, first.storage);
+    expect(resumed.steered).toHaveLength(0);
+    if (["contradiction", "no-stage", "integrity failure"].includes(outcome)) {
+      expect(resolution).toMatchObject({ status: "failed", error: expect.stringContaining("integrity failure") });
+      expect(resumed.calls).toHaveLength(0);
+    } else {
+      expect(resolution).toMatchObject({ status: "completed", rounds: 2, validRounds: 2, steering: [{round: 2, state: outcome}] });
+      expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r2"]);
+    }
   });
 });
 
@@ -1933,8 +2225,9 @@ test("architecture persists a full replacement at a confirmed mid-round boundary
   const interrupted = await first.execute({ currentDecision: snapshot("OBSOLETE mechanism A"), maxRounds: 3 });
   expect(interrupted).toMatchObject({ status: "failed", rounds: 1, validRounds: 0 });
   const second = fixture((key, request) => {
-    const retained = first.storage.get("architecture-decision") as { currentDecision: { revision: number; snapshot: { brief: string } } };
-    expect(retained.currentDecision).toMatchObject({ revision: 2, snapshot: JSON.stringify(snapshot("CURRENT whole mechanism B")) });
+    const retained = first.storage.get("pitako-architecture") as { currentDecision: { revision: number; digest: string } };
+    expect(retained.currentDecision).toEqual({ revision: 2,
+      digest: canonicalDigest({ revision: 2, snapshot: snapshot("CURRENT whole mechanism B") }) });
     expect(request.task).not.toContain("OBSOLETE mechanism A");
     expect(request.task).toContain("CURRENT whole mechanism B");
     return child(key);
@@ -1943,7 +2236,7 @@ test("architecture persists a full replacement at a confirmed mid-round boundary
     replacement: replacement("decision", 1, snapshot("CURRENT whole mechanism B")) }, first.storage);
   expect(result).toMatchObject({ status: "completed", rounds: 2, validRounds: 1 });
   expect(second.calls.some(call => call.key.startsWith("r1-"))).toBe(false);
-  expect(first.storage.get("architecture-decision")).toMatchObject({ currentDecision: { revision: 2 } });
+  expect(first.storage.get("pitako-architecture")).toMatchObject({ currentDecision: { revision: 2 } });
   expect(ledgerRecords(first.storage).find(record => record.kind === "decision")?.body).toMatchObject({ revision: 1, snapshot: { brief: "OBSOLETE mechanism A" } });
 });
 
@@ -1959,9 +2252,9 @@ describe("architecture paused human answers", () => {
   function respond(key: string): Result {
     return key.startsWith("director-doubts-") ? { ...child(key), structuredOutput: { doubts: questions } } : child(key);
   }
-  async function pause() {
+  async function pause(humanDecisions: DecisionSnapshot["humanDecisions"] = []) {
     const first = fixture(respond);
-    const result = await first.execute({ planning: true, currentDecision: snapshot("Decision") });
+    const result = await first.execute({ planning: true, currentDecision: snapshot("Decision", { humanDecisions }) });
     expect(result).toMatchObject({ status: "needs-human", rounds: 1, validRounds: 1 });
     return { first, result };
   }
@@ -2057,7 +2350,7 @@ describe("architecture paused human answers", () => {
         { ...questions[2], prerequisiteFacts: [] },
         { ...questions[3], prerequisiteFacts: [{ id: "needed", key: "doubts-r1-1", originalId: expect.any(String), humanContext: expect.stringContaining("Brief factual frontier") }] },
       ] } });
-    const retained = first.storage.get("architecture-decision") as DurableConsultation;
+    const retained = first.storage.get("pitako-architecture") as DurableConsultation;
     expect(retained.cursor).toMatchObject({ control: { stage: "awaiting-human", pending: { round: 1, revision: 1, ids: ["scope", "reuse"] } } });
     expect(retained.cursor.dispatches.every(item => item.boundary === "confirmed")).toBe(true);
     expect(first.calls.map(call => call.request.phase)).not.toContain("architecture-human");
@@ -2086,7 +2379,9 @@ describe("architecture paused human answers", () => {
       firstWrite ??= structuredClone(value);
     }, undefined, clock);
     const done = await resumed.execute({ ...reentry, humanAnswers: input }, first.storage);
-    expect(firstWrite).toMatchObject({ cursor: { control: { stage: "evaluate", context: {humanAnswers: {seq: expect.any(Number), digest: expect.any(String)}} } } });
+    expect(firstWrite).toMatchObject({ cursor: { control: { stage: "evaluate", context: {humanAnswers: {
+      store: {scope: "arch:decision", seq: expect.any(Number)}, digest: expect.any(String),
+    }} } } });
     expect(JSON.stringify(firstWrite)).not.toContain("approve implementation");
     expect(firstWrite!.cursor).not.toHaveProperty("control.pending");
     expect(done).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
@@ -2097,7 +2392,7 @@ describe("architecture paused human answers", () => {
     expect(JSON.stringify([...first.storage])).toBe(saved);
     expect(duplicate.stateWrites).toHaveLength(0); expect(duplicate.calls).toHaveLength(0);
   });
-  test.each(["missing", "extra", "duplicate", "round", "revision", "consultation", "no-pending", "missing-pending", "not-planning", "replacement", "evidence", "factualRetry", "content", "provenance", "disposition", "bytes", "items", "fields", "depth", "state-capacity"])
+  test.each(["missing", "extra", "duplicate", "round", "revision", "consultation", "no-pending", "missing-pending", "not-planning", "replacement", "evidence", "factualRetry", "content", "provenance", "disposition", "bytes", "items", "fields", "depth"])
     ("rejects %s with byte-identical storage and no dispatch", async fault => {
       const { first, result } = await pause();
       const input = answers(result);
@@ -2110,11 +2405,11 @@ describe("architecture paused human answers", () => {
       if (fault === "consultation") input.consultation = "other";
       if (fault === "not-planning") args.planning = false;
       if (fault === "missing-pending") {
-        const value = first.storage.get("architecture-decision") as { cursor: { control: { pending?: unknown } } };
+        const value = first.storage.get("pitako-architecture") as { cursor: { control: { pending?: unknown } } };
         delete value.cursor.control.pending;
       }
       if (fault === "no-pending") {
-        const value = first.storage.get("architecture-decision") as { cursor: { control: { stage: string; pending?: unknown } } };
+        const value = first.storage.get("pitako-architecture") as { cursor: { control: { stage: string; pending?: unknown } } };
         value.cursor.control.stage = "evaluate"; delete value.cursor.control.pending;
       }
       if (fault === "replacement") args.replacement = replacement("decision", 1, snapshot("Changed"));
@@ -2125,11 +2420,9 @@ describe("architecture paused human answers", () => {
       if (fault === "items") input.answers = Array.from({ length: 65 }, (_, index) => ({ ...input.answers[0]!, id: `q${index}` }));
       if (fault === "fields") Object.assign(input.answers[0]!, Object.fromEntries(Array.from({ length: 17 }, (_, i) => [`field${i}`, "x"])));
       if (fault === "depth") Object.assign(input.answers[0]!, { nested: { a: { b: { c: { d: { e: { f: { g: "deep" } } } } } } } });
-      if (fault === "state-capacity") first.storage.set("unrelated", "x".repeat(256 * 1024 - Buffer.byteLength(JSON.stringify(Object.fromEntries(first.storage))) - 100));
       const before = JSON.stringify([...first.storage]), persisted = readFileSync(first.stateFile, "utf8");
       const resumed = fixture();
-      if (fault === "state-capacity") expect(await resumed.execute(args, first.storage)).toMatchObject({ status: "blocked", error: expect.stringContaining("Use a new mission") });
-      else await expect(resumed.execute(args, first.storage)).rejects.toThrow();
+      await expect(resumed.execute(args, first.storage)).rejects.toThrow();
       expect(JSON.stringify([...first.storage])).toBe(before);
       expect(readFileSync(first.stateFile, "utf8")).toBe(persisted);
       expect(resumed.calls).toHaveLength(0);
@@ -2150,12 +2443,8 @@ describe("architecture paused human answers", () => {
     expect(ledgerRecords(first.storage).find(record => record.kind === "context")?.body.humanAnswers.answers).toEqual(humanAnswers.answers);
   });
   test("replacement discards pending at prepare with counters and human snapshot provenance preserved", async () => {
-    const { first } = await pause();
     const prior = { id: "earlier", content: "Use A", provenance: "Actual human message 54" };
-    const retained = first.storage.get("architecture-decision") as { currentDecision: { snapshot: DecisionSnapshot } };
-    const priorSnapshot = JSON.parse(retained.currentDecision.snapshot as unknown as string);
-    priorSnapshot.humanDecisions = [prior];
-    retained.currentDecision.snapshot = JSON.stringify(priorSnapshot) as unknown as DecisionSnapshot;
+    const { first } = await pause([prior]);
     const resumed = fixture((key, request) => {
       expect(key).toBe("director-prepare"); expect(request.task).toContain(prior.provenance);
       return { ...child(key), structuredOutput: { ...finish, action: "blocked" } };
@@ -2185,7 +2474,7 @@ describe("architecture paused human answers", () => {
     const first = fixture(key => key === "doubts-r1-1" ? { ...child(key), ok: false, error: "Terminal factual failure", structuredOutput: { status: "blocked", report: "Missing prerequisite" } } : respond(key));
     const failed = await first.execute({ planning: true, currentDecision: snapshot("Decision") });
     expect(failed).toMatchObject({ status: "failed", error: expect.stringContaining("No adequate report"), rounds: 1, validRounds: 1 });
-    const retained = first.storage.get("architecture-decision") as { cursor: { control: { stage: string } }; originals: Original[] };
+    const retained = first.storage.get("pitako-architecture") as { cursor: { control: { stage: string } }; originals: Original[] };
     expect(retained.cursor.control.stage).toBe("frontier");
     const resumed = fixture();
     expect(await resumed.execute({ ...reentry, factualRetry: { consultation: "decision", revision: 1,
@@ -2203,7 +2492,7 @@ describe("architecture paused human answers", () => {
     expect(await first.execute({ planning: true, currentDecision: snapshot("Decision") }))
       .toMatchObject({ status: "failed", error: expect.stringContaining("64 pending IDs") });
     expect(first.calls.some(call => call.key === "director-after-r1")).toBe(false);
-    expect(first.storage.get("architecture-decision")).toMatchObject({ cursor: { dispatches: expect.arrayContaining([expect.objectContaining({invalid: "factual-count", boundary: "incomplete"})]) } });
+    expect(first.storage.get("pitako-architecture")).toMatchObject({ cursor: { dispatches: expect.arrayContaining([expect.objectContaining({invalid: "factual-count", boundary: "incomplete"})]) } });
   });
 });
 
@@ -2216,11 +2505,24 @@ describe("architecture deterministic access receipts", () => {
     expect(touched).toBe(false);
   });
 
-  test("one verifier per consuming gate over its required originals; none when nothing is required", async () => {
+  test("a busy verifier retries only its consuming gate and resumes past cached attempts", async () => {
     const host = fixture();
-    expect(await host.execute()).toMatchObject({ status: "completed" });
-    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-v1-r1-simple-a1", "verify-v1-director-after-r1-a1", "verify-v1-memo-director-after-r1-a1-a1"]);
-    const request = JSON.parse(host.verifications.find(entry => entry.key === "verify-v1-director-after-r1-a1")!.request.task);
+    const key = "verify-v1-director-after-r1-a1";
+    const busyKeys = [key, `${key}.r1`, `${key}.r2`];
+    let reused = false;
+    host.beforeVerify = subject => busyKeys.includes(subject)
+      ? {ok: true, reused, output: JSON.stringify({v: 1, code: "store-busy"})} : undefined;
+    const first = await host.execute();
+    expect(first).toMatchObject({status: "failed",
+      error: "Access verifier store-busy after three attempts at v1-director-after-r1-a1."});
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-v1-r1-simple-a1", ...busyKeys]);
+    const initial = host.verifications.find(entry => entry.key === key)!.request.task;
+    host.verifications.length = 0;
+    reused = true;
+    expect(await host.execute({continuation: first.continuation})).toMatchObject({ status: "completed" });
+    expect(host.verifications.map(entry => entry.key)).toEqual([...busyKeys, `${key}.r3`, "verify-v1-memo-director-after-r1-a1-a1"]);
+    expect(host.verifications.slice(0, 4).every(entry => entry.request.task === initial)).toBe(true);
+    const request = JSON.parse(initial);
     expect(request).toMatchObject({ namespace: "architecture-decision", gate: "v1-director-after-r1-a1" });
     expect(request.items.every((item: object) => "digest" in item && !("admitted" in item))).toBe(true);
     const pins = host.verifications.filter(entry => entry.key.startsWith("verify-pin-"));
@@ -2228,6 +2530,72 @@ describe("architecture deterministic access receipts", () => {
     expect(request.items.map((item: { id: string }) => item.id)).toEqual(["decision.v1.r1-simple.a1", "decision.v1.r1-recover.a1"]);
     const consumer = host.calls.find(call => call.key === "director-after-r1")!.request;
     expect(essentials(consumer).map(item => (item as unknown as { id: string }).id)).toEqual(request.items.map((item: { id: string }) => item.id));
+  });
+
+  test("a verifier that quarantines the store ends without human action and relaunch skips its reused settlement", async () => {
+    const host = fixture(undefined, undefined, undefined, undefined, Date, false, true);
+    const key = "verify-v1-director-after-r1-a1";
+    let settlement: (Result & {task: string; reused?: boolean}) | undefined;
+    host.beforeVerify = (subject, {task}) => {
+      if (subject !== key) return;
+      if (settlement) {
+        expect(task).toBe(settlement.task);
+        return {...settlement, reused: true};
+      }
+      const cwd = ledgerCwd(JSON.parse(task).missionPath);
+      const db = openSqliteSync(new PitakoStore(cwd).file);
+      try { db.exec("PRAGMA user_version=2"); } finally { db.close(); }
+      const verifier = Bun.spawnSync([process.execPath, path.join(import.meta.dir, "../extensions/access-receipts.mjs"), "--verify-stdin"],
+        { cwd, env: guardEnv(process.env), stdin: Buffer.from(task), stdout: "pipe", stderr: "pipe" });
+      expect(verifier.exitCode, verifier.stderr.toString()).toBe(0);
+      const output = verifier.stdout.toString();
+      expect(JSON.parse(output)).toMatchObject({v: 1, code: "store-corrupt", recovery: {quarantine: expect.any(String)}});
+      settlement = {ok: true, agent: "pitako.access-verifier", runId: `native-${key}`, output, results: [{exitCode: 0}], task};
+      return settlement;
+    };
+
+    const halted = await host.execute();
+    expect(halted).toMatchObject({status: "failed", rounds: 1, validRounds: 1});
+    expect(halted.error).toContain("store-corrupt");
+    expect(halted.error).not.toMatch(/native barrier|inspect|resolve its failure|new mission/i);
+    expect(host.calls.map(call => call.key)).toEqual(["director-prepare", "r1-simple", "r1-recover"]);
+    expect(host.verifications.at(-1)?.key).toBe(key);
+
+    host.calls.length = 0;
+    host.verifications.length = 0;
+    expect(await host.execute({continuation: halted.continuation})).toMatchObject({status: "completed", rounds: 1, validRounds: 1});
+    expect(host.verifications.map(entry => entry.key)).toEqual([key, `${key}.r1`, "verify-v1-memo-director-after-r1-a1-a1"]);
+    expect(host.calls.map(call => call.key)).toEqual(["director-after-r1"]);
+    expect(new PitakoStore(ledgerCwd(fixtureMissions.get(host.storage)!)).readRecords("arch:decision").identity.storeId)
+      .toBe(JSON.parse(settlement!.output!).recovery.storeId);
+  });
+
+  test("a busy ledger bounds fresh attempts and resumes past cached busy settlements", async () => {
+    const first = fixture(undefined, undefined, undefined, () => { throw new Error("Cut after ledger admission"); });
+    expect(await first.execute()).toMatchObject({status: "failed", error: "Cut after ledger admission"});
+    const host = fixture();
+    const args = { continuation: {version: 4, consultation: "decision"} };
+    const base = "ledger-observe-1";
+    const keys = [base, `${base}.r1`, `${base}.r2`];
+    const requests: {key: string; task: string}[] = [];
+    let reused = false;
+    host.beforeLedger = (key, request) => {
+      if (key === base || key.startsWith(`${base}.r`)) requests.push({key, task: request.task});
+      if (keys.includes(key)) return {ok: true, reused, output: JSON.stringify({
+        error: "ledger-integrity", code: "store-busy", reason: "Store remained busy.",
+      })};
+    };
+
+    await expect(host.execute(args, first.storage)).rejects.toThrow("Architecture ledger store-busy after three attempts");
+    expect(requests.map(({key}) => key)).toEqual(keys);
+    expect(host.calls).toHaveLength(0);
+    expect(host.stateWrites).toHaveLength(0);
+    const task = requests[0].task;
+
+    requests.length = 0;
+    reused = true;
+    expect(await host.execute(args, first.storage)).toMatchObject({status: "completed", rounds: 1, validRounds: 1});
+    expect(requests).toEqual([...keys, `${base}.r3`].map(key => ({key, task})));
   });
 
   test("a contradictory published original blocks the consumer before dispatch with an explanation", async () => {
@@ -2284,10 +2652,10 @@ describe("architecture v4 bounded mission state", () => {
           label: "l".repeat(64), focus: "f".repeat(1400) })),
       } };
     }, undefined, value => {
-      const bytes = Buffer.byteLength(JSON.stringify({ ["architecture-decision"]: value }, null, 2));
+      const saved = physical(value);
+      const bytes = Buffer.byteLength(JSON.stringify({ ["pitako-architecture"]: saved }, null, 2));
       roundPeaks.set(value.rounds, Math.max(roundPeaks.get(value.rounds) ?? 0, bytes));
-      expect(bytes).toBeLessThan(256 * 1024);
-      expect(bytes).toBeLessThan(108306);
+      expect(bytes).toBeLessThanOrEqual(16384);
       const retained = value as unknown as { originals: Original[]; decisionHistory?: unknown; evidence: object[] };
       expect(retained.originals.every(item => !Object.hasOwn(item, "value") && !Object.hasOwn(item, "results"))).toBe(true);
       expect(retained.decisionHistory).toBeUndefined();
@@ -2306,7 +2674,11 @@ describe("architecture v4 bounded mission state", () => {
     expect(Math.max(...steady)).toBeLessThan(roundPeaks.get(2)! + 1024);
     expect(Math.max(...steady.slice(0, -1)) - Math.min(...steady.slice(0, -1))).toBeLessThan(1024);
     expect(ledgerRecords(host.storage).filter(record => record.kind === "round")).toHaveLength(10);
-    expect(host.stateWrites.every(write => write.persisted && write.bytes <= 262144)).toBe(true);
+    const persisted = JSON.parse(readFileSync(host.stateFile, "utf8")).state;
+    expect(Object.keys(persisted)).toEqual(["pitako-architecture"]);
+    expect(persisted["pitako-architecture"].cursor.dispatches).toEqual([]);
+    expect(persisted["pitako-architecture"]).not.toHaveProperty("originals");
+    expect(Buffer.byteLength(JSON.stringify(persisted, null, 2))).toBeLessThanOrEqual(16384);
     console.log(`architecture v4 ten-round pretty-state peak ${Math.max(...roundPeaks.values())} bytes; steady range ${Math.min(...steady)}..${Math.max(...steady)}`);
   });
 
@@ -2320,7 +2692,7 @@ describe("architecture v4 bounded mission state", () => {
     expect(await host.execute({planning: true, currentDecision: snapshot("Large published prose")})).toMatchObject({status: "completed"});
     expect(host.calls.some(call => call.key.includes("compact"))).toBe(false);
     expect(host.verifications.some(call => call.key.includes("pin-"))).toBe(false);
-    const state = JSON.stringify(host.storage.get("architecture-decision"));
+    const state = JSON.stringify(host.storage.get("pitako-architecture"));
     expect(state).not.toContain("中");
     expect(state).not.toContain("focusfocus");
   });
@@ -2328,37 +2700,44 @@ describe("architecture v4 bounded mission state", () => {
 
 test.each([false, true])("round publication before a failed anchor save reconciles identical bytes, never skips a conflict (tamper=%s)", async tamper => {
   let cut = false;
-  const first = fixture(undefined, undefined, value => {
-    if (!cut && value.rounds === 1 && (value as any).ledger.count === 2) { cut = true; throw new Error("Anchor save cut after publication"); }
+  // An unchanged replay in round three must include the earlier closed
+  // round's steering outcomes without copying them into the current cursor.
+  const round = tamper ? 1 : 3;
+  const first = fixture(key => child(key, key === "director-after-r1" || key === "director-after-r2" ? discuss : finish), undefined, value => {
+    if (!cut && value.rounds === round && (value as any).ledger.count === round + 1) { cut = true; throw new Error("Anchor save cut after publication"); }
   });
   const result = await first.execute();
   expect(result).toMatchObject({ status: "failed", error: expect.stringContaining("Anchor save cut") });
   expect(cut).toBe(true);
-  const prior = structuredClone(first.storage.get("architecture-decision")) as any;
-  expect(prior.ledger.count).toBe(1);
-  const file = path.join(ledgerPath(fixtureMissions.get(first.storage)!, "decision"), "000001.json");
-  const bytes = readFileSync(file, "utf8");
+  const prior = structuredClone(first.storage.get("pitako-architecture")) as any;
+  expect(prior.ledger.count).toBe(round);
+  const store = new PitakoStore(ledgerCwd(fixtureMissions.get(first.storage)!));
+  const row = store.readRecords("arch:decision").records[round]!;
   if (tamper) {
+    const bytes = canonicalJSON(row.body);
     expect(bytes).not.toContain(finish.memo);
-    writeFileSync(file, bytes.replace("director-after-r1", "director-after-r9"));
+    const db = openSqliteSync(store.file);
+    try { db.prepare("UPDATE records SET body=? WHERE scope=? AND seq=?").run(bytes.replace("director-after-r1", "director-after-r9"), row.scope, row.seq); }
+    finally { db.close(); }
   }
   if (!tamper) {
     const blocked = fixture();
     expect(await blocked.execute({continuation: result.continuation, replacement: replacement("decision", 1, snapshot("Replacement after round replay"))}, first.storage))
       .toMatchObject({status: "blocked", error: expect.stringContaining("re-enter without replacement first")});
     expect(blocked.calls).toEqual([]); expect(blocked.stateWrites).toEqual([]);
-    expect(first.storage.get("architecture-decision")).toEqual(prior);
+    expect(first.storage.get("pitako-architecture")).toEqual(prior);
   }
   const resumed = fixture();
   const outcome = await resumed.execute({ continuation: result.continuation }, first.storage);
   expect(resumed.calls).toHaveLength(0);
   if (tamper) {
-    expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("conflict") });
-    expect(first.storage.get("architecture-decision")).toEqual(prior);
+    expect(outcome).toMatchObject({ status: "failed", error: expect.stringContaining("native originals do not prove") });
+    expect(first.storage.get("pitako-architecture")).toEqual(prior);
   } else {
-    expect(outcome).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
-    expect(readFileSync(file, "utf8")).toBe(bytes);
-    expect(ledgerRecords(first.storage)).toHaveLength(2);
+    expect(outcome).toMatchObject({ status: "completed", rounds: round, validRounds: round,
+      steering: [{ round: 2, state: "missed" }, { round: 3, state: "missed" }] });
+    expect(store.readRecords("arch:decision").records[round]).toEqual(row);
+    expect(ledgerRecords(first.storage)).toHaveLength(round + 1);
     expect(await fixture().execute({continuation: result.continuation, replacement: replacement("decision", 1, snapshot("Replacement after round replay"))}, first.storage))
       .toMatchObject({status: "completed"});
   }
@@ -2374,11 +2753,11 @@ test.each(["omitted", "identical", "different"])("write-ahead replacement surviv
   const cut = await interrupted.execute({ continuation: first.continuation, replacement: update }, storage);
   expect(cut).toMatchObject({ status: "failed", error: expect.stringContaining("Replacement anchor save cut") });
   expect(interrupted.calls).toHaveLength(0);
-  const pending = structuredClone(storage.get("architecture-decision")) as any;
+  const pending = structuredClone(storage.get("pitako-architecture")) as any;
   expect(pending).toMatchObject({ currentDecision: { revision: 1 }, cursor: { ledgerPending: { kind: "decision", expectedRevision: 1, digest: canonicalDigest(update) } } });
   const resumed = fixture(key => {
-    expect((storage.get("architecture-decision") as any).cursor.ledgerPending).toBeUndefined();
-    expect(storage.get("architecture-decision")).toMatchObject({ currentDecision: { revision: 2 } });
+    expect((storage.get("pitako-architecture") as any).cursor.ledgerPending).toBeUndefined();
+    expect(storage.get("pitako-architecture")).toMatchObject({ currentDecision: { revision: 2 } });
     return { ...child(key), structuredOutput: finish };
   });
   const result = await resumed.execute({ continuation: first.continuation,
@@ -2387,14 +2766,44 @@ test.each(["omitted", "identical", "different"])("write-ahead replacement surviv
   }, storage);
   if (kind !== "identical") {
     expect(result).toMatchObject({ status: "blocked", error: expect.stringContaining("earlier architecture replacement is still pending") });
-    expect(storage.get("architecture-decision")).toEqual(pending);
+    expect(storage.get("pitako-architecture")).toEqual(pending);
     expect(resumed.calls).toHaveLength(0);
   } else {
     expect(result).toMatchObject({ status: "completed", rounds: 1, validRounds: 1 });
     expect(resumed.calls.map(call => call.key)).toEqual(["director-prepare"]);
     expect(ledgerRecords(storage).filter(record => record.kind === "decision")).toHaveLength(1);
-    expect((storage.get("architecture-decision") as any).cursor.ledgerPending).toBeUndefined();
+    expect((storage.get("pitako-architecture") as any).cursor.ledgerPending).toBeUndefined();
   }
+});
+
+test("a different committed operation at count+1 is adopted, not acknowledged as the requested replacement", async () => {
+  const initial = fixture();
+  const first = await initial.execute();
+  const storage = initial.storage;
+  const scope = "decision", missionPath = fixtureMissions.get(storage)!;
+  const before = (storage.get("pitako-architecture") as any).ledger;
+  let committed: { head: string; count: number } | undefined;
+  const conflicting = fixture(undefined, undefined, value => {
+    if (!(value.cursor as any).ledgerPending || committed) return;
+    committed = appendLedger({missionPath, consultation: scope, identity: before.identity,
+      expected: {head: before.head, count: before.count},
+      record: {kind: "context", round: 1, body: {callerEvidence: "Competing committed evidence", priorActive: {}}}},
+      ledgerCwd(missionPath));
+  });
+  const result = await conflicting.execute({continuation: first.continuation,
+    replacement: replacement(scope, 1, snapshot("Rejected replacement"))}, storage);
+  expect(result).toMatchObject({status: "failed", rounds: 1, validRounds: 1, error: expect.stringContaining("operation was not applied")});
+  expect(conflicting.calls).toEqual([]);
+  expect(committed).toBeDefined();
+  expect(storage.get("pitako-architecture")).toMatchObject({ledger: {head: committed!.head, count: committed!.count},
+    currentDecision: {revision: 1}, cursor: {control: {stage: "prepare"}}});
+  expect(ledgerRecords(storage).map(record => record.kind)).toEqual(["admission", "round", "context"]);
+  const resumed = fixture((key, request) => {
+    expect(evidenceText(request)).toContain("Competing committed evidence");
+    expect(request.task).not.toContain("Rejected replacement");
+    return child(key);
+  });
+  expect(await resumed.execute({continuation: result.continuation}, storage)).toMatchObject({status: "completed", rounds: 2});
 });
 
 test("prose is uncapped and more than eight factual doubts fails before confirmation and provider dispatch", async () => {
@@ -2424,9 +2833,7 @@ test("prose is uncapped and more than eight factual doubts fails before confirma
 
 const digestFunctions = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8");
 const scriptDigest = new Function(digestFunctions + "; return canonicalDigest;")() as (value: unknown) => string;
-const stateBound = new Function(nativeFlagsSource + "function utf8Bytes(value) { return unescape(encodeURIComponent(value)).length; }\n" +
-  rawSource.slice(rawSource.indexOf("function architectureStateBound("), rawSource.indexOf("function retainedConsultation(")) +
-  "; return architectureStateBound();")() as {bytes: number; skeleton: any};
+const stateBound = architectureStateBound() as {bytes: number; skeleton: any};
 
 test("workflow canonical digest matches canonical.mjs across UTF-8, escapes, blocks and nested numeric key ordering", () => {
   for (const value of [null, true, false, 0, -0, 1.25, "", "\u0000\n\r\t\"\\", "漢字 😀 𝄞 é", "\ud800",
@@ -2439,6 +2846,9 @@ test.each(["finish", "blocked"])("continuation-only %s returns the identical ver
   const host = fixture(key => child(key, {...finish, action}));
   const result = await host.execute();
   expect(result.status).toBe(action === "finish" ? "completed" : "blocked");
+  const { state } = JSON.parse(readFileSync(host.stateFile, "utf8"));
+  expect(state).toMatchObject({ "pitako-architecture": { cursor: { dispatches: [] } } });
+  expect(state["pitako-architecture"].cursor.control).not.toHaveProperty("resultSteering");
   const continued = fixture();
   expect(await continued.execute({continuation: result.continuation}, host.storage)).toEqual(result);
   expect(continued.calls).toEqual([]);
@@ -2447,44 +2857,90 @@ test.each(["finish", "blocked"])("continuation-only %s returns the identical ver
 });
 
 test("a missing admitted digest is diagnosed separately from publication failure", async () => {
-  const host = fixture();
+  const host = fixture(undefined, undefined, undefined, value => {
+    if (value.cursor.dispatches.some(item => item.key === "r1-simple" && item.boundary === "confirmed"))
+      throw new Error("Cut while round is still open");
+  });
   const result = await host.execute();
-  const retained = host.storage.get("architecture-decision") as any;
-  delete retained.originals.find((item: Original) => item.id === "decision.v1.r1-simple.a1").digest;
+  const retained = JSON.parse(readFileSync(host.stateFile, "utf8")).state["pitako-architecture"];
+  retained.cursor.dispatches.find((item: {key: string}) => item.key === "r1-simple").digest = null;
+  host.storage.set("pitako-architecture", retained);
   const continued = fixture();
-  const failure = await continued.execute({continuation: result.continuation, evidence: "New caller evidence"}, host.storage);
+  const failure = await continued.execute({continuation: result.continuation}, host.storage);
   expect(failure.status).toBe("failed");
   expect(failure.error).toContain("missing-digest");
   expect(failure.error).not.toContain("output-save-error");
   expect(continued.calls).toEqual([]);
 });
 
-test("caller-context append/save cut diagnoses missing input and reconciles the identical human answers", async () => {
-  let cut = false;
-  const questions = [{id: "scope", kind: "human", dependsOn: [], question: "Keep baseline?", decision: "Scope", recommendation: "Keep it"}];
-  const host = fixture(key => key.startsWith("director-doubts-") ? {...child(key), structuredOutput: {doubts: questions}} : child(key), undefined,
-    value => { if (!cut && (value as any).cursor.control.context?.humanAnswers) {cut = true; throw new Error("Context anchor save cut");} });
-  const paused = await host.execute({planning: true, currentDecision: snapshot("Context crash safety")});
-  const input = {planning: true, continuation: paused.continuation, humanAnswers: {consultation: "decision", revision: 1, round: 1,
-    answers: [{id: "scope", disposition: "answer", content: "Keep the human baseline", provenance: "Actual human message 72"}]}};
-  expect(await host.execute(input)).toMatchObject({status: "failed", error: expect.stringContaining("Context anchor save cut")});
-  const restarted = fixture();
-  await expect(restarted.execute({planning: true, continuation: paused.continuation}, host.storage)).rejects.toThrow("Replay the identical caller input");
-  expect(restarted.calls).toEqual([]);
+test.each(["recover", "tampered basis", "native outcome"])("a committed answer after an intervening round close: %s", async mode => {
+  let closed: any, cut = false;
+  const question = {id: "scope", kind: "human", dependsOn: [], question: "Keep baseline?", decision: "Scope", recommendation: "Keep it"};
+  const respond = (key: string) => key.startsWith("director-doubts-")
+    ? {...child(key), structuredOutput: {doubts: key.endsWith("r2") ? [question] : []}}
+    : child(key, key === "director-after-r1" ? discuss : finish);
+  const first = fixture(respond, () => ({state: "delivered"}), undefined, value => {
+    if (!closed && value.rounds === 1 && (value as any).ledger.count === 2)
+      closed = JSON.parse(readFileSync(first.stateFile, "utf8")).state["pitako-architecture"];
+    if (mode !== "native outcome" && !cut && value.rounds === 2 &&
+        value.cursor.dispatches.some(item => item.key === "r2-simple" && item.boundary === "confirmed")) {
+      cut = true;
+      throw new Error("Cut before a steering send");
+    }
+  });
+  let paused = await first.execute({planning: true, currentDecision: snapshot("Context crash safety")});
+  if (mode !== "native outcome") {
+    expect(paused.error).toContain("Cut before a steering send");
+    const continueRound = fixture(respond);
+    paused = await continueRound.execute({planning: true, continuation: paused.continuation}, first.storage);
+    expect(continueRound.steered).toEqual([]);
+  }
+  expect(paused).toMatchObject({status: "needs-human", rounds: 2, validRounds: 2});
+  const humanAnswers = {consultation: "decision", revision: 1, round: 2,
+    answers: [{id: "scope", disposition: "answer", content: "Keep the human baseline", provenance: "Actual human message 72"}]};
+  const storage = first.storage;
+  if (mode === "tampered basis") {
+    const retained = physical(storage.get("pitako-architecture"));
+    const {ledger: {head, count, identity}, cursor} = retained;
+    const missionPath = fixtureMissions.get(storage)!;
+    appendLedger({missionPath, consultation: "decision", identity, expected: {head, count}, record: {
+      kind: "context", round: 2, body: {humanAnswers, priorActive: {},
+        basis: {phase: cursor.phase, stage: cursor.control.stage, slots: cursor.dispatches}, basisDigest: "0".repeat(64)}
+    }}, ledgerCwd(missionPath));
+  } else {
+    const interrupted = fixture(undefined, undefined, value => {
+      if ((value as any).cursor.control.context?.humanAnswers) throw new Error("Context anchor save cut");
+    });
+    expect(await interrupted.execute({planning: true, continuation: paused.continuation, humanAnswers}, storage))
+      .toMatchObject({status: "failed", error: expect.stringContaining("Context anchor save cut")});
+    expect(interrupted.calls).toEqual([]);
+  }
+  expect(closed.cursor.dispatches).toEqual([]);
+  storage.set("pitako-architecture", closed);
   const resumed = fixture((key, request) => {
     expect(evidenceText(request)).toContain("Actual human message 72");
     expect(request.task).not.toContain("Keep the human baseline");
     return child(key);
   });
-  expect(await resumed.execute(input, host.storage)).toMatchObject({status: "completed"});
-  expect(ledgerRecords(host.storage).filter(record => record.kind === "context")).toHaveLength(1);
+  const result = await resumed.execute({planning: true, continuation: paused.continuation}, storage);
+  expect(resumed.steered).toEqual([]);
+  if (mode === "recover") {
+    expect(result).toMatchObject({status: "completed", rounds: 2, validRounds: 2});
+    expect(resumed.calls.map(call => call.key)).toEqual(["director-after-r2"]);
+    expect(ledgerRecords(storage).filter(record => record.kind === "context")).toHaveLength(1);
+  } else {
+    expect(result).toMatchObject({status: "failed", error: expect.stringContaining(
+      mode === "native outcome" ? "without a saved sending stage" : "invalid cursor basis")});
+    expect(resumed.calls).toEqual([]);
+    expect(resumed.verifications).toEqual([]);
+    expect(resumed.stateWrites).toEqual([]);
+  }
 });
 
 test("every save-point component fits the derived maximal skeleton with all components filled simultaneously", async () => {
-  expect(compactConsultation(expandConsultation(stateBound.skeleton))).toEqual(stateBound.skeleton);
-  expect(stateBound.bytes).toBe(108306);
-  expect(stateBound.bytes).toBeLessThanOrEqual(112 * 1024);
-  const measure = (value: any) => Buffer.byteLength(JSON.stringify({state: {["architecture-" + "x".repeat(64)]: value}}, null, 2));
+  expect(stateBound.bytes).toBeLessThanOrEqual(16384);
+  expect(JSON.stringify(architectureCursorSchema())).not.toMatch(/"(?:status|nextAction|nextReadyAction)":/);
+  const measure = (value: any) => Buffer.byteLength(JSON.stringify({state: {"pitako-architecture": value}}, null, 2));
   const maximize = (actual: any, maximum: any, path: string[] = []): any => {
     if (actual && typeof actual === "object" && !Array.isArray(actual)) {
       const result: any = {};
@@ -2544,7 +3000,7 @@ test("every save-point component fits the derived maximal skeleton with all comp
     expect(measure(saved)).toBeLessThanOrEqual(stateBound.bytes);
   });
   const paused = await host.execute({planning: true, currentDecision: snapshot("Large caller snapshot " + "\\".repeat(7500)), maxRounds: 2});
-  expect(paused.status).toBe("needs-human");
+  expect(paused.status, paused.error).toBe("needs-human");
   expect(paused.frontier!.questions).toHaveLength(64);
   expect(paused.frontier!.questions.every(item => JSON.stringify(item.dependsOn) === JSON.stringify(ids))).toBe(true);
   expect(await host.execute({planning: true, continuation: paused.continuation, humanAnswers: {consultation: "decision", revision: 1, round: 1,
@@ -2554,43 +3010,11 @@ test("every save-point component fits the derived maximal skeleton with all comp
   expect(again).toMatchObject({status: "needs-human", rounds: 2});
   expect(await host.execute({planning: true, continuation: again.continuation, humanAnswers: {consultation: "decision", revision: 1, round: 2,
     answers: humanIds.map(id => ({id, disposition: "answer", content: "Keep baseline", provenance: "Actual human"}))}})).toMatchObject({status: "failed"});
-  const retained = host.storage.get("architecture-decision") as any;
+  const retained = host.storage.get("pitako-architecture") as any;
   expect(retained.originals.filter((item: any) => item.diagnostic)).toHaveLength(9);
   expect(saves).toBeGreaterThan(30);
-  expect(host.stateWrites.every(write => write.persisted && write.bytes <= 262144)).toBe(true);
 });
 
-
-test("plan initial-context at maximal admitted reference sizes coexists with a maximal consultation", async () => {
-  // Run the real /plan producer script: it stores native reference envelopes, not
-  // report prose. Fill every documented native reference slot at architecture's
-  // admitted path/runId limits, including escaped bytes and the output mapping.
-  const contextSource = readFileSync(new URL("../skills/plan/context.js", import.meta.url), "utf8");
-  const storage = new Map<string, unknown>();
-  const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
-  const initial = await new AsyncFunction("args", "runs", "state", contextSource)(
-    {brief: "Choose persistence", workDescription: "Choose persistence architecture"},
-    {all: async (requests: Request[]) => requests.map(request => {
-      const association = Object.fromEntries(Object.entries((request.outputSchema as any).properties.association.properties).map(([key, schema]: [string, any]) => [key, schema.const]));
-      const file = "/" + "p".repeat(1021);
-      return {ok: true, runId: "r".repeat(94), agent: request.agent,
-        outputReference: file, outputArtifactPath: file, artifactPaths: [file], state: "complete",
-        structuredOutput: {association, delivery: "complete", status: "ready", report: "Unbounded report stays outside mission state",
-          briefing: Object.fromEntries(["facts", "reasons", "contradictions", "limits", "questions", "sources", "essentialReasons"].map(key => [key, ["Initial provider context"]]))},
-        results: [{index: 0, agent: request.agent, runId: "r".repeat(94), workflowKey: request.key, savedOutputPath: file,
-          outputReference: {path: file, bytes: Number.MAX_SAFE_INTEGER, lines: Number.MAX_SAFE_INTEGER, message: "Output saved to: " + file},
-          structuredOutputPath: file, artifactPaths: [file], exitCode: 0, state: "complete"}]};
-    })}, {set: async (key: string, value: unknown) => storage.set(key, value)});
-  expect(initial.status).toBe("ready");
-  const initialBytes = Buffer.byteLength(JSON.stringify({state: Object.fromEntries(storage)}, null, 2));
-  expect(initialBytes).toBeGreaterThan(7000);
-  expect(Buffer.byteLength(JSON.stringify({state: {...Object.fromEntries(storage), ["architecture-" + "x".repeat(64)]: stateBound.skeleton}}, null, 2))).toBeLessThan(262144);
-  const host = fixture();
-  expect(await host.execute(undefined, storage)).toMatchObject({status: "completed"});
-  expect(host.calls.length).toBeGreaterThan(0);
-  expect(host.stateWrites.every(write => write.persisted && write.bytes < 262144)).toBe(true);
-  console.log(`plan maximal reference-envelope initial-context ${initialBytes} bytes; maximal consultation ${stateBound.bytes} bytes`);
-});
 
 test.each(["../outside.json", "/outside-root.json", "sub/../outside.json"])("published path %s with traversal or an empty derived root is rejected before dependent dispatch", async file => {
   const host = fixture((key, request) => {
@@ -2636,7 +3060,7 @@ test.each([false, true])("failed-comparison archive survives append/anchor cut, 
   const archived = ledgerRecords(storage).filter(record => record.kind === "round" && record.body.comparison === "failed");
   expect(archived).toHaveLength(barrier ? 0 : 1);
   if (!barrier) {
-    const comparison = logical(archived[0]!.body);
+    const comparison = archived[0]!.body;
     expect(comparison).toMatchObject({rounds: 1, validRounds: 0});
     expect(comparison.originals.find((original: Original) => original.key === "r1-simple").diagnostic).toContain("Terminal inadequate comparison");
   } else expect(resumed.calls).toEqual([]);
@@ -2651,7 +3075,7 @@ test("ten failed comparisons, replacement, then repeated ceiling synthesis never
       : request.phase === "architecture-perspective" ? {...child(key), structuredOutput: {status: "blocked", report: "Insufficient comparison"}} : child(key), undefined,
       value => {
         expect(value.cursor.dispatches.length).toBeLessThanOrEqual(16);
-        expect(Buffer.byteLength(JSON.stringify({state: {"architecture-decision": physical(value)}}, null, 2))).toBeLessThanOrEqual(stateBound.bytes);
+        expect(Buffer.byteLength(JSON.stringify({state: {"pitako-architecture": physical(value)}}, null, 2))).toBeLessThanOrEqual(stateBound.bytes);
       });
     const result = await host.execute(round === 1 ? {currentDecision: snapshot("Bound failed comparisons"), maxRounds: 10} : {continuation, evidence: `New facts for round ${round}`}, storage);
     expect(result).toMatchObject({status: "failed", rounds: round, validRounds: 0});
@@ -2674,7 +3098,7 @@ test("ten failed comparisons, replacement, then repeated ceiling synthesis never
     expect(continued.stateWrites).toEqual([]);
     const memoItems = (host: ReturnType<typeof fixture>) => JSON.parse([...host.verifications].reverse().find(call => JSON.parse(call.request.task).gate.includes("memo-"))!.request.task).items;
     expect(memoItems(continued)).toEqual(memoItems(host));
-    const retained = storage.get("architecture-decision") as any;
+    const retained = storage.get("pitako-architecture") as any;
     expect(retained.cursor.dispatches).toHaveLength(1);
     expect(retained.originals.length).toBeLessThanOrEqual(2);
     expect(host.stateWrites.every(write => write.persisted && write.bytes <= stateBound.bytes)).toBe(true);
@@ -2703,7 +3127,7 @@ test("round-zero blocked conclusions close and remain constant across evidence c
   for (let i = 0; i < 6; i++) {
     result = await host.execute({continuation: result.continuation, evidence: `Caller evidence ${i}`});
     expect(result).toMatchObject({status: "blocked", rounds: 0});
-    const saved = host.storage.get("architecture-decision") as any;
+    const saved = host.storage.get("pitako-architecture") as any;
     expect(saved.cursor.dispatches).toHaveLength(1);
     expect(saved.originals).toHaveLength(1);
     expect(saved.cursor.dispatches[0].controlOutput.perspectives).toEqual([]);
@@ -2714,33 +3138,97 @@ test("round-zero blocked conclusions close and remain constant across evidence c
   expect(ledgerRecords(host.storage).filter(record => record.kind === "round")).toHaveLength(7);
 });
 
-test("two paused rounds keep earlier human answers and caller evidence ACTIVE through pinned priorActive context", async () => {
+test.each(["retained", "native originals", "neither"])("paused rounds preserve priorActive context using %s", async source => {
   const question = {id: "scope", kind: "human", dependsOn: [], question: "Keep baseline?", decision: "Scope", recommendation: "Keep it"};
   const host = fixture((key, request) => request.phase === "architecture-doubts"
     ? {...child(key), structuredOutput: {doubts: key === "director-doubts-r3" ? [] : [question]}}
-    : key.startsWith("director-after-r") ? child(key, key === "director-after-r3" ? finish : discuss) : child(key));
+    : key.startsWith("director-after-r") ? child(key, key === "director-after-r3" ? finish : discuss) : child(key),
+    undefined, undefined, undefined, undefined, false, source === "native originals");
   let result = await host.execute({planning: true, currentDecision: snapshot("Active human context"), evidence: "Initial caller fact provenance 10"});
   for (let round = 1; round <= 2; round++) {
     expect(result).toMatchObject({status: "needs-human", rounds: round});
+    const count = host.calls.length;
+    const priorStore = (host.storage.get("pitako-architecture") as any).ledger.identity.storeId;
+    // Lose a previously restored store as well: the second restore must prove
+    // the first recovery receipt and still recover the earlier human answer.
+    if (source === "native originals" && round === 2) {
+      const { count } = (host.storage.get("pitako-architecture") as any).ledger;
+      const file = new PitakoStore(ledgerCwd(fixtureMissions.get(host.storage)!)).file;
+      const db = openSqliteSync(file);
+      try { db.prepare("DELETE FROM records WHERE scope=? AND seq=?").run("arch:decision", count); }
+      finally { db.close(); }
+    } else if (source === "native originals" || round === 2 && source === "neither") {
+      const cwd = ledgerCwd(fixtureMissions.get(host.storage)!);
+      const file = new PitakoStore(cwd).file;
+      for (const suffix of ["-wal", "-shm", ""]) rmSync(file + suffix, { force: true });
+    }
     result = await host.execute({planning: true, continuation: result.continuation, humanAnswers: {consultation: "decision", revision: 1, round,
       answers: [{id: "scope", disposition: "answer", content: `Human answer ${round}`, provenance: `Actual human message ${round}`} ]}});
+    if (round === 2 && source === "neither") {
+      expect(result.error).toContain("native originals do not prove");
+      expect(result.error).not.toMatch(/new mission|modify Pitako|resubmit/i);
+      expect(result).toMatchObject({ status: "failed", rounds: 2 });
+      expect(host.calls).toHaveLength(count);
+      expect((host.storage.get("pitako-architecture") as any).ledger.identity.storeId).toBe(priorStore);
+      return;
+    }
+    if (source === "native originals") {
+      expect((host.storage.get("pitako-architecture") as any).ledger.identity.storeId).not.toBe(priorStore);
+      expect(host.calls.slice(count).map(call => call.key)).toEqual([
+        `director-after-r${round}`, `r${round + 1}-simple`, `r${round + 1}-recover`, `director-doubts-r${round + 1}`,
+        ...(round === 2 ? ["director-after-r3"] : []),
+      ]);
+    }
   }
   expect(result.status).toBe("completed");
-  const readContext = (ref: {path: string; digest: string}): string => {
-    const value = JSON.parse(readFileSync(ref.path, "utf8"));
-    expect(canonicalDigest(value)).toBe(ref.digest);
-    // Follow only the path the record gives its consumer; never rebuild the filename convention.
-    const prior = Object.values(value.body.priorActive ?? {}) as {path: string; digest: string}[];
-    return JSON.stringify(value) + prior.map(item => readContext({path: item.path, digest: item.digest})).join("\n");
+  expect(ledgerRecords(host.storage).filter(row => row.kind === "context")
+    .map(row => row.body.humanAnswers?.answers[0].provenance ?? row.body.callerEvidence)).toEqual([
+    "Initial caller fact provenance 10", "Actual human message 1", "Actual human message 2",
+  ]);
+  const readContext = (ref: {store: StoreRecordLocation; digest: string}): string => {
+    const value = storeOriginal(ref.store, ref.digest);
+    const prior = Object.values(value.priorActive ?? {}) as {store: StoreRecordLocation; digest: string}[];
+    return JSON.stringify(value) + prior.map(readContext).join("\n");
   };
   const prompts = host.calls.filter(call => call.request.phase === "architecture-perspective" && call.key.startsWith("r3-"));
   expect(prompts).toHaveLength(2);
   for (const {request} of prompts) {
     expect(request.task).toContain("ACTIVE decision context");
+    expect(request.task).toContain("Active human context");
     const active = essentials(request).filter(item => item.id.startsWith("context-"));
-    const contents = active.map(item => readContext({path: item.results![0]!.savedOutputPath!, digest: (item as any).digest})).join("\n");
+    const contents = active.map(item => readContext({store: item.store!, digest: item.digest!})).join("\n");
     for (const text of ["Actual human message 1", "Actual human message 2", "Initial caller fact provenance 10"]) expect(contents).toContain(text);
   }
+});
+
+test("store loss before a consuming gate halts without model work and relaunch uses the normal gate", async () => {
+  let cut = false;
+  const host = fixture(undefined, undefined, undefined, value => {
+    const control = (value.cursor as any).control;
+    if (cut || control.stage !== "prepare" || !control.context?.callerEvidence) return;
+    cut = true;
+    const file = new PitakoStore(ledgerCwd(fixtureMissions.get(host.storage)!)).file;
+    for (const suffix of ["-wal", "-shm", ""]) rmSync(file + suffix, {force: true});
+  }, undefined, false, true);
+  const completed = await host.execute();
+  expect(completed.status).toBe("completed");
+  const models = host.calls.length, gates = host.verifications.length;
+  const halted = await host.execute({continuation: completed.continuation, evidence: "Committed before gate"});
+  expect(cut).toBe(true);
+  expect(halted).toMatchObject({status: "failed", rounds: 1, validRounds: 1,
+    error: expect.stringContaining("store-backed original unavailable")});
+  expect(host.calls).toHaveLength(models);
+  expect(host.verifications.slice(gates).map(gate => gate.key)).toEqual(["verify-v1-director-prepare-a2"]);
+  const resumed = fixture((key, request) => {
+    expect(evidenceText(request)).toContain("Committed before gate");
+    return child(key);
+  });
+  expect(await resumed.execute({continuation: halted.continuation}, host.storage))
+    .toMatchObject({status: "completed", rounds: 2, validRounds: 2});
+  expect(resumed.calls.map(call => call.key)).toEqual(["director-prepare", "r2-simple", "r2-recover", "director-after-r2"]);
+  expect(resumed.verifications.map(gate => gate.key)).toEqual([
+    "verify-v1-director-prepare-a2", "verify-v1-r2-simple-a1", "verify-v1-director-after-r2-a1", "verify-v1-memo-director-after-r2-a1-a1",
+  ]);
 });
 
 test("original references survive new workflow run roots and changed artifacts directories across human and evidence reentry", async () => {
@@ -2769,12 +3257,12 @@ test("pending caller context blocks replacement without an intention, then ident
     if ((value as any).cursor.control.context?.callerEvidence) throw new Error("Context anchor cut");
   });
   expect(await interrupted.execute(input, storage)).toMatchObject({status: "failed"});
-  const prior = structuredClone(storage.get("architecture-decision"));
+  const prior = structuredClone(storage.get("pitako-architecture"));
   const update = replacement("decision", 1, snapshot("Replacement after reconciliation"));
   const blocked = fixture();
   expect(await blocked.execute({continuation: first.continuation, replacement: update}, storage)).toMatchObject({status: "blocked", error: expect.stringContaining("re-enter without replacement first")});
   expect(blocked.calls).toEqual([]); expect(blocked.stateWrites).toEqual([]);
-  expect(storage.get("architecture-decision")).toEqual(prior);
+  expect(storage.get("pitako-architecture")).toEqual(prior);
   expect(await fixture().execute(input, storage)).toMatchObject({status: "completed"});
   expect(await fixture().execute({continuation: first.continuation, replacement: update}, storage)).toMatchObject({status: "completed"});
 });

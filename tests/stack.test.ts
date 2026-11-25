@@ -144,6 +144,9 @@ describe("stack configuration", () => {
       id: "pitako-file-sha256", spec: "pitako", entry: "extensions/file-sha256.ts",
       tools: ["file_sha256", "file_sha256_save"],
     });
+    expect(stack.required.find(({ id }) => id === "pitako-store")).toEqual({
+      id: "pitako-store", spec: "pitako", entry: "extensions/pitako-store-tool.ts", tools: ["pitako_store"],
+    });
     expect(manifest.bundledDependencies).toContain("@juicesharp/rpiv-config");
     expect(JSON.parse(readFileSync(path.join(root, "package.json"), "utf8")).files).toContain("vendor");
     for (const id of ["billion-context-pi", "@sting8k/pi-vcc", "pi-hermes-memory"]) {

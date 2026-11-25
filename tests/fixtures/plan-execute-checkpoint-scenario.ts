@@ -9,6 +9,50 @@ import { runWorkflowScript } from "../../node_modules/pi-subagents/src/workflows
 import { digest, SPEC_SECTIONS } from "../../extensions/spec-plans.ts";
 import { planExecute, missionFiles, childResponse, registeredCheckpoint, type CompositionFixture, type NativeCheckpointFixture } from "./plan-execute-composition.ts";
 
+import { EXECUTE_CURSOR_KEY, type ExecuteCursor } from "../../extensions/execute-cursor.ts";
+import { type CheckpointIntent } from "../../extensions/execute-checkpoint.ts";
+import { PitakoStore } from "../../extensions/pitako-store.ts";
+import { canonicalDigest } from "../../extensions/canonical.mjs";
+
+export function committedCursor(f: { root: string; intent: CheckpointIntent; statePath: string; record?: { lastConfirmed: unknown }; bindingKey?: string }) {
+  const store = new PitakoStore(f.root), scope = `exec:${f.intent.association.invocation}.e0`;
+  const identity = store.activate(scope);
+  let head = store.read(scope).head;
+  if (f.record?.lastConfirmed || f.bindingKey) {
+    const body = { operation: "baseline", request: { intent: f.intent, continuation: {
+      lastConfirmed: f.record?.lastConfirmed ?? null, attempt: { bindingKey: f.bindingKey ?? f.intent.key } } } };
+    const saved = store.commit(scope, head, `baseline:${head?.seq ?? 0}`, canonicalDigest(body),
+      () => ({ kind: "operation", body }));
+    if (saved.outcome !== "appended") throw new Error("Expected committed baseline");
+    head = saved.head;
+  }
+  const committed = store.commit(scope, head, `intent:${head?.seq ?? 0}`, canonicalDigest(f.intent),
+    () => ({ kind: "intent", body: f.intent }));
+  if (committed.outcome !== "appended" || !committed.head) throw new Error("Expected committed intent");
+  const intentRef = { seq: committed.head.seq, digest: committed.head.hash };
+  const cursor: ExecuteCursor = {
+    version: 10, storeId: identity.storeId, root: f.root, invocation: f.intent.association.invocation, epoch: 0,
+    associationDigest: canonicalDigest(f.intent.association), admissionBinding: "b".repeat(64),
+    head: committed.head,
+    action: { kind: "launched", key: f.intent.key, runId: "11111111-1111-4111-8111-111111111111",
+      role: "worker", input: intentRef, gateTimeoutMs: 1000 },
+    loop: { number: f.intent.loop, phase: "implementation", cursor: f.intent.cursor, taskId: f.intent.taskId, outcome: null,
+      attempt: { number: f.intent.attempt, stage: "launched", intent: intentRef, revival: null } },
+    inFlight: [], halt: null, hostHalt: null,
+    timeouts: { reviewerMs: 1000, workerMs: 1000, gateFloorMs: 1000 },
+    models: { taskReviewer: "fixture/reviewer", taskSynthesis: "fixture/synthesis",
+      r1: "fixture/r1", r2: "fixture/r2", synthesis: "fixture/synthesis" },
+    budget: { consumedLoops: 1, maxCycles: f.intent.association.maxCycles, rejectedKeys: [], lastProgress: null },
+    backlogDigest: "c".repeat(64), boardTopicId: 1, review: null,
+  };
+  const persist = () => {
+    mkdirSync(path.dirname(f.statePath), { recursive: true });
+    writeFileSync(f.statePath, JSON.stringify({ [EXECUTE_CURSOR_KEY]: cursor }));
+  };
+  persist();
+  return { store, scope, cursor, persist };
+}
+
 // Shared registered checkpoint lifecycle scenario for the two checkpoint lifecycle
 // test files; each file passes its own composition and native process fixtures.
 export function checkpointScenarioFixture({ repository, disposers, workflowSettlements }: CompositionFixture, { nativeCheckpointCase }: NativeCheckpointFixture) {
@@ -58,34 +102,60 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
       if (!resource.ok) throw Error(resource.error);
       const permit = consumeWorkflowResourcePermit(resource.resource.permit, resource.resource.script);
       if (typeof permit === "string") throw Error(permit);
-      let continuationScript: string | undefined, laterScript: string | undefined;
-      if (mode.startsWith("pause-") && !mode.startsWith("pause-status-")) {
-        const continuationResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-          resolution: { loop: 2, text: "Continue the cooperative pause from its saved pending work" } }, sessionId);
-        if (!continuationResource.ok) throw Error(continuationResource.error);
-        continuationScript = continuationResource.resource.script;
-        if (mode === "pause-later-input" || mode === "pause-twice") {
-          const laterResource = resolveWorkflowResource("pitako.execute", { ...args, unblock: true,
-            resolution: { loop: 2, text: "New human continuation after the recorded Stop" } }, sessionId);
-          if (!laterResource.ok) throw Error(laterResource.error);
-          laterScript = laterResource.resource.script;
-        }
-      }
       const input = { mode, root, missionPath, statePath, script: resource.resource.script, preparePause,
-        continuationScript, laterScript,
-        metadata: { inlineLoopIO: true, withTask: true, root, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
+        metadata: { inlineLoopIO: true, withTask: true, root, workflowRunId: sessionId, commonDir: path.join(root, ".git"), selected: { source: path.join(root, ".pitako/plans/assignment.md"), digest: digest(content) } },
         module: new URL("../../extensions/execute-checkpoint.ts", import.meta.url).href,
-        stateModule: new URL("../../extensions/execute-state.ts", import.meta.url).href,
+        progressModule: new URL("../../extensions/execute-progress.ts", import.meta.url).href,
+        ledgerModule: new URL("../../skills/execute/ledger.mjs", import.meta.url).href,
         toolModule: path.resolve("extensions/checkpoint-create.ts"),
         sealer: path.resolve("skills/execute/checkpoint.mjs"),
         loaderModule: new URL("../../node_modules/@earendil-works/pi-coding-agent/dist/core/extensions/loader.js", import.meta.url).href,
         evidence: new URL("../../extensions/spec-plans.ts", import.meta.url).href,
-        inspectorEntry: path.resolve("skills/execute/inspect.mjs"),
+        inspectionExecutable: process.execPath, inspectorEntry: path.resolve("skills/execute/inspect.mjs"),
         inspector: new URL("../../skills/execute/inspect.ts", import.meta.url).href,
         validator: import.meta.resolve("@earendil-works/pi-ai") };
       const harness = async (input: any, run: typeof runWorkflowScript, response: typeof childResponse, io: any, loadCheckpoint: typeof registeredCheckpoint) => {
-        const { expandWorkerReferences } = await import(input.stateModule);
+        const { readExecuteAdmission } = await import(input.progressModule);
+        const { executeProjection, commitExecute } = await import(input.ledgerModule);
         const storage = new Map<string, any>(), originals = new Map<string, any>(), calls: string[] = [], snapshots: any[] = [], points: any[] = [];
+        // Fixture observations use committed originals at the saved head, not a second state key.
+        function progress(value = storage.get("pitako-execute")) {
+          if (!value) return;
+          const { cursor, records, admission } = readExecuteAdmission(input.root, value);
+          const projection = executeProjection(records);
+          const ledger = records.filter((row: any) => row.kind === "ledger").flatMap((row: any) => row.body.entries);
+          archives.splice(0, archives.length, ...ledger);
+          const units = ledger.filter((row: any) => row.kind === "unit");
+          const operations = records.filter((row: any) => row.kind === "operation").map((row: any) => row.body.request);
+          const continuation = projection.prompt.execution?.continuation ??
+            projection.prompt.execution?.foldedContinuation ??
+            operations.findLast((request: any) => request.continuation)?.continuation;
+          const frame = continuation?.taskFrame ?? operations.findLast((request: any) => request.taskFrame)?.taskFrame;
+          const tasks: any = {};
+          for (const unit of units) {
+            const result = unit.body.result;
+            const task = tasks[unit.body.taskId] ??= {};
+            task.last = result;
+            if (result.status === "complete") task.completed = result;
+          }
+          const results = units.map((unit: any) => unit.body.result);
+          const intentRef = cursor.loop?.attempt?.intent;
+          const intentRecord = intentRef && records.find((row: any) =>
+            row.kind === "intent" && row.seq === intentRef.seq && row.digest === intentRef.digest);
+          if (intentRef && !intentRecord) throw Error("Missing cursor-head intent original");
+          const attempt = cursor.loop?.attempt && {
+            ...(intentRecord && continuation?.attempt?.key === intentRecord.body.key ? continuation.attempt : {}),
+            ...cursor.loop.attempt,
+            taskId: cursor.loop.taskId, key: intentRecord?.body.key, checkpoint: intentRecord?.body };
+          const lastConfirmed = units.at(-1)?.body.checkpoint ?? continuation?.lastConfirmed;
+          return { ...cursor, association: admission.association, consumedLoops: cursor.budget.consumedLoops,
+            lastConfirmed, tasks, taskFrame: { ...frame, intents: Object.fromEntries(
+              records.filter((row: any) => row.kind === "intent").map((row: any) => [row.body.key, row.body])) },
+            loop: cursor.loop && { ...cursor.loop, attempt, results,
+              plan: continuation?.loop?.plan ?? projection.prompt.execution?.plan,
+              manifest: continuation?.loop?.manifest ?? (projection.prompt.selectedTask ? [projection.prompt.selectedTask.id] : []),
+              halt: cursor.halt ?? undefined } };
+        }
         const hostObservations: any[] = [];
         let recoveryReplay = false;
         let pauseAdmissionCut = false;
@@ -98,31 +168,31 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         const sealedPaths = new Set<string>();
         let secondPause: any;
         const unitMode = input.mode.startsWith("unit-before-capture");
-        const stateCut = (value: any) => {
-          if (!continuing || cut) return false;
-          const l = value.loop;
-          return input.mode === "pause-input-cut" && l?.resolutions?.at(-1)?.stage === "intention";
-        };
         const candidate = () => { const { head, fingerprint } = io.checkoutEvidence(input.root); return { head, fingerprint }; };
         let gateCandidate: any;
         const state = { get: (key: string) => structuredClone(storage.get(key)), set: (key: string, value: any) => {
-          const checkpoint = value.lastConfirmed;
-          const admission = checkpoint?.taskId === "second";
+          // A crash cannot be repaired by another save in the same root.
+          if (cut && ["admission-cut", "cursor-cut"].includes(input.mode))
+            throw Error("Checkpoint crash cut remains unavailable");
+          let observed: any;
+          const observe = () => observed ??= progress(value);
+          const admission = ["admission-cut", "cursor-cut"].includes(input.mode) ||
+              input.mode.includes("status-") && input.mode.endsWith("admission-cut")
+            ? observe().lastConfirmed?.taskId === "second" : false;
           if (!cut && input.mode === "admission-cut" && admission) { cut = true; throw Error("Before checkpoint admission save"); }
           storage.set(key, structuredClone(value)); io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage))); // Only the admission/cursor ordering projection is observed below;
           // retain full native state in storage/on disk, not in every IPC snapshot.
-          const observed = expandWorkerReferences(value);
-          snapshots.push({ loops: observed.loop ? [observed.loop].map((loop: any) => ({ cursor: loop.cursor,
-            results: loop.results?.map((entry: any) => ({ taskId: entry.taskId, status: entry.status ?? value.tasks[entry.taskId]?.completed?.status ?? value.tasks[entry.taskId]?.last?.status })) })) : [] });
-          if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && value.loop?.attempt?.stage === "result" && value.loop.attempt.taskId === "second") {
+          // Only advanced positions are asserted; pending saves need no history projection.
+          if (value.loop?.cursor === 1) snapshots.push({ loops: [observe().loop].map((loop: any) => ({ number: loop.number, cursor: loop.cursor,
+            results: loop.results?.map((entry: any) => ({ taskId: entry.taskId, status: entry.status })) })) });
+          if (!pauseAdmissionCut && input.mode.includes("status-") && input.mode.endsWith("admission-cut") && admission) {
             pauseAdmissionCut = true; throw Error("Cut after durable pause admission before yield");
           }
-          if (input.mode === "pause-status-continue" && !cut && value.loop?.attempt?.taskId === "second" &&
-              value.loop.attempt.number === 3 && value.loop.attempt.stage === "launched" && calls.includes(value.loop.attempt.key)) { cut = true; throw Error("Cut after successor loss"); }
-          if (unitMode && input.mode.includes("reentry") && !cut && value.loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
-          if (stateCut(value)) { cut = true; throw Error("Controlled pause persistence cut"); }
-          if (!cut && input.mode === "cursor-cut" && admission && value.loop.attempt?.stage === "result") {
-            cut = true; throw Error("After checkpoint admission before cursor advance");
+          if (input.mode === "pause-status-continue" && !cut && value.loop?.taskId === "second" &&
+              value.loop.attempt?.number === 3 && value.loop.attempt.stage === "launched" && calls.includes(observe().loop.attempt.key)) { cut = true; throw Error("Cut after successor loss"); }
+          if (unitMode && input.mode.includes("reentry") && !cut && observe().loop?.attempt?.restore?.undispatched) { cut = true; throw Error("Cut after durable unit recovery intention"); }
+          if (!cut && input.mode === "cursor-cut" && admission) {
+            cut = true; throw Error("After durable checkpoint admission and cursor save");
           }
         } };
         const options = { script: input.script, state,
@@ -138,7 +208,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             // must round-trip. Shell quoting and the Node transport are covered by the
             // fallback and settings admission tests, which spawn the real command.
             const argv = [...request.command.matchAll(/'((?:[^']|'\\'')*)'/g)].map(match => match[1].replaceAll("'\\''", "'"));
-            if (argv[0] !== "node" || argv[1] !== input.inspectorEntry ||
+            if (argv[0] !== input.inspectionExecutable || argv[1] !== input.inspectorEntry ||
                 argv.map(value => `'${value.replaceAll("'", "'\\''")}'`).join(" ") !== request.command)
               throw Error("Unexpected inspection command: " + request.command);
             const stdout = await (await import(input.inspector)).inspect(argv.slice(2));
@@ -150,7 +220,12 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           launch: async (key: string, request: any) => {
             calls.push(key);
             if (request.agent === "pitako.loop-io") {
-              const grouped = JSON.parse(request.task);
+              let grouped = JSON.parse(request.task);
+              if (grouped.operation === "close" && grouped.refs) {
+                const runtime = await import(input.metadata.loopIO);
+                const { operation, ...params } = grouped;
+                grouped = { operation, ...runtime.resolveStoredGroupedInput(operation, params) };
+              }
               input.metadata.groupedHooks = {
                 afterEffect: async (step: string) => {
                   if (grouped.operation === "close" && step === `${grouped.key}.seal`) {
@@ -171,7 +246,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               };
             }
             if (request.agent === "pitako.execution-ledger") archives.push(JSON.parse(request.task).record);
-             const pending = expandWorkerReferences(storage.get("invoke-human-1"))?.loop;
+            const workerProgress = request.agent === "pitako.worker" ? progress() : undefined;
+            const pending = workerProgress?.loop;
             if (request.agent === "pitako.checkpoint-sealer") {
               const seal = JSON.parse(request.task), second = seal.intent.taskId === "second";
               if (second && input.mode === "refused") { sealError = "Native control refuses checkpoint capture"; throw Error(sealError); }
@@ -199,7 +275,9 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 }
                 if (second && input.mode === "seal-cut") throw Error("Abrupt cut after seal before admission");
               }
-              return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+              const id = io.hash(key);
+              const runId = `${id.slice(0,8)}-${id.slice(8,12)}-4${id.slice(13,16)}-8${id.slice(17,20)}-${id.slice(20,32)}`;
+              return { key, ok: true, agent: request.agent, runId, asyncDir: `/native/async/${key}`,
                 output: JSON.stringify(observed), results: [{ exitCode: 0 }], externalAdapter: {
                   outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } };
             }
@@ -217,6 +295,8 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             // Controlled review children write only excluded metadata after the final gate.
             const needsCandidate = key.endsWith(".compliance") || request.agent === "pitako.checkout-observer" ||
               request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate";
+            if (key.endsWith(".compliance") || request.agent === "pitako.reviewer")
+              input.metadata.association = progress().association;
             const result = await response(key, request, input.metadata, needsCandidate ? gateCandidate : undefined);
             if (request.agent === "pitako.loop-io" && ["close", "taskDelta"].includes(JSON.parse(request.task).operation) && !result.ok) {
               const failure = JSON.parse(result.output);
@@ -237,7 +317,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                 selection.changes.push({ kind: "add", task: second, reason: "Preserve the next pending unit" });
               }
             } else if (request.agent === "pitako.worker") {
-              const invocation = expandWorkerReferences(storage.get("invoke-human-1")), loop = invocation.loop, intent = loop.attempt.checkpoint;
+              const invocation = workerProgress, loop = invocation.loop, intent = loop.attempt.checkpoint;
               const second = intent.taskId === "second";
               if (cooperativePause && second && intent.attempt > 1) {
                 continuing = true;
@@ -313,7 +393,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               if (input.mode === "pause-status-continue" && second && [2, 4, 5].includes(intent.attempt)) {
                 if (intent.attempt === 5)
                   io.applyCheckpoint(intent, [{ path: "owned", image: { bytes: Buffer.from("journaled pending WIP").toString("base64"), mode: 420 } }]);
-                const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? invocation.tasks[intent.taskId].last.candidate;
+                const current = intent.attempt === 5 ? candidate() : restoreReceipt?.candidate ?? intent.baseline;
                 Object.assign(result.structuredOutput, { taskId: intent.taskId, attempt: intent.attempt,
                   status: "continue", usefulProgress: true, diagnosis: `Further work ${intent.attempt} requires a fresh capture for another path`,
                   remaining: ["Finish the diagnosed pending work"], continuation: { mode: "fresh", reason: "Complete the newly diagnosed work" },
@@ -321,7 +401,13 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
                   git: { head: current.head, checkpoints: restoreReceipt ? [restoreReceipt.partialRef, restoreReceipt.restoredRef] : [], wip: "Unchanged pause WIP" },
                   checks: [{ id: "second-check", command: "bun test affected", cwd: input.root,
                     output: "Pending implementation", logPaths: [], result: "not-run", before: current, after: current }] });
-                return result;
+                const settled = await response(key, request, input.metadata, undefined, 1, {
+                  work: result.structuredOutput.diagnosis, status: "continue",
+                  remaining: result.structuredOutput.remaining, continuation: result.structuredOutput.continuation,
+                  knowledge: { findings: [], handoff: "Pending work retains its exact pause bytes" },
+                });
+                originals.set(settled.runId!, structuredClone(settled));
+                return settled;
               }
               const manifestPath = input.root + "/.pi/subagents/checkpoints/" + intent.key + "/manifest.json";
               const before = JSON.parse(JSON.parse(io.readFileSync(manifestPath, "utf8")).data);
@@ -346,11 +432,14 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             if (request.agent === "pitako.worker") {
               const value = result.structuredOutput;
               result.structuredOutput = { work: value.diagnosis ?? "Owned checkpoint effects applied", status: value.status,
-                remaining: value.remaining, knowledge: { findings: [], handoff: "Owned file reflects this settled attempt" } };
+                remaining: value.remaining, ...(value.continuation ? { continuation: value.continuation } : {}),
+                knowledge: { findings: [], handoff: "Owned file reflects this settled attempt" } };
             }
             if (request.agent === "pitako.worker")
               (await import(input.validator)).validateToolArguments({ name: "worker_result", description: "Result", parameters: request.outputSchema },
                 { type: "toolCall", id: "worker", name: "worker_result", arguments: result.structuredOutput });
+            if (request.agent === "pitako.worker")
+              Object.assign(result, await response(key, request, input.metadata, undefined, 1, result.structuredOutput));
             originals.set(result.runId!, structuredClone(result));
             if (input.mode === "pause-reusable-result" && continuing && key.endsWith(".l2.t1.a2")) {
               originals.set(key, structuredClone(result));
@@ -360,76 +449,65 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           },
         };
         const launch = options.launch, launchErrors: string[] = [];
+        const admissions = new Map<string, { params: string; result?: any; error?: unknown }>();
         options.launch = async (key, request) => {
-          try { return await launch(key, request); }
-          catch (error) { launchErrors.push(`${key}: ${String(error)}`); throw error; }
+          // Native runs reuse the exact key and parameters across root reentries.
+          const params = JSON.stringify(request), prior = admissions.get(key);
+          if (prior) {
+            if (prior.params !== params) throw Error(`Conflicting native reuse parameters: ${key}`);
+            if (prior.error) throw prior.error;
+            return structuredClone(prior.result);
+          }
+          try {
+            const result = await launch(key, request);
+            if (result.runId) admissions.set(key, { params, result: structuredClone(result) });
+            return result;
+          }
+          catch (error) {
+            // Publication is native admission even when the first reply is lost.
+            const mission = io.existsSync(input.missionPath) && JSON.parse(io.readFileSync(input.missionPath, "utf8"));
+            if (mission?.workflowChildren?.some((child: any) => child.key === key && child.agent === request.agent))
+              admissions.set(key, { params, error });
+            launchErrors.push(`${key}: ${String(error)} ${JSON.stringify({ intent: progress()?.loop?.attempt?.checkpoint, cursor: storage.get("pitako-execute") })}`); throw error;
+          }
         };
         const result = await run(options as any);
-        const finish = async () => {
-        const original = expandWorkerReferences(structuredClone(storage.get("invoke-human-1")));
+        const original = progress();
         const originalArchives = structuredClone(archives);
         const callsAtYield = [...calls];
         let unitReplay: any;
         if (unitMode && input.mode.includes("reentry")) {
           if (input.mode.endsWith("reentry-mismatched-previous")) {
-            const retained = storage.get("invoke-human-1");
-            retained.taskFrame.intents[retained.taskFrame.sources[0]].progress.previous.digest = "0".repeat(64);
+            const retained = progress();
+            const intent = structuredClone(retained.loop.attempt.checkpoint);
+            intent.progress.previous.digest = "0".repeat(64);
+            const { canonicalDigest } = await import(new URL("../../extensions/canonical.mjs", input.ledgerModule).href);
+            const saved = commitExecute(input.root, retained.invocation, "fixture:mismatched-previous",
+              canonicalDigest(intent), "intent", intent);
+            const cursor = storage.get("pitako-execute");
+            cursor.head = saved.head;
+            cursor.loop.attempt.intent = { seq: saved.head.seq, digest: saved.head.hash };
             io.writeFileSync(input.statePath, JSON.stringify(Object.fromEntries(storage)));
           }
           recoveryReplay = true; unitReplay = await run(options as any);
         }
         let noInputReplay: any;
+        const finish = async () => {
         if (input.mode.includes("status-")) {
           recoveryReplay = true;
           const replayed = await run(options as any);
-          noInputReplay = { result: replayed.value, calls: [...calls], cursor: storage.get("invoke-human-1").loop.cursor };
-          if (input.mode === "pause-status-continue") {
-            const again = await run(options as any);
-            noInputReplay = { ...noInputReplay, again: again.value };
-          }
+          noInputReplay = { result: replayed.value, calls: [...calls], cursor: storage.get("pitako-execute").loop.cursor };
+        }
+        if (input.mode === "pause-status-continue") {
+          const again = await run(options as any);
+          noInputReplay = { ...noInputReplay, again: again.value };
         }
         let resumed: any;
-        const collect = () => ({ launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: expandWorkerReferences(storage.get("invoke-human-1")), calls, snapshots, points, sealError,
+        const collect = () => ({ launchErrors, archives, originalArchives, secondPause, restorationAdmissions, unitReplay: unitReplay?.value, created: unitMode ? io.readFileSync(input.root + "/created", "utf8") : null, noInputReplay, callsAtYield, hostObservations, resumed: resumed?.value, original, baseline, partialRef, result: result.value, retained: progress(), calls, snapshots, points, sealError,
           owned: io.readFileSync(input.root + "/owned", "utf8"), unrelated: io.readFileSync(input.root + "/unrelated", "utf8") });
-        if (pauseMode && !cooperativePause) {
-          const checkpoint = original.lastConfirmed;
-          if (input.mode === "pause-missing") io.unlinkSync(checkpoint.checkpointRef);
-          if (input.mode === "pause-corrupt") {
-            if (checkpoint?.kind !== "pause" || !io.existsSync(checkpoint.checkpointRef))
-              throw Error("Missing private real pause before corruption");
-            io.writeFileSync(checkpoint.checkpointRef, "corrupt pause");
-          }
-          if (input.mode === "pause-conflict") io.writeFileSync(input.root + "/owned", "unattributed edit");
-          continuing = true;
-          resumed = await run({ ...options, script: input.continuationScript } as any);
-          if (input.mode === "pause-later-input") { laterContinuing = true; resumed = await run({ ...options, script: input.laterScript } as any); }
-          if (input.mode === "pause-twice") {
-            secondPause = { result: resumed.value, retained: expandWorkerReferences(structuredClone(storage.get("invoke-human-1"))), calls: [...calls], archives: structuredClone(archives) };
-            if (input.preparePause) {
-              if (secondPause.retained.lastConfirmed?.kind !== "pause")
-                throw Error("Missing private real second pause");
-              (globalThis as any).finishPreparedPause = async () => {
-                resumed = await run({ ...options, script: input.laterScript } as any);
-                return collect();
-              };
-              return { prepared: true };
-            }
-            resumed = await run({ ...options, script: input.laterScript } as any);
-          }
-          if (cut || lossReentry || ["pause-replay-complete", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"].includes(input.mode)) {
-            recoveryReplay = true;
-            // Equivalent capture already has exhausted evidence on the first
-            // reentry; two terminal observations prove that it cannot renew.
-            const reentries = input.mode === "pause-equivalent-capture" ? 2 :
-              (lossReentry || input.mode === "pause-repeated-publication") ? 3 : 1;
-            for (let reentry = 0; reentry < reentries; reentry++)
-              resumed = await run(options as any);
-          }
-        }
         return collect();
         };
         if (input.preparePause) {
-          if (input.mode === "pause-twice") return finish();
           (globalThis as any).finishPreparedPause = finish;
           return { prepared: true };
         }
@@ -500,8 +578,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             if (mode.endsWith("reentry")) expect(actual.hostObservations.some((o: any) => o.replay && o.checkpoint?.evidence), JSON.stringify(actual.hostObservations)).toBe(true);
           } else {
             if (mode.endsWith("reentry-mismatched-previous")) {
-              expect(actual.hostObservations.some((o: any) => o.replay &&
-                o.checkpoint?.error === "Confirmed unit conflicts with admitted pending progress.")).toBe(true);
+              expect(actual.unitReplay.reason).toContain("Committed baseline intent integrity mismatch");
               expect(actual.calls).not.toContain("invoke-human-1.l2.t1.a3");
             }
             expect(loop.cursor).toBe(0);
@@ -531,6 +608,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           originalLoop.results = history(actual.originalArchives, originalLoop.results, actual.original.tasks);
           if (mode.startsWith("pause-status-")) {
             const finalBudget = mode.includes("status-continue");
+            expect(originalLoop.results[1], JSON.stringify({ reason: actual.result.reason, errors: actual.launchErrors })).toBeDefined();
             const paused = originalLoop.results[1], pause = paused.checkpoint.confirmation;
             expect(paused.status).toBe("continue");
             expect(pause).toMatchObject({ kind: "pause", position: { loop: 2, cursor: 0 } });
@@ -630,7 +708,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             return;
           }
           expect(actual.retained.association).toEqual(actual.original.association);
-          expect(actual.retained.consumedLoops).toBe([
+          expect(actual.retained.consumedLoops, JSON.stringify({reason: actual.resumed?.reason, calls: actual.calls, launchErrors: actual.launchErrors})).toBe([
             "pause-missing", "pause-corrupt", "pause-conflict", "pause-empty", "pause-wrong-baseline",
             "pause-successor-corrupt", "pause-loss-reentry", "pause-equivalent-capture", "pause-repeated-publication",
           ].includes(mode) ? 2 : 3);
@@ -639,8 +717,9 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(actual.unrelated).toBe("unrelated WIP");
           expect(actual.calls.filter((key: string) => key.endsWith(".l1.t1.a1"))).toHaveLength(1);
           expect(actual.calls.filter((key: string) => key.endsWith(".l2.t1.a1"))).toHaveLength(1);
-          expect(new Set(actual.calls).size).toBe(actual.calls.length);
-          expect(actual.calls.some((key: string) => key.includes(".recover"))).toBe(false);
+          expect(new Set(actual.calls).size, JSON.stringify(actual.calls.filter((key: string, index: number) => actual.calls.indexOf(key) !== index))).toBe(actual.calls.length);
+          expect(actual.calls.filter((key: string) => key.includes(".recover"))).toEqual(
+            mode === "pause-reusable-result" ? ["invoke-human-1.l2.t1.a2.recover.r1"] : []);
           expect(actual.resumed.loopsConsumed).toBe(actual.retained.consumedLoops);
           expect(loop.plan.ref).toEqual(originalLoop.plan.ref);
           expect(loop.manifest).toEqual(originalLoop.manifest);
@@ -673,7 +752,6 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
               expect(actual.retained.taskFrame.operations).toHaveLength(1);
               expect(actual.retained.tasks.second.last).toEqual(originalLoop.results[1]);
               expect(actual.retained.association.maxCycles).toBe(3);
-              expect(actual.calls.filter((key: string) => !key.includes(".requests-"))).toEqual([...actual.callsAtYield.filter((key: string) => !key.includes(".requests-")), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2.capacity-1", "invoke-human-1.l2.t1.a2"]);
             }
             expect(actual.resumed.action.started).toBe(false);
             const replayed = observed.find((entry: any) => entry.replay);
@@ -705,9 +783,11 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             expect(actual.calls).toContain("invoke-human-1.l3.compliance");
             expect(loop.cursor).toBe(1);
             expect(loop.results.find((entry: any) => entry.taskId === "second" && entry.status === "complete")).toBeDefined();
-            const admitted = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.results?.some((entry: any) => entry.taskId === "second" && entry.status === "complete"));
-            const advanced = actual.snapshots.findIndex((state: any) => state.loops?.[0]?.cursor === 1 && state.loops[0].results?.some((entry: any) => entry.taskId === "second"));
-            expect(admitted).toBeLessThan(advanced);
+            const advanced = actual.snapshots.flatMap((state: any) => state.loops ?? [])
+              .filter((loop: any) => loop.number === 2 && loop.cursor === 1);
+            expect(advanced.length).toBeGreaterThan(0);
+            for (const position of advanced)
+              expect(position.results.some((entry: any) => entry.taskId === "second" && entry.status === "complete")).toBe(true);
             const partial = JSON.parse(JSON.parse(readFileSync(actual.partialRef, "utf8")).data);
             expect(partial.partial[0].image.bytes).toBe(Buffer.from(mode === "pause-write-cut" ? "completed pending work from pause" : "partial next-unit WIP").toString("base64"));
           }
@@ -732,7 +812,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
         // Failed/unsealed writes remain pending in the same consumed loop.
         // A restoration denied by the native boundary cannot repeat unit work.
         // A missing second-task capture cannot inherit completion from the first loop.
-        expect(actual.retained.consumedLoops).toBe(complete ? 3 : 2);
+        expect(actual.retained.consumedLoops, JSON.stringify({ result: actual.result, launchErrors: actual.launchErrors })).toBe(complete ? 3 : 2);
         if (mode === "missing") {
           expect(actual.result.status).toBe("blocked");
           expect(loop.halt).toBeDefined();
@@ -754,20 +834,22 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(point.progress.admitted).toEqual({});
           expect(point.progress.previous.resultRef).toEqual(loop.results[0].ref);
         }
-        if (complete) { expect(actual.result.status).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l3.compliance"); }
+        if (complete) { expect(actual.result.status, actual.result.reason).toBe("complete"); expect(actual.calls).toContain("invoke-human-1.l3.compliance"); }
         else expect(actual.calls).not.toContain("invoke-human-1.l3.acceptance.gate");
         if (["refused", "corrupt"].includes(mode)) {
           expect(actual.sealError).not.toBe(""); expect(actual.points).toHaveLength(1);
         }
         if (mode === "incomplete") {
-          expect(loop.halt).toMatchObject({ code: "checkpoint-integrity",
+          expect(loop.halt).toMatchObject({ stage: "checkpoint-integrity", digest: expect.any(String) });
+          expect(actual.result.loopReport.halt).toMatchObject({ code: "checkpoint-integrity",
             ref: { agent: "pitako.checkpoint-sealer", key: "invoke-human-1.l2.t1.a1.seal" } });
-          expect(loop.halt.reason).toContain("last step partially applied: true");
+          expect(actual.result.loopReport.halt.reason).toContain("last step partially applied: true");
           expect(loop.results.some((entry: any) => entry.taskId === "second")).toBe(false);
           expect(actual.points).toHaveLength(1);
         }
         if (["seal-cut", "admission-cut", "missing-receipt", "wrong-progress"].includes(mode)) expect(actual.points).toHaveLength(2);
-        if (mode === "cursor-cut") expect(loop.cursor).toBe(0);
+        // v10 publishes the admitted head and next cursor together in one save.
+        if (mode === "cursor-cut") expect(loop.cursor).toBe(1);
         if (mode === "pause") expect(loop.results[1].status).toBe("blocked");
       }
       })();

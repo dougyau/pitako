@@ -1,110 +1,100 @@
-import { afterEach, expect, test } from "bun:test";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { spawn } from "node:child_process";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
-import { canonicalJSON, canonicalDigest, sha256 } from "../extensions/canonical.mjs";
+import { canonicalDigest } from "../extensions/canonical.mjs";
+import { PitakoStore } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
 const roots: string[] = [];
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+let git: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { git = gitFakeFixture(); });
+afterEach(() => {
+  try { git.dispose(); } finally { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); }
+});
 const empty = { count: 0, head: null };
 const entry = path.resolve("skills/architecture/ledger.mjs");
-const { appendLedger, ledgerPath, verifyLedger } = await import(entry);
+const { appendLedger, verifyLedger } = await import(entry);
+const anchor = ({ count, head }: any) => ({ count, head });
 function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-architecture-ledger-")); roots.push(root);
+  git.fakeRepo(root);
+  git.set(root, ["rev-parse", "--git-path", "info/exclude"], { stdout: ".git/info/exclude\n", stderr: "", status: 0 });
   const missionPath = path.join(root, "missions", "mission-1.json"), consultation = "parser";
-  const directory = ledgerPath(missionPath, consultation);
-  const missionDirectory = path.join(root, "missions", "mission-1");
   const request = (expected: any = empty, kind = "admission", round = 0, body: any = { decision: "Initial é中😀" }) =>
     ({ missionPath, consultation, expected, record: { kind, round, body } });
-  const file = (seq: number) => path.join(directory, `${String(seq).padStart(6, "0")}.json`);
-  return { root, missionPath, consultation, directory, missionDirectory, request, file };
+  const store = new PitakoStore(root);
+  const append = (...args: Parameters<typeof request>) => appendLedger(request(...args), root);
+  return { root, missionPath, consultation, request, append, store };
 }
-function cli(request: unknown) {
-  return spawnSync("node", [entry], { input: buildExternalCliPrompt("Fixed architecture ledger.", JSON.stringify(request)), encoding: "utf8" });
+async function cli(cwd: string, request: unknown) {
+  const child = spawn(process.execPath, [entry], { cwd, stdio: ["pipe", "pipe", "pipe"] });
+  let stdout = "", stderr = "";
+  child.stdout.setEncoding("utf8").on("data", chunk => { stdout += chunk; });
+  child.stderr.setEncoding("utf8").on("data", chunk => { stderr += chunk; });
+  const closed = new Promise<number | null>((resolve, reject) => {
+    child.once("error", reject);
+    child.once("close", resolve);
+  });
+  child.stdin.end(buildExternalCliPrompt("Fixed architecture ledger.", JSON.stringify(request)));
+  const status = await closed;
+  return { status, stdout, stderr };
 }
-const anchor = ({ count, head }: any) => ({ count, head });
 
-test("architecture ledger archives canonical admission, decision replacements and rounds outside the checkout", () => {
+test("architecture ledger archives admissions, replacements, rounds and context in the cwd store", () => {
   const f = fixture();
-  expect(verifyLedger(f.missionPath, f.consultation, empty)).toEqual([]);
-  expect(existsSync(f.directory)).toBe(false);
-  let saved = appendLedger(f.request());
-  expect(saved.stateBytes).toBe(0);
-  const bytes = readFileSync(f.file(0), "utf8");
-  expect(bytes).toBe(canonicalJSON({ seq: 0, prev: null, ...f.request().record }));
-  expect(saved.head).toBe(sha256(bytes));
-  saved = appendLedger(f.request(anchor(saved), "decision", 0, { decision: "Replacement" }));
-  saved = appendLedger(f.request(anchor(saved), "round", 0, { originals: ["verified reference"] }));
-  saved = appendLedger(f.request(anchor(saved), "context", 0, {humanAnswers: "Actual human", priorActive: {}}));
-  const before = readdirSync(f.directory);
-  const records = verifyLedger(f.missionPath, f.consultation, anchor(saved));
+  expect(verifyLedger(f.missionPath, f.consultation, empty, f.root)).toEqual([]);
+  expect(existsSync(f.store.file)).toBe(false);
+  let saved = f.append();
+  const admission = saved;
+  saved = f.append(anchor(saved), "decision", 0, { decision: "Replacement" });
+  saved = f.append(anchor(saved), "round", 1, { originals: ["verified reference"] });
+  saved = f.append(anchor(saved), "context", 1, { humanAnswers: "Actual human", priorActive: {} });
+  const records = verifyLedger(f.missionPath, f.consultation, anchor(saved), f.root);
   expect(records.map((record: any) => record.kind)).toEqual(["admission", "decision", "round", "context"]);
-  expect(records[1].prev).toBe(sha256(bytes));
-  expect(readdirSync(f.directory)).toEqual(before);
-  expect(f.directory).toBe(path.join(f.missionDirectory, "ledger", "architecture-parser"));
-  expect(existsSync(path.join(f.root, ".pi"))).toBe(false);
+  expect(records[1].prev).toBe(admission.head);
+  expect(records[0].body).toEqual(f.request().record.body);
+  expect(existsSync(path.join(f.root, "missions"))).toBe(false);
+  appendLedger({ ...f.request(), consultation: "later" }, f.root);
+  expect(() => f.append(anchor(saved), "round", 2, {})).toThrow("superseded");
+  expect(() => f.append()).toThrow("superseded");
+  expect(verifyLedger(f.missionPath, f.consultation, anchor(saved), f.root)).toEqual(records);
+  const wrong = fixture();
+  expect(() => appendLedger({ missionPath: f.missionPath, consultation: f.consultation,
+    expected: anchor(saved), identity: saved.identity, observe: true }, wrong.root)).toThrow("Cursor root differs from cwd");
+  expect(existsSync(wrong.store.file)).toBe(false);
 });
 
-test("framed CLI returns current state file byte size, accepts identical retries and reports conflicts", () => {
+test("framed CLI replays the original head without adopting the tip and rejects changed input", async () => {
   const f = fixture();
-  mkdirSync(f.missionDirectory, { recursive: true });
-  const state = JSON.stringify({ otherWorkflow: "é中😀" }, null, 2);
-  const stateFile = path.join(f.missionDirectory, "state.json");
-  writeFileSync(stateFile, state);
-  const first = cli(f.request());
+  const first = await cli(f.root, f.request());
   expect(first.status, first.stderr).toBe(0);
   const saved = JSON.parse(first.stdout);
-  expect(Object.keys(saved).sort()).toEqual(["count", "head", "stateBytes"]);
-  expect(saved.stateBytes).toBe(Buffer.byteLength(state));
-  expect(cli(f.request()).stdout).toBe(first.stdout);
-  writeFileSync(stateFile, state + "\n");
-  expect(JSON.parse(cli(f.request()).stdout)).toEqual({ ...saved, stateBytes: Buffer.byteLength(state) + 1 });
-  expect(readFileSync(stateFile, "utf8")).toBe(state + "\n");
-  const conflict = cli(f.request(empty, "admission", 0, { decision: "Changed" }));
+  const next = f.append(anchor(saved), "round", 1, { memo: "Closed" });
+  expect((await cli(f.root, f.request())).stdout).toBe(first.stdout);
+  expect(f.append(anchor(saved), "context", 0, { callerEvidence: "Different operation at the same anchor" }))
+    .toMatchObject({ stale: true, ...anchor(next) });
+  const conflict = await cli(f.root, f.request(empty, "admission", 0, { decision: "Changed" }));
   expect(conflict.status).toBe(1);
   expect(JSON.parse(conflict.stdout)).toMatchObject({ error: "ledger-integrity", reason: expect.stringContaining("conflict") });
-  expect(verifyLedger(f.missionPath, f.consultation, anchor(saved))).toHaveLength(1);
-  const next = f.request(anchor(saved), "round", 1, { memo: "Closed" });
-  const second = appendLedger(next);
-  expect(appendLedger(next)).toEqual(second);
-  expect(verifyLedger(f.missionPath, f.consultation, anchor(second))).toHaveLength(2);
+  expect(verifyLedger(f.missionPath, f.consultation, anchor(next), f.root)).toHaveLength(2);
 });
 
-test.each(["gap", "head", "link", "noncanonical", "future"])("rejects %s without appending", damage => {
+test("observe detects tampering anywhere in the scope, including beyond the saved head", async () => {
   const f = fixture();
-  const saved = appendLedger(f.request());
-  if (damage === "gap") unlinkSync(f.file(0));
-  if (damage === "head") saved.head = "0".repeat(64);
-  if (damage === "link") {
-    const record = JSON.parse(readFileSync(f.file(0), "utf8")); record.prev = "0".repeat(64);
-    writeFileSync(f.file(0), canonicalJSON(record));
-  }
-  if (damage === "noncanonical") writeFileSync(f.file(0), readFileSync(f.file(0), "utf8") + "\n");
-  if (damage === "future") writeFileSync(f.file(3), "{}");
-  const rejected = cli(f.request(anchor(saved), "round", 1, {}));
+  const saved = f.append(), tip = f.append(anchor(saved), "round", 1, { memo: "Closed" });
+  const db = openSqliteSync(f.store.file);
+  try { db.prepare("UPDATE records SET body=body||' ' WHERE scope=? AND seq=?").run("arch:parser", tip.count); }
+  finally { db.close(); }
+  const rejected = await cli(f.root, { missionPath: f.missionPath, consultation: f.consultation, expected: anchor(saved), observe: true });
   expect(rejected.status).toBe(1);
-  expect(JSON.parse(rejected.stdout).error).toBe("ledger-integrity");
-  expect(existsSync(f.file(1))).toBe(false);
-});
-
-test.each(["ancestor", "record", "next", "state"])("rejects a symlink at %s without altering its target", component => {
-  const f = fixture(), outside = fixture();
-  const target = path.join(outside.root, "target");
-  writeFileSync(target, "untouched");
-  if (component === "ancestor") {
-    symlinkSync(outside.root, path.join(f.root, "missions"));
-    expect(() => appendLedger(f.request())).toThrow("symlink");
-    expect(readdirSync(outside.root)).toEqual(["target"]);
-  } else {
-    const saved = appendLedger(f.request());
-    const file = component === "state" ? path.join(f.missionDirectory, "state.json") : f.file(component === "record" ? 0 : 1);
-    if (component === "record") unlinkSync(file);
-    symlinkSync(target, file);
-    expect(() => appendLedger(f.request(anchor(saved), "round", 1, {}))).toThrow("symlink");
-  }
-  expect(readFileSync(target, "utf8")).toBe("untouched");
+  const result = JSON.parse(rejected.stdout);
+  expect(result).toMatchObject({ error: "ledger-integrity", code: "store-corrupt", reason: "Record body mismatch." });
+  expect(existsSync(result.recovery.quarantine)).toBe(true);
+  expect(f.store.readRecords("arch:parser").head).toBeNull();
 });
 
 test("rejects unsafe identities and invalid record order before publication", () => {
@@ -112,39 +102,23 @@ test("rejects unsafe identities and invalid record order before publication", ()
   for (const request of [
     { ...f.request(), consultation: "../escape" }, { ...f.request(), missionPath: "relative.json" },
     f.request(empty, "round", 1), f.request(empty, "admission", 1), f.request(empty, "unknown", 0),
-  ]) expect(() => appendLedger(request)).toThrow();
-  expect(existsSync(f.directory)).toBe(false);
-  const saved = appendLedger(f.request());
-  expect(() => appendLedger(f.request(anchor(saved), "admission", 0))).toThrow();
-  expect(existsSync(f.file(1))).toBe(false);
+  ]) expect(() => appendLedger(request, f.root)).toThrow();
+  expect(existsSync(f.store.file)).toBe(false);
+  const saved = f.append();
+  expect(() => f.append(anchor(saved), "admission", 0)).toThrow();
+  expect(f.store.readRecords("arch:parser").records).toHaveLength(1);
 });
 
-test("observe verifies the retained chain and reports state bytes without publishing or changing files", () => {
+test("observe verifies a pinned memo and reports unanchored context without appending", async () => {
   const f = fixture();
-  const saved = appendLedger(f.request());
-  const stateFile = path.join(f.missionDirectory, "state.json");
-  writeFileSync(stateFile, JSON.stringify({ unrelated: "中".repeat(100) }, null, 2));
-  const before = readdirSync(f.directory), bytes = readFileSync(f.file(0), "utf8");
-  const request = { missionPath: f.missionPath, consultation: f.consultation, expected: anchor(saved), observe: true };
-  const observed = cli(request);
-  expect(observed.status, observed.stderr).toBe(0);
-  expect(JSON.parse(observed.stdout)).toEqual({ ...anchor(saved), stateBytes: Buffer.byteLength(readFileSync(stateFile)) });
-  expect(readdirSync(f.directory)).toEqual(before);
-  expect(readFileSync(f.file(0), "utf8")).toBe(bytes);
-  const memoPath = path.join(f.root, "memo.json"), memo = {memo: "Verified memo. ".repeat(30)};
+  const saved = f.append(), request = { missionPath: f.missionPath, consultation: f.consultation, expected: anchor(saved), observe: true };
+  const memoPath = path.join(f.root, "memo.json"), memo = { memo: "Verified memo. ".repeat(30) };
   writeFileSync(memoPath, JSON.stringify(memo));
-  const memoRequest = {...request, memo: {path: memoPath, digest: canonicalDigest(memo)}};
-  expect(JSON.parse(cli(memoRequest).stdout)).toEqual({...anchor(saved), stateBytes: Buffer.byteLength(readFileSync(stateFile)), excerpt: memo.memo.slice(0, 240)});
-  writeFileSync(memoPath, JSON.stringify({memo: "Tampered"}));
-  const mismatch = cli(memoRequest);
-  expect(mismatch.status).toBe(1);
-  expect(JSON.parse(mismatch.stdout)).toMatchObject({error: "ledger-integrity", reason: "Memo digest/content mismatch."});
-  appendLedger(f.request(anchor(saved), "context", 1, {callerEvidence: "Unanchored"}));
-  expect(JSON.parse(cli(request).stdout)).toEqual({...anchor(saved), stateBytes: Buffer.byteLength(readFileSync(stateFile)), pendingKind: "context"});
-  const withPending = readdirSync(f.directory);
-  writeFileSync(f.file(0), bytes.replace("Initial", "Changed"));
-  const damaged = cli(request);
-  expect(damaged.status).toBe(1);
-  expect(JSON.parse(damaged.stdout)).toMatchObject({ error: "ledger-integrity", reason: expect.stringContaining("head mismatch") });
-  expect(readdirSync(f.directory)).toEqual(withPending);
+  const memoRequest = { ...request, memo: { path: memoPath, digest: canonicalDigest(memo) } };
+  expect(JSON.parse((await cli(f.root, memoRequest)).stdout)).toEqual({ ...saved, excerpt: memo.memo.slice(0, 240) });
+  writeFileSync(memoPath, JSON.stringify({ memo: "Tampered" }));
+  expect(JSON.parse((await cli(f.root, memoRequest)).stdout)).toMatchObject({ error: "ledger-integrity", reason: "Memo digest/content mismatch." });
+  f.append(anchor(saved), "context", 1, { callerEvidence: "Unanchored" });
+  expect(JSON.parse((await cli(f.root, request)).stdout)).toEqual({ ...saved, pendingKind: "context" });
+  expect(f.store.readRecords("arch:parser").records).toHaveLength(2);
 });

@@ -2,7 +2,7 @@ import { readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 
 // Node >=22.19 supports these hooks. Native stripping alone rejects node_modules.
-// Only the owned observation/inspector source closure is loaded here, never package dependencies.
+// Only the owned runtime-agent and inspector source closure is loaded here, never package dependencies.
 const require = createRequire(import.meta.url);
 const sources = new Set([
   "./loop.ts",
@@ -15,8 +15,12 @@ const sources = new Set([
   "../../extensions/git-port.ts",
   "../../extensions/dev-tools/core/process.ts",
   "../../extensions/execute-retained.ts",
+  "../../extensions/execute-progress.ts",
   "../../extensions/execute-checkpoint.ts",
   "../../extensions/execute-state.ts",
+  "../../extensions/execute-cursor.ts",
+  "../../extensions/execute-intent.ts",
+  "../../extensions/pitako-store.ts",
   "../../extensions/board/workspace.ts",
   "../../extensions/board/paths.ts",
   "../../extensions/errors.ts",

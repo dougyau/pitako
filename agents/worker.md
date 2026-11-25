@@ -14,11 +14,12 @@ thinking: high
 systemPromptMode: replace
 inheritProjectContext: true
 inheritSkills: false
-tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, file_sha256_save, todo, codemode
+tools: read, grep, find, ls, bash, edit, write, contact_supervisor, apply_patch, codegraph_search, codegraph_callers, codegraph_callees, codegraph_impact, codegraph_explore, codegraph_node, codegraph_status, codegraph_files, lsp_diagnostics, lsp_goto_definition, lsp_find_references, lsp_symbols, lsp_prepare_rename, lsp_rename, ast_search, ast_rewrite, git_worktree_list, git_worktree_add, git_worktree_remove, git_worktree_prune, git_status, git_diff, git_log, git_show, git_commit, ssh_exec, ssh_pull, ssh_push, py_lint, py_format, py_typecheck, py_test, py_uv, cargo_check, cargo_clippy, cargo_fmt, cargo_test, cargo_build, cargo_run, cargo_doc, cargo_bench, cargo_add, resource_snapshot, file_sha256, pitako_store, file_sha256_save, todo, codemode
 extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/pitako-store-tool.ts
   - ../extensions/checkpoint-create.ts
   - ../extensions/todo.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts

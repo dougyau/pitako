@@ -338,31 +338,31 @@ earlier. No automatic invocation/mission, publication, commits or slot renewal.
 
 ## Recovery uses native missions and Git
 
-Native state retains versioned immutable association, loops consumed, phase,
-manifest/cursor, frozen task/attempt, intent/launch/result distinctions and exact
-refs. Git preserves code/checkpoints/WIP, not acceptance receipts. Preserve exact
+Native state retains only the `pitako-execute` v10 cursor: store identity, saved
+head, recorded action, bounded loop/task/attempt and producer references, loop
+budget, and an integrated-review sub-cursor. Each save validates the closed
+schema and the 16384-byte UTF-8 single-key envelope. Git preserves code and WIP,
+not acceptance receipts. Preserve exact
 producer/run, outputReference/outputArtifactPath/outputPathMapping/artifactPaths
 and optional results[].structuredOutputPath. Binding JSON, optional original
 native value and debug artifacts are different. Consume the original complete
 structuredOutput, not previews or invented paths. Store compact explicit result
-projections, not full child objects/prompts/reports under allowed string fields.
-Snapshot/frozen descriptor/progress are essential; failure to persist halts new
-dispatch. Cache at most one identical active plan if it fits the entire 256 KiB
-native state file. Closed-loop history goes to a verified ledger; superseded
-recovery data is archived then discarded. Execute state uses one contract
-version (v5); older retained runs fail before any resume or dispatch with an
-actionable message and are neither replayed nor migrated.
+projections in memory, not full child objects/prompts/reports under allowed string
+fields. The cwd-local SQLite store retains the admission, bodies, checkpoint
+intents, receipts and hash-chained ledger. No legacy keys migrate. Every invocation
+verifies the record chain; operations commit before saving the cursor and return
+an in-memory projection with a 61440-byte receipt-line limit. Readers verify
+against `cursor.head`, not the tip. The intent record is committed before each
+worker launch, and checkpoint images remain files. Gate logs are capped
+head+tail blobs identified by `logRef`; deltas are pinned execute records.
+Foreground `todo:<invocation>` and verifier `access:<namespace>` appends have
+independent keys and do not stale an execute cursor. See
+[read-only store inspection](engineering.md#cwd-local-workflow-store).
 
-Native state retains only current control/progress, full admitted task results,
-usage totals and three-loop rings of plan-rejection diagnostics, close-native
-references and bounded loop summaries. Completed attempts point to their task's
-single full result; `last` is only needed for pending continuation. Closing
-rebuilds its deterministic record from immutable source fields, freezing only
-usage and resolutions that may change during publication/reentry.
-Every seal publishes before discarding recovery data. Every consumed loop,
-including a gaps final, has a ledger record anchored by native `{count, head}`.
-The close observer verifies, observes and publishes in one spawn; an unpublished
-close retries with `.checkout.r<n>`. Seals cost one additional child dispatch.
+Relaunch resumes the recorded action and observes existing children by run ID.
+A lost save after COMMIT reuses the original result by operation key; authorized
+`.rN` recovery preserves request identity and does not repeat settled effects.
+A new epoch for store recovery preserves the spent and maximum loop counts.
 
 Reports, review/compliance and the director receive retained summaries plus
 `{ledgerPath, head}`. The publisher verifies the chain with `ledger.mjs` and
@@ -371,9 +371,7 @@ ledger reads because the director has no shell. Further reads must verify
 against that head; missing/altered records block. The inspector remains limited
 to exact supplied references.
 
-`--unblock` searches invocation resolutions, the literal last closed
-disposition, then the open loop. Older closed entries cannot be resumed and
-are excluded from conflicting-request detection. Repeated plan defects beyond
+Repeated plan defects beyond
 three loops are not automatically detected. Duplicate task completion is
 rejected at admission, rather than when dispatching a dependent.
 All loop-owned dispatch/observation keys include `.l<n>.`; pre-admission
@@ -401,7 +399,7 @@ The next ordinary director gets that corrective input within existing budget and
 capacity. Replay before the write can repeat validation; after it, the rejected
 plan is not recovered/readmitted and its slot is not counted twice. An unchanged
 repeated defect without new corrective information blocks even with spare slots.
-That diagnosed halt is essential state: losing the optional plan cache or exact
+That diagnosed halt is essential state: losing the in-memory plan or exact
 original cannot relabel it as a lost-plan gap or open another director slot.
 Schema failure without a usable original is not automatically eligible; exact
 settled recovery can establish eligibility. Stop, permission, capacity, settlement,
@@ -427,12 +425,10 @@ settled original from the same producer may supersede a historical barrier,
 without redispatch or automatic promotion of failed evidence. Standalone review
 keeps its existing independent protocol.
 
-Old supervisor invoke-* and pitako-execution records and Git stay unchanged.
-Clearly reject obsolete supervisor replay, without migration,
-deletion, new invocation or native barrier bypass. A later explicit invocation
-requires actual human authorization; technical continuation never renews slots.
+Leave unrelated native keys and Git unchanged. Technical continuation never
+renews slots or bypasses native barriers.
 For a retained host transport failure with unknown cause, ordinary reentry can
-perform one bounded read-only reconstruction without `--unblock`. It saves the
+perform one bounded read-only reconstruction. It saves the
 exact observation and intention before inspection and admission after validating
 the immutable state. A pending or failed reconstruction is not a fresh route;
 changing a key does not authorize another inspection. Original observations remain
@@ -440,26 +436,13 @@ retained. This does not settle interrupted writers or pending recovery queries.
 Observed Stop, permission denial or positive pending activity still blocks automatic
 replacement; explicit current input and native reconciliation remain necessary.
 
-Current human continuation instead supplies `unblock:true` and `resolution:{loop,text}`
-to the same mission/invocation through the registered route. A bare flag, agent
-statement or historical memo is not that input. Retain the original impediment,
-question, producer refs and current input before observation; loop 0 means an
-interrupted request before admission, without inventing a snapshot. Matching durable
-input survives technical replay even when flag/text are omitted;
-acceptance is not application and neither certifies later intentions as settled.
-Reconstruct association, admitted limit, Git/WIP, retained results/intentions and phase independently
-of historical host-error classification. Fresh bounded read-only inspection uses
-only existing grants/native policy and does not certify the old receipt's settlement.
-Positive current pertinent activity, identity or scope conflicts and essential
-persistence failure prevent the affected effect. Unknown historical writer status
-alone does not veto checkpoint restoration or authorize query replacement.
-A completed needs-decision outcome with useful current input uses the next ordinary
-slot. A recorded Stop requires actual later human continuation input before effects;
-never reuse that answer for a later Stop/question. Current native denial remains
-binding. Reuse useful immediately available complete results, but do not require
-rescuing every process/query/result before checkpoint restoration. Unknown stays
-unknown; no historical closure certificate, extra inspector, redundant consent,
-blind keyed redispatch, new grants or generic terminal-root restart is provided.
+Human-needed halts are terminal for their invocation. A continuation after a
+human fix or ruling is a new invocation on the same worktree and backlog, with
+the ruling posted as Board HUMAN. Relaunch verifies retained halts without
+advancing or admitting children; this does not extend native resume authority.
+Missing or changed originals fail integrity. A Stop before the first COMMIT
+leaves no Pitako cursor. `--unblock` is removed; `unblock` and `resolution`
+launch arguments are rejected by name.
 
 ### Resource and presentation boundaries
 
@@ -507,7 +490,7 @@ An O(1) marker retains the latest admitted seal, ledger count/head and last clos
 loop plus the marker at the previous budget end. Repeated exhaustion without
 progress is a human-needed halt explaining that one step needs more spawns than
 the per-run budget and naming `maxSubagentSpawnsPerRun`. Progress permits another
-automatic relaunch. Relaunch never supplies human continuation or unblock input;
+automatic relaunch. Relaunch never clears a human-needed halt;
 recorded Stop/refusal or other human-needed barriers return unchanged without
 dispatch. The per-seal archiver remains mandatory.
 
@@ -576,7 +559,7 @@ Retain concurrent barriers. Native Stop, rejection, uncertain activity and
 essential-save failure need their supported native inspection/reconciliation
 route; correcting a source cannot override them. For terminal roots, inspect
 retained evidence and report only operations valid for that state, never resume
-advice or a generic `--unblock`. No `--force`, silent hash replacement, extra
+advice. No `--force`, silent hash replacement, extra
 arbitrary approvals or restart that erases consumed work is supported.
 
 Foreground presents existing structured progress and per-loop/final results,
@@ -725,13 +708,15 @@ automation or commit policy.
 The packaged plan skill keeps all human grilling and final confirmation in the
 foreground. Its context script and the existing architecture workflow dispatch
 read-only evidence providers; planning consultations retain counts in native
-mission state. Specs use a v1 complete-document header and substantive named
-sections; shape validation is not human authentication or semantic completeness.
+mission state. Initial context returns native original references without
+writing an `initial-context` state key. Specs use a v1 complete-document header
+and substantive named sections; shape validation is not human authentication or
+semantic completeness.
 
 Execution registers one session-scoped named resource through the public API,
 disposed on shutdown/re-registration, with only exact read-only Git/spec host
-commands. It snapshots source/digest/content in native mission state, separately
-from implementation cwd. Preliminary serialized data and one compact native
+commands. It binds source/digest/content in the cwd-local store after admission.
+Preliminary serialized data and one compact native
 admission replace chunked source transport, retaining the 39,936-byte UTF-8 spec
 boundary (shared docs may be linked, never truncated).
 The native host-command API mandates a finite per-operation timeout; the native
@@ -757,9 +742,9 @@ pending obligations, not necessarily human consent. Continuation is announced
 as started only with its retained native reference; no generic resume of
 failed/completed roots, new replacement root or foreground polling is provided.
 
-No historical marker/closure ceremony or bare --unblock bypass survives. Tests exercise
+No historical marker/closure ceremony survives. Tests exercise
 shared review with two mirrored angles and findings, native capacity exhaustion,
-full state-file bounds and compact projection of large reports. Maximum UTF-8
+cursor and receipt bounds and bounded projections of large reports. Maximum UTF-8
 snapshots/metadata, inert preliminary transport, immutable association and bounded
 synchronous discovery in resolve remain owned guarantees. Presentation checks
 cover per-loop/combined final reports, decisions, unrun checks, pauses and partial/unavailable metrics.
@@ -776,12 +761,30 @@ Reviewers always apply ponytail-review to correctness, safety, tests and simplic
 never reduces assigned specs/scope, weakens required tests or replaces acceptance
 criteria. Project instructions and output schemas/reporting take precedence over
 generic Ponytail prose/test-minimization preferences; upstream bytes are unchanged.
+Execute launch skill lists retain the declared director, worker and reviewer
+skills alongside workflow additions, including scope-discipline. Task review,
+task synthesis and integrated review receive Ponytail and Ponytail Review.
+Integrated review stores its sub-cursor in `pitako-execute`, not a separate
+mission-state key. The shared review library receives the in-memory loop;
+execute uses the existing `reviewOriginals` loop-io call. Clear/material-gaps replay
+resumes original-reference conversion without another review/verifier admission;
+the enclosing save binds converted references to the synthesis pointer, and the
+closed-loop archive retains them before the next loop replaces the snapshot.
 
-Read-only review/compliance protocol rejections can be re-evaluated in the same
-invocation after a reader correction, without relaunching their completed producers
-or consuming an implementation loop. Findings associate screening assessments by
-`findingId`, not literal requirement wording; sources, consequences and verdict
-consistency remain required. Originals are never rewritten.
+Final review and compliance receive the same blocking final-acceptance record
+reference and digest, plus `id`, `status`, `exit`, `ms`, and `logRef` per gate,
+`after`, `mutated`, and the current-acceptance result. This applies with or
+without task results. No gate tails are included; without a receipt the block
+is `null`. HUMAN-excepted results are separate. Replay verifies the committed
+data and reconstructs the same prompt; digest mismatch is an integrity failure.
+
+Findings associate screening assessments by `findingId`, not literal requirement
+wording; sources, consequences and verdict consistency remain required.
+Technical interruption may re-evaluate exact read-only originals without
+relaunching completed producers. A human-needed rejection is terminal for that
+invocation: relaunch only verifies the halt. After a human correction or ruling,
+post it as Board HUMAN and start a new invocation on the same worktree and
+backlog. Originals are never rewritten.
 
 A recovery query's returned producer reference is saved before body validation or
 admission. Replay observes that exact producer, reading its full retained original
@@ -899,7 +902,7 @@ in `invocation.amendments`, outside the base association/snapshot/sourceRefs and
 without renewing budget. Recovery requires identical references and revalidates
 the bytes. The root delivers the exact frozen references to director, worker,
 review and compliance; plans need not copy them into sharedContext. The
-existing resolution delivery route is unchanged. See execute skill syntax.
+terminal-halt rules apply. See execute skill syntax.
 
 Separately delivered current human amendments remain separate from the admitted
 base snapshot/sourceRefs/association. They remain effective without replacing base
@@ -913,12 +916,12 @@ to replace frozen sources, infer authority from agent text, or renew the budget.
 Preserve known unmet historical evidence obligations; new checkpoint observations
 do not establish an unavailable historical before-state contrast.
 
-Architecture admission reserves a derived 108306 pretty-printed bytes (<=112 KiB),
-including maximal structural controls, escaping and indentation; unrelated mission
-state plus that reservation must fit 262144 bytes. This admits /plan initial-context
-alongside a consultation without relaxing rejection of genuinely large unrelated
-state. Artifact roots are stored per original, published paths are reconstructed exactly
-from validated relative descendants, and prior originals retain only id/root/path/digest.
+Architecture writes one fixed mission-state key, `pitako-architecture`, with a
+current-round cursor of at most 16384 bytes. The byte limit applies only to that
+cursor; consultation history lives in the cwd-local store scope
+`arch:<consultation>`. Artifact roots are stored per original, published paths
+are reconstructed exactly from validated relative descendants, and prior
+originals retain only id/root/path/digest.
 A pending replacement contains only kind/expectedRevision/canonical SHA-256; resubmit
 the identical complete replacement to finish an interrupted append/save. Omission or
 a different digest blocks before children. Confirmed failed comparisons archive as

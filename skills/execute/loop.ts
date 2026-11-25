@@ -6,7 +6,9 @@ import { spawn } from "node:child_process";
 import { readContextPeak, type CheckpointIntent } from "../../extensions/execute-checkpoint.ts";
 import { checkoutEvidence } from "../../extensions/spec-plans.ts";
 import { repositoryIdentity } from "../../extensions/board/workspace.ts";
-import { openBoard, viewEntry, viewBudget, BINDING_BAND_BYTES, BOARD_VIEW_AUTHORITY, type Board, type Post } from "../../extensions/board/store.ts";
+import { EXECUTE_TASK_GATES_MAX } from "../../extensions/execute-cursor.ts";
+import { MAX_GATE_LOG_BYTES, PitakoStore } from "../../extensions/pitako-store.ts";
+import { openBoard, viewEntry, viewBudget, GATE_RESERVE, BINDING_BAND_BYTES, BOARD_VIEW_AUTHORITY, type Board, type Post } from "../../extensions/board/store.ts";
 
 const require = createRequire(import.meta.url);
 const { canonicalDigest } = require("../../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
@@ -49,9 +51,86 @@ export type GateResult = { id: string; status: "pass" | "fail" | "timeout" | "er
 export type FinalAcceptance = { loop: number; gateKey: string; candidate: { head: string; fingerprint: string };
   exec: Command[]; results: GateResult[] };
 export type GateReceipt = { before: Pick<ReturnType<typeof checkoutEvidence>, "head" | "fingerprint">; after: Pick<ReturnType<typeof checkoutEvidence>, "head" | "fingerprint">;
-  mutated: boolean; gates: GateResult[]; metric: { value: number | null; error: string | null } | null;
-  progress: Progress; stalled: boolean; contextPeak?: number | null; view: BoardView; reused?: { loop: number; gateKey: string } };
+  mutated: boolean; gates: GateResult[]; metric: { value: number | null; error: string | null; logRef: string } | null;
+  progress: Progress; stalled: boolean; contextPeak?: number | null; view: BoardView; reused?: { loop: number; gateKey: string };
+  workerOriginal?: { key: string; runId: string; path: string; sha256: string } };
 const bytes = (value: unknown) => Buffer.byteLength(JSON.stringify(value));
+
+// The reserve is what remains after the full binding band and its Board envelope.
+// Only the task wire may omit IDs (already bound by the ordered request), tails
+// and the worker path (carried by the enclosing transport). Store records keep
+// the full diagnostic and blob digests.
+// At 16 gates and five samples these two base64 columns cost 920 + 448 bytes,
+// leaving the rest of GATE_RESERVE for checkout, metric and scalar fields.
+export function taskGateWire<T extends GateReceipt>(receipt: T) {
+  const { before, after, mutated, gates, metric, progress, stalled, contextPeak, view, workerOriginal, ...envelope } = receipt;
+  const payload = { before, after, mutated, gates, metric, progress, stalled, contextPeak, view };
+  const size = bytes({ ...payload, workerOriginal });
+  if (gates.length > EXECUTE_TASK_GATES_MAX ||
+      size <= viewBudget(0) || size - bytes(view) <= GATE_RESERVE) return receipt;
+  const results = Buffer.alloc(43 * gates.length);
+  gates.forEach(({ status, exit, ms, logRef }, i) => {
+    assert(digest(logRef), "Invalid task gate log digest");
+    const offset = 43 * i;
+    results[offset] = ["pass", "fail", "timeout", "error"].indexOf(status);
+    results.writeInt16BE(exit ?? -1, offset + 1);
+    results.writeDoubleBE(ms, offset + 3);
+    results.write(logRef, offset + 11, 32, "hex");
+  });
+  const series = Buffer.alloc(16 + 64 * progress.last5.length);
+  series.writeDoubleBE(progress.stalls ?? 0);
+  series.writeDoubleBE(progress.nonImproving, 8);
+  progress.last5.forEach(({ fingerprint, value, best, gatesPassed, gatesTotal }, i) => {
+    assert(digest(fingerprint), "Invalid task gate sample fingerprint");
+    const offset = 16 + 64 * i;
+    series.write(fingerprint, offset, 32, "hex");
+    [value, best, gatesPassed, gatesTotal].forEach((n, j) => series.writeDoubleBE(n ?? NaN, offset + 32 + 8 * j));
+  });
+  return { ...envelope, ...payload, gates: results.toString("base64"), progress: series.toString("base64") };
+}
+
+/** Pure decoder embedded in the workflow sandbox (no Buffer or filesystem). */
+export function readTaskGateWire<T extends { gates?: unknown; progress?: unknown }>(
+  receipt: T, definitions: readonly Pick<Command, "id">[], workerOriginal?: GateReceipt["workerOriginal"],
+) {
+  if (typeof receipt?.gates !== "string") return receipt;
+  const decode = (encoded: unknown, max: number) => {
+    if (typeof encoded !== "string" || encoded.length > max ||
+        !/^[A-Za-z0-9+/]*={0,2}$/.test(encoded) || encoded.length % 4 !== 0)
+      throw new Error("Invalid packed task gate receipt.");
+    const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const data = new Uint8Array(Math.floor(encoded.replace(/=+$/, "").length * 6 / 8));
+    let pending = 0, bits = 0, i = 0;
+    for (const char of encoded.replace(/=+$/, "")) {
+      pending = (pending << 6) | alphabet.indexOf(char);
+      bits += 6;
+      if (bits >= 8) data[i++] = pending >> (bits -= 8);
+    }
+    return new DataView(data.buffer);
+  };
+  const hex = (view: DataView, offset: number) => Array.from(
+    new Uint8Array(view.buffer, offset, 32), byte => byte.toString(16).padStart(2, "0"),
+  ).join("");
+  const results = decode(receipt.gates, 920), series = decode(receipt.progress, 448);
+  if (results.byteLength !== 0 && results.byteLength !== 43 * definitions.length ||
+      series.byteLength < 16 || (series.byteLength - 16) % 64 !== 0)
+    throw new Error("Invalid packed task gate receipt.");
+  const gates = results.byteLength === 0 ? [] : definitions.map(({ id }, i) => {
+    const offset = 43 * i, exit = results.getInt16(offset + 1);
+    return { id, status: ["pass", "fail", "timeout", "error"][results.getUint8(offset)],
+      exit: exit === -1 ? null : exit, ms: results.getFloat64(offset + 3), tail: "", logRef: hex(results, offset + 11) };
+  });
+  const last5 = [];
+  for (let offset = 16; offset < series.byteLength; offset += 64) {
+    const value = series.getFloat64(offset + 32), best = series.getFloat64(offset + 40);
+    last5.push({ fingerprint: hex(series, offset), value: Number.isNaN(value) ? null : value,
+      best: Number.isNaN(best) ? null : best, gatesPassed: series.getFloat64(offset + 48),
+      gatesTotal: series.getFloat64(offset + 56) });
+  }
+  return { ...receipt, gates, progress: { stalls: series.getFloat64(0), nonImproving: series.getFloat64(8), last5 },
+    ...(workerOriginal ? { workerOriginal } : {}) };
+}
+
 const hash = (value: string) => createHash("sha256").update(value).digest("hex");
 function assert(ok: unknown, message: string): asserts ok { if (!ok) throw new Error(message); }
 function record(value: unknown): value is Record<string, unknown> { return !!value && typeof value === "object" && !Array.isArray(value); }
@@ -86,6 +165,8 @@ export function validateBacklog(value: unknown): asserts value is Backlog {
     assert(record(task.origin) && ["spec", "director", "final-phase", "human"].includes(String(task.origin.kind)) && text(task.origin.ref), `Invalid origin for ${task.id}`);
     assert(strings(task.specRefs) && strings(task.dependsOn), `Invalid references for ${task.id}`);
     assert(Array.isArray(task.gates), `Invalid gates for ${task.id}`); task.gates.forEach(c => command(c, true));
+    assert(task.gates.length <= EXECUTE_TASK_GATES_MAX,
+      `Task ${task.id} has ${task.gates.length} gates; maximum is ${EXECUTE_TASK_GATES_MAX}`);
     assert(new Set(task.gates.map(c => c.id)).size === task.gates.length, `Duplicate gates for ${task.id}`);
     assert(task.metric === null || record(task.metric) && text(task.metric.command) && text(task.metric.unit) && typeof task.metric.target === "number" && Number.isFinite(task.metric.target), `Invalid metric for ${task.id}`);
     assert(task.parent === null || text(task.parent), `Invalid parent for ${task.id}`);
@@ -123,8 +204,8 @@ export function readBacklog(root: string, specId: string) {
   }
 }
 export function topicOwner(root: string, specId: string) { key(specId); return `execute:${specId}:${hash(realpathSync(root)).slice(0, 16)}`; }
-function assertViewFits(ok: boolean, message: string): void {
-  if (!ok) throw Object.assign(new Error(message), { viewOverflow: true });
+function assertViewFits(ok: boolean, message: string, topicId: number): void {
+  if (!ok) throw Object.assign(new Error(message), { viewOverflow: true, topicId });
 }
 export function boardView(board: Board, workspace: string, topicId: number, { taskId, maxBytes = 12 * 1024, doneTaskIds = [] }: { taskId?: string; maxBytes?: number; doneTaskIds?: readonly string[] } = {}): BoardView {
   const posts: Post[] = [];
@@ -143,9 +224,9 @@ export function boardView(board: Board, workspace: string, topicId: number, { ta
   const relevant = posts.filter(p => !superseded.has(p.id) && (p.type === "HUMAN" || p.type === "DECISION" || p.type === "FINDING" && (taskId ? !p.metadata?.taskId || p.metadata.taskId === taskId : !doneTaskIds.includes(p.metadata?.taskId as string)) || p.type === "HANDOFF" && taskId && p.metadata?.taskId === taskId));
   const project = viewEntry;
   const binding = relevant.filter(p => p.type === "HUMAN" || p.type === "DECISION").map(project);
-  assertViewFits(bytes(binding) <= BINDING_BAND_BYTES, "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions");
+  assertViewFits(bytes(binding) <= BINDING_BAND_BYTES, "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions", topicId);
   const view: BoardView = { topicId, authority: BOARD_VIEW_AUTHORITY, posts: [...binding], omitted: relevant.length - binding.length };
-  assertViewFits(bytes(view) <= maxBytes, "HUMAN + DECISION overflow: Board view cannot retain binding rules; human consolidation required");
+  assertViewFits(bytes(view) <= maxBytes, "HUMAN + DECISION overflow: Board view cannot retain binding rules; human consolidation required", topicId);
   for (const p of relevant.filter(p => p.type !== "HUMAN" && p.type !== "DECISION")) {
     const entry = project(p); view.posts.push(entry); view.omitted--;
     if (bytes(view) > maxBytes) { view.posts.pop(); view.omitted++; }
@@ -196,8 +277,9 @@ function selectTask(backlog: Backlog, selected: string | null, currentHumanIds?:
 }
 export function apply(input: { root: string; specId: string; expectedDigest: string | null; key: string; invocation: string; loop: number;
   authority: Authority; acceptance?: Backlog["acceptance"]; director: Selection; settle?: boolean; recordGaps?: boolean; cancellations?: Cancellation[];
-  finalGapOutputs?: { key: string; path: string }[]; currentHumanIds?: number[];
-  confirmedUnit?: { taskId: string; kind: "unit"; workerStatus: "complete"; receipt: GateReceipt }; progress?: { taskId: string; progress: Progress; remaining: string } }) {
+  finalGapOutputs?: ({ key: string; path: string } | { key: string; logRef: string })[]; currentHumanIds?: number[];
+  confirmedUnit?: { taskId: string; kind: "unit"; workerStatus: "complete"; receipt: GateReceipt }; progress?: { taskId: string; progress: Progress; remaining: string } },
+verifyGateLog = (digest: string) => new PitakoStore(input.root).verifyGateLogForWrite(digest)) {
   key(input.key); key(input.invocation); authority(input.authority);
   assert(Number.isSafeInteger(input.loop) && input.loop >= 1, "Invalid loop number");
   if (input.settle) assert((input.confirmedUnit || input.progress) && input.director.select === null && input.director.changes.length === 0, "Settlement requires workflow progress or a confirmed unit, without director changes");
@@ -239,7 +321,7 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
   let selected: Task | null;
   try {
     assert(text(input.director.reason) && Array.isArray(input.director.changes), "Director changes and reason required");
-    if (JSON.stringify(backlog.authority) !== JSON.stringify(input.authority)) assert(input.director.changes.length > 0, "Authority changed: director must reconcile with reasons");
+    if (canonicalDigest(backlog.authority) !== canonicalDigest(input.authority)) assert(input.director.changes.length > 0, "Authority changed: director must reconcile with reasons");
     if (current.backlog) auditHumanAcceptance(backlog, input.invocation, input.loop);
     const acceptance = input.director.acceptance ?? input.acceptance;
     if (!current.backlog || acceptance !== undefined) {
@@ -259,7 +341,8 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
       assert(input.director.changes.length > 0 && input.director.changes.every(c => c.kind === "add" && c.task.origin.kind === "final-phase"), "Final-phase gaps must add findings without changing tombstones");
     }
     if (input.finalGapOutputs) assert(input.recordGaps && input.finalGapOutputs.length === input.director.changes.length &&
-      input.finalGapOutputs.every(output => record(output) && text(output.key) && text(output.path)), "Invalid final-gap outputs");
+      input.finalGapOutputs.every(output => record(output) && text(output.key) &&
+        (("path" in output) !== ("logRef" in output)) && text("path" in output ? output.path : output.logRef)), "Invalid final-gap outputs");
     const add = (task: Task, reason: string, parent: string | null = null) => {
       assert(!backlog.tasks.some(t => t.id === task.id), `Task ID never reused: ${task.id}`);
       assert(task.status === "pending", "New tasks must be pending");
@@ -271,8 +354,13 @@ export function apply(input: { root: string; specId: string; expectedDigest: str
       if (input.finalGapOutputs && change.kind === "add") {
         const output = input.finalGapOutputs[index]!;
         // The workflow VM has no filesystem; hash the original bytes at the atomic backlog-write boundary.
-        change.task.origin.ref = JSON.stringify({ key: output.key, path: output.path,
-          sha256: createHash("sha256").update(readFileSync(safePath(output.path))).digest("hex") });
+        if ("path" in output)
+          change.task.origin.ref = JSON.stringify({ key: output.key, path: output.path,
+            sha256: createHash("sha256").update(readFileSync(safePath(output.path))).digest("hex") });
+        else {
+          verifyGateLog(output.logRef);
+          change.task.origin.ref = JSON.stringify(output);
+        }
       }
       assert(text(change.reason), "Every backlog change needs a reason");
       if (change.kind === "add") add(change.task, change.reason);
@@ -427,11 +515,11 @@ function clipped(value: string, maxBytes: number): string {
   return value;
 }
 /** Command groups are separate so a timeout can kill the tree without killing its receipt producer. */
-export async function runCommand(root: string, cmd: Command, logRef: string): Promise<{ result: GateResult; stdout: string }> {
+export async function runCommand(root: string, cmd: Command, store: PitakoStore<any>, scope?: string): Promise<{ result: GateResult; stdout: string }> {
   command(cmd, true);
-  safePath(logRef); mkdirSync(path.dirname(logRef), { recursive: true });
-  const fd = openSync(logRef, "w", 0o600), start = Date.now();
-  let written = 0, tail = "", pendingLine = "", lastLine = "", timedOut = false, errorMessage = "";
+  const start = Date.now(), half = MAX_GATE_LOG_BYTES / 2;
+  const first = Buffer.alloc(half), last = Buffer.alloc(half);
+  let total = 0, tail = "", pendingLine = "", lastLine = "", timedOut = false, errorMessage = "";
   let childPid: number | undefined;
   const killGroup = (signal: NodeJS.Signals) => {
     if (!childPid) return;
@@ -447,8 +535,16 @@ export async function runCommand(root: string, cmd: Command, logRef: string): Pr
   let hardKill: ReturnType<typeof setTimeout> | undefined;
   const timer = setTimeout(() => { timedOut = true; killGroup("SIGTERM"); hardKill = setTimeout(() => killGroup("SIGKILL"), 100); }, cmd.timeoutMs);
   function consume(data: Buffer, isStdout: boolean) {
-    const available = Math.max(0, 8 * 1024 * 1024 - written);
-    if (available) { const chunk = data.subarray(0, available); writeFileSync(fd, chunk); written += chunk.length; }
+    const prefix = Math.min(data.length, Math.max(0, half - total));
+    if (prefix) data.copy(first, total, 0, prefix);
+    const end = total + data.length;
+    const suffix = data.subarray(Math.max(prefix, data.length - half));
+    if (suffix.length) {
+      const offset = (end - suffix.length - half) % half;
+      suffix.copy(last, offset);
+      if (offset + suffix.length > half) suffix.copy(last, 0, half - offset);
+    }
+    total = end;
     tail = clipped(tail + data.toString("utf8"), 2048);
     // Retain the last non-empty stdout line, independently of stderr and log truncation.
     if (isStdout) {
@@ -465,41 +561,97 @@ export async function runCommand(root: string, cmd: Command, logRef: string): Pr
       child.on("exit", () => killGroup("SIGKILL"));
       child.on("close", code => resolve(code));
     });
+    const ms = Date.now() - start;
+    const end = total > MAX_GATE_LOG_BYTES ? total % half : 0;
+    const log = Buffer.concat([first.subarray(0, total), last.subarray(end, Math.max(0, total - half)), last.subarray(0, end)]);
+    const logRef = store.writeGateLog(log, total, scope);
     return { result: { id: cmd.id, status: timedOut ? "timeout" : errorMessage ? "error" : exit === 0 ? "pass" : "fail", exit,
-      ms: Date.now() - start, tail: errorMessage || tail, logRef }, stdout: pendingLine.trim() ? pendingLine : lastLine };
+      ms, tail: errorMessage || tail, logRef }, stdout: pendingLine.trim() ? pendingLine : lastLine };
   } finally {
-    clearTimeout(timer); if (hardKill) clearTimeout(hardKill); killGroup("SIGKILL"); closeSync(fd);
+    clearTimeout(timer); if (hardKill) clearTimeout(hardKill); killGroup("SIGKILL");
     process.off("SIGTERM", onTerm); process.off("SIGINT", onInt); process.off("SIGHUP", onHup); process.off("exit", onExit);
   }
 }
 export type GateInput = { root: string; specId: string; invocation: string; loop: number; attempt: number; key: string;
   task: Pick<Task, "id" | "gates" | "metric" | "progress">; workerStatus: string; writerSettled: true;
-  checkpoint?: CheckpointIntent; knowledge?: { findings?: unknown; handoff?: unknown }; dbPath?: string; metricTimeoutMs?: number; reuse?: FinalAcceptance };
+  checkpoint?: CheckpointIntent; worker?: { key: string; runId: string }; revival?: { decision: string };
+  dbPath?: string; metricTimeoutMs?: number; reuse?: FinalAcceptance };
 type GateIdentity = { attemptKey: string; commandsDigest: string; workerStatus: string; progressInputDigest: string;
-  after: GateReceipt["after"] };
+  workerOriginalDigest?: string; after: GateReceipt["after"] };
 type SavedGateReceipt = GateReceipt & { identity: GateIdentity; receiptDigest: string };
 
-function publishGateReceipt(directory: string, receipt: GateReceipt, identity: GateIdentity) {
-  const body = { ...receipt, identity };
-  const temporary = path.join(directory, `${randomUUID()}.tmp`);
-  try {
-    const fd = openSync(temporary, "wx", 0o600);
-    try { writeFileSync(fd, JSON.stringify({ ...body, receiptDigest: canonicalDigest(body) }) + "\n"); fsyncSync(fd); }
-    finally { closeSync(fd); }
-    // The directory was exclusively reserved before commands ran; no other run owns this destination.
-    renameSync(temporary, safePath(path.join(directory, "receipt.json")));
-    const dirFd = openSync(directory, "r");
-    try { fsyncSync(dirFd); } finally { closeSync(dirFd); }
-  } finally { if (existsSync(temporary)) unlinkSync(temporary); }
+/** Resolve only the exact native producer, never a key-only lookup or an inline root copy. */
+export function readWorkerOriginal(input: GateInput, accounting = true) {
+  return readNativeOriginal(input.root, input.checkpoint!, input.worker!, "pitako.worker", accounting);
+}
+export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
+  worker: { key: string; runId: string }, agent: "pitako.worker" | "pitako.reviewer", accounting: boolean | "settlement" = true) {
+  assert(worker && checkpoint && (agent === "pitako.reviewer" || worker.key === checkpoint.key) && text(worker.runId), "Missing gate worker producer");
+  key(worker.key);
+  const mission = JSON.parse(readFileSync(safePath(checkpoint.association.missionPath), "utf8"));
+  assert(mission.id === checkpoint.association.missionId && Array.isArray(mission.workflowChildren), "Worker mission identity mismatch");
+  const children = mission.workflowChildren.filter((child: any) => child.key === worker.key && child.runId === worker.runId);
+  assert(children.length === 1 && children[0].agent === agent, "Worker native producer identity mismatch");
+  const artifacts: unknown[] = children[0].artifactPaths;
+  assert(Array.isArray(artifacts), "Worker native artifact references unavailable");
+  const directories = artifacts.filter((file): file is string => text(file) && path.isAbsolute(file) && path.basename(file) === worker.runId);
+  const originals = artifacts.filter((file): file is string => text(file) && path.isAbsolute(file) && path.basename(file) === `${worker.key}.json`);
+  assert(directories.length === 1 && originals.length === 1, "Worker native original unavailable or ambiguous");
+  const native = JSON.parse(readFileSync(safePath(path.join(directories[0]!, "status.json")), "utf8"));
+  assert(native.runId === worker.runId && native.cwd === root && native.workflowKey === worker.key &&
+    native.state === "complete" && Array.isArray(native.steps) && native.steps.length === 1, "Worker native status conflicts with its original");
+  const step = native.steps[0];
+  assert(step.agent === agent && step.exitCode === 0 && !step.stopped && !step.interrupted &&
+    !step.detached && !step.timedOut && !step.outputSaveError && !step.outputPartial && !step.truncation,
+  "Worker native original has a terminal barrier");
+  const file = safePath(originals[0]!);
+  const bytes = readFileSync(file), value = JSON.parse(bytes.toString("utf8"));
+  // Checkpoint recovery may downgrade the root's admitted status; the native original stays unchanged.
+  assert(record(value) && record(step.structuredOutput) &&
+    canonicalDigest(value) === canonicalDigest(step.structuredOutput), "Worker native original digest mismatch");
+  // Status steps omit usage; the native workflow settlement retains the aggregate SingleResult.
+  let usage, settled;
+  if (accounting && (accounting === "settlement" || agent === "pitako.reviewer" && worker.key.endsWith(".compliance") ||
+      agent === "pitako.worker" && text(native.parentWorkflowRunId))) {
+    assert(text(native.parentWorkflowRunId) && path.basename(native.parentWorkflowRunId) === native.parentWorkflowRunId,
+      "Reviewer native workflow identity unavailable");
+    const journal = safePath(path.join(path.dirname(directories[0]!), native.parentWorkflowRunId, "workflow-children.jsonl"));
+    // A reattached child may settle in a newer parent's journal; missing accounting is unknown usage.
+    for (const line of (existsSync(journal) ? readFileSync(journal, "utf8") : "").split("\n").reverse()) {
+      let entry;
+      try { entry = JSON.parse(line); } catch { continue; }
+      if (entry?.type === "settle" && entry.key === worker.key && entry.result?.runId === worker.runId) {
+        settled = entry.result;
+        break;
+      }
+    }
+    if (settled) {
+      assert(settled.ok === true && settled.agent === agent && settled.results?.length === 1 &&
+        settled.results[0].exitCode === 0 && canonicalDigest(settled.structuredOutput) === canonicalDigest(value),
+      "Reviewer native settlement conflicts with its original");
+      if (agent === "pitako.worker" && typeof settled.output === "string" && /^\s*\{/.test(settled.output)) {
+        let binding;
+        try { binding = JSON.parse(settled.output); } catch { throw new Error("Invalid complete worker binding JSON."); }
+        assert(canonicalDigest(binding) === canonicalDigest(value), "Changed/conflicting worker binding.");
+      }
+      usage = settled.results[0].usage;
+    }
+  }
+  if (accounting === "settlement") assert(settled, "Native analysis settlement unavailable");
+  return { value, ...(usage ? { usage } : {}), ...(accounting === "settlement" ? { settlement: settled } : {}),
+    reference: { ...worker, path: file, sha256: createHash("sha256").update(bytes).digest("hex") } };
 }
 
-export async function gate(input: GateInput): Promise<GateReceipt> {
+export async function gate(input: GateInput, finalRequest?: { digest: string; producer: string }): Promise<GateReceipt> {
   assert(input.writerSettled === true, "Gate requires a settled worker and no active writer");
   key(input.invocation); key(input.key); key(input.task.id);
   assert(Number.isSafeInteger(input.loop) && input.loop > 0 && Number.isSafeInteger(input.attempt) && input.attempt > 0, "Invalid gate attempt");
   if (input.checkpoint) assert(input.checkpoint.association.root === input.root &&
     input.checkpoint.association.invocation === input.invocation && input.checkpoint.loop === input.loop &&
     input.checkpoint.attempt === input.attempt && input.checkpoint.taskId === input.task.id, "Gate checkpoint attempt mismatch");
+  const original = input.checkpoint ? readWorkerOriginal(input, false) : undefined;
+  assert(!input.worker || original, "Gate worker requires a checkpoint");
+  const knowledge = original?.value.knowledge;
   const contextPeak = input.checkpoint ? readContextPeak(input.checkpoint) : null;
   const current = checkoutEvidence(input.root), gates: GateResult[] = [];
   const executed = (commands: Command[]) => commands.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
@@ -507,29 +659,32 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
   // Workflow transport retries append .rN to the gate key, not to the worker's attempt identity.
   const attemptKey = input.key.replace(/\.gate(?:\.r\d+)?$/, "");
   const identityInput = { attemptKey, workerStatus: input.workerStatus,
+    ...(original ? { workerOriginalDigest: canonicalDigest(original.reference) } : {}),
     commandsDigest: canonicalDigest({ gates: executed(input.task.gates), metric: input.task.metric ?
       { command: input.task.metric.command, timeoutMs: input.metricTimeoutMs ?? 30 * 60 * 1000, cwd: "." } : null }),
     progressInputDigest: canonicalDigest({ progress: input.task.progress, target: input.task.metric?.target ?? null }) };
   const parent = safePath(path.join(input.root, ".pi/subagents/execute", input.invocation, "gates"));
+  const { executeStore, commitExecute } = await import("./ledger.mjs");
+  const { store, scope } = executeStore(input.root, input.invocation, true);
+  const retained = store.readRecords(scope).records;
   mkdirSync(parent, { recursive: true });
   let directory = "", cached: SavedGateReceipt | undefined;
   for (let retry = 0; ; retry++) {
     directory = safePath(path.join(parent, `${attemptKey}.gate${retry ? `.r${retry}` : ""}`));
-    try { mkdirSync(directory); break; }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
-    const file = safePath(path.join(directory, "receipt.json"));
-    let raw: string;
-    try { raw = readFileSync(file, "utf8"); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") continue; throw error; }
-    try {
-      const saved = JSON.parse(raw) as SavedGateReceipt;
-      const { receiptDigest, ...body } = saved;
-      if (raw === JSON.stringify(saved) + "\n" && receiptDigest === canonicalDigest(body) &&
-          canonicalDigest(body.identity) === canonicalDigest({ ...identityInput, after: { head: current.head, fingerprint: current.fingerprint } }) &&
-          body.after.head === current.head && body.after.fingerprint === current.fingerprint) {
-        cached = { ...body, receiptDigest }; break;
-      }
-    } catch { /* An incomplete or corrupt receipt is never reusable. */ }
+    const saved = retained.find(row => row.opKey === `gate:${path.basename(directory)}`)?.body as SavedGateReceipt | undefined;
+    if (!saved) {
+      try { mkdirSync(directory); break; }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+      continue;
+    }
+    const { receiptDigest, ...body } = saved;
+    assert(receiptDigest === canonicalDigest(body), "Completed gate receipt integrity mismatch");
+    assert(!original || body.identity.workerOriginalDigest === identityInput.workerOriginalDigest,
+      "Completed gate worker original changed");
+    if (canonicalDigest(body.identity) === canonicalDigest({ ...identityInput, after: { head: current.head, fingerprint: current.fingerprint } }) &&
+        body.after.head === current.head && body.after.fingerprint === current.fingerprint) {
+      cached = { ...body, receiptDigest }; break;
+    }
   }
   const before = cached?.before ?? current;
   const reuse = input.reuse;
@@ -546,13 +701,17 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
     gates.push(...structuredClone(reuse.results));
   }
   let metric: GateReceipt["metric"] = cached?.metric ?? null;
+  if (cached || reused) {
+    const refs = [...gates.map(g => g.logRef), ...(metric ? [metric.logRef] : [])];
+    for (const ref of new Set(refs)) store.verifyGateLogForWrite(ref, scope);
+  }
   if (!cached && input.task.metric) {
-    const result = await runCommand(input.root, { id: "metric", command: input.task.metric.command, cwd: ".", timeoutMs: input.metricTimeoutMs ?? 30 * 60 * 1000 }, path.join(directory, "metric.log"));
+    const result = await runCommand(input.root, { id: "metric", command: input.task.metric.command, cwd: ".", timeoutMs: input.metricTimeoutMs ?? 30 * 60 * 1000 }, store, scope);
     const value = result.result.status === "timeout" || result.result.status === "error" ? null : parseMetric(result.stdout);
-    metric = { value, error: value === null ? `Metric ${result.result.status}: no finite value; ${result.result.logRef}` : null };
+    metric = { value, error: value === null ? `Metric ${result.result.status}: no finite value; ${result.result.logRef}` : null, logRef: result.result.logRef };
   }
   if (!cached && !reused && (input.workerStatus === "complete" || !input.task.metric)) {
-    for (const [index, cmd] of input.task.gates.entries()) gates.push((await runCommand(input.root, cmd, path.join(directory, `${index}.log`))).result);
+    for (const cmd of input.task.gates) gates.push((await runCommand(input.root, cmd, store, scope)).result);
   }
   const after = cached?.after ?? checkoutEvidence(input.root), mutated = before.head !== after.head || before.fingerprint !== after.fingerprint;
   const progress = cached?.progress ?? updateProgress(input.task.progress, { value: metric?.value ?? null, fingerprint: after.fingerprint,
@@ -560,26 +719,36 @@ export async function gate(input: GateInput): Promise<GateReceipt> {
     mutated || gates.some(g => g.status === "timeout") || !!metric?.error);
   return withBoard(input.root, input.specId, input.dbPath, (board, workspace, topicId) => {
     const prefix = `execute:${input.invocation}:l${input.loop}:a${input.attempt}`;
-    const findings = Array.isArray(input.knowledge?.findings) ? input.knowledge.findings : [];
+    const findings = record(knowledge) && Array.isArray(knowledge.findings) ? knowledge.findings.filter(text).slice(0, 8) : [];
     findings.forEach((finding, n) => {
       if (text(finding)) board.postOnce(workspace, `${prefix}:FINDING:${n}`, { topicId, type: "FINDING", content: clipped(finding, 2048), metadata: { taskId: input.task.id } });
     });
-    if (text(input.knowledge?.handoff)) board.postOnce(workspace, `${prefix}:HANDOFF`, { topicId, type: "HANDOFF", content: clipped(input.knowledge.handoff, 2048), metadata: { taskId: input.task.id } });
+    if (record(knowledge) && text(knowledge.handoff)) board.postOnce(workspace, `${prefix}:HANDOFF`, { topicId, type: "HANDOFF", content: clipped(knowledge.handoff, 2048), metadata: { taskId: input.task.id } });
     const receipt: GateReceipt = { before: { head: before.head, fingerprint: before.fingerprint },
       after: { head: after.head, fingerprint: after.fingerprint }, mutated, gates, metric, progress, contextPeak, stalled: progress.nonImproving >= 3,
+      ...(original ? { workerOriginal: original.reference } : {}),
       view: boardView(board, workspace, topicId, { taskId: input.task.id }),
       ...(cached?.reused ? { reused: cached.reused } : reused ? { reused: { loop: reuse.loop, gateKey: reuse.gateKey } } : {}) };
     // Keep the full diagnostic even when the wire representation needs smaller tails/views.
-    if (!cached) publishGateReceipt(directory, { ...receipt, before, after }, { ...identityInput, after: receipt.after });
+    const diagnostic = { ...receipt, gates: finalRequest ? structuredClone(gates) : gates, before, after,
+      identity: { ...identityInput, after: receipt.after } };
+    const publish = () => {
+      const body = finalRequest ? { ...diagnostic, finalRequest, wireReceipt: receipt } : diagnostic;
+      commitExecute(input.root, input.invocation, `gate:${path.basename(directory)}`, canonicalDigest(body.identity),
+        "gate", { ...body, receiptDigest: canonicalDigest(body) });
+    };
+    if (!cached && !finalRequest) publish();
     for (const g of receipt.gates) { while (bytes(g.tail) > 2048) g.tail = g.tail.slice(Math.max(1, Math.ceil(g.tail.length / 8))); }
     while (bytes(receipt) > viewBudget(0) && receipt.gates.some(g => g.tail.length > 0)) {
       for (const g of receipt.gates) g.tail = g.tail.slice(Math.ceil(g.tail.length / 2));
     }
-    if (bytes(receipt) > viewBudget(0)) {
-      const overhead = bytes(receipt) - bytes(receipt.view);
+    const wire = () => input.task.id === "final-acceptance" ? receipt : taskGateWire(receipt);
+    if (bytes(wire()) > viewBudget(0)) {
+      const overhead = bytes(wire()) - bytes(receipt.view);
       receipt.view = boardView(board, workspace, topicId, { taskId: input.task.id, maxBytes: viewBudget(overhead) });
     }
-    assertViewFits(bytes(receipt) <= viewBudget(0), `Gate receipt exceeds 8 KiB; see ${path.join(directory, "receipt.json")}`);
+    if (!cached && finalRequest) publish();
+    assertViewFits(bytes(wire()) <= viewBudget(0), `Gate receipt exceeds 8 KiB; see ${scope} opKey gate:${path.basename(directory)}`, topicId);
     return receipt;
   });
 }

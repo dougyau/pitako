@@ -1,65 +1,114 @@
 import { describe, expect, test } from "bun:test";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { readReviewOriginal, readBacklog } from "../skills/execute/loop.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
-import { applyCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
-import { expandWorkerReferences, EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
+import { executeStore } from "../skills/execute/ledger.mjs";
+import { applyCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
+import { readExecuteIntentContext } from "../extensions/execute-intent.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
 import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
-import { executeControllerFixture, resolvedLoop, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, removeCache, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
-import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
+import { executeControllerFixture, executeField, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
+import { childResponse, realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
 
 const recoveryComposition = realCheckoutCompositionFixture();
 const { fixture } = executeControllerFixture(recoveryComposition.fake);
 const recoveryScripts = recoveryComposition.scripts;
 
-// Association/access witnesses belong to the in-progress manifest, not compact references.
-function observeInlineReviewOriginals(host: ReturnType<typeof fixture>) {
-  const originals = new Map<string, any>();
-  host.setSaveObserver(() => {
-    const manifest = host.storage.get("review-invoke-human-1");
-    for (const original of manifest?.originals ?? [])
-      if (Object.hasOwn(original, "digest"))
-        originals.set(original.key, copy({ ...manifest.originalDefaults, ...original }));
+function atCursor(host: ReturnType<typeof fixture>, cursor = host.current()) {
+  const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
+  return store.read(scope, cursor.head);
+}
+
+function storedRows(host: ReturnType<typeof fixture>, cursor = host.current()) {
+  const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
+  return [...store.readRecords(scope, cursor.head).records];
+}
+
+function storeTipRows(host: ReturnType<typeof fixture>) {
+  const { invocation, epoch } = host.current();
+  const { store, scope } = executeStore(host.root, invocation, false, epoch);
+  return [...store.readRecords(scope).records];
+}
+
+function cutAfterOriginal(host: ReturnType<typeof fixture>, childKey: string) {
+  host.setFailSave(() => host.native.has(childKey));
+}
+
+async function cutBeforeSelection(host: ReturnType<typeof fixture>) {
+  const key = "invoke-human-1.l1.director";
+  host.setSaveObserver(value => {
+    if (value.action.key === key && value.action.runId) throw Error("Cut before selection");
   });
-  return originals;
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  host.setSaveObserver(undefined);
+  const cursor = copy(host.current()), producer = copy(host.native.get(key)!);
+  expect(cursor.action).toMatchObject({ kind: "launched", key, runId: producer.runId });
+  expect(atCursor(host).P.control.operation).toMatchObject({ operation: "advance", loop: 1 });
+  return { cursor, producer, rows: storedRows(host), launches: copy(host.launches) };
+}
+
+function lastConfirmed(host: ReturnType<typeof fixture>) {
+  return [...host.records()].reverse().find((record: { kind: string }) => record.kind === "unit")?.body.checkpoint ?? null;
+}
+
+function restoreRecordedAttempt(host: ReturnType<typeof fixture>, key: string, producer?: string) {
+  const rows = storedRows(host);
+  const baseline = [...rows].reverse().find(row => row.kind === "operation" &&
+    (row.body as { operation?: string; request?: { intent?: CheckpointIntent } }).operation === "baseline" &&
+    (row.body as { request: { intent: CheckpointIntent } }).request.intent.key === key);
+  const { restore } = (baseline!.body as { request: { continuation: { attempt: {
+    restore: { sourceKeys: string[]; authority: Parameters<typeof restoreCheckpoint>[1]; producer: { key: string } };
+  } } } }).request.continuation.attempt;
+  if (producer) expect(restore.producer.key).toBe(producer);
+  const sources = restore.sourceKeys.map(source => {
+    const row = [...rows].reverse().find(row => row.kind === "intent" && (row.body as CheckpointIntent).key === source);
+    if (!row) throw new Error(`Missing admitted restoration source: ${source}`);
+    return row.body as CheckpointIntent;
+  });
+  return restoreCheckpoint(sources, restore.authority);
+}
+
+function expectOpenHalt(host: ReturnType<typeof fixture>, output: Awaited<ReturnType<typeof host.execute>>,
+  stage = output.loopReport.halt.code) {
+  const halt = output.loopReport.halt;
+  expect(halt).not.toBeNull();
+  expect(host.current().halt, output.reason).toEqual({ stage, digest: canonicalDigest(halt),
+    ...(["capacity", "native-dispatch", "permission"].includes(stage) && !halt.ref.runId ? { reason: halt.reason } : {}) });
+  expect(host.history().some((loop: { number: number }) => loop.number === host.current().loop.number)).toBe(false);
+  expect(atCursor(host).head).toEqual(host.current().head);
+  return halt;
+}
+
+function closingReview(host: ReturnType<typeof fixture>) {
+  const closed = [...host.history()].reverse().find((loop: { kind: string }) => loop.kind === "final");
+  const seed = storedRows(host).reverse().find(row => row.kind === "review-originals" &&
+    (row.body as { archiveSeed?: unknown }).archiveSeed);
+  const { originals } = seed!.body as {
+    originals: { key: string; runId: string; path: string; sha256: string; body: unknown }[];
+  };
+  return { closed, originals };
 }
 
 describe("workflow-owned execute controller", () => {
-  test.each([2, 3])("v6 never migrates or rewrites a retained v%s invocation", async version => {
+  test("terminal reentry cannot admit a second completion, seal or dependent dispatch", async () => {
     const host = fixture(); host.setLimit(1);
-    await host.execute();
-    host.current().version = version;
-    const retained = copy(host.current()), calls = host.calls.length;
-    expect((await host.execute()).status).toBe("blocked");
-    expect(host.current()).toEqual(retained);
-    expect(host.calls).toHaveLength(calls);
-  });
-
-  test("v6 rejects duplicate completion at admission, before another seal or dependent dispatch", async () => {
-    const host = fixture(); host.setLimit(1);
-    await host.execute();
-    const retained = host.current();
-    const selected = host.snapshots.find(value => value.loop?.selection?.receipt);
-    retained.loop.selection = copy(selected.loop.selection);
-    retained.loop.taskBacklogDigest = selected.loop.taskBacklogDigest;
-    retained.loop.attempt = copy(host.snapshots.find(value =>
-      value.loop?.attempt?.key.endsWith(".t1.a1") && value.loop.attempt.stage === "launched").loop.attempt);
-    retained.loop.phase = "implementation"; retained.loop.cursor = 0;
-    delete retained.loop.outcome;
-    const count = host.calls.length;
+    expect((await host.execute()).status).toBe("partial");
+    const retained = copy(host.current()), rows = storedRows(host), count = host.launches.length;
+    expect(retained.action.kind).toBe("terminal");
     const outcome = await host.execute();
-    expect(outcome.reason).toContain("Duplicate task completion rejected at admission");
-    expect(outcome.status).toBe("blocked");
-    expect(host.calls.slice(count).some(call => call.agent === "pitako.execution-ledger" || call.agent === "pitako.worker")).toBe(false);
+    expect(outcome).toMatchObject({ status: "partial", loopsConsumed: 1, maxLoops: 1 });
+    expect(host.launches).toHaveLength(count);
+    expect(host.current()).toEqual(retained);
+    expect(storeTipRows(host)).toEqual(rows);
     expect(host.records()).toHaveLength(3);
   });
 
-  test("v6 repeated worker handoffs cannot bypass measured stall detection", async () => {
+  test("repeated worker handoffs cannot bypass measured stall detection", async () => {
     const host = fixture(); host.setLimit(1);
     host.setRespond((request, normal) => request.agent === "pitako.worker" && request.key.includes(".l1.t1.") ?
       host.result(request, { ...host.worker(request, "pause"), status: "continue",
@@ -71,9 +120,10 @@ describe("workflow-owned execute controller", () => {
     const pauses = host.records().filter((record: any) => record.loop === 1 && record.kind === "unit");
     expect(pauses).toHaveLength(4);
     expect(pauses.every((record: any) => record.body.result.checkpoint.confirmation.kind === "pause")).toBe(true);
-    expect(host.current().loop.metricSeries.nonImproving).toBe(3);
-    expect(resolvedLoop(host.current()).results.at(-1).diagnosis).toContain("Three consecutive non-improving");
-    expect(host.current().tasks.change1.completed).toBeNull();
+    const task = readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!;
+    expect(task.progress.nonImproving).toBe(3);
+    expect(host.history().at(-1).results.at(-1).diagnosis).toContain("Three consecutive non-improving");
+    expect(task.status).not.toBe("done");
   });
 
   test.each(["gaps", "continue"])("a closed loop's %s pause cannot block the next loop's checkpoint recovery", async status => {
@@ -99,9 +149,7 @@ describe("workflow-owned execute controller", () => {
         return { ok: false, output: "", error: "Writer disappeared" };
       }
       if (request.key === "invoke-human-1.l2.t1.a2") {
-        const restore = host.current().loop.attempt.restore;
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-        const restored = restoreCheckpoint(sources, restore.authority);
+        const restored = restoreRecordedAttempt(host, request.key);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         const value = host.worker(request);
         return host.result(request, { ...value, restoreReceipt: { ...restored, restoredRef } });
@@ -111,7 +159,7 @@ describe("workflow-owned execute controller", () => {
     const output = await host.execute();
     expect(output.status, output.reason).toBe("partial");
     expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a2")).toHaveLength(1);
-    expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 2, cursor: 1 } });
+    expect(lastConfirmed(host)).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 2, cursor: 1 } });
     // Measured 194 including IPC Git and one shared runtime, plus twenty.
     expectProcessBudget([host.processes(), recoveryComposition.processes()], 214);
   });
@@ -129,68 +177,78 @@ describe("workflow-owned execute controller", () => {
           remaining: ["Same pending defect"], knowledge: { findings: [], handoff: "Branch located" },
           diagnosis: "Still pending", continuation: { mode: "fresh", reason: "Fix the located branch" }, usefulProgress: true });
       if (request.key === "invoke-human-1.l2.t1.a2") {
-        expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 1, cursor: 1 } });
-        expect(host.current().loop.attempt.checkpoint.progress.admitted).toEqual({ change2: ["continue"] });
+        expect(lastConfirmed(host)).toMatchObject({ kind: "unit", taskId: "change1", position: { loop: 1, cursor: 1 } });
+        const ref = host.current().loop.attempt.intent;
+        const intent = storedRows(host).find(row => row.seq === ref.seq && row.digest === ref.digest);
+        expect(intent).toMatchObject({ kind: "intent", body: { key: request.key, progress: {
+          admitted: { change2: ["continue"] }, previous: { taskId: "change1", attempt: 1, digest: lastConfirmed(host).digest },
+        } } });
         if (capture === "published") host.worker(request);
         return { ok: false, output: "", error: "Writer disappeared" };
       }
       if (request.key === "invoke-human-1.l2.t1.a3") {
-        const restore = host.current().loop.attempt.restore;
-        expect(restore.authority.confirmedUnit).toMatchObject({ taskId: "change1", position: { loop: 1 } });
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-        const restored = restoreCheckpoint(sources, restore.authority);
+        const restored = restoreRecordedAttempt(host, request.key);
         const restoredRef = restored.partialRef.replace(/restore\.json$/, "restored.json");
         return host.result(request, { ...host.worker(request), restoreReceipt: { ...restored, restoredRef } });
       }
       return normal();
     });
     const output = await host.execute();
-    expect(host.current().loop.halt?.reason).toBeUndefined();
+    expect(host.current().halt).toBeNull();
     expect(output.status, output.reason).toBe("partial");
     expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a3")).toHaveLength(1);
-    expect(host.current().tasks.change2.completed).toMatchObject({ attempt: 3 });
-    expect(host.current().lastConfirmed).toMatchObject({ kind: "unit", taskId: "change2", position: { loop: 2, cursor: 1 } });
+    expect(host.history().at(-1).results).toContainEqual(expect.objectContaining({ taskId: "change2", attempt: 3, status: "complete" }));
+    expect(lastConfirmed(host)).toMatchObject({ kind: "unit", taskId: "change2", position: { loop: 2, cursor: 1 } });
   });
 
   test.each(["spawn", "nonzero", "stdout", "published-crash", "state-save"])(
-    "v6 seal automatically reconciles transient %s without a halt or discarded pending data", async failure => {
+    "final drain reconciles transient %s without a duplicate admission", async failure => {
       const host = fixture(); host.setLimit(1);
+      const drainKey = "invoke-human-1.l1.finishDrain";
       let injected = false;
+      let committed: ReturnType<typeof storedRows> | undefined;
+      let retained: ReturnType<typeof host.current>;
       host.setLaunchRespond(async (request, normal) => {
         if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" || injected) return normal();
         if (failure === "state-save") return normal();
         injected = true;
-        expect(host.current().intentions.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
-        expect(host.current().ledger.count).toBe(0);
-        expect(host.current().loop.cursor).toBe(1);
-        if (failure === "published-crash") { await normal(); throw Error("Archiver disappeared after link"); }
+        retained = copy(host.current());
         if (failure === "spawn") throw Error("Transient spawn failure");
         const result = await normal();
+        committed = storeTipRows(host);
+        if (failure === "published-crash") throw Error("Drain disappeared after COMMIT");
         return failure === "stdout" ? { ...result, output: "{" } :
           { ...result, ok: false, results: result.results?.map(entry => ({ ...entry, exitCode: 1 })), output: "" };
       });
       if (failure === "state-save") host.setFailSave(value => {
-        if (injected || value.intentions?.length || value.ledger?.count !== 3) return false;
+        if (injected || value.action.kind !== "terminal") return false;
         injected = true;
         return true;
       });
       const outcome = await host.execute();
       expect(injected).toBe(true);
       expect(outcome.status, outcome.reason).toBe("partial");
-      expect(host.current()).toMatchObject({ version: EXECUTE_STATE_VERSION, consumedLoops: 1, sealPending: null, taskFrame: null,
-        ledger: { count: 3 }, loop: { cursor: 1 } });
+      if (failure !== "state-save") {
+        expect(retained.action).toMatchObject({ kind: "launched", role: "reviewer", key: "invoke-human-1.l1.t1.a1.task-synthesis" });
+        expect(storedRows(host, retained).some(row => row.kind === "ledger")).toBe(false);
+      }
+      if (!["state-save", "spawn"].includes(failure)) expect(committed).toBeDefined();
+      expect(host.current()).toMatchObject({ version: EXECUTE_STATE_VERSION, budget: { consumedLoops: 1, maxCycles: 1 },
+        action: { kind: "terminal" }, loop: { cursor: 1 } });
+      expect(executeField(atCursor(host).P.control, "ledger", "count")).toBe(3);
+      if (committed) expect(storedRows(host).slice(0, committed.length)).toEqual(committed);
       expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
         .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"]);
-      expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain").map(call => call.key))
-        .toEqual(failure === "state-save" ? ["invoke-human-1.l1.finishDrain"] :
-          ["invoke-human-1.l1.finishDrain", "invoke-human-1.l1.finishDrain.r1"]);
+      const drains = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+      expect(drains.map(call => call.key)).toEqual(failure === "state-save" ? [drainKey] : [drainKey, `${drainKey}.r1`]);
+      expect(new Set(drains.map(call => call.task)).size).toBe(1);
       expect(host.emits.some(item => item.type === "execution-progress" && ["blocked", "cancelled"].includes(item.status))).toBe(false);
       expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
       expect(host.current()).not.toHaveProperty("snapshot");
       expect(host.calls.find(call => call.agent === "pitako.worker")!.task).toContain("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\n[]");
     });
 
-  test("v6 exhausted publication retries preserve all pending data and reentry publishes the same record", async () => {
+  test("exhausted final drain attempts retain the input for identical reentry", async () => {
     const host = fixture(); host.setLimit(1);
     host.setLaunchRespond((request, normal) => {
       if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain") throw Error("Filesystem temporarily unavailable");
@@ -199,20 +257,26 @@ describe("workflow-owned execute controller", () => {
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
     expect(outcome.reason).toContain("Filesystem temporarily unavailable");
-    const pending = copy(host.current().intentions);
-    expect(host.current()).toMatchObject({ ledger: { count: 0, head: null }, loop: { cursor: 1 } });
-    expect(pending.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
-    expect(host.current().loop.results).toHaveLength(1);
-    expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(3);
+    const pending = copy(host.current());
+    expect(pending).toMatchObject({ loop: { cursor: 0, taskId: "change1" },
+      action: { kind: "launched", role: "reviewer", key: "invoke-human-1.l1.t1.a1.task-synthesis" } });
+    expect(host.records()).toEqual([]);
+    const drains = () => host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+    expect(drains()).toHaveLength(3);
+    const models = host.calls.filter(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!));
     host.setLaunchRespond();
     expect((await host.execute()).status).toBe("partial");
-    expect(host.records()[1].body).toEqual(pending[0].input.record.body);
+    expect(drains()).toHaveLength(4);
+    expect(drains().at(-1)?.task).toBe(drains()[0]?.task);
+    expect(storedRows(host).find(row => row.opKey === `final-drain:${drains()[0]!.key}`)?.body)
+      .toMatchObject({ request: { expectedHead: pending.head } });
+    expect(host.calls.filter(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!))).toEqual(models);
     expect(host.calls.filter(call => call.agent === "pitako.execution-ledger" && call.key.includes(".seal")).at(-1)?.key)
       .toBe("invoke-human-1.l1.seal1");
     expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
   });
 
-  test.each(["integrity", "stopped", "capacity"])("v6 seal preserves native or human-only %s barriers without retry", async cause => {
+  test.each(["integrity", "stopped", "capacity"])("final drain does not retry %s evidence as a transport failure", async cause => {
     const host = fixture(); host.setLimit(1);
     host.setLaunchRespond((request, normal) => request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" ? normal() : ({
       key: request.key, agent: request.agent, runId: `native-${request.key}`, ok: false,
@@ -224,92 +288,88 @@ describe("workflow-owned execute controller", () => {
     }));
     const outcome = await host.execute();
     expect(outcome.status).not.toBe("complete");
-    expect(outcome.reason).toContain(cause === "integrity" ? "Ledger integrity requires human reconciliation: Ledger head mismatch."
+    expect(outcome.reason).toContain(cause === "integrity" ? "Execute ledger integrity failure: Ledger head mismatch."
       : cause === "stopped" ? "stopped" : "capacity exhausted");
     expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(1);
-    expect(host.current()).toMatchObject({ ledger: { count: 0 }, loop: { cursor: 1 } });
-    expect(host.current().intentions.map((entry: any) => entry.operation)).toEqual(["ledger", "apply", "ledger"]);
+    if (cause === "stopped") {
+      expectOpenHalt(host, outcome);
+      expect(host.current()).toMatchObject({ loop: { cursor: 1, taskId: "change1" },
+        action: { kind: "pending", op: "drain", opKey: "invoke-human-1.l1.finishDrain" } });
+    } else {
+      expect(host.current()).toMatchObject({ loop: { cursor: 0, taskId: "change1" },
+        action: { kind: "launched", role: "reviewer", key: "invoke-human-1.l1.t1.a1.task-synthesis" } });
+    }
+    expect(host.records()).toEqual([]);
+    expect(executeField(atCursor(host).P.control, "ledger")).toMatchObject({ count: 0, head: null });
   });
 
-  test.each(["unit", "pause"].flatMap(kind => ["none", "resolution-cut"].map(cut => [kind, cut])))(
-    "v6 stale %s seal Stop requires fresh human input before any archiver dispatch (%s)", async (kind, cut) => {
+  test.each(["unit", "pause"])(
+    "a stopped %s drain is terminal without another archiver dispatch", async kind => {
     const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
+    const drainKey = "invoke-human-1.l1.finishDrain";
     host.setLaunchRespond((request, normal) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain"
-      ? { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "" } : normal());
+      ? { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "",
+        results: [{ exitCode: -1, processSignal: "SIGTERM" }] } : normal());
     host.setRespond((request, normal) => {
       if (kind === "pause" && request.key.endsWith(".t1.a1")) return host.result(request, {
         ...host.worker(request, "pause"), status: "blocked", remaining: ["Finish saved task"], diagnosis: "Saved partial work",
       });
       return normal();
     });
-    expect((await host.execute()).status).toBe("cancelled");
-    const retained = copy(host.current()), count = host.calls.length;
-    expect(retained.loop.halt.ref).toMatchObject({ agent: "pitako.loop-io", key: "invoke-human-1.l1.finishDrain" });
+    const stopped = await host.execute();
+    expect(stopped.status).toBe("cancelled");
+    const retained = copy(host.current()), count = host.launches.length, effects = host.calls.length;
+    expect(stopped.reason).not.toContain("Essential persistence failed");
+    const halt = stopped.loopReport.halt;
+    expect(retained.halt).toEqual({ stage: "native-barrier", digest: canonicalDigest(halt) });
+    expect(halt.ref).toMatchObject({ agent: "pitako.loop-io", key: drainKey });
+    expect(retained.action).toMatchObject({ kind: "pending", op: "drain", opKey: drainKey });
+    expect(retained.inFlight).toContainEqual({ key: drainKey, runId: halt.ref.runId, role: "loop-io" });
+    const original = JSON.parse(host.launches.find(call => call.key === drainKey)!.task);
+    expect(retained.action.drainDigest).toBe(canonicalDigest(original));
+    expect(host.records()).toEqual([]);
     host.setLaunchRespond();
     host.setRespond((request, normal) => {
       if (kind !== "pause" || !request.key.endsWith(".t1.a2")) return normal();
-      const restore = host.current().loop.attempt.restore;
-      const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-      restoreCheckpoint(sources, restore.authority);
+      restoreRecordedAttempt(host, request.key, "invoke-human-1.l1.t1.a1");
       return normal();
     });
     expect((await host.execute()).status).toBe("cancelled");
-    expect(host.calls).toHaveLength(count);
+    expect(host.launches).toHaveLength(count);
     expect(host.current()).toEqual(retained);
-    const input = { unblock: true, resolution: { loop: 1, text: "Continue after the actual archiver Stop" } };
-    if (cut === "resolution-cut") {
-      const set = host.state.set;
-      host.state.set = async (key, value: any) => {
-        await set(key, value);
-        if (value.loop?.resolutions?.at(-1)?.observations?.length && !value.loop.halt)
-          throw Error("Cut after durable grouped drain resolution");
-      };
-      expect((await host.execute(input)).reason).toContain("Essential persistence failed");
-      host.state.set = set;
-    }
-    const resumed = await host.execute(cut === "none" ? input : {});
-    expect(resumed.status, resumed.reason).toBe("partial");
-    expect(host.records().map((record: any) => record.kind), resumed.reason).toEqual(kind === "unit" ? ["spec", "unit", "loop"] : ["spec", "unit", "unit", "loop"]);
-    expect(host.calls.slice(count).filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
-      .toEqual(kind === "unit" ? ["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"] :
-        ["invoke-human-1.l1.seal1", "invoke-human-1.l1.seal2", "invoke-human-1.l1.gaps"]);
-    expect(host.records()[1].body).toEqual(retained.intentions[0].input.record.body);
+    host.setStatus(ref => {
+      const observed = host.native.get(ref);
+      return ref === halt.ref.runId && observed ? { ...observed, stopped: false, ok: true, state: "complete" }
+        : observed ?? { ok: true, state: "unknown" };
+    });
+    expect((await host.execute()).reason).toContain("integrity");
+    expect(host.launches).toHaveLength(count);
+    expect(host.current()).toEqual(retained);
+    expect(host.calls).toHaveLength(effects);
   });
 
-  test("v6 a post-publication persistence cut resumes identical bytes before moving the cursor", async () => {
+  test("a post-publication persistence cut resumes identical bytes before moving the cursor", async () => {
     const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
-    host.setFailSave(value => value.ledger?.count === 3 && !value.intentions?.length);
+    host.setFailSave(value => value.action.kind === "terminal");
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
-    const file = path.join(host.root, ".pi/subagents/execute/human-1/000001.json");
-    const bytes = readFileSync(file);
-    const pending = copy(host.current().intentions);
-    expect(host.current().loop.cursor).toBe(1);
+    expect(outcome.reason).toContain("Essential persistence failed");
+    const committed = storeTipRows(host);
+    const rows = storedRows(host);
+    expect(committed.length).toBeGreaterThan(rows.length);
+    expect(host.current()).toMatchObject({ action: { kind: "launched", role: "reviewer", key: "invoke-human-1.l1.t1.a1.task-synthesis" },
+      loop: { cursor: 0, taskId: "change1", outcome: null } });
+    const unit = committed.flatMap(row => row.kind === "ledger"
+      ? (row.body as { entries: ReturnType<typeof host.records> }).entries : []).find(entry => entry.kind === "unit");
+    expect(unit).toBeDefined();
     host.setFailSave();
     expect((await host.execute()).status).toBe("partial");
-    expect(readFileSync(file)).toEqual(bytes);
-    expect(host.records()[1].body).toEqual(pending[0].input.record.body);
+    expect(storedRows(host).slice(0, committed.length)).toEqual(committed);
+    expect(storedRows(host).filter(row => row.kind === "ledger")).toEqual(committed.filter(row => row.kind === "ledger"));
+    expect(host.records()[1]).toEqual(unit);
     expect(host.calls.filter(call => call.key.endsWith(".t1.a1"))).toHaveLength(1);
   });
 
-  test("v6 admission-to-archive halt cannot enter frozen record bytes", async () => {
-    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
-    let cut = false;
-    const set = host.state.set;
-    host.state.set = async (key, value: any) => {
-      await set(key, value);
-      if (!cut && value.sealPending) { cut = true; throw Error("Injected admission-to-archive halt"); }
-    };
-    expect((await host.execute()).status).toBe("partial");
-    expect(host.calls.some(call => call.agent === "pitako.execution-ledger")).toBe(false);
-    const pending = copy(host.current().sealPending);
-    host.current().loop.halt = { status: "blocked", code: "semantic-block", reason: "Injected reentry diagnostic" };
-    host.setFailSave();
-    await host.execute();
-    expect(host.records()[1].body).toEqual(pending.record.body);
-    expect(readFileSync(path.join(host.root, ".pi/subagents/execute/human-1/000001.json"), "utf8"))
-      .not.toContain("Injected reentry diagnostic");
-  });
   test("a saved cooperative pause continues the same task without human input or another loop", async () => {
     const host = fixture(); host.setLimit(1);
     host.setRespond((request, normal) => request.key.endsWith(".t1.a1") ? host.result(request, {
@@ -327,10 +387,10 @@ describe("workflow-owned execute controller", () => {
     expect(units[0]).toMatchObject({
       usefulContinuation: true, checkpoint: { confirmation: { kind: "pause", position: { cursor: 0 } } },
     });
-    const loop = resolvedLoop(host.current());
+    const loop = host.history()[0];
     expect(loop.results.at(-1)).toMatchObject({ taskId: "change1", attempt: 2, status: "complete" });
     expect(loop.cursor).toBe(1);
-    expect(loop.halt).toBeUndefined();
+    expect(host.current().halt).toBeNull();
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
     for (const suffix of [".t1.a1", ".t1.a2"])
       expect(host.calls.filter(call => call.key.endsWith(suffix))).toHaveLength(1);
@@ -347,9 +407,9 @@ describe("workflow-owned execute controller", () => {
     }) : normal());
     const outcome = await host.execute();
     expect(outcome).toMatchObject({ status: "partial", loopsConsumed: 1 });
-    expect(resolvedLoop(host.current())).toMatchObject({ outcome: "gaps", cursor: 0 });
-    expect(resolvedLoop(host.current()).halt).toBeUndefined();
-    expect(host.current().lastConfirmed.kind).toBe("pause");
+    expect(host.history()[0]).toMatchObject({ outcome: "gaps", cursor: 0 });
+    expect(host.current().halt).toBeNull();
+    expect(lastConfirmed(host)).toMatchObject({ kind: "pause" });
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(4);
     expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
   });
@@ -365,64 +425,31 @@ describe("workflow-owned execute controller", () => {
     });
     const outcome = await host.execute();
     expect(outcome.status).toBe(cause === "stopped" ? "cancelled" : "blocked");
-    expect(resolvedLoop(host.current()).halt).toMatchObject({
+    expect(outcome.loopReport.halt).toMatchObject({
       code: "native-barrier", cause: cause === "stopped" ? "stopped" : "native permission denial",
     });
+    expectOpenHalt(host, outcome, "native-settlement");
     expect(outcome.loopsConsumed).toBe(1);
-    expect(resolvedLoop(host.current()).results).toHaveLength(1);
-    expect(host.current().lastConfirmed.kind).toBe("pause");
+    expect(outcome.loopReport.work).toMatchObject([{ taskId: "change1", attempt: 1, status: "continue" }]);
+    expect(JSON.parse(host.native.get("invoke-human-1.l1.t1.a1.seal")!.output!))
+      .toMatchObject({ kind: "pause", outcome: "sealed", position: { loop: 1, cursor: 0 } });
+    expect(host.records().filter((record: { kind: string; body: { result?: unknown } }) =>
+      record.kind === "unit" && record.body.result != null)
+      .map((record: { body: { result?: unknown } }) => record.body.result))
+      .not.toContainEqual(expect.objectContaining({ status: "complete" }));
     expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
   });
 
-  test.each(["continue", "gaps"])("an exact retained synthetic pause halt is reconciled without renewed authorization: %s", async status => {
-    const host = fixture();
-    host.setLimit(1);
-    host.setRespond((request, normal) => request.key.endsWith(".t1.a1") ? host.result(request, {
-      ...host.worker(request, "pause"), status, remaining: ["Finish pending work"],
-      diagnosis: "The saved implementation is partial, not an external impediment.",
-      continuation: { mode: "fresh", reason: "Complete the remaining implementation" },
-    }) : normal());
-    let retained: any;
-    cutAt(host, value => {
-      const expanded = expandWorkerReferences(value);
-      if (expanded.loop?.attempt?.result?.status !== "continue") return false;
-      retained = copy(expanded);
-      return true;
-    });
-    expect((await host.execute()).status).toBe("partial");
-    expect(retained).toBeDefined();
-    // Model the previously published reader's exact false classification, not
-    // a worker barrier, native Stop, new plan or invented checkpoint receipt.
-    const loop = retained.loop, result = loop.attempt.result;
-    loop.outcome = "blocked";
-    loop.halt = { status: "blocked", code: "semantic-block", reason: result.diagnosis, ref: copy(result.ref) };
-    host.storage.set("invoke-human-1", copy(retained));
-    host.setFailSave();
-    const outcome = await host.execute();
-    expect(outcome).toMatchObject({ status: "partial", loopsConsumed: 1 });
-    expect(host.current().association).toEqual(retained.association);
-    expect(host.history()).toHaveLength(1);
-    expect(host.records().find((record: any) => record.kind === "unit").body.result).toEqual(result);
-    expect(host.history()[0].halt).toBeUndefined();
-    expect(host.calls.filter(call => call.key.endsWith(".t1.a1"))).toHaveLength(1);
-    expect(host.calls.filter(call => call.key.endsWith(".t1.a2"))).toHaveLength(1);
-    expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
-  });
-
-
   // Hold the observer input fixed to test durable dispatch policy; the registered
   // Node loss-reentry case covers real inspection, journaled bytes and tool loading.
-  test.each([
-    { status: "blocked", retained: "current" },
-    { status: "blocked", retained: "missing-evidence" },
-    { status: "blocked", retained: "missing-authority" },
-    { status: "blocked", retained: "conflicting-authority" },
-  ])("pause recovery does not renew a lost writer: $status / $retained", async ({ status, retained }) => {
+  test("a committed worker block holds without renewing its writer", async () => {
+    const status = "blocked";
     const host = fixture("FULL SPECS", { taskCount: 2 }); host.setLimit(2);
     host.setHostResponse((key, value) => {
       const loop = host.current()?.loop, attempt = loop?.attempt;
       return !key.startsWith("inspect-") || !attempt ? value : { ...value, checkpointObservation: {
-        key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
+        key: `invoke-human-1.l${loop.number}.t${loop.cursor + 1}.a${attempt.number}`,
+        taskId: loop.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
         evidence: digest("unchanged checkpoint observation"),
       } };
     });
@@ -437,71 +464,20 @@ describe("workflow-owned execute controller", () => {
       return normal();
     });
     expect((await host.execute()).status).toBe("blocked");
-    const paused = copy(host.current()), point = paused.lastConfirmed;
+    const paused = copy(host.current()), point = lastConfirmed(host);
     const completed = copy(host.history()[0].results);
+    const pause = [...host.records()].reverse().find((record: { kind: string }) => record.kind === "unit")!.body.result;
     expect(completed).toMatchObject([{ taskId: "change1", status: "complete" }]);
     expect(point).toMatchObject({ kind: "pause", taskId: "change2", position: { cursor: 0 } });
-    expect(resolvedLoop(paused).results.map((result: any) => result.status)).toEqual([status]);
-    const yieldedCalls = copy(host.calls);
+    expect(pause).toMatchObject({ taskId: "change2", status, attempt: 1 });
+    expect(paused.loop).toMatchObject({ number: 2, taskId: "change2", cursor: 0, attempt: { number: 1, stage: "result" } });
+    const yieldedCalls = host.calls.length, pausedRows = storedRows(host);
     expect((await host.execute()).status).toBe("blocked");
-    expect(host.calls).toEqual(yieldedCalls);
+    expect(host.calls).toHaveLength(yieldedCalls);
+    expect(storedRows(host)).toEqual(pausedRows);
 
-    expect((await host.execute({ unblock: true, resolution: { loop: 2, text: "Resume the saved pending unit" } })).status).not.toBe("complete");
-    const loop = host.history()[1];
-    expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a2")).toHaveLength(1);
-    expect(loop.attempt.restore.authority.confirmedPause).toEqual(resolvedLoop(paused).results[0].checkpoint.confirmation);
-    expect(loop.attempt.restore.evidence).toBe(digest("unchanged checkpoint observation"));
-    if (retained !== "current") {
-      loop.attempt.restore.evidence = null;
-      if (retained === "missing-authority") delete loop.attempt.restore.authority.confirmedPause;
-      if (retained === "conflicting-authority") loop.attempt.restore.authority.confirmedPause.digest = "0".repeat(64);
-    }
-    const pending = copy(loop.attempt.restore), calls = copy(host.calls);
-    for (let reentry = 0; reentry < 2; reentry++) {
-      const outcome = await host.execute();
-      expect(outcome.status).not.toBe("complete");
-      expect(outcome.loopsConsumed).toBe(2);
-      expect(outcome.reason).toContain(retained !== "current" ? "Confirmed pause conflicts" : "no new checkpoint evidence");
-      expect(host.calls).toEqual(calls);
-      expect(host.current().association).toEqual(paused.association);
-      expect(host.history()).toHaveLength(2);
-      expect(host.history()[1].cursor).toBe(0);
-      expect(host.history()[1].results).toEqual(resolvedLoop(paused).results);
-      expect(host.history()[0].results).toEqual(completed);
-      expect(host.current().lastConfirmed).toEqual(point);
-      expect(host.history()[1].attempt.restore).toEqual(pending);
-    }
-    expect(host.calls.filter(call => call.agent !== "pitako.request-observer").map(call => call.key)).toEqual([...yieldedCalls.filter((call: any) => call.agent !== "pitako.request-observer").map((call: any) => call.key), "invoke-human-1.l2.t1.a2.baseline", "invoke-human-1.l2.t1.a2.capacity-1", "invoke-human-1.l2.t1.a2"]);
-  });
-
-  // Human input cannot restore a confirmed pause while its producer currently
-  // reports Stop, denial or activity; the restoration writer is never dispatched.
-  test.each([
-    { mode: "stopped", status: "cancelled", cause: "stopped" },
-    { mode: "permission", status: "blocked", cause: "native permission denial" },
-    { mode: "observer-permission", status: "blocked", cause: "native permission denial" },
-    { mode: "active", status: "blocked", cause: "current pertinent writer activity or native refusal" },
-  ])("pause restoration honors the paused producer's current $mode", async ({ mode, status, cause }) => {
-    const host = fixture("FULL SPECS", { taskCount: 2 }); host.setLimit(2);
-    host.setRespond((request, normal) => request.key === "invoke-human-1.l2.t1.a1" ? host.result(request, {
-      ...host.worker(request, "pause"), status: "blocked", remaining: ["Finish pending second unit"],
-      continuation: { mode: "fresh", reason: "Resume the admitted pause" },
-    }) : normal());
-    expect((await host.execute()).status).toBe("blocked");
-    const paused = copy(host.current()), calls = copy(host.calls);
-    expect(paused.lastConfirmed).toMatchObject({ kind: "pause", taskId: "change2" });
-    host.setStatus(ref => {
-      if (!ref.includes(".l2.t1.a1")) return copy(host.native.get(ref) ?? { ok: true, output: "", results: [] });
-      if (mode === "observer-permission") throw Error("Blocked by pi-subagents permission rule: 'status' is denied.");
-      return { ...copy(host.native.get(ref)!), ...(mode === "stopped" ? { stopped: true } : mode === "active" ? { state: "running" }
-        : { error: "Blocked by pi-subagents permission rule: current denial" }) };
-    });
-    const outcome = await host.execute({ unblock: true, resolution: { loop: 2, text: "Resume the saved pending unit" } });
-    expect(outcome).toMatchObject({ status, loopsConsumed: 2 });
-    expect(host.calls).toEqual(calls);
-    expect(host.history()[1]).toMatchObject({ cursor: 0, halt: { code: "native-barrier", cause } });
-    expect(host.history()[1].attempt.restore).toBeUndefined();
-    expect(host.current().lastConfirmed).toEqual(paused.lastConfirmed);
+    expect(lastConfirmed(host)).toEqual(point);
+    expect(host.history()[0].results).toEqual(completed);
   });
 
   // Missing preimages cannot be repaired by replanning or accepting a report.
@@ -521,8 +497,8 @@ describe("workflow-owned execute controller", () => {
     expect(output.reason).toContain("candidate-drift");
     const sealer = host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => [call.key, JSON.parse(call.task).kind]);
     expect(sealer).toContainEqual(["invoke-human-1.l1.t1.a1.seal", "unit"]);
-    expect(host.current().tasks.change1.completed).toBeNull();
-    expect(host.current().lastConfirmed).toBeNull();
+    expect(readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!.status).not.toBe("done");
+    expect(lastConfirmed(host)).toBeNull();
     const calls = host.calls.length;
     expect((await host.execute()).status).toBe("blocked");
     expect(host.calls.slice(calls).some(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!))).toBe(false);
@@ -539,11 +515,17 @@ describe("workflow-owned execute controller", () => {
       });
       expect((await host.executeNative()).status).toBe("blocked");
       const prior = copy(host.current()), calls = host.calls.length;
-      const ref = prior.loop.review.references[0];
+      const ref = prior.action;
+      expect(ref).toMatchObject({ kind: "launched", role: "reviewer",
+        key: "invoke-human-1.l2.review.director-prepare" });
+      const original = host.native.get(ref.runId)!.structuredOutput;
+      expect(prior.review.slots).toContainEqual({ key: ref.key, runId: ref.runId,
+        phase: "prepare", digest: canonicalDigest(original) });
+      const rows = storedRows(host);
       host.setHostResponse((key, value) => key === "inspect-initial" ? {
         ...value, retainedAnalyses: [{ key: ref.key, runId: ref.runId, ok: true,
           ...(mode === "native-complete" ? { state: "complete" } : {}),
-          structuredOutput: copy(host.native.get(ref.runId)!.structuredOutput) }],
+          structuredOutput: copy(original) }],
       } : value);
       host.setStatus(runId => ({ ok: true, runId, results: [], output: mode.includes("complete") && mode !== "native-complete" ?
         `${mode === "wrapped-complete" ? `Status target: run ${runId}\nSpawn budget: 1/10\nActive async capacity: 0/5\n` : ""}Run: ${runId}\nState: complete` :
@@ -552,9 +534,9 @@ describe("workflow-owned execute controller", () => {
       expect(result.status).toBe("blocked");
       expect(result.reason).toContain(mode === "unknown" ? "Read-only producer settlement uncertain" : "Prior");
       expect(host.calls).toHaveLength(calls);
-      expect(host.history().at(-1).results).toEqual(resolvedLoop(prior).results);
-      expect(host.history().at(-1).review.references).toMatchObject(prior.loop.review.references.map((entry: any) =>
-        mode === "unknown" ? entry : { ...entry, reused: true }));
+      expect(host.current()).toEqual(prior);
+      expect(storeTipRows(host)).toEqual(rows);
+      if (mode !== "unknown") expect(canonicalDigest(result.loopReport.halt)).toBe(prior.halt.digest);
     });
 
   test("compliance reentry preserves original references with metadata-only management delivery", async () => {
@@ -564,21 +546,34 @@ describe("workflow-owned execute controller", () => {
       if (request.key.endsWith(".compliance")) result.structuredOutput.status = "blocked";
       return result;
     });
-    expect((await host.executeNative()).status).toBe("blocked");
+    const output = await host.executeNative();
+    expect(output.status).toBe("blocked");
     const prior = copy(host.current()), calls = host.calls.length;
-    const refs = [...prior.loop.review.references, prior.loop.compliance.ref];
+    const rows = storedRows(host);
+    const ref = prior.action;
+    expect(ref).toMatchObject({ kind: "launched", role: "reviewer", key: "invoke-human-1.l2.compliance" });
+    const originals = [...rows].reverse().find(row => row.kind === "review-originals")!.body as {
+      originals: { key: string; runId: string; path: string; sha256: string; body: unknown }[];
+    };
+    expect(originals.originals.map(({ key, runId }) => ({ key, runId }))).toEqual(
+      prior.review.slots.map(({ key, runId }: { key: string; runId: string }) => ({ key, runId })));
+    for (const original of originals.originals) {
+      expect(original.body).toEqual(readReviewOriginal(original));
+      expect(original.body).toEqual(host.native.get(original.runId)!.structuredOutput);
+    }
     host.setHostResponse((key, value) => key === "inspect-initial" ? {
-      ...value, retainedAnalyses: refs.map(ref => ({
-        key: ref.key, runId: ref.runId, ok: true,
-        structuredOutput: copy(host.native.get(ref.runId)!.structuredOutput),
-      })),
+      ...value, retainedAnalyses: [{ key: ref.key, runId: ref.runId, ok: true,
+        structuredOutput: copy(host.native.get(ref.runId)!.structuredOutput) }],
     } : value);
     host.setStatus(ref => ({ ok: true, runId: ref, output: `Run: ${ref}\nState: complete`, results: [] }));
-    expect((await host.executeNative()).status).toBe("blocked");
+    const replay = await host.executeNative();
+    expect(replay.status).toBe("blocked");
+    expect(replay.reason).toBe(output.reason);
+    expect(replay.loopReport.halt).toEqual(output.loopReport.halt);
+    expect(replay.loopReport.pending[0].references).toContainEqual({ key: ref.key, runId: ref.runId });
     expect(host.calls).toHaveLength(calls);
-    expect(host.history().at(-1).compliance.ref).toEqual(prior.loop.compliance.ref);
-    expect(host.history().at(-1).review.references).toEqual(prior.loop.review.references);
-    expect(host.history().at(-1).results).toEqual(resolvedLoop(prior).results);
+    expect(host.current()).toEqual(prior);
+    expect(storeTipRows(host)).toEqual(rows);
   });
 
   test.each(["conflict", "escape", "stopped", "pending"])(
@@ -591,7 +586,11 @@ describe("workflow-owned execute controller", () => {
       });
       expect((await host.executeNative()).status).toBe("blocked");
       const prior = copy(host.current()), calls = host.calls.length;
-      const ref = prior.loop.review.references[0];
+      const ref = prior.action;
+      const rows = storedRows(host);
+      expect(ref).toMatchObject({ kind: "launched", role: "reviewer",
+        key: "invoke-human-1.l2.review.director-prepare" });
+      expect(host.native.get(ref.runId)!.structuredOutput.status).toBe("blocked");
       host.setHostResponse((key, value) => key === "inspect-initial" ? {
         ...value, retainedAnalyses: [{ key: ref.key, runId: ref.runId, ok: false,
           ...(mode === "conflict" ? { error: "Conflicting complete retained analysis originals." } :
@@ -601,10 +600,10 @@ describe("workflow-owned execute controller", () => {
       const result = await host.executeNative();
       expect(result.status).toBe(mode === "stopped" ? "cancelled" : "blocked");
       expect(host.calls).toHaveLength(calls);
-      expect(host.history().at(-1).review.references).toEqual(prior.loop.review.references);
-      expect(host.history().at(-1).results).toEqual(resolvedLoop(prior).results);
+      expect(host.current()).toEqual(prior);
+      expect(storeTipRows(host)).toEqual(rows);
       expect(result.reason).toContain(mode === "conflict" ? "Conflicting complete" :
-        mode === "escape" ? "escapes its retained" : mode === "stopped" ? "Execution cancelled" : "Positive native barrier");
+        mode === "escape" ? "escapes its retained" : `Positive native barrier: ${mode}`);
     });
 
   test.each(["stopped", "permission", "unavailable"])("current %s after a historical semantic block still prevents continuation", async mode => {
@@ -615,9 +614,14 @@ describe("workflow-owned execute controller", () => {
         Object.assign(result.structuredOutput, { status: "blocked", reason: "Prior semantic impediment" });
       return result;
     });
-    expect((await host.executeNative()).status).toBe("blocked");
-    expect(host.history().at(-1).halt.code).toBe("semantic-block");
+    const output = await host.executeNative();
+    expect(output.status).toBe("blocked");
+    expect(expectOpenHalt(host, output).code).toBe("semantic-block");
     const prior = copy(host.current()), calls = host.calls.length;
+    const rows = storedRows(host);
+    const ref = prior.action;
+    expect(ref).toMatchObject({ kind: "launched", role: "reviewer",
+      key: "invoke-human-1.l2.review.director-prepare" });
     host.setStatus(ref => {
       if (mode === "permission") throw Error("Blocked by pi-subagents permission rule: 'run' is denied.");
       if (mode === "unavailable") return { ok: true, output: "A preview is not the complete result", results: [] };
@@ -625,14 +629,13 @@ describe("workflow-owned execute controller", () => {
     });
     const result = await host.executeNative();
     expect(result).toMatchObject({ status: mode === "stopped" ? "cancelled" : "blocked", loopsConsumed: 2 });
-    expect(host.current().association).toEqual(prior.association);
     // The current missing original is a recovery impediment, not the earlier
     // semantic verdict. It must not erase that verdict's producer references.
-    expect(host.history().at(-1).halt).toMatchObject({ code: mode === "unavailable" ? "recovery" : "native-barrier" });
-    if (mode === "unavailable") expect(result.reason).toContain("Complete retained analysis unavailable");
+    expect(result.reason).toContain(mode === "unavailable" ? "Complete retained analysis unavailable" :
+      `Positive native barrier: ${mode === "permission" ? "native permission denial" : "stopped"}`);
     expect(host.calls).toHaveLength(calls);
-    expect(host.history().at(-1).results).toEqual(resolvedLoop(prior).results);
-    expect(host.history().at(-1).review.references).toEqual(prior.loop.review.references);
+    expect(host.current()).toEqual(prior);
+    expect(storeTipRows(host)).toEqual(rows);
     expect((await host.executeNative()).status).toBe(result.status);
     expect(host.calls).toHaveLength(calls);
   });
@@ -640,494 +643,468 @@ describe("workflow-owned execute controller", () => {
 
   // Reject a replacement inspector after its result returned but admission save
   // failed. Management previews alone must not hide its exact retained original.
-  test.each(["complete", "pending", "unknown-settlement", "conflict", "wrong-run", "missing", "current-stop", "current-permission", "current-run-conflict"])(
+  test.each(["complete", "pending", "unknown-settlement", "conflict", "wrong-run", "missing", "current-stop", "current-permission", "current-run-conflict", "source-binding-mismatch"] as const)(
     "pending recovery receipt reconciles its retained original: %s", async mode => {
       const host = fixture(); host.setLimit(1);
       const director = "invoke-human-1.l1.director";
-      host.setRespond((request, normal) => {
+      const responses = (subject: typeof host) => subject.setRespond((request, normal) => {
         const result = normal();
-        if (request.agent === "pitako.execution-inspector") return host.result(request, {
-          status: "recovered", reason: "Exact associated original retained", original: host.plan(), workerResult: null,
+        if (request.agent === "pitako.execution-inspector") return subject.result(request, {
+          status: "recovered", reason: "Exact associated original retained", original: subject.plan(), workerResult: null,
           originalAvailable: true, binding: "absent", comparison: "only-original", provenance: ["/native/original.json"],
         });
-        return request.key === director ? { ...result, structuredOutput: undefined } : result;
+        if (request.key === director) {
+          rmSync(result.results![0]!.savedOutputPath!);
+          return { ...result, structuredOutput: undefined };
+        }
+        return result;
       });
-      cutAt(host, value => value.loop?.recoveries?.[0]?.stage === "observed");
-      expect((await host.executeNative()).status).toBe("partial");
+      responses(host);
+      const inspectorKey = "invoke-human-1.l1.recover1";
+      let savedReceipt = false;
+      cutAt(host, value => {
+        if (value.action?.key !== inspectorKey || !value.action.runId) return false;
+        if (savedReceipt) return true;
+        savedReceipt = true;
+        return false;
+      });
+      const cut = await host.executeNative();
+      expect(cut.status, cut.reason).toBe("partial");
+      expect(cut.reason).toContain("Essential persistence failed");
       host.setFailSave();
-      const recovery = copy(host.history().at(-1).recoveries[0]), calls = host.calls.length;
-      expect(recovery.stage).toBe("intention");
-      expect(typeof recovery.ref.runId).toBe("string");
-      const receipt = copy(host.native.get(recovery.ref.key)!);
-      host.setStatus(ref => ({ key: ref, runId: ref === recovery.ref.runId && mode === "current-run-conflict" ? "other-producer" : ref, ok: true,
-        ...(ref === recovery.ref.runId && mode === "current-stop" ? { stopped: true } : {}),
-        ...(ref === recovery.ref.runId && mode === "current-permission" ? { error: "Blocked by pi-subagents permission rule: 'run' is denied." } : {}),
-        output: mode === "unknown-settlement" && ref === recovery.ref.runId ? "No current settlement inventory" : `Run: ${ref}\nState: complete`,
+      const cursor = copy(host.current()), calls = host.calls.length, launchCount = host.launches.length, rows = storedRows(host);
+      const receipt = copy(host.native.get(inspectorKey)!);
+      const runId = receipt.runId!;
+      expect(cursor.action).toMatchObject({ kind: "launched", role: "execution-inspector", key: inspectorKey, runId });
+      expect(cursor.inFlight).toContainEqual({ key: director, runId: host.native.get(director)!.runId, role: "execution-director" });
+      expect(cursor.loop).toMatchObject({ number: 1, phase: "director", attempt: null });
+      expect(cursor.halt).toBeNull();
+      expect(executeField(atCursor(host).P.control, "ledger")).toEqual({ count: 0, head: null });
+      expect(cursor.budget).toMatchObject({ consumedLoops: 1, maxCycles: 1 });
+      const originalPath = receipt.results![0]!.savedOutputPath!;
+      expect(JSON.parse(readFileSync(originalPath, "utf8"))).toEqual(receipt.structuredOutput);
+      let retainedOriginal;
+      host.setStatus(ref => ({ key: ref, runId: ref === runId && mode === "current-run-conflict" ? "other-producer" : ref, ok: true,
+        ...(ref === runId && mode === "current-stop" ? { stopped: true } : {}),
+        ...(ref === runId && mode === "current-permission" ? { error: "Blocked by pi-subagents permission rule: 'run' is denied." } : {}),
+        output: mode === "unknown-settlement" && ref === runId ? "No current settlement inventory" : `Run: ${ref}\nState: complete`,
         results: [] }));
-      host.setHostResponse((key, value) => key === "inspect-initial" ? { ...value, retainedAnalyses: mode === "missing" ? [] : [{
-        key: recovery.ref.key, runId: mode === "wrong-run" ? "other-producer" : recovery.ref.runId, ok: true,
-        ...(mode === "complete" || mode === "conflict" ? { state: "complete" } : mode === "pending" ? { state: "running" } : {}),
-        ...(mode === "conflict" ? { ok: false, error: "Conflicting complete retained analysis originals." } : {}),
-        structuredOutput: receipt.structuredOutput,
-      }] } : value);
+      host.setHostResponse((key, value) => {
+        if (key !== "inspect-initial") return value;
+        const original = value.retainedAnalyses.find((item: { key: string }) => item.key === inspectorKey);
+        retainedOriginal = original;
+        if (mode === "complete" || mode === "source-binding-mismatch") return value;
+        const changed = { ...original };
+        if (mode === "wrong-run") changed.runId = "other-producer";
+        if (mode === "pending") changed.state = "running";
+        if (mode === "unknown-settlement") delete changed.state;
+        if (mode === "conflict") Object.assign(changed, {
+          ok: false, error: "Conflicting complete retained analysis originals.",
+        });
+        return { ...value, retainedAnalyses: mode === "missing" ? [] : [changed] };
+      });
+      if (mode === "source-binding-mismatch") {
+        const statusDir = path.join(host.root, ".pi/native-review", runId);
+        const { parentWorkflowRunId } = JSON.parse(readFileSync(path.join(statusDir, "status.json"), "utf8"));
+        const journal = path.join(path.dirname(statusDir), parentWorkflowRunId, "workflow-children.jsonl");
+        const original = readFileSync(journal, "utf8");
+        const changed = original.split("\n").map(line => {
+          if (!line) return line;
+          const entry = JSON.parse(line);
+          if (entry.key === inspectorKey) entry.result.results[0].task = entry.result.results[0].task.replace(
+            /(Selection source \(data\): )([^\n]+)/, (_match: string, prefix: string, data: string) => {
+              const binding = JSON.parse(data);
+              binding.director.digest = "0".repeat(64);
+              return prefix + JSON.stringify(binding);
+            });
+          return JSON.stringify(entry);
+        }).join("\n");
+        expect(changed).not.toBe(original);
+        writeFileSync(journal, changed);
+      }
       const result = await host.executeNative();
+      expect(retainedOriginal).toMatchObject({ key: inspectorKey, runId, ok: true, structuredOutput: receipt.structuredOutput });
       expect(result.status, result.reason).toBe(mode === "complete" ? "partial" : mode === "current-stop" ? "cancelled" : "blocked");
+      expect(host.statusCalls).toContain(runId);
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(1);
       expect(host.calls.slice(calls).filter(call => call.key.endsWith(".director"))).toHaveLength(0);
-      expect(host.history()).toHaveLength(1);
-      expect(host.current().association.maxCycles).toBe(1);
-      if (mode !== "complete") expect(host.calls).toHaveLength(calls);
-      else {
-        expect(host.records().flatMap((record: any) => record.body.recoveries ?? [])[0]).toMatchObject({ stage: "observed", disposition: "recovered" });
+      expect(host.current().budget).toMatchObject({ consumedLoops: 1, maxCycles: 1 });
+      if (mode !== "complete") {
+        expect(host.launches.slice(launchCount).map(call => call.key)).toEqual(
+          mode === "source-binding-mismatch" ? ["invoke-human-1.l1.selectionIO.r1"] : []);
+        if (mode !== "source-binding-mismatch") expect(host.calls).toHaveLength(calls);
+        expect(host.current()).toEqual(cursor);
+        expect(storeTipRows(host)).toEqual(rows);
+        expect(host.history()).toHaveLength(0);
+        const diagnostic = {
+          pending: "Positive native barrier: running",
+          "unknown-settlement": "Read-only producer settlement uncertain",
+          conflict: "Conflicting complete retained analysis originals",
+          "wrong-run": "Exact retained recovery original is unavailable",
+          missing: "Exact retained recovery original is unavailable",
+          "current-stop": "Positive native barrier: stopped",
+          "current-permission": "Positive native barrier: native permission denial",
+          "current-run-conflict": "Recovery producer/run identity conflict",
+          "source-binding-mismatch": "inspector source binding or digest mismatch",
+        }[mode];
+        expect(result.reason).toContain(diagnostic);
+      } else {
+        expect(host.history()).toHaveLength(1);
+        const selection = "invoke-human-1.l1.selectionIO";
+        const selectionRecord = storedRows(host).find(row => row.opKey === `operation:${selection}`)!;
+        const recoveries = (selectionRecord.body as { request: { recoveries: unknown[] } }).request.recoveries;
+        expect(recoveries).toContainEqual(expect.objectContaining({
+          stage: "observed", disposition: "recovered", ref: expect.objectContaining({ key: inspectorKey, runId }),
+        }));
+        expect(host.launches.filter(call => call.key.startsWith(selection)).map(call => call.key)).toEqual([`${selection}.r1`]);
+        expect(Buffer.byteLength(JSON.stringify({ "pitako-execute": cursor }, null, 2))).toBeLessThanOrEqual(16384);
         expect(host.calls.slice(calls).filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-        expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+        expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+        const direct = fixture(); direct.setLimit(1); responses(direct);
+        expect((await direct.executeNative()).status).toBe("partial");
+        expect(host.launches.map(call => call.key)).toEqual(direct.launches.map(call =>
+          call.key === selection ? `${selection}.r1` : call.key));
+        function evidence(subject: typeof host, launchKey: string) {
+          const output = subject.native.get(launchKey)!.output!;
+          expect(Buffer.byteLength(output)).toBeLessThanOrEqual(61440);
+          const wire = JSON.parse(output);
+          const prefix = atCursor(subject, { ...subject.current(), head: wire.head });
+          expect(canonicalDigest(wire.P)).toBe(canonicalDigest(prefix.P));
+          const opened = (wire.P.prompt.loopOpen as { number: number; startedAt: number }).startedAt;
+          expect(wire.P.prompt.selectedTask.id).toBe("change1");
+          const worker = subject.launches.find(call => call.key === "invoke-human-1.l1.t1.a1")!;
+          const rows = storedRows(subject, { ...subject.current(), head: wire.head });
+          const backlog = wire.projection.steps.find((step: { operation: string }) => step.operation === "apply").result.digest;
+          expect(wire.P.preview.manifest.digest).toBe(backlog);
+          expect(worker.task).toContain(`admitted backlog digest ${backlog}`);
+          expect(wire.P.prompt.admission.admissionBinding).toBe(subject.current().admissionBinding);
+          const normalize = (value: string) => rows.reduce((content, row) =>
+            content.replaceAll(row.digest, `<record:${row.seq}>`), value.replaceAll(subject.root, "<root>")
+              .replaceAll(backlog, "<backlog-digest>")
+              .replaceAll(subject.current().admissionBinding, "<admission-binding>")
+              .replaceAll(`"startedAt":${wire.P.prompt.admission.startedAt}`, '"startedAt":0')
+              .replaceAll(`"startedAt":${opened}`, '"startedAt":0'));
+          return { P: normalize(JSON.stringify(wire.P)), prompt: normalize(worker.task) };
+        }
+        expect(evidence(host, `${selection}.r1`)).toEqual(evidence(direct, selection));
       }
     });
 
-  // Reject treating an unknown transport cause as Stop or requiring --unblock
-  // for ordinary technical reconstruction. Closing replay must not repeat work.
+  // An unknown transport cause does not fabricate Stop before admission.
   test.each(["inspect-initial"])(
-    "technical host reentry reconstructs without redundant human input at %s", async target => {
+    "technical failure before the first COMMIT at %s leaves admission available without human input", async target => {
       const host = fixture(); host.setLimit(1);
       host.setHostResponse((key, value) => {
         if (key === target) throw Error(`Host command '${target}' failed: Command stopped because the workflow was aborted.`);
         return value;
       });
-      expect((await host.execute()).status).toBe("blocked");
-      const original = copy(host.current().hostHalt), calls = host.calls.length;
+      const blocked = await host.execute();
+      expect(blocked).toMatchObject({ status: "blocked", phase: "admission", loopsConsumed: 0 });
+      expect(blocked.reason).toContain("ambiguous");
+      expect(blocked.references).toContainEqual({ key: target });
+      expect(host.current()).toBeUndefined();
+      expect(host.storage.size).toBe(0);
+      expect(host.launches).toEqual([]);
       host.setHostResponse();
-      expect(await host.execute()).toMatchObject({ status: "partial" });
-      expect(host.current().hostHalt).toEqual(original);
-      expect(host.current().hostReconstruction).toMatchObject({ source: original, stage: "admitted" });
-      expect(host.current().resolutions).toBeUndefined();
+      expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1, maxLoops: 1 });
+      expect(host.current()).toMatchObject({ hostHalt: null, action: { kind: "terminal" } });
       expect(host.history()).toHaveLength(1);
-      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-      const completed = host.calls.length;
+      expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+      expect(storedRows(host).filter(row => row.kind === "root-admission")).toHaveLength(1);
+      expect(host.launches.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
+      const completed = host.launches.length;
       expect(await host.execute()).toMatchObject({ status: "partial" });
-      expect(host.calls).toHaveLength(completed);
+      expect(host.launches).toHaveLength(completed);
     });
 
-  // A durable intention is not a receipt. Repeating only the fixed pure reads
-  // must reconstruct state, not repeat an admitted worker or a pending query.
   test.each(["inspect-initial"])(
-    "technical host committed reconstruction intention resumes pure projections at %s", async target => {
+    "a committed host failure at %s holds without a fresh inspection or child", async target => {
       const host = fixture(); host.setLimit(1);
+      const director = "invoke-human-1.l1.director";
+      host.setSaveObserver(value => {
+        if (value.action.key === director && value.action.runId)
+          throw Error("Cut after director receipt and before selection");
+      });
+      expect((await host.execute()).reason).toContain("Essential persistence failed");
+      host.setSaveObserver(undefined);
+      const cursor = copy(host.current()), rows = storedRows(host), count = host.launches.length;
+      const producer = host.native.get(director)!;
+      expect(cursor.action).toMatchObject({ kind: "launched", key: director, runId: producer.runId });
+      expect(atCursor(host).P.control.operation).toMatchObject({ operation: "advance", loop: 1 });
+      host.setStatus(ref => ref === producer.runId ? { ...producer, state: "complete" }
+        : host.native.get(ref) ?? { ok: false, state: "unknown" });
       host.setHostResponse((key, value) => {
         if (key === target) throw Error("Controlled ambiguous transport failure");
         return value;
       });
-      expect((await host.execute()).status).toBe("blocked");
-      const original = copy(host.current().hostHalt), priorCalls = host.calls.length;
-      host.current().hostReconstruction = { source: copy(original), stage: "intention" };
+      const blocked = await host.execute();
+      expect(blocked).toMatchObject({ status: "blocked", phase: "director", loopsConsumed: 1,
+        loopReport: { halt: { ref: { key: director, runId: producer.runId } } } });
+      expect(blocked.reason).toContain("Controlled ambiguous transport failure");
+      const held = copy(host.current());
+      expect(held).toEqual({ ...cursor, hostHalt: expect.objectContaining({ digest: expect.any(String) }) });
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.launches).toHaveLength(count);
       host.setHostResponse();
-      expect((await host.execute()).status).toBe("partial");
-      expect(host.current().hostHalt).toEqual(original);
-      expect(host.current().hostReconstruction).toMatchObject({ source: original, stage: "admitted",
-        observation: { ref: { key: "inspect-initial", outputReference: "/native/host/inspect-initial.log" },
-          candidate: host.observedCandidate(), source: host.current().association.source,
-          digest: host.current().association.digest } });
-      expect(host.history()).toHaveLength(1);
-      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-      expect(host.current().association.maxCycles).toBe(1);
-      expect(host.current().resolutions).toBeUndefined();
-      expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
-      const completed = host.calls.length;
-      expect((await host.execute()).status).toBe("partial");
-      expect(host.calls).toHaveLength(completed);
+      const inspections = host.hostCalls.length;
+      expect(await host.execute()).toEqual(blocked);
+      expect(host.current()).toEqual(held);
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.hostCalls).toHaveLength(inspections);
+      expect(host.launches).toHaveLength(count);
+      host.current().hostHalt.reason = "changed diagnostic";
+      expect((await host.execute()).reason).toContain("host halt integrity failure");
+      expect(host.hostCalls).toHaveLength(inspections);
+      expect(host.launches).toHaveLength(count);
     });
 
-  test("technical host intention replay cannot replace a pending read-only model recovery", async () => {
+  test("selection replay cannot inspect or replace a pending read-only model recovery", async () => {
     const host = fixture(); host.setLimit(1);
+    const inspector = "invoke-human-1.l1.recover1";
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.agent === "pitako.execution-director") delete result.structuredOutput;
-      if (request.agent === "pitako.execution-inspector") result.state = "running";
       return result;
     });
-    expect((await host.execute()).status).toBe("blocked");
-    const pending = copy(host.history().at(-1).recoveries[0]);
-    expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(1);
-    host.setHostResponse(() => { throw Error("Controlled host transport failure on reentry"); });
-    expect((await host.execute()).status).toBe("blocked");
-    host.current().hostReconstruction = { source: copy(host.current().hostHalt), stage: "intention" };
-    const calls = host.calls.length;
-    host.setHostResponse();
-    expect((await host.execute()).status).toBe("blocked");
-    expect(host.current().hostReconstruction.stage).toBe("admitted");
-    expect(host.history().at(-1).recoveries[0]).toEqual(pending);
-    expect(host.history()).toHaveLength(1);
-    expect(host.calls).toHaveLength(calls);
+    host.setSaveObserver(value => {
+      if (value.action.key === inspector && value.action.runId)
+        throw Error("Cut after inspector receipt");
+    });
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    host.setSaveObserver(undefined);
+    const cursor = copy(host.current()), rows = storedRows(host), count = host.launches.length;
+    const runId = host.native.get(inspector)!.runId!;
+    expect(cursor.action).toMatchObject({ kind: "launched", role: "execution-inspector", key: inspector, runId });
+    expect(atCursor(host).P.control.operation).toMatchObject({ operation: "advance", loop: 1 });
+    const inspections = host.hostCalls.length;
+    host.setStatus(ref => ref === runId ? { ok: true, runId, state: "pending" } : host.native.get(ref)!);
+    expect(await host.execute()).toMatchObject({ status: "blocked", reason: "Positive native barrier: pending" });
+    expect(host.statusCalls.at(-1)).toBe(runId);
+    expect(host.hostCalls).toHaveLength(inspections);
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
+    expect(host.launches).toHaveLength(count);
+    expect(host.launches.filter(call => call.agent === "pitako.execution-inspector").map(call => call.key)).toEqual([inspector]);
   });
 
   test.each(["stopped", "pending", "permission"])(
-    "technical host reentry preserves observed %s without current human input", async cause => {
+    "committed host failure stays terminal at +0 even if its producer now reports %s", async cause => {
       const host = fixture(); host.setLimit(1);
+      const { cursor, producer, rows, launches } = await cutBeforeSelection(host);
+      host.setStatus(ref => ref === producer.runId ? { ...producer, state: "complete" } : host.native.get(ref)!);
       host.setHostResponse(() => { throw Error("Controlled ambiguous host failure"); });
-      await host.execute();
-      const checkpoint = host.current();
-      if (cause === "permission") checkpoint.hostHalt.observedBarrier = "native permission denial";
-      else checkpoint.hostHalt.observedState = cause;
-      host.storage.set("invoke-human-1", copy(checkpoint));
-      const original = copy(host.current()), calls = host.hostCalls.length;
+      const blocked = await host.execute();
+      expect(blocked).toMatchObject({ status: "blocked", reason: "Read-only host inspection failed: Controlled ambiguous host failure",
+        loopReport: { halt: { ref: { key: cursor.action.key, runId: producer.runId } } } });
+      const held = copy(host.current());
+      expect(held).toEqual({ ...cursor, hostHalt: { stage: "host", reason: blocked.reason, digest: expect.stringMatching(/^[a-f0-9]{64}$/) } });
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.launches).toEqual(launches);
+      host.setStatus(ref => ref !== producer.runId ? host.native.get(ref)! : cause === "permission"
+        ? { key: cursor.action.key, runId: producer.runId, ok: false, error: "Blocked by pi-subagents permission rule: 'run' is denied." }
+        : { key: cursor.action.key, runId: producer.runId, ok: false, state: cause });
+      const calls = host.hostCalls.length;
+      const statuses = copy(host.statusCalls);
       host.setHostResponse();
-      expect((await host.execute()).status).toBe("blocked");
+      expect(await host.execute()).toEqual(blocked);
+      expect(host.statusCalls).toEqual(statuses);
       expect(host.hostCalls).toHaveLength(calls);
-      expect(host.current()).toEqual(original);
-      expect(host.calls).toHaveLength(0);
+      expect(host.current()).toEqual(held);
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.launches).toEqual(launches);
     });
 
-  test.each(["intention", "failure"])("technical host reconstruction %s cannot dispatch blindly on replay", async cut => {
+  test("selection replay observes a pending selection before admitting its one recovery child", async () => {
     const host = fixture(); host.setLimit(1);
-    host.setHostResponse(() => { throw Error("Controlled read-only failure"); });
-    await host.execute();
-    if (cut === "intention") {
-      host.setHostResponse();
-      cutAt(host, value => value.hostReconstruction?.stage === "intention");
-    }
-    const second = await host.execute();
-    expect(second.status).not.toBe("complete");
-    expect(host.calls).toHaveLength(0);
-    const calls = host.hostCalls.length;
-    host.setFailSave(); host.setHostResponse();
-    // A cut before saving the intention has launched nothing, so reentry may
-    // safely persist it. A failed attempted inspection cannot renew its route.
+    const { cursor, producer, rows, launches } = await cutBeforeSelection(host);
+    const key = "invoke-human-1.l1.selectionIO";
+    host.setStatus(ref => ref === key ? { key, ok: false, state: "pending" }
+      : ref === producer.runId ? { ...producer, state: "complete" } : host.native.get(ref)!);
+    expect(await host.execute()).toMatchObject({ status: "blocked", reason: "Positive native barrier: pending" });
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
+    expect(host.launches).toEqual(launches);
+    host.setStatus(ref => ref === producer.runId ? { ...producer, state: "complete" } : host.native.get(ref)!);
     const replay = await host.execute();
-    if (cut === "failure") {
-      expect(replay.status).toBe("blocked");
-      expect(host.hostCalls).toHaveLength(calls);
-      expect(host.current().hostReconstruction.stage).toBe("failed");
-    } else {
-      expect(replay.status).toBe("partial");
-      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-    }
+    expect(replay).toMatchObject({ status: "partial", loopsConsumed: 1, maxLoops: 1 });
+    expect(host.launches.slice(launches.length)[0]).toMatchObject({ key: "invoke-human-1.l1.selectionIO.r1", agent: "pitako.loop-io" });
+    expect(host.launches.filter(call => call.agent === "pitako.execution-director").map(call => call.key)).toEqual([cursor.action.key]);
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+    expect(storedRows(host).slice(0, rows.length)).toEqual(rows);
   });
 
-  // Reject a permanent historical-host veto, fabricated Stop classification,
-  // repeated completed producers, and renewal/double consumption of loop slots.
-  test.each(["inspect-initial"])(
-    "current human resolution reconstructs after historical host ambiguity at %s", async target => {
-      const host = fixture(); host.setLimit(1);
-      host.setHostResponse((key, value) => {
-        if (key === target) throw Error(`Host command '${target}' failed: Command stopped because the workflow was aborted.`);
-        return value;
-      });
-      expect((await host.execute()).status).toBe("blocked");
-      const original = copy(host.current().hostHalt), count = host.calls.length;
-      expect(original).not.toHaveProperty("observedState");
-      expect(host.current().association).toBeUndefined();
-      const loops = host.current()?.consumedLoops ?? 0;
-      host.setHostResponse();
-      const input = { unblock: true, resolution: { loop: loops, text: "Continue the same request; reconstruct state under current native policy." } };
-      expect((await host.execute(input)).status).toBe("partial");
-      expect(host.current().hostHalt).toEqual(original);
-      const retained = loops ? host.history().at(-1).resolutions[0] : host.current().resolutions[0];
-      expect(retained).toMatchObject({ text: input.resolution.text, hostHalt: original });
-      expect(host.history()).toHaveLength(1);
-      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-      const complete = host.calls.length;
-      expect((await host.execute(input)).status).toBe("partial");
-      expect(host.calls).toHaveLength(complete);
-    });
-
-  test.each(["stopped", "pending"])("checkpointed host %s is retained, not fabricated from text", async observedState => {
+  test("pre-admission inspect-initial ambiguity does not fabricate Stop or a resolution", async () => {
     const host = fixture(); host.setLimit(1);
-    host.setHostResponse(key => { throw Error(`Host command '${key}' failed: Command stopped because the workflow was aborted.`); });
-    expect((await host.execute()).status).toBe("blocked");
-    // Model an already-retained checkpoint that really has a structured state;
-    // the ambiguous native exception in the adjacent test does NOT supply it.
-    const checkpoint = host.current();
-    checkpoint.hostHalt.observedState = observedState;
-    checkpoint.hostHalt.status = observedState === "stopped" ? "cancelled" : "blocked";
-    host.storage.set("invoke-human-1", copy(checkpoint));
-    const original = copy(checkpoint.hostHalt), calls = host.hostCalls.length;
+    const error = "Host command 'inspect-initial' failed: Command stopped because the workflow was aborted.";
+    host.setHostResponse(key => { expect(key).toBe("inspect-initial"); throw Error(error); });
+    expect(await host.execute()).toMatchObject({ status: "blocked", loopsConsumed: 0, reason: expect.stringContaining(error) });
+    expect(host.storage.size).toBe(0);
+    expect(host.launches).toEqual([]);
     host.setHostResponse();
-    const output = await host.execute({ unblock: true, resolution: { loop: 0, text: "Continue state reconstruction under current native authority." } });
-    expect(output.status).toBe(observedState === "stopped" ? "partial" : "blocked");
-    expect(host.current().hostHalt).toEqual(original);
-    expect(host.current().resolutions[0].hostHalt).toEqual(original);
-    if (observedState === "stopped") expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-    if (observedState === "pending") {
-      expect(host.hostCalls).toHaveLength(calls);
-      expect(host.calls).toHaveLength(0);
-      expect(host.current()).not.toHaveProperty("association");
-    }
+    expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1, maxLoops: 1 });
+    expect(host.history()).toHaveLength(1);
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+    expect(storedRows(host).filter(row => row.kind === "resolution")).toEqual([]);
+    const count = host.launches.length;
+    expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
+    expect(host.launches).toHaveLength(count);
   });
 
-  test.each(["accepted", "applied"])("host resolution %s cut replays without another human input", async cut => {
+  test.each(["stopped", "pending"])("checkpointed drain %s is retained from native evidence, not fabricated from text", async observedState => {
     const host = fixture(); host.setLimit(1);
-    host.setHostResponse(key => { throw Error(`Host command '${key}' failed: Command stopped because the workflow was aborted.`); });
-    expect((await host.execute()).status).toBe("blocked");
-    const original = copy(host.current().hostHalt);
-    host.setHostResponse();
-    cutAt(host, value => value.resolutions?.[0]?.stage === cut);
-    expect((await host.execute({ unblock: true, resolution: { loop: 0, text: "Continue bounded state reconstruction under current policy." } })).reason)
-      .toContain("Essential persistence failed");
-    host.setFailSave();
-    expect((await host.execute()).status).toBe("partial");
-    const calls = host.calls.length;
-    expect((await host.execute()).status).toBe("partial");
-    expect(host.calls).toHaveLength(calls);
-    expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(0);
-    expect(host.current().resolutions).toHaveLength(1);
-    expect(host.current().resolutions[0]).toMatchObject({ stage: "applied", hostHalt: original });
-    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-    expect(host.current().hostHalt).toEqual(original);
+    const key = "invoke-human-1.l1.finishDrain";
+    host.setLaunchRespond((request, normal) => request.key === key
+      ? { key, runId: `native-${key}`, agent: "pitako.loop-io", ok: false, stopped: true, output: "",
+        results: [{ exitCode: -1, processSignal: "SIGTERM" }] } : normal());
+    const stopped = await host.execute();
+    expect(stopped.status).toBe("cancelled");
+    const halt = expectOpenHalt(host, stopped), retained = copy(host.current()), rows = storeTipRows(host);
+    const launches = copy(host.launches), producer = host.native.get(key)!;
+    expect(halt.ref).toMatchObject({ key, runId: producer.runId });
+    expect(retained.inFlight).toContainEqual({ key, runId: producer.runId, role: "loop-io" });
+    expect(retained.action).toMatchObject({ kind: "pending", op: "drain", opKey: key });
+    expect(retained.action.drainDigest).toBe(canonicalDigest(JSON.parse(launches.find(call => call.key === key)!.task)));
+    host.setLaunchRespond();
+    host.setStatus(ref => ref === producer.runId ? { ...producer, stopped: observedState === "stopped", state: observedState }
+      : host.native.get(ref)!);
+    expect((await host.execute()).status).toBe(observedState === "stopped" ? "cancelled" : "blocked");
+    expect(host.current()).toEqual(retained);
+    expect(storeTipRows(host)).toEqual(rows);
+    expect(host.launches).toEqual(launches);
   });
+
+  function writeFreeBlockedWorker() {
+    const host = fixture(); host.setLimit(1);
+    const first = "invoke-human-1.l1.t1.a1";
+    const reason = "Current input required: choose the supported API";
+    host.setRespond((request, normal) => request.key === first ? host.result(request, {
+      status: "blocked", work: "Located the conflicting API", remaining: [reason],
+      knowledge: { findings: [], handoff: "Awaiting the API decision" }, diagnosis: reason,
+    }) : normal());
+    return host;
+  }
+
+
 
   // A prior answer does not settle a later failure. Equally, that answer must
   // not turn an otherwise recoverable technical read into a human-only veto.
-  test.each(["none", "intention", "admitted"])(
-    "technical failure after applied human input reconstructs without another answer at %s", async cut => {
-      const host = fixture(); host.setLimit(1);
-      const fail = (key: string) => { throw Error(`Host command '${key}' failed: Command stopped because the workflow was aborted.`); };
-      host.setHostResponse(fail);
-      expect((await host.execute()).status).toBe("blocked");
-      const original = copy(host.current().hostHalt);
-      host.setHostResponse();
-      expect((await host.execute({ unblock: true, resolution: { loop: 0, text: "Continue the interrupted read under current policy." } })).status).toBe("partial");
-      host.setHostResponse(fail);
-      expect((await host.execute()).status).toBe("blocked"); // identical text, NEW operation
-      const later = copy(host.current().hostHalt), writers = host.calls.length;
-      expect(host.current().resolutions[0]).toMatchObject({ hostHalt: original, failedHostObservation: later });
-      host.setHostResponse();
-      if (cut !== "none") {
-        cutAt(host, value => value.hostReconstruction?.stage === cut);
-        expect((await host.execute()).reason).toContain("Essential persistence failed");
-        host.setFailSave();
-      }
-      expect((await host.execute()).status).toBe("partial");
-      expect(host.current().hostReconstruction).toMatchObject({ source: later, stage: "admitted" });
-      expect(host.current().resolutions).toHaveLength(1);
-      expect(host.current().resolutions[0]).toMatchObject({ hostHalt: original, failedHostObservation: later });
-      expect(host.history()).toHaveLength(1);
-      expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
-      expect(host.calls).toHaveLength(writers);
-      expect((await host.execute()).status).toBe("partial");
-      expect(host.calls).toHaveLength(writers);
-    });
 
-  test.each(["stopped", "pending", "permission", "failed-reconstruction"])(
-    "later host %s after applied input remains a real barrier", async cause => {
-      const host = fixture(); host.setLimit(1);
-      const fail = () => { throw Error("Controlled ambiguous host failure"); };
-      host.setHostResponse(fail);
-      await host.execute();
-      host.setHostResponse();
-      expect((await host.execute({ unblock: true, resolution: { loop: 0, text: "Continue the original read under current policy." } })).status).toBe("partial");
-      host.setHostResponse(fail);
-      expect((await host.execute()).status).toBe("blocked");
-      const record = host.current();
-      if (cause === "failed-reconstruction") {
-        expect((await host.execute()).status).toBe("blocked");
-        expect(host.current().hostReconstruction.stage).toBe("failed");
-      } else {
-        if (cause === "permission") record.hostHalt.observedBarrier = "native permission denial";
-        else record.hostHalt.observedState = cause;
-        record.resolutions[0].failedHostObservation = copy(record.hostHalt);
-      }
-      const retained = copy(host.current()), calls = host.hostCalls.length, writers = host.calls.length;
-      host.setHostResponse();
-      expect((await host.execute()).status).toBe("blocked");
-      expect(host.hostCalls).toHaveLength(calls);
-      expect(host.calls).toHaveLength(writers);
-      expect(host.current()).toEqual(retained);
-    });
 
-  test("retained resolution without an exact request match cannot clear host history", async () => {
-    const host = fixture(); host.setLimit(1);
-    host.setHostResponse(key => { throw Error(`Host command '${key}' failed: Command stopped because the workflow was aborted.`); });
-    expect((await host.execute()).status).toBe("blocked");
-    host.setHostResponse();
-    expect((await host.execute({ unblock: true, resolution: { loop: 0, text: "Continue under current policy." } })).status).toBe("partial");
-    host.current().resolutions[0].request.invocation = "unrelated-invocation";
-    const retained = copy(host.current()), calls = host.hostCalls.length;
-    expect((await host.execute()).status).toBe("blocked");
-    expect(host.current()).toEqual(retained);
-    expect(host.hostCalls).toHaveLength(calls);
-  });
 
-  test.each(["intention", "accepted", "applied", "next-slot", "none"])(
-    "loop-three director Stop resolution survives %s cut without replacing completed work", async cut => {
-      const host = fixture(undefined, { taskCount: 4 }); host.setLimit(4);
-      const target = "invoke-human-1.l3.director";
-      host.setRespond((request, normal) => request.key === target ? closedInterruptedProducer(normal()) : normal());
-      expect((await host.execute()).status).toBe("cancelled");
-      const original = copy(host.history()[2]), completed = copy(host.current().tasks), prior = host.calls.length;
-      host.setRespond((request, normal) => request.agent === "pitako.execution-inspector"
-        ? host.result(request, { status: "recovered", reason: "Exact settled director original",
-          original: copy(host.native.get(target)), workerResult: null, originalAvailable: true,
-          binding: "absent", comparison: "only-original", provenance: ["/native/output/" + target + ".json"] }) : normal());
-      const input = { unblock: true, resolution: { loop: 3, text: "Continue after the settled director Stop in the next ordinary slot." } };
-      if (cut !== "none") cutAt(host, value => cut === "next-slot" ? value.consumedLoops === 4
-        : value.loop?.number === 3 && value.loop.resolutions?.[0]?.stage === cut);
-      const first = await host.execute(input);
-      if (cut !== "none") {
-        expect(first.reason).toContain("Essential persistence failed");
-        host.setFailSave();
-      }
-      const output = await host.execute(cut === "intention" ? input : {});
-      expect(output).toMatchObject({ status: "partial", loopsConsumed: 4, maxLoops: 4 });
-      const record = host.history()[2];
-      expect(host.records().find((entry: any) => entry.kind === "loop" && entry.loop === 3).body.plan).toEqual(original.plan);
-      expect(record.resolutions).toHaveLength(1);
-      expect(record.resolutions[0]).toMatchObject({ ...input.resolution, stage: "applied", halt: original.halt });
-      for (const id of ["change1", "change2"]) expect(host.current().tasks[id]).toEqual(completed[id]);
-      expect(host.records().find((entry: any) => entry.kind === "unit" && entry.body.taskId === "change3").body.result.status).toBe("complete");
-      expect(readBacklog(host.root, "spec").backlog?.tasks.find(task => task.id === "change4")?.status).toBe("pending");
-      expect(host.calls.slice(prior).every(call => call.agent === "pitako.execution-inspector" ||
-        call.key.startsWith("invoke-human-1.l4.") || call.key === "invoke-human-1.l3.gaps" ||
-        call.key.startsWith("invoke-human-1.l3.nextAdvance."))).toBe(true);
-      expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(4);
-      expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
-      expect(host.calls.find(call => call.key === "invoke-human-1.l4.director")?.task).toContain(input.resolution.text);
-    });
 
-  test("resolution cannot invent an invocation, clear a scope gap, or replace a pending writer", async () => {
-    const fresh = fixture(), input = { unblock: true, resolution: { loop: 0, text: "Continue" } };
-    expect((await fresh.execute(input)).status).toBe("blocked");
-    expect(fresh.hostCalls).toHaveLength(0);
-    const host = fixture();
-    host.setRespond((request, normal) => request.agent === "pitako.worker" ? { ...normal(), ok: false, state: "running" } : normal());
-    expect((await host.execute()).status).toBe("blocked");
-    const count = host.calls.length;
-    expect((await host.execute({ ...input, resolution: { ...input.resolution, loop: 1 } })).status).toBe("blocked");
-    expect(host.calls).toHaveLength(count);
-    expect(host.statusCalls.length).toBeGreaterThan(0);
-    const scope = fixture();
-    scope.setRespond((request, normal) => {
-      const result = normal();
-      // Every settled non-complete backlog attempt seals pause; a semantic block still requires authority.
-      if (request.agent === "pitako.worker")
-        Object.assign(result.structuredOutput, { status: "blocked", work: "Expansion needed: unauthorized external resource", remaining: [] });
-      return result;
-    });
-    expect((await scope.execute()).status).toBe("blocked");
-    expect(scope.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["pause"]);
-    const before = scope.calls.length;
-    expect((await scope.execute({ ...input, resolution: { ...input.resolution, loop: 1 } })).status).toBe("blocked");
-    expect(scope.calls).toHaveLength(before);
-  });
 
-  test.each(["settled", "unknown", "permission", "current-stop"])(
-    "historical worker %s uses checkpoint-first recovery without redispatch", async mode => {
+
+
+
+
+
+
+
+  test.each(["settled", "missing-original", "permission"])(
+    "historical worker %s never redispatches after a terminal native halt", async mode => {
       const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
       const target = "invoke-human-1.l1.t1.a1";
-      host.setRespond((request, normal) => request.key !== target ? normal() : mode === "unknown"
-        ? { ...normal(), ok: false, stopped: true }
-        : closedInterruptedProducer(normal(), mode === "permission" ? "permission" : "stopped"));
-      expect((await host.executeNative()).status).toBe(mode === "permission" ? "blocked" : "cancelled");
-      const count = host.calls.length;
+      host.setRespond((request, normal) => request.key !== target ? normal()
+        : closedInterruptedProducer({ key: request.key, ...normal() }, mode === "permission" ? "permission" : "stopped"));
+      const initial = await host.executeNative();
+      expect(initial.status).toBe(mode === "permission" ? "blocked" : "cancelled");
+      const cursor = copy(host.current()), count = host.calls.length, launchCount = host.launches.length;
+      const intentRow = storedRows(host, cursor).find(row => row.seq === cursor.loop.attempt.intent.seq);
+      expect(intentRow).toMatchObject({ kind: "intent", digest: cursor.loop.attempt.intent.digest,
+        body: { key: target, taskId: "change1", attempt: 1 } });
+      expect(cursor.action).toMatchObject({ kind: "launched", role: "worker", key: target,
+        runId: host.native.get(target)!.runId });
+      expect(cursor.halt.digest).toBe(canonicalDigest(initial.loopReport.halt));
+      const rows = storeTipRows(host);
+      if (mode === "missing-original") {
+        const mission = JSON.parse(readFileSync(initial.missionPath, "utf8"));
+        const child = mission.workflowChildren.find((item: { key: string }) => item.key === target);
+        const dir = child.artifactPaths.find((file: string) => path.basename(file) === child.runId);
+        rmSync(path.join(path.dirname(dir), child.workflowRunId, "workflow-children.jsonl"));
+      }
       host.setStatus(ref => {
         const response = copy(host.native.get(ref)!);
         if (response?.key === target && mode !== "permission")
           return { ok: false, output: "", error: "Historical writer unavailable" };
         return response;
       });
-      host.setRespond((request, normal) => {
-        if (request.key === "invoke-human-1.l1.t1.a2") {
-          if (mode === "current-stop") return { ...normal(), ok: false, stopped: true };
-          const restore = host.current().loop.attempt.restore;
-          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-          const restored = restoreCheckpoint(sources, restore.authority);
-          return host.result(request, { ...host.worker(request), restoreReceipt: {
-            ...restored, restoredRef: restored.partialRef.replace(/restore\.json$/, "restored.json") } });
-        }
-        return normal();
-      });
-      const output = await host.executeNative({ unblock: true, resolution: { loop: 1,
-        text: "Continue the task from its captured checkpoint after the historical interruption." } });
-      expect(output.status, output.reason).toBe(mode === "permission" ? "blocked" : mode === "current-stop" ? "cancelled" : "partial");
-      expect(host.calls.filter(call => call.key === target)).toHaveLength(1);
-      expect(host.calls.some(call => call.key.endsWith(".l2.director"))).toBe(false);
-      if (mode === "permission") expect(host.calls).toHaveLength(count);
-      else {
-        expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a2")).toHaveLength(1);
-        if (mode !== "current-stop") expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+      const replay = await host.executeNative();
+      if (mode === "missing-original") {
+        expect(replay.status).toBe("blocked");
+        expect(replay.reason).toContain("native original integrity failure");
+      } else {
+        expect(replay.status, replay.reason).toBe(initial.status);
+        expect(replay.loopReport?.halt, replay.reason).toEqual(initial.loopReport.halt);
       }
-      const after = host.calls.length;
-      await host.executeNative();
-      expect(host.calls).toHaveLength(after);
+      expect(host.launches).toHaveLength(launchCount);
+      expect(host.calls).toHaveLength(count);
+      expect(host.current()).toEqual(cursor);
+      expect(storeTipRows(host)).toEqual(rows);
     });
 
-  // Review and compliance require their exact settled read-only originals.
   test.each(["review", "compliance"].flatMap(phase =>
     ["stopped", "permission", "unknown", "current-stop"].map(mode => ({ phase, mode }))))(
-    "historical $phase $mode requires exact settlement and current authority", async ({ phase, mode }) => {
+    "historical $phase $mode holds the verified halt without dispatch", async ({ phase, mode }) => {
       const host = fixture(undefined, { taskCount: 0 });
-      const target = `invoke-human-1.l1.${phase === "worker" ? "t1.a1" : phase === "review" ? "review.director-prepare" : "compliance"}`;
+      const target = `invoke-human-1.l1.${phase === "review" ? "review.director-prepare" : "compliance"}`;
+      const denied = mode === "permission";
       host.setRespond((request, normal) => request.key !== target ? normal() : mode === "unknown"
         ? { ...normal(), ok: false, stopped: true }
-        : closedInterruptedProducer(normal(), mode === "permission" ? "permission" : "stopped"));
-      expect((await host.executeNative()).status).toBe(mode === "permission" ? "blocked" : "cancelled");
-      const original = copy(host.current()), count = host.calls.length;
-      host.setStatus(ref => {
-        const response = copy(host.native.get(ref)!);
-        if (response?.key === target || ref === `native-${target}` || ref === target) {
-          if (mode === "unknown") return { ...response, state: "completed" }; // label alone does not establish closure
-          return response;
+        : closedInterruptedProducer(normal(), denied ? "permission" : "stopped"));
+      const initial = await host.executeNative();
+      expect(initial.status).toBe(denied ? "blocked" : "cancelled");
+      const original = copy(host.current()), calls = copy(host.calls);
+      const rows = storeTipRows(host), launches = copy(host.launches);
+      const producer = copy(host.native.get(target)!);
+      const halt = denied ? initial.loopReport.halt : expectOpenHalt(host, initial);
+      expect(halt).toMatchObject({ code: "native-barrier", cause: denied ? "native permission denial" : "stopped",
+        ref: { key: target, runId: producer.runId } });
+      expect(original).toMatchObject({ version: 10,
+        halt: { stage: denied ? "native-permission" : "native-barrier", digest: canonicalDigest(halt) },
+        loop: { number: 1, phase }, action: { kind: "launched", key: target, runId: producer.runId } });
+      host.setStatus(ref => ref !== producer.runId ? copy(host.native.get(ref)!) :
+        mode === "stopped" || denied ? producer :
+          { ok: false, runId: producer.runId, state: mode === "unknown" ? "unknown" : "stopped" });
+      const output = await host.executeNative();
+      expect(output, output.reason).toMatchObject({ status: denied ? "blocked" : "cancelled",
+        phase, loopsConsumed: 1, maxLoops: original.budget.maxCycles });
+      expect(output.loopReport.halt).toEqual(halt);
+      expect(output.reason).toBe(halt.reason);
+      expect(host.current()).toEqual(original);
+      expect(host.history()).toEqual([]);
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.native.get(target)).toEqual(producer);
+      expect(host.launches).toEqual(launches);
+      expect(host.calls).toEqual(calls);
+
+      // A positive current Stop is not a substitute for the retained original.
+      if (mode === "current-stop") {
+        const mission = JSON.parse(readFileSync(initial.missionPath, "utf8"));
+        const child = mission.workflowChildren.find((item: { key: string }) => item.key === target);
+        const dir = child.artifactPaths.find((file: string) => path.basename(file) === producer.runId);
+        const journal = path.join(path.dirname(dir), child.workflowRunId, "workflow-children.jsonl");
+        const bytes = readFileSync(journal);
+        try {
+          rmSync(journal);
+          expect((await host.executeNative()).reason).toContain("native original integrity failure");
+        } finally {
+          writeFileSync(journal, bytes);
         }
-        return response;
-      });
-      host.setRespond((request, normal) => request.agent === "pitako.execution-inspector"
-        ? host.result(request, { status: mode === "unknown" ? "unresolved" : "recovered", reason: "Exact retained operation receipt; settlement checked",
-          original: mode === "unknown" ? null : copy(host.native.get(target)), workerResult: null,
-          originalAvailable: mode !== "unknown", binding: "absent", comparison: mode === "unknown" ? "neither" : "only-original",
-          provenance: [`/native/output/${target}.json`] })
-        : mode === "current-stop" && request.key.endsWith(".l2.director") ? { ...normal(), ok: false, stopped: true } : normal());
-      const input = { unblock: true, resolution: { loop: 1, text: "Continue pending work after reconciling the historical interruption." } };
-      const output = await host.executeNative(input);
-      expect(output.status).toBe(mode === "permission" ? "blocked" : mode === "unknown" || mode === "current-stop" ? "cancelled" : "complete");
-      if (mode === "permission") {
-        expect(host.calls).toHaveLength(count);
-        expect(host.history()).toHaveLength(1);
-        expect(host.history()[0].halt).toMatchObject({ code: "native-barrier", cause: "native permission denial" });
-        expect(host.history()[0].resolutions[0].stage).toBe("accepted");
-        expect((await host.executeNative()).status).toBe("blocked");
-        expect(host.calls).toHaveLength(count);
-      } else if (mode === "unknown") {
-        expect(host.calls).toHaveLength(count + 1); // one exact exceptional observation, not a writer
-        expect(host.history()).toHaveLength(1);
-      } else {
-        expect(host.history()).toHaveLength(2);
-        expect(host.history()[0].resolutions[0]).toMatchObject({ stage: "applied", halt: original.loop.halt });
-        expect(host.calls.slice(count).every(call => call.agent === "pitako.execution-inspector" || call.key === "invoke-human-1.l1.gaps" ||
-          call.key.startsWith("invoke-human-1.l1.nextAdvance.") || call.key.startsWith("invoke-human-1.l2."))).toBe(true);
-        const after = host.calls.length;
-        await host.executeNative();
-        expect(host.calls).toHaveLength(after);
+        host.storage.set("pitako-execute", { ...original, halt: { ...original.halt, digest: "e".repeat(64) } });
+        expect((await host.executeNative()).reason).toContain("halt digest or status integrity mismatch");
+        host.storage.set("pitako-execute", original);
+        host.setStatus(ref => ref === producer.runId ? { ok: true, runId: producer.runId, state: "complete" }
+          : copy(host.native.get(ref)!));
+        const contradictory = await host.executeNative();
+        expect(contradictory.status).toBe("blocked");
+        expect(contradictory.reason).toContain("halt digest or status integrity mismatch");
+        expect(storeTipRows(host)).toEqual(rows);
+        expect(host.launches).toEqual(launches);
+        expect(host.calls).toEqual(calls);
       }
     });
 
-  test("later director Stop needs new current input without reviving an older barrier after application", async () => {
-    const host = fixture(), firstDirector = "invoke-human-1.l1.director", director = "invoke-human-1.l2.director";
-    host.setLimit(4);
-    host.setRespond((request, normal) => request.key === firstDirector ? closedInterruptedProducer(normal()) : normal());
-    expect((await host.executeNative()).status).toBe("cancelled");
-    host.setRespond((request, normal) => {
-      if (request.agent === "pitako.execution-inspector") {
-        const target = request.task.includes(`"key":"${director}"`) ? director : firstDirector;
-        return host.result(request, { status: "recovered", reason: "Exact complete settled original operation receipt",
-          original: copy(host.native.get(target)), workerResult: null, originalAvailable: true,
-          binding: "absent", comparison: "only-original", provenance: [`/native/output/${target}.json`] });
-      }
-      return request.key === director ? closedInterruptedProducer(normal()) : normal();
-    });
-    expect((await host.executeNative({ unblock: true, resolution: { loop: 1, text: "Continue after the first settled interruption under current policy." } })).status).toBe("cancelled");
-    const before = host.calls.length;
-    expect((await host.executeNative()).status).toBe("cancelled");
-    expect(host.calls).toHaveLength(before);
-    expect((await host.executeNative({ unblock: true, resolution: { loop: 2, text: "New current request after the later director Stop: reconcile and continue within the original budget." } })).status).toBe("complete");
-    const after = host.calls.length;
-    expect((await host.executeNative()).status).toBe("complete");
-    expect(host.calls).toHaveLength(after);
-    expect(host.history()).toHaveLength(4);
-    expect(readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!.status).toBe("done");
-    expect(host.current().association.maxCycles).toBe(4);
-    expect(host.history()[0].resolutions[0].currentBarrier).toBeUndefined();
-    expect(host.snapshots.some(value => value.loop?.number === 2 && value.loop.halt?.cause === "stopped")).toBe(true);
-    expect(host.history()[1].resolutions[0]).toMatchObject({ stage: "applied", halt: { cause: "stopped" } });
-    expect(host.calls.filter(call => call.key === director)).toHaveLength(1);
-  });
+
 });
 
 describe("workflow-owned execute controller", () => {
@@ -1135,6 +1112,8 @@ describe("workflow-owned execute controller", () => {
   // not redispatch a director or admit an invalid selection.
   test.each(["none", "publication", "rejection", "next-slot"])("new rejected plan is accounted once across %s cut", async cut => {
     const host = fixture(); host.setLimit(2);
+    const rejectedDirector = "invoke-human-1.l1.director.d1";
+    const rejectedSelection = "invoke-human-1.l1.selectionIO.d1";
     let original: any;
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1150,22 +1129,24 @@ describe("workflow-owned execute controller", () => {
       }
       return result;
     });
+    if (cut === "publication") host.setSaveObserver(value => {
+      if (value.action.key === rejectedDirector && value.action.runId) throw Error("Cut after native publication was recorded");
+    });
+    if (cut === "rejection") cutAfterOriginal(host, rejectedSelection);
+    if (cut === "next-slot") cutAt(host, value => value.budget.consumedLoops === 2);
     if (cut !== "none") {
-      cutAt(host, value => {
-        const first = value.loop;
-        return cut === "publication" ? first?.plan?.stage === "published"
-          : cut === "rejection" ? first?.plan?.stage === "rejected"
-          : value.consumedLoops === 2;
-      });
-      expect((await host.execute()).status).toBe("partial");
+      expect((await host.execute()).reason).toContain("Essential persistence failed");
       host.setFailSave();
+      host.setSaveObserver(undefined);
     }
-    expect((await host.execute()).status).toBe("partial");
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe("partial");
     const first = host.history()[0];
     expect(first).toMatchObject({ number: 1, outcome: "gaps", cursor: 0, manifest: null, results: [],
-      plan: { stage: "rejected", rejection: { diagnostic: expect.stringContaining("Selected task must be pending"), ref: { runId: "native-invoke-human-1.l1.director.d1" } } } });
+      plan: { stage: "rejected", rejection: { diagnostic: expect.stringContaining("Selected task must be pending"),
+        ref: { key: rejectedDirector, runId: host.native.get(rejectedDirector)!.runId } } } });
     expect(host.history()).toHaveLength(2);
-    expect(host.history()[1].task.id).toBe("change1");
+    expect(host.history()[1].manifest).toEqual(["change1"]);
     expect(host.history()[1].results).toMatchObject([{ taskId: "change1", status: "complete" }]);
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(3);
     expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.includes(".l1."))).toHaveLength(0);
@@ -1173,11 +1154,9 @@ describe("workflow-owned execute controller", () => {
     expect(host.native.get("invoke-human-1.l1.director")!.structuredOutput).toEqual(original);
     // The publication cut deliberately failed its write; the surviving intent
     // is reconciled by exact status rather than redispatching the director.
-    if (cut !== "publication") {
-      const published = host.snapshots.find(value => value.loop?.plan?.stage === "published");
-      expect(published.loop.manifest).toBeNull();
-      expect(published.loop.outcome).toBeUndefined();
-    }
+    const published = host.snapshots.find(value => value.action.kind === "launched" &&
+      value.action.key === rejectedDirector && value.action.runId === host.native.get(rejectedDirector)!.runId);
+    expect(published?.loop).toMatchObject({ taskId: null, outcome: null });
   });
 
   test("repeated invalid selection consumes frozen slots without dispatching a writer", async () => {
@@ -1188,12 +1167,12 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 3 });
-    expect(host.history().map(loop => loop.plan.stage)).toEqual(["rejected", "rejected", "rejected"]);
+    expect(host.history().map((loop: { plan: { stage: string } }) => loop.plan.stage)).toEqual(["rejected", "rejected", "rejected"]);
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(6);
     expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
   });
 
-  test.each(["available", "lost", "unresolved"])("last-slot rejection survives optional-cache loss with %s original", async mode => {
+  test.each(["available", "lost", "unresolved"])("last-slot rejection remains settled with %s original", async mode => {
     const host = fixture(); host.setLimit(1);
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1202,7 +1181,8 @@ describe("workflow-owned execute controller", () => {
     });
     expect(await host.executeNative()).toMatchObject({ status: "partial", loopsConsumed: 1 });
     const retained = copy(host.history()[0]);
-    removeCache(host);
+    const cursor = copy(host.current());
+    expect(cursor.action).toEqual({ kind: "terminal" });
     if (mode !== "available") {
       for (const result of host.native.values()) delete result.structuredOutput;
       host.setRespond((request, normal) => request.agent === "pitako.execution-inspector"
@@ -1212,6 +1192,7 @@ describe("workflow-owned execute controller", () => {
     const actions = host.calls.map(call => call.key), statuses = host.statusCalls.length;
     expect(await host.executeNative()).toMatchObject({ status: "partial", loopsConsumed: 1 });
     expect(host.history()[0]).toEqual(retained);
+    expect(host.current()).toEqual(cursor);
     expect(host.calls.map(call => call.key)).toEqual(actions);
     expect(host.statusCalls).toHaveLength(statuses);
   });
@@ -1223,16 +1204,21 @@ describe("workflow-owned execute controller", () => {
       if (request.agent === "pitako.execution-director") result.structuredOutput.select = "missing";
       return result;
     });
-    cutAt(host, value => value.loop?.plan?.stage === "rejected");
+    const director = "invoke-human-1.l1.director.d1", selection = "invoke-human-1.l1.selectionIO.d1";
+    cutAfterOriginal(host, selection);
     expect((await host.executeNative()).reason).toContain("Essential persistence failed");
     expect(host.calls.some(call => call.key.endsWith(".gaps") || call.agent === "pitako.worker")).toBe(false);
-    expect(host.history()[0].plan.stage).toBe("published");
-    expect(host.history()[0].plan.ref.key).toBe("invoke-human-1.l1.director.d1");
+    expect(host.current().action).toMatchObject({ kind: "launched", key: director, runId: host.native.get(director)!.runId });
+    expect(host.history()).toEqual([]);
+    const committed = storeTipRows(host).find(row => row.opKey === `operation:${selection}`);
+    expect(committed).toBeDefined();
+    expect(storedRows(host)).not.toContainEqual(committed);
     host.setFailSave();
     expect(await host.executeNative()).toMatchObject({ status: "partial", loopsConsumed: 1 });
     expect(host.history()[0].plan.stage).toBe("rejected");
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(2);
-    expect(host.statusCalls).toContain("native-invoke-human-1.l1.director.d1");
+    expect(host.statusCalls).toContain(host.native.get(director)!.runId!);
+    expect(storedRows(host).find(row => row.seq === committed!.seq)).toEqual(committed);
   });
 
   test("last-slot rejection remains a durable accounted gap without another director", async () => {
@@ -1258,7 +1244,7 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 2 });
-    expect(host.history().map(loop => loop.plan.stage)).toEqual(["rejected", "rejected"]);
+    expect(host.history().map((loop: { plan: { stage: string } }) => loop.plan.stage)).toEqual(["rejected", "rejected"]);
     expect(host.history()[0].plan.rejection.diagnostic).toContain("pending");
     expect(host.history()[1].plan.rejection.diagnostic).toContain("focused gates");
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(4);
@@ -1287,8 +1273,9 @@ describe("workflow-owned execute controller", () => {
       });
       const output = await host.execute();
       expect(output.status).toBe(mode === "stopped" ? "cancelled" : "blocked");
-      expect(host.history()).toHaveLength(1);
-      expect(host.history()[0].plan.stage).not.toBe("rejected");
+      expectOpenHalt(host, output, mode === "permission" ? "permission" : undefined);
+      expect(host.history()).toEqual([]);
+      expect(atCursor(host).P.preview.planRejections).toEqual([]);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
       expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
       if (["producer", "binding"].includes(mode)) {
@@ -1297,7 +1284,7 @@ describe("workflow-owned execute controller", () => {
         host.setStatus(() => ({ ok: true, output: "", structuredOutput: host.plan() }));
         expect((await host.execute()).status).toBe("blocked");
         expect(host.calls).toHaveLength(calls);
-        expect(host.history()[0].plan.stage).not.toBe("rejected");
+        expect(atCursor(host).P.preview.planRejections).toEqual([]);
       }
     },
   );
@@ -1315,10 +1302,12 @@ describe("workflow-owned execute controller", () => {
       }
       return result;
     });
-    expect((await host.execute()).status).toBe(mode === "stopped" ? "cancelled" : mode === "capacity" ? "partial" : "blocked");
-    expect(host.history()).toHaveLength(2);
+    const output = await host.execute();
+    expect(output.status).toBe(mode === "stopped" ? "cancelled" : mode === "capacity" ? "partial" : "blocked");
+    expectOpenHalt(host, output, mode === "permission" ? "native-settlement" : undefined);
+    expect(host.history()).toHaveLength(1);
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected" } });
-    expect(host.history()[1].plan.stage).not.toBe("rejected");
+    expect(atCursor(host).P.preview.planRejections.map(rejection => rejection.loop)).toEqual([1]);
     expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps", "invoke-human-1.l1.nextAdvance.requests", "invoke-human-1.l2.director"]);
     expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
   });
@@ -1334,7 +1323,9 @@ describe("workflow-owned execute controller", () => {
         delete result.structuredOutput; result.ok = false; result.error = "Native schema rejected";
       }
       if (request.agent === "pitako.execution-inspector") {
-        recoverySubjects.push(copy(host.history()[0].recoveries.at(-1)));
+        recoverySubjects.push(JSON.parse(request.task.split(
+          "Use existing read tools and ONLY these exact native producer/run/output references, plus Git/WIP:\n",
+        )[1]!.split("\n")[0]!));
         result.structuredOutput = { status: "recovered", reason: "Exact settled producer original", original: copy(original),
           workerResult: null, originalAvailable: true, binding: "identical", comparison: "equal-full-json",
           provenance: ["/native/witness/invoke-human-1.l1.director.json"] };
@@ -1346,10 +1337,8 @@ describe("workflow-owned execute controller", () => {
     expect(host.records().find((record: any) => record.kind === "loop").body.plan).toMatchObject({ stage: "rejected",
       rejection: { diagnostic: "Selected task must be pending" }, recoverySource: { comparison: "equal-full-json" } });
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(2);
-    expect(recoverySubjects).toMatchObject([
-      { subject: "loop-plan", source: { key: "invoke-human-1.l1.director" }, stage: "intention", disposition: "pending" },
-      { subject: "loop-plan:d1", source: { key: "invoke-human-1.l1.director.d1" }, stage: "intention", disposition: "pending" },
-    ]);
+    expect(recoverySubjects).toHaveLength(2);
+    expect(recoverySubjects.map(subject => subject.key)).toEqual(["invoke-human-1.l1.director", "invoke-human-1.l1.director.d1"]);
     expect(original.select).toBe("missing");
     expect(host.history()[1].results).toMatchObject([{ taskId: "change1", status: "complete" }]);
   });
@@ -1374,16 +1363,16 @@ describe("workflow-owned execute controller", () => {
   test("native director returns selections while the root attaches the actual association on each task loop", async () => {
     const host = fixture(undefined, { taskCount: 2 }); host.setLimit(2);
     const sourceRefs = [{ path: "/stable/inherited.md", digest: "f".repeat(64) }];
-    const known: any[] = [];
+    const workerBindings: { key: string; cursor: any; association: any }[] = [];
     host.setRespond((request, normal) => {
       if (request.agent === "pitako.worker") {
-        const expected = JSON.parse(request.task.split("ASSOCIATION (data): ")[1]!.split("\n")[0]!);
-        expect(host.current().loop.plan.association).toEqual(expected);
-        known.push(copy(expected));
+        const association = JSON.parse(request.task.split("ASSOCIATION (data): ")[1]!.split("\n")[0]!);
+        workerBindings.push({ key: request.key, cursor: copy(host.current()), association });
       }
       return normal();
     });
-    expect((await host.executeNative({ sourceRefs })).status).toBe("partial");
+    const outcome = await host.executeNative({ sourceRefs });
+    expect(outcome).toMatchObject({ status: "partial", loopsConsumed: 2 });
     const directors = host.calls.filter(request => request.key.endsWith(".director"));
     expect(directors).toHaveLength(2);
     for (const request of directors) {
@@ -1397,8 +1386,15 @@ describe("workflow-owned execute controller", () => {
       expect(() => validate({ ...selection, association: { digest: "mistyped" } })).toThrow();
       expect(selection).toEqual(original);
     }
-    expect(known.map(value => value.loop)).toEqual([1, 2]);
-    expect(known.every(value => JSON.stringify(value.sourceRefs) === JSON.stringify(sourceRefs))).toBe(true);
+    expect(workerBindings.map(({ association }) => association.loop)).toEqual([1, 2]);
+    for (const { key, cursor, association } of workerBindings) {
+      expect(association.sourceRefs).toEqual(sourceRefs);
+      const ref = cursor.loop.attempt.intent;
+      const intent = storedRows(host, cursor)
+        .find(row => row.seq === ref.seq && row.digest === ref.digest && row.kind === "intent");
+      const { loop, ...binding } = association;
+      expect(intent?.body).toMatchObject({ key, loop, association: binding });
+    }
   });
 
   test.each([false, true])("backlog insertion order does not override the single selected definition (%s)", async reverse => {
@@ -1430,8 +1426,8 @@ describe("workflow-owned execute controller", () => {
       expect(call.task).not.toContain("FROZEN ATTEMPT");
     }
     expect(workers.map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l2.t1.a1"]);
-    expect(host.current().activePlan).toBeNull();
-    expect(host.current().loop.manifest).toEqual(["change1"]);
+    expect(host.current()).not.toHaveProperty("activePlan");
+    expect(host.history().map((loop: { manifest: string[] }) => loop.manifest)).toEqual([["change2"], ["change1"]]);
     expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   });
 
@@ -1452,7 +1448,8 @@ describe("workflow-owned execute controller", () => {
     expect(output.status).toBe("partial");
     const diagnostic = host.history()[0].plan.rejection.diagnostic;
     expect(diagnostic).toMatch(/references|dependency/);
-    expect(host.history().every(loop => loop.plan.stage === "rejected" && loop.outcome === "gaps")).toBe(true);
+    expect(host.history().every((loop: { plan: { stage: string }; outcome: string }) =>
+      loop.plan.stage === "rejected" && loop.outcome === "gaps")).toBe(true);
     expect(host.calls.find(call => call.key.endsWith(".l2.director"))!.task).toContain(diagnostic);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
   });
@@ -1475,7 +1472,8 @@ describe("workflow-owned execute controller", () => {
     const output = await host.execute();
     expect(output.status).toBe("partial");
     const diagnostic = host.history()[0].plan.rejection.diagnostic;
-    expect(host.history().every(loop => loop.plan.stage === "rejected" && loop.outcome === "gaps")).toBe(true);
+    expect(host.history().every((loop: { plan: { stage: string }; outcome: string }) =>
+      loop.plan.stage === "rejected" && loop.outcome === "gaps")).toBe(true);
     expect(host.calls.find(call => call.key.endsWith(".l2.director"))!.task).toContain(diagnostic);
     expect(diagnostic).toMatch(/dependency|dependencies/);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
@@ -1491,21 +1489,34 @@ describe("workflow-owned execute controller", () => {
         Object.assign(result.structuredOutput, { status: "continue", remaining: ["Finish the assigned API"] });
       if (request.key === "invoke-human-1.l2.t1.a1") {
         const references = JSON.parse(request.task.split("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\n")[1]!.split("\nRead relevant")[0]!);
-        expect(references).toEqual([{ taskId: "change1", status: "done", source: host.current().backlogPath }]);
+        expect(references).toEqual([{ taskId: "change1", status: "done", source: readBacklog(host.root, "spec").path }]);
         expect(request.task).toContain("do not automatically repeat all prerequisite gates");
       }
       return result;
     });
-    cutAt(host, value => value.loop?.number === 1 && (cut === "before-result"
-      ? value.loop.attempt?.number === 2 && value.loop.attempt.stage === "result"
-      : value.loop.cursor === 1));
-    expect((await host.execute()).status).toBe("partial");
+    if (cut === "before-result") cutAfterOriginal(host, "invoke-human-1.l1.t1.a2");
+    else cutAt(host, value => value.loop?.number === 1 && value.loop.cursor === 1);
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
     expect(host.calls.some(call => call.key.includes(".l2."))).toBe(false);
+    if (cut === "before-cursor") expect(host.current()).toMatchObject({
+      action: { kind: "pending", op: "gate", opKey: "invoke-human-1.l1.t1.a2.gate" },
+      loop: { number: 1, cursor: 0, attempt: { number: 2, stage: "result" } },
+    });
+    const cutLaunches = host.launches.length;
+    const committedPrefix = storedRows(host);
     host.setFailSave();
-    expect((await host.execute()).status).toBe("partial");
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe("partial");
     expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a2")).toHaveLength(1);
     expect(host.calls.filter(call => call.key === "invoke-human-1.l2.t1.a1")).toHaveLength(1);
     expect(host.history().map((loop: any) => loop.manifest)).toEqual([["change1"], ["change2"]]);
+    if (cut === "before-cursor") {
+      expect(host.launches.slice(cutLaunches).filter(call => call.key.startsWith("invoke-human-1.l1.t1.a2."))
+        .map(({ key, agent }) => ({ key, agent }))).toEqual([
+        { key: "invoke-human-1.l1.t1.a2.task-synthesis.review-recovery.r1", agent: "pitako.loop-io" },
+      ]);
+      expect(storedRows(host).slice(0, committedPrefix.length)).toEqual(committedPrefix);
+    }
   });
 
   test.each(["continue", "gaps"])("a %s worker result never satisfies a backlog prerequisite", async status => {
@@ -1522,20 +1533,7 @@ describe("workflow-owned execute controller", () => {
     expect((await host.execute()).status).toBe("partial");
     expect(host.calls.some(call => call.key === "invoke-human-1.l2.t1.a1")).toBe(false);
     expect(host.history()[1].plan.rejection.diagnostic).toContain("unfinished dependencies");
-    expect(host.current().lastConfirmed?.kind).not.toBe("unit");
-  });
-
-  test("an incompatible v5 admitted contract is retained without dispatch or migration", async () => {
-    const host = fixture();
-    cutAt(host, value => value.loop?.attempt?.stage === "intention");
-    expect((await host.execute()).status).toBe("partial");
-    host.setFailSave();
-    const saved = copy(host.current()); saved.version = 5;
-    host.storage.set("invoke-human-1", saved);
-    const calls = host.calls.length;
-    expect((await host.execute()).reason).toContain("incompatible Pitako contract v5");
-    expect(host.calls).toHaveLength(calls);
-    expect(host.current()).toEqual(saved);
+    expect(host.records().filter((record: { kind: string; loop: number }) => record.kind === "unit" && record.loop === 2)).toEqual([]);
   });
 
   test.each([1, 2, 4])("admitted limit %s controls every gap report and dispatch, independent of later settings", async limit => {
@@ -1543,7 +1541,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => request.key.endsWith(".compliance") ? gaps(normal()) : normal());
     const output = await host.execute();
     expect(output).toMatchObject({ status: "partial", loopsConsumed: limit, maxLoops: limit });
-    expect(host.current().association.maxCycles).toBe(limit);
+    expect(host.current().budget).toMatchObject({ maxCycles: limit, consumedLoops: limit });
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(limit);
     for (const report of host.emits) {
       expect(report.maxLoops).toBe(limit);
@@ -1592,39 +1590,40 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(9);
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(5);
     expect(host.hostCalls).toEqual(["inspect-initial"]);
-    expect(host.current().association.maxCycles).toBe(10);
-    const refs = host.history().filter((loop: any) => loop.closing).map((loop: any) => loop.closing.ref);
-    for (const field of ["runId", "asyncDir"]) expect(new Set(refs.map((ref: any) => ref[field])).size).toBe(5);
-    for (const field of ["stdoutPath", "stderrPath"]) expect(new Set(refs.map((ref: any) => ref.externalAdapter.outputArtifacts[field])).size).toBe(5);
-  });
-
-  test("new human invocation admits new settings without changing old native records", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1); expect((await host.execute()).status).toBe("complete");
-    const previous = copy(host.current()), oldStore = copy(Object.fromEntries(host.storage));
-    // Another explicit mission/invocation owns its own marker; original store stays intact.
-    const next = fixture(); next.storage.set("prior-invocation-history", oldStore); next.setLimit(4);
-    expect(await next.execute({ invocation: "human-2", missionId: "another-mission", missionPath: "/native/another-mission.json" }))
-      .toMatchObject({ status: "complete", maxLoops: 4 });
-    expect(next.storage.get("invoke-human-2").association.maxCycles).toBe(4);
-    expect(host.current()).toEqual(previous);
-    expect(next.storage.get("prior-invocation-history")).toEqual(oldStore);
-  });
-
-  test.each([2, 3, 4, 5, 6])("prior retained state v%s fails before any resume or dispatch with the actionable message", async version => {
-    const host = fixture();
-    host.setRespond((request, normal) => request.key.endsWith(".compliance") ? gaps(normal()) : normal());
-    await host.execute();
-    for (const field of ["invoke-human-1", "pitako-execution"]) {
-      const old = copy(host.storage.get(field)); old.version = version;
-      host.storage.set(field, old);
-      const before = copy([...host.storage.entries()]), reads = host.hostCalls.length, calls = host.calls.length;
-      const output = await host.execute();
-      expect(output.status).toBe("blocked");
-      expect(output.reason).toContain(`created by an incompatible Pitako contract v${version}; start a new mission`);
-      expect([...host.storage.entries()]).toEqual(before);
-      expect(host.calls).toHaveLength(calls); expect(host.hostCalls).toHaveLength(reads);
-      old.version = EXECUTE_STATE_VERSION; host.storage.set(field, old);
+    expect(host.current().budget).toMatchObject({ maxCycles: 10, consumedLoops: 9 });
+    const closes = host.launches.filter(call => call.agent === "pitako.checkout-observer");
+    const refs = closes.map(call => host.native.get(call.key)!);
+    expect(host.history().filter((loop: { kind: string }) => loop.kind === "final")
+      .map((loop: { number: number }) => loop.number))
+      .toEqual(closes.map(call => Number(call.key.match(/\.l(\d+)\./)![1])));
+    for (const field of ["runId", "asyncDir"] as const) {
+      expect(refs.every(ref => ref[field])).toBe(true);
+      expect(new Set(refs.map(ref => ref[field])).size).toBe(5);
     }
+    for (const field of ["stdoutPath", "stderrPath"] as const) {
+      const paths = refs.map(ref => ref.externalAdapter?.outputArtifacts?.[field]);
+      expect(paths.every(Boolean)).toBe(true);
+      expect(new Set(paths).size).toBe(5);
+    }
+  });
+
+  test("new human invocation replaces the fixed cursor without changing old store or native records", async () => {
+    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1); expect((await host.execute()).status).toBe("complete");
+    const previous = copy(host.current());
+    const prior = atCursor(host, previous);
+    const originals = copy([...host.native.entries()]);
+    host.setLimit(4);
+    host.setInvocation("human-2");
+    host.setRespond((request, normal) => request.agent === "pitako.execution-director"
+      ? { ...normal(), ok: false, stopped: true } : normal());
+    expect(await host.execute()).toMatchObject({ status: "cancelled", maxLoops: 4 });
+    expect(host.calls.at(-1)?.key).toBe("invoke-human-2.l1.director");
+    expect([...host.storage.keys()]).toEqual(["pitako-execute"]);
+    expect(host.current()).toMatchObject({ version: 10, invocation: "human-2", storeId: previous.storeId,
+      budget: { maxCycles: 4, consumedLoops: 1 } });
+    expect(atCursor(host).P.prompt.admission?.association.invocation).toBe("human-2");
+    expect(atCursor(host, previous)).toEqual(prior);
+    for (const [key, original] of originals) expect(host.native.get(key)).toEqual(original);
   });
 
   test.each([0, -1, 1.5, "4", true, null, Number.MAX_SAFE_INTEGER + 1])("invalid admission receipt %s consumes no cycle or director", async invalid => {
@@ -1641,7 +1640,7 @@ describe("workflow-owned execute controller", () => {
         ...(cause === "stopped" ? { stopped: true } : { error: "Blocked by pi-subagents permission rule: fixture" }) };
       return result;
     });
-    cutAt(host, value => !!value.loop?.halt);
+    cutAt(host, value => value.halt !== null);
     const output = await host.execute();
     expect(output.status).toBe(cause === "stopped" ? "cancelled" : "blocked");
     expect(output.reason).toContain("Essential persistence failed");
@@ -1656,16 +1655,17 @@ describe("workflow-owned execute controller", () => {
     }
     const calls = copy(host.calls); host.setFailSave();
     const replay = await host.execute();
-    expect(replay.status).toBe(output.status); expect(replay.loopReport.next).toBe("resolve observed impediment");
+    expect(replay.status).toBe(output.status);
+    expect(replay.reason).toContain(cause === "stopped" ? "stopped" : "permission");
+    expect(replay.reason).not.toMatch(/Essential persistence failed|new invocation/);
     expect(host.calls).toEqual(calls); expect(replay.loopsConsumed).toBe(1);
   });
 
   test.each([
-    ["worker", "stopped", "essential"], ["worker", "permission", "essential"],
-    ["review", "stopped", "essential"], ["review", "permission", "essential"],
-    ["worker", "detached", "essential"], ["review", "recovery", "essential"],
-    ["worker", "stopped", "optional"], ["review", "permission", "optional"],
-  ])("pre-attachment %s %s survives %s save failure in every report", async (phase, cause, saveKind) => {
+    ["worker", "stopped"], ["worker", "permission"],
+    ["review", "stopped"], ["review", "permission"],
+    ["worker", "detached"], ["review", "recovery"],
+  ])("pre-attachment %s %s survives essential save failure in every report", async (phase, cause) => {
     const host = fixture(undefined, { taskCount: phase === "worker" ? 1 : 0 }); host.setLimit(1);
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1674,15 +1674,10 @@ describe("workflow-owned execute controller", () => {
           ? { error: "Blocked by pi-subagents permission rule: fixture" } : { [cause!]: true }) };
       return result;
     });
-    host.setFailSave(value => {
-      const loop = value.loop;
-      const observed = phase === "worker" ? !!loop?.attempt?.launch : !!loop?.review;
-      return observed && (saveKind === "optional" ? !!value.activePlan : !value.activePlan);
-    });
+    cutAfterOriginal(host, phase === "worker"
+      ? "invoke-human-1.l1.t1.a1" : "invoke-human-1.l1.review.director-prepare");
     const output = await host.execute();
-    if (saveKind === "optional") expect(host.snapshots.every(value => !value.activePlan)).toBe(true);
-    expectImpediment(host, output, cause === "stopped" ? "cancelled" : "blocked", cause!,
-      saveKind === "essential" ? "Essential persistence failed" : undefined);
+    expectImpediment(host, output, cause === "stopped" ? "cancelled" : "blocked", cause!, "Essential persistence failed");
     expect(output.maxLoops).toBe(1);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(phase === "worker" ? 1 : 0);
@@ -1690,8 +1685,8 @@ describe("workflow-owned execute controller", () => {
     expect(host.hostCalls.filter(key => key === "inspect-initial")).toHaveLength(1);
   });
 
-  test.each([["decision", "essential"], ["worker", "essential"], ["decision", "optional"], ["worker", "optional"]])(
-    "%s block survives pre-finish %s save failure without replacing its reason", async (phase, saveKind) => {
+  test.each([["decision", "lost save"], ["worker", "lost save"], ["decision", "committed halt"], ["worker", "committed halt"]])(
+    "%s block preserves its reason on replay after %s", async (phase, cutKind) => {
       const host = fixture(undefined, { taskCount: phase === "worker" ? 1 : 0 }); host.setLimit(1);
       const reason = "Decision required: conflicting source obligations";
       host.setRespond((request, normal) => {
@@ -1702,25 +1697,39 @@ describe("workflow-owned execute controller", () => {
           Object.assign(result.structuredOutput, { status: "blocked", diagnosis: reason, remaining: [reason] });
         return result;
       });
-      host.setFailSave(value => (value.loop?.outcome === "blocked" || value.loop?.halt?.status === "blocked") &&
-        (saveKind === "optional" ? !!value.activePlan : !value.activePlan));
+      if (cutKind === "lost save") cutAt(host, value => value.halt?.stage === "semantic-block" &&
+        (phase !== "worker" || value.loop?.attempt?.stage === "result"));
       const output = await host.execute();
-      if (saveKind === "optional") expect(host.snapshots.every(value => !value.activePlan)).toBe(true);
       expectImpediment(host, output, "blocked", reason,
-        saveKind === "essential" ? "Essential persistence failed" : undefined);
+        cutKind === "lost save" ? "Essential persistence failed" : undefined);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(phase === "worker" ? 1 : 0);
+      const cut = copy(host.current()), rows = storeTipRows(host), admissions = copy(host.launches);
       const dispatches = () => host.calls.filter(call => call.agent === "pitako.worker" || call.key.endsWith(".director"));
       const calls = copy(dispatches()), reads = host.hostCalls.filter(key => key === "execute-settings").length;
       host.setFailSave(); host.setLimit(4); host.emits.length = 0;
       const replay = await host.execute();
       expectImpediment(host, replay, "blocked", reason);
       expect(replay.maxLoops).toBe(1); expect(dispatches()).toEqual(calls);
+      if (phase === "decision" || cutKind === "committed halt") {
+        expectOpenHalt(host, replay);
+        expect(replay.loopReport.pending[0].references).toContainEqual(replay.loopReport.halt.ref ??
+          { key: "invoke-human-1.l1.compliance", runId: host.native.get("invoke-human-1.l1.compliance")!.runId });
+        expect(host.launches).toEqual(admissions);
+        expect(storeTipRows(host)).toEqual(rows);
+      }
+      if (phase === "decision") {
+        const key = "invoke-human-1.l1.compliance";
+        const native = host.native.get(key)!;
+        expect(cut.action).toMatchObject({ kind: "launched", role: "reviewer", key, runId: native.runId });
+        expect(host.current().head).toEqual(cut.head);
+      }
       expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(reads);
     });
 
   test.each([1, 2])("blocked result is atomic and old committed cut replays as blocked at limit %s", async limit => {
     const host = fixture(); host.setLimit(limit);
+    const key = "invoke-human-1.l1.t1.a1";
     const reason = "Human decision required before editing the conflicting API";
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1728,137 +1737,58 @@ describe("workflow-owned execute controller", () => {
         { status: "blocked", diagnosis: reason, remaining: [reason] });
       return result;
     });
-    expect(await host.execute()).toMatchObject({ status: "blocked", loopsConsumed: 1 });
-    const committed = host.snapshots.find(value => value.loop?.attempt?.stage === "result");
-    const cut = copy(committed);
-    delete cut.loop.outcome; delete cut.loop.halt; cut.activePlan = null;
-    host.storage.set("invoke-human-1", cut);
-    const before = copy(cut), calls = copy(host.calls), reads = host.hostCalls.filter(key => key === "execute-settings").length;
+    const closeKey = `${key}.close`;
+    cutAt(host, value => value.loop?.attempt?.stage === "result" && value.halt?.stage === "semantic-block");
+    const first = await host.execute();
+    expect(first.reason).toContain("Essential persistence failed");
+    const cut = copy(host.current()), before = storeTipRows(host), admissions = copy(host.launches);
+    expect(cut.loop).toMatchObject({ number: 1, cursor: 0, taskId: "change1", attempt: { number: 1, stage: "launched" } });
+    expect(cut.action).toMatchObject({ kind: "pending", op: "close", opKey: closeKey });
+    const folded = atCursor(host, cut).P.prompt.execution?.foldedContinuation;
+    const worker = folded == null ? undefined : executeField(folded, "worker");
+    expect(worker).toMatchObject({ reference: { key, runId: host.native.get(key)!.runId },
+      value: { status: "blocked", remaining: [reason] } });
+    expect(before.filter(row => row.kind === "receipt" && (row.body as { key: string }).key === closeKey)).toHaveLength(1);
+    const reads = host.hostCalls.filter(key => key === "execute-settings").length;
+    host.setFailSave();
     host.setLimit(4); host.emits.length = 0;
     const replay = await host.execute();
     expectImpediment(host, replay, "blocked", reason);
-    // The root pause seal of the blocked result may only finish its idempotent
-    // archive under the already-dispatched ledger key; no worker/director repeats.
-    expect(replay.maxLoops).toBe(limit); expect(host.calls.slice(0, calls.length)).toEqual(calls);
-    const sealKeys = calls.filter((call: any) => call.agent === "pitako.execution-ledger").map((call: any) => call.key);
-    expect(host.calls.slice(calls.length).every(call => call.agent === "pitako.execution-ledger" && sealKeys.includes(call.key))).toBe(true);
-    expect(host.current().loop.attempt).toEqual(before.loop.attempt);
-    expect(host.current().tasks).toEqual(before.tasks);
+    expect(replay.maxLoops).toBe(limit);
+    expect(host.launches.slice(0, admissions.length)).toEqual(admissions);
+    expect(host.launches.slice(admissions.length).map(({ key, agent }) => ({ key, agent }))).toEqual([
+      { key: `${closeKey}.r1`, agent: "pitako.loop-io" }, // the only extra admission
+      { key: "invoke-human-1.l1.finishDrain", agent: "pitako.loop-io" },
+    ]);
+    expect(storeTipRows(host).slice(0, before.length)).toEqual(before);
     expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(reads);
-    expect(committed.loop).toMatchObject({ outcome: "blocked",
-      halt: { status: "blocked", code: "semantic-block", reason } });
-    expect(replay.loopReport.halt.ref).toEqual(committed.loop.attempt.result.ref);
-    expect(replay.loopReport.work).toEqual(resolvedLoop(committed).results.map((result: any) => ({
-      taskId: result.taskId, attempt: result.attempt, status: result.status, reference: result.ref,
-      workDone: result.workDone, remaining: result.remaining, remainingCount: result.remainingCount, diagnosis: result.diagnosis,
-    })));
+    expect(host.current().loop).toMatchObject({ outcome: "blocked", attempt: { number: 1, stage: "result", intent: cut.loop.attempt.intent } });
+    const halt = expectOpenHalt(host, replay);
+    expect(halt).toMatchObject({ status: "blocked", code: "semantic-block", reason,
+      ref: { key, runId: host.native.get(key)!.runId } });
+    expect(replay.loopReport.work).toEqual([expect.objectContaining({
+      taskId: "change1", attempt: 1, status: "blocked", reference: halt.ref, remaining: [reason], diagnosis: reason,
+    })]);
   });
 
   // A write-free worker block has no pause seal. Current input answering that exact
   // block continues the task in the same loop; anything else keeps the halt.
-  test.each(["continue", "successor-cut", "repeat-block", "foreign-halt", "captured", "stale-resolution"])(
-    "current input continues a write-free worker block without a new slot: %s", async mode => {
-      const host = fixture(); host.setLimit(1);
-      const reason = "Human decision required: choose the supported API", text = "Use the supported v2 API";
-      const block = (request: any) => host.result(request, { status: "blocked", work: "Located the conflicting API",
-        remaining: [reason], knowledge: { findings: [], handoff: "Awaiting the API decision" }, diagnosis: reason });
-      host.setRespond((request, normal) => request.key === "invoke-human-1.l1.t1.a1" ||
-        mode === "repeat-block" && request.key === "invoke-human-1.l1.t1.a2" ? block(request) : normal());
-      expect(await host.execute()).toMatchObject({ status: "blocked", loopsConsumed: 1 });
-      const halted = host.current();
-      expect(halted.loop.attempt).toMatchObject({ capturedPaths: 0, result: { status: "blocked" } });
-      expect(halted.loop.attempt.result.checkpoint.confirmation).toBeUndefined();
-      expect(halted.lastConfirmed).toBeNull();
-      if (mode === "foreign-halt") halted.loop.halt.ref = { ...halted.loop.halt.ref, key: "invoke-human-1.l1.other" };
-      if (mode === "captured") halted.loop.attempt.capturedPaths = 1;
-      const input = { unblock: true, resolution: { loop: 1, text } };
-      const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key);
-      if (mode === "stale-resolution") {
-        // The retained input answered an earlier impediment, not this block.
-        const set = host.state.set;
-        host.state.set = async (key, value: any) => {
-          await set(key, value);
-          if (value.loop?.resolutions?.length) throw Error("Cut after retaining the input");
-        };
-        expect((await host.execute(input)).reason).toContain("Essential persistence failed");
-        host.state.set = set;
-        host.current().loop.resolutions[0].halt.reason = "Earlier impediment";
-      }
-      if (mode === "successor-cut") {
-        // A cut before the successor launches must not leave an unobservable writer key.
-        const set = host.state.set;
-        host.state.set = async (key, value: any) => {
-          await set(key, value);
-          if (value.loop?.attempt?.number === 2 && !value.loop.attempt.checkpoint) throw Error("Cut after the successor intention");
-        };
-        expect((await host.execute(input)).reason).toContain("Essential persistence failed");
-        host.state.set = set;
-        expect(host.current().loop.attempt).toMatchObject({ number: 2, stage: "intention", undispatched: true });
-        expect(workers()).toEqual(["invoke-human-1.l1.t1.a1"]);
-      }
-      host.emits.length = 0;
-      const outcome = await host.execute(["stale-resolution", "successor-cut"].includes(mode) ? {} : input);
-      expect(host.current().consumedLoops).toBe(1);
-      expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
-      if (mode === "foreign-halt" || mode === "captured" || mode === "stale-resolution") {
-        expect(outcome.status).toBe("blocked");
-        expect(workers()).toEqual(["invoke-human-1.l1.t1.a1"]);
-        expect(host.current().loop.attempt.humanContinuation).toBeUndefined();
-        return;
-      }
-      expect(workers()).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
-      expect(host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!.task).toContain(text);
-      expect(host.current().loop.resolutions.at(-1).stage).toBe("applied");
-      if (mode === "continue" || mode === "successor-cut") {
-        expect(outcome.status, outcome.reason).toBe("partial");
-        expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2 });
-        return;
-      }
-      // The answer applies once: a later block halts again and needs new input.
-      expectImpediment(host, outcome, "blocked", reason);
-      expect(host.current().loop.attempt).toMatchObject({ number: 2, result: { status: "blocked" } });
-      expect((await host.execute()).status).toBe("blocked");
-      expect(workers()).toHaveLength(2);
-    });
+
 
   // A blocked restorer can change historical paths while capturing none of its own.
-  test("current input does not directly continue a write-free block of a restoring attempt", async () => {
-    const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
-    const block = (request: any) => host.result(request, { status: "blocked", work: "Located the conflicting API",
-      remaining: ["Choose the supported API"], knowledge: { findings: [], handoff: "Awaiting the API decision" } });
-    host.setRespond((request, normal) => {
-      if (request.key === "invoke-human-1.l1.t1.a1") {
-        host.worker(request);
-        applyCheckpoint(expandWorkerReferences(host.current()).loop.attempt.checkpoint, [{ path: "src/change1.ts",
-          image: { bytes: Buffer.from("partial owned work").toString("base64"), mode: 0o644 } }]);
-        return { ok: false, output: "", error: "Writer disappeared" };
-      }
-      if (request.key === "invoke-human-1.l1.t1.a2") {
-        const restore = host.current().loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]), restore.authority);
-        return block(request);
-      }
-      return normal();
-    });
-    expect((await host.execute()).status).toBe("blocked");
-    const attempt = host.current().loop.attempt;
-    expect(attempt).toMatchObject({ number: 2, capturedPaths: 0, result: { status: "blocked" } });
-    expect(attempt.restore).toBeDefined();
-    expect(attempt.result.checkpoint.confirmation).toBeUndefined();
-    const outcome = await host.execute({ unblock: true, resolution: { loop: 1, text: "Use the supported v2 API" } });
-    expect(outcome.status).toBe("blocked");
-    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(2);
-    expect(host.current().loop.attempt.humanContinuation).toBeUndefined();
-  });
+
 
   test("complete additional spec sources are immutable context for all fresh phases", async () => {
     const host = fixture("SELECTED SNAPSHOT INTACT");
     const sourceRefs = [{ path: "/stable/.pitako/plans/inherited.md", digest: "f".repeat(64) }];
     expect((await host.execute({ sourceRefs })).status).toBe("complete");
-    expect(host.current().association.sourceRefs).toEqual(sourceRefs);
+    expect(atCursor(host).P.prompt.admission?.association.sourceRefs).toEqual(sourceRefs);
     for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.loop-io" && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier")) {
       expect(request.task).toContain("SELECTED SNAPSHOT INTACT");
-      expect(request.task).toContain(JSON.stringify(sourceRefs));
+      for (const ref of sourceRefs) {
+        expect(request.task).toContain(JSON.stringify(ref.path));
+        expect(request.task).toContain(JSON.stringify(ref.digest));
+      }
       expect(request.task).toContain("read EVERY referenced source IN FULL");
     }
     const count = host.calls.length;
@@ -1873,7 +1803,7 @@ describe("workflow-owned execute controller", () => {
         { status: "blocked", reason: "Decision required: conflicting source obligations" });
       return result;
     });
-    cutAt(host, value => value.loop?.halt?.code === "semantic-block");
+    cutAt(host, value => value.halt?.stage === "semantic-block");
     const output = await host.execute();
     expect(output.status).toBe("blocked");
     for (const report of host.emits.filter(value => value.type === "execution-loop")) {
@@ -1893,7 +1823,8 @@ describe("workflow-owned execute controller", () => {
     expect(director).toMatchObject({ key: "invoke-human-1.l1.director", label: "Plan execution work", phase: "planning" });
     expect(director.agent).toBe("pitako.execution-director"); expect(director.task).toContain("then END");
     expect(Object.keys(director.outputSchema.properties).sort()).toEqual(["acceptance", "changes", "reason", "select"]);
-    expect(host.snapshots.some(value => value.loop?.plan?.stage === "intention")).toBe(true);
+    expect(host.snapshots.some(value => value.action?.kind === "launched" &&
+      value.action.key === director.key && value.action.runId === null)).toBe(true);
     const workers = host.calls.filter(call => call.agent === "pitako.worker"); expect(workers).toHaveLength(1);
     for (const worker of workers) {
       const selectedTask = JSON.parse(worker.task.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!);
@@ -1916,12 +1847,12 @@ describe("workflow-owned execute controller", () => {
     expect(host.hostCalls).toEqual(["inspect-initial"]);
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(1);
     expect(output.actionRequired).toBe("none"); expect(output.reason).toContain("No more loops");
-    expect(host.current().loop.finalAttempt.gate.receipt).toMatchObject({ mutated: false, gates: [{ id: "full", status: "pass", exit: 0 }] });
-    expect(host.history()[0].plan.ref).toMatchObject({ agent: "pitako.execution-director", runId: "native-invoke-human-1.l1.director",
+    expect(host.history().at(-1).finalAttempt.gate.receipt).toMatchObject({ mutated: false, gates: [{ id: "full", status: "pass", exit: 0 }] });
+    expect(host.history()[0].plan.ref).toMatchObject({ agent: "pitako.execution-director", runId: host.native.get(director.key)!.runId,
       outputReference: "/native/output/invoke-human-1.l1.director.json", outputArtifactPath: "/native/binding/invoke-human-1.l1.director.json",
       outputPathMapping: { requestedPath: "invoke-human-1.l1.director.json", savedPath: "/native/remapped/invoke-human-1.l1.director.json" },
       results: [{ structuredOutputPath: "/native/witness/invoke-human-1.l1.director.json" }] });
-    expect(host.current().association.digest).toBe(digest("ALL COMPLETE SPEC SECTIONS"));
+    expect(atCursor(host).P.prompt.admission?.association.digest).toBe(digest("ALL COMPLETE SPEC SECTIONS"));
   });
 
   test("Fleet labels use short titles without truncating the selected task", async () => {
@@ -1936,7 +1867,7 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect((await host.execute()).status).toBe("partial");
-    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
     const worker = host.calls.find(call => call.agent === "pitako.worker")!;
     expect(worker.label).toBe("Fix recovery");
     expect(worker.label).not.toContain("with complete evidence");
@@ -1964,7 +1895,6 @@ describe("workflow-owned execute controller", () => {
 
   test("real mirrored two-angle review runs directly to synthesis, not include=material", async () => {
     const host = fixture("FULL SPECS", { findings: true });
-    const inlineOriginals = observeInlineReviewOriginals(host);
     const goal = "Improve record selection\n " + "with complete caller evidence ".repeat(12);
     host.setRespond((request, normal) => {
       const result = normal();
@@ -1985,8 +1915,11 @@ describe("workflow-owned execute controller", () => {
     expect(new Set(requests.map(request => request.phase))).toEqual(new Set([
       "review-prepare", "review-independent", "review-synthesis",
     ]));
-    const manifest = host.storage.get("review-invoke-human-1");
+    const { closed, originals } = closingReview(host);
+    const manifest = closed.integratedReview;
     expect(manifest.originals).toHaveLength(requests.length);
+    expect(originals).toHaveLength(requests.length);
+    expect(manifest.decision.reference).toMatchObject({ stateKey: "invoke-human-1", loop: 2 });
     for (const request of requests) {
       const label = request.label ?? "";
       expect(label).toBe(request.task.split("\n")[0]);
@@ -1999,16 +1932,15 @@ describe("workflow-owned execute controller", () => {
       expect(request.outputMode).toBe("file-only");
       expect(request.output).toBe(`review/${request.key}.json`);
       expect(request).toMatchObject({ cwd: host.root, reads: false, progress: false });
-      const ref = resolvedLoop(host.current()).review.references.find((entry: any) => entry.key === request.key);
+      const ref = closed.review.references.find((entry: any) => entry.key === request.key);
       const retained = manifest.originals.find((entry: any) => entry.key === request.key);
       expect(Object.keys(retained).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
-      const original = inlineOriginals.get(request.key);
-      expect(canonicalDigest(readReviewOriginal(retained))).toBe(original.digest);
-      expect(ref.runId).toBe(original.runId);
+      const original = originals.find(value => value.key === request.key)!;
+      expect(original).toMatchObject({ key: request.key, runId: ref.runId, sha256: retained.sha256, path: retained.path });
+      expect(readReviewOriginal(retained)).toEqual(original.body);
       expect(ref.model).toBe(request.model);
       expect(ref.outputReference).toBe(`/native/output/${request.key}.json`);
-      expect(original.results).toBeUndefined(); // canonical witnesses belong to execute, not a second manifest copy
-      expect(manifest.decision.reference).toMatchObject({ stateKey: "invoke-human-1", loop: 2 });
+      expect(original).not.toHaveProperty("results"); // native witnesses belong to execute, not a second manifest copy
       const witness = publicationWitness(ref.results[0], host.native.get(ref.runId)!.results![0]);
       expect(witness.outputReference).toEqual({ path: witness.savedOutputPath,
         bytes: readFileSync(witness.savedOutputPath).byteLength, lines: 1, message: "Saved" });
@@ -2016,11 +1948,8 @@ describe("workflow-owned execute controller", () => {
       const recovered = JSON.parse(readFileSync(witness.savedOutputPath, "utf8"));
       for (const field of ["association", "delivery", "access"])
         expect(request.outputSchema.properties).not.toHaveProperty(field);
-      expect(original.association).toMatchObject({ key: request.key, namespace: manifest.namespace,
-        query: manifest.query, revision: manifest.revision, attempt: 1 });
-      expect(original.digest).toBe(canonicalDigest(recovered));
-      expect(original).toMatchObject({ terminal: "succeeded", publication: "published", sufficient: true });
-      expect(original.failedOriginal).toBeUndefined();
+      expect(original.body).toEqual(recovered);
+      expect(closed.review.verdict).toBe("clear");
     }
   });
 
@@ -2045,18 +1974,26 @@ describe("workflow-owned execute controller", () => {
       expect(output.status).toBe(fault === "nested-timeout" ? "partial" : "blocked");
       expect(host.calls.filter(request => request.key.includes(".review."))).toHaveLength(1);
       expect(host.calls.some(request => request.key.endsWith(".compliance"))).toBe(false);
-      const manifest = host.storage.get("review-invoke-human-1");
-      const original = { ...manifest.originalDefaults, ...manifest.originals[0] };
-      const call = host.current().loop.analysisCalls.find((call: any) => call.key.endsWith("review.director-prepare"));
-      if (["failed-outcome", "nested-running"].includes(fault)) expect(call.barrier).toBeTruthy();
-      else if (fault === "nested-timeout") {
-        expect(call.timeout).toBe(true);
-        expect(host.current().loop.halt).toMatchObject({ code: "timeout", class: "final-review",
-          key: call.key, launchedMs: 14400000 });
-      } else expect(original.sufficient).toBe(false);
-      expect(original.failedOriginal).toBeUndefined();
+      const key = "invoke-human-1.l2.review.director-prepare";
+      const runId = observed!.runId;
+      expect(host.current().action).toMatchObject({ kind: "launched", role: "reviewer", key, runId });
+      const halt = expectOpenHalt(host, output);
+      const rows = storedRows(host);
+      expect(rows.some(row => row.kind === "review-originals")).toBe(false);
       const rootRefusal = ["failed-outcome", "nested-running", "nested-timeout"].includes(fault);
-      const reference = rootRefusal ? call.ref : resolvedLoop(host.current()).review.references[0];
+      if (fault === "nested-timeout")
+        expect(halt).toMatchObject({ code: "timeout", class: "final-review", key, launchedMs: 14400000 });
+      else if (rootRefusal)
+        expect(halt).toMatchObject({ code: "native-barrier",
+          cause: fault === "nested-running" ? "running" : "native child barrier" });
+      else {
+        expect(halt.code).toBe("semantic-block");
+        expect(host.current().review.slots).toEqual([expect.objectContaining({ key, runId,
+          digest: fault === "failed-state" ? canonicalDigest(observed!.structuredOutput) : null })]);
+        expect(output.reason).toContain(fault === "failed-state" ? "Native child control/terminal failure" : "producer/key/run identity");
+      }
+      const reference = output.loopReport.pending[0].references.flat().find((entry: any) => entry?.key === key && entry.results?.length);
+      expect(reference).toMatchObject({ key, runId });
       const actual = observed!.results![0]!;
       const witness = publicationWitness(reference.results[0], actual);
       expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
@@ -2064,17 +2001,27 @@ describe("workflow-owned execute controller", () => {
       for (const field of ["key", "agent", "runId", "workflowKey", "terminalOutcome", "state", "timedOut"])
         expect(witness[field]).toEqual((actual as any)[field]);
       if (fault === "failed-state") expect(reference.state).toBe("failed");
-      const prior = copy(reference), count = host.calls.length;
-      expect((await host.executeNative()).status).toBe(fault === "nested-timeout" ? "partial" : "blocked");
-      expect(host.calls).toHaveLength(count);
-      expect(rootRefusal
-        ? host.current().loop.analysisCalls.find((entry: any) => entry.key === call.key).ref
-        : resolvedLoop(host.current()).review.references[0]).toEqual(prior);
+      const cursor = copy(host.current()), count = host.launches.length;
+      const original = copy(host.native.get(runId!));
+      expect(host.native.get(key)).toEqual(original);
+      if (fault === "nested-timeout") {
+        // Native management metadata proves settlement, not the nested timeout body.
+        host.setStatus(ref => ({ ok: true, output: `Run: ${ref}\nState: complete`, results: [] }));
+      }
+      const replay = await host.executeNative();
+      expect(replay.status, replay.reason).toBe(fault === "nested-timeout" ? "partial" : "blocked");
+      if (fault === "nested-timeout") {
+        expect(replay.loopReport.halt).toEqual(halt);
+        expect(replay.loopReport.pending[0].references).toEqual([halt.ref]);
+      }
+      expect(host.launches).toHaveLength(count);
+      expect(host.current()).toEqual(cursor);
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.native.get(runId!)).toEqual(original);
     });
 
   test.each(["different-path", "no-reference"])("integrated review retains distinct or missing publication references: %s", async mode => {
     const host = fixture();
-    const inlineOriginals = observeInlineReviewOriginals(host);
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.phase?.startsWith("review-")) {
@@ -2086,13 +2033,14 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.execute();
     expect(output.status).toBe("complete");
-    for (const ref of resolvedLoop(host.current()).review.references) {
+    const { closed, originals } = closingReview(host);
+    expect(originals.length).toBeGreaterThan(0);
+    for (const ref of closed.review.references) {
       const witness = ref.results[0], actual = host.native.get(ref.runId)!.results![0];
       expect(witness.savedOutputPath).toBe(actual.savedOutputPath);
       expect(witness.outputReference).toEqual(actual.outputReference);
-      const original = host.storage.get("review-invoke-human-1").originals.find((entry: any) => entry.key === ref.key);
-      expect(inlineOriginals.get(ref.key).association.key).toBe(ref.key);
-      expect(canonicalDigest(readReviewOriginal(original))).toBe(inlineOriginals.get(ref.key).digest);
+      const original = closed.integratedReview.originals.find((entry: any) => entry.key === ref.key);
+      expect(originals.find(value => value.key === ref.key)).toMatchObject({ runId: ref.runId, body: readReviewOriginal(original) });
       expect(JSON.parse(readFileSync(witness.savedOutputPath, "utf8"))).toEqual(readReviewOriginal(original));
     }
   });
@@ -2101,6 +2049,7 @@ describe("workflow-owned execute controller", () => {
     "integrated review distinguishes publication/delivery/access: %s", async mode => {
       const host = fixture();
       let observed: Result | undefined;
+      let observedKey: string;
       host.setRespond((request, normal) => {
         const result = normal();
         if (mode === "inaccessible-essential" ? request.phase === "review-independent" && !observed : request.key.endsWith("review.director-prepare")) {
@@ -2120,60 +2069,87 @@ describe("workflow-owned execute controller", () => {
           if (mode === "non-delivery") delete result.structuredOutput;
           if (mode === "unknown-completeness") delete result.structuredOutput.angles;
           observed = copy(result);
+          observedKey = request.key;
         }
         return result;
       });
-      // The failed original must exist once in every durable merged checkpoint.
+      // Failure bodies belong to store/native evidence, never to the cursor.
       const bodyCopies: number[] = [];
-      let optionalOriginal: any;
       host.setSaveObserver(() => {
-        const manifest = host.storage.get("review-invoke-human-1");
-        const original = manifest?.originals.find((entry: any) => entry.runId === observed?.runId);
-        if (original?.digest) optionalOriginal = copy({ ...manifest.originalDefaults, ...original });
         if (!observed?.structuredOutput) return;
         const merged = JSON.stringify(Object.fromEntries(host.storage));
         bodyCopies.push(merged.split(JSON.stringify(observed.structuredOutput.reason).slice(1, -1)).length - 1);
       });
       const output = await host.executeNative();
-      if (mode === "mandatory-publication") {
+      if (observed!.structuredOutput) {
         expect(bodyCopies.length).toBeGreaterThan(0);
-        expect(Math.max(...bodyCopies)).toBe(1);
+        expect(Math.max(...bodyCopies)).toBe(0);
       }
       if (mode === "optional-artifact") {
         expect(output.status).toBe("complete");
+        const { closed, originals } = closingReview(host);
+        expect(closed.review.verdict).toBe("clear");
+        expect(closed.compliance.status).toBe("fulfilled");
+        const key = host.calls.find(call => call.key.endsWith(".review.director-prepare"))!.key;
+        const { runId, structuredOutput, metadataSaveError } = observed!;
+        expect(metadataSaveError).toBe("Optional debug artifact unavailable");
+        const retained = closed.integratedReview.originals.find((entry: { key: string }) => entry.key === key);
+        expect(retained).toMatchObject({ key, runId });
+        const matching = originals.filter(entry => entry.key === key);
+        expect(matching).toEqual([{ ...retained, body: structuredOutput }]);
+        expect(readReviewOriginal(retained)).toEqual(structuredOutput);
+        expect(host.snapshots.some(cursor => cursor.review?.slots.some((slot: { key: string; runId: string; digest: string }) =>
+          slot.key === key && slot.runId === runId && slot.digest === canonicalDigest(structuredOutput)))).toBe(true);
+        const ref = closed.review.references.find((entry: { key: string }) => entry.key === key);
+        expect(ref.runId).toBe(runId);
+        publicationWitness(ref.results[0], observed!.results![0]);
+        return;
       } else {
         expect(output.status).toBe("blocked");
         expect(host.calls.some(request => request.key.endsWith(".compliance"))).toBe(false);
       }
-      const manifest = host.storage.get("review-invoke-human-1");
-      const retainedOriginal = manifest.originals.find((entry: any) => entry.runId === observed!.runId);
-      expect(retainedOriginal).toBeDefined();
-      const original = { ...manifest.originalDefaults, ...retainedOriginal };
-      expect(manifest.originals.filter((entry: any) => entry.id === original.id)).toHaveLength(1);
+      expectOpenHalt(host, output);
+      const { runId, structuredOutput } = observed!;
+      const key = observedKey!;
+      const slots = host.current().review.slots.filter((slot: { key: string }) => slot.key === key);
+      const digest = ["mandatory-publication", "partial-failed", "inaccessible-essential"].includes(mode)
+        ? canonicalDigest(structuredOutput) : null;
+      expect(slots).toEqual([expect.objectContaining({ key, runId, digest })]);
+      const admitted = storedRows(host);
+      expect(admitted.some(row => row.kind === "review-originals")).toBe(false);
+      const native = host.native.get(runId!)!;
+      expect(host.native.get(key)).toEqual(native);
+      expect(native.structuredOutput).toEqual(structuredOutput);
+      const ref = output.loopReport.pending[0].references.flat().find((entry: any) => entry?.key === key);
+      expect(ref).toMatchObject({ key, runId });
+      publicationWitness(ref.results[0], observed!.results![0]);
       if (["mandatory-publication", "partial-failed", "inaccessible-essential"].includes(mode)) {
-        expect(original).toMatchObject({ publication: "unpublished", delivery: "complete", sufficient: false });
-        expect(original.failedOriginal).toEqual(observed!.structuredOutput);
-      } else expect(original.failedOriginal).toBeUndefined();
-      if (mode === "non-delivery") expect(original.delivery).toBe("not-delivered");
-      if (mode === "unknown-completeness") expect(original.delivery).toBe("unproved");
+        expect(ref.results[0].savedOutputPath).toBeUndefined();
+        expect(ref.results[0].outputSaveError).toBe("Required output save failed");
+        expect(native.structuredOutput).toBeDefined();
+      }
+      if (mode === "non-delivery") {
+        expect(native.structuredOutput).toBeUndefined();
+        expect(output.reason).toContain("No usable structured result");
+      }
+      if (mode === "unknown-completeness") {
+        expect(native.structuredOutput).toBeDefined();
+        expect(output.reason).toContain("Original completeness/schema/association not demonstrated");
+      }
       if (mode === "inaccessible-essential") {
-        expect(original).toMatchObject({ publication: "unpublished", sufficient: false });
         expect(host.calls.some(request => ["review-critique", "review-defense", "review-synthesis"].includes(request.phase!))).toBe(false);
       }
-      if (mode === "optional-artifact") {
-        expect(optionalOriginal).toMatchObject({ publication: "published", observability: "failed", sufficient: true });
-        expect(optionalOriginal).not.toHaveProperty("value");
-        expect(optionalOriginal.digest).toBe(canonicalDigest(observed!.structuredOutput));
-        expect(readReviewOriginal(retainedOriginal)).toEqual(observed!.structuredOutput);
-      }
       if (mode === "partial-failed") {
+        const cursor = copy(host.current()), calls = copy(host.calls);
         host.setStatus(ref => ({ ...copy(host.native.get(ref)!), ok: true,
           structuredOutput: { ...observed!.structuredOutput, angles: undefined } }));
-        expect((await host.executeNative()).status).toBe("blocked");
-        const retained = host.storage.get("review-invoke-human-1").originals;
-        expect(retained).toHaveLength(1);
-        expect(retained[0].failedOriginal).toEqual(observed!.structuredOutput);
-        expect(retained[0]).toMatchObject({ sufficient: false, publication: "unpublished" });
+        const replay = await host.executeNative();
+        expect(replay.status).toBe("blocked");
+        expect(replay.reason).toBe("Retained review original integrity mismatch.");
+        expect(host.current()).toEqual(cursor);
+        expect(storedRows(host)).toEqual(admitted);
+        expect(host.native.get(runId!)).toEqual(native);
+        expect(host.calls).toEqual(calls);
       }
     });
 
@@ -2203,13 +2179,18 @@ describe("workflow-owned execute controller", () => {
     expect((await host.executeNative()).status).toBe("partial");
     const workers = host.calls.filter(call => call.agent === "pitako.worker");
     expect(workers.map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
-    expect(workers[1]!.task).toContain("/native/output/invoke-human-1.l1.t1.a1.json");
+    const original = host.native.get(workers[0]!.key)!;
+    const previous = JSON.parse(workers[1]!.task.split("TASK CONTINUATION (data):\n")[1]!.split("\nTASK REVIEW REPAIR")[0]!);
+    expect(previous.previousResult).toEqual(expect.any(String));
+    const result = host.history()[0].results.find((entry: any) => entry.attempt === 1);
+    expect(result?.ref).toMatchObject({ key: workers[0]!.key, runId: original.runId });
+    expect(previous.previousResult).toBe(result.ref.path ?? result.ref.outputReference ?? result.ref.outputArtifactPath);
     expect(workers[1]!.task).toContain("src/change1.ts contains the parser branch.");
     expect(workers[1]!.task).toContain("TASK CONTINUATION");
     expect(workers[1]!.task).not.toContain("FROZEN ATTEMPT");
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
     expect(host.history()[0].manifest).toEqual(["change1"]);
-    expect(host.current().tasks.change1.completed).toMatchObject({ taskId: "change1", attempt: 2 });
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 2, status: "complete" }));
     expect(workers[1]!.task).toContain("DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):\n[]");
     expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["pause", "unit"]);
     expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
@@ -2223,8 +2204,9 @@ describe("workflow-owned execute controller", () => {
       return result;
     });
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
-    expect(host.current().tasks.change1.completed).toBeDefined();
-    expect(host.current().association.root).toBe(host.root);
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+    expect(atCursor(host).P.prompt.admission?.association).toMatchObject({ root: host.root, invocation: "human-1" });
+    expect(host.current()).toMatchObject({ root: host.root, invocation: "human-1" });
   });
 
   test.each(["duplicate-id", "preview-only"])("rejects selection %s before any edit", async mode => {
@@ -2275,10 +2257,13 @@ describe("workflow-owned execute controller", () => {
       });
       expect((await host.executeNative()).status).toBe("partial");
       expect(host.native.get("invoke-human-1.l1.t1.a1")!.structuredOutput).toEqual(original);
-      expect(host.current().tasks.change1.completed).toBeDefined();
+      expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
       expect(host.history()[0].results[0].checks).toMatchObject({ current: true, count: 1, passed: 1 });
-      const gate = host.calls.find(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")!;
-      expect(JSON.parse(gate.task).task.gates[0].command).toBe("bun test change1");
+      const rows = storeTipRows(host);
+      const gate = rows.find(row => row.opKey === "worker-gate:invoke-human-1.l1.t1.a1.gate");
+      expect(gate?.body).toMatchObject({ result: { gates: [{ id: "change1-check", status: "pass" }] } });
+      const task = readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!;
+      expect(task.gates).toMatchObject([{ id: "change1-check", command: "bun test change1", cwd: host.root }]);
     });
 
   test.each(["work", "status", "remaining", "remaining-entry"])("invalid worker %s is rejected before gate dispatch", async field => {
@@ -2321,7 +2306,7 @@ describe("workflow-owned execute controller", () => {
       if (mode === "native-ok-only") {
         expect(workers[1]!.key).toBe("invoke-human-1.l1.t1.a2");
         expect(workers[1]!.task).toContain("CHECKPOINT FALLBACK");
-        expect(host.current().tasks.change1.completed).toBeNull();
+        expect(readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!.status).not.toBe("done");
       }
       expect(host.calls.some(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
       expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
@@ -2340,7 +2325,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
     const director = host.calls.find(call => call.key === "invoke-human-1.l2.director")!;
     expect(director.task).toContain("Worker returned an invalid work/status/remaining contract.");
-    expect(host.current().tasks.change1.completed).toBeDefined();
+    expect(host.history()[1].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
   });
 
   test("known worker identity echoes cannot override deterministic observation", async () => {
@@ -2479,10 +2464,15 @@ describe("workflow-owned execute controller", () => {
     expect(reports.slice(0, 2).map(value => value.next)).toEqual(["continue loop 2", "continue loop 3"]);
     expect(reports.slice(0, 2).every(value => value.status === "gaps" && value.actionRequired === "none")).toBe(true);
     expect(reports.filter(value => value.loop === 3)).toHaveLength(2);
-    const count = host.calls.length; expect((await host.execute()).status).toBe("partial"); expect(host.calls).toHaveLength(count);
+    const count = host.launches.length, terminal = copy(host.current()), rows = storedRows(host);
+    host.setLimit(4);
+    expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 3, maxLoops: 3 });
+    expect(host.launches).toHaveLength(count);
+    expect(host.current()).toEqual(terminal);
+    expect(storeTipRows(host)).toEqual(rows);
     expect(host.history()).toHaveLength(3);
     const exhausted = host.emits.filter(value => value.type === "execution-loop" && value.loop === 3);
-    expect(exhausted).toHaveLength(3);
+    expect(exhausted).toHaveLength(2); // Terminal reentry does not read or emit another loop.
     for (const report of exhausted) {
       expect(report.status).toBe("partial");
       expect(report.next).toBe("new invocation requires human authorization");
@@ -2539,25 +2529,39 @@ describe("workflow-owned execute controller", () => {
       }
       expect(report.verification.compliance.status).toBe(mode === "adversarial" ? "not-run" : mode === "candidate-drift" ? "stale" : "gaps");
     }
-    expect(host.history()[2]).toMatchObject({ phase: "closing" });
-    expect(host.history()[2].outcome).toBeUndefined();
-    const calls = copy(host.calls), usage = host.history().map((loop: any) => copy(loop.usage));
-    const startedAt = host.current().startedAt, loopStartedAt = host.history()[2].startedAt;
-    const closes = host.hostCalls.filter(key => key === "inspect-loop-3").length;
+    const cursor = copy(host.current());
+    expect(cursor.loop).toMatchObject({ number: 3, phase: "closing", outcome: null });
+    expect(cursor.budget).toMatchObject({ consumedLoops: 3, maxCycles: 3 });
+    expect(host.history().map((loop: { number: number }) => loop.number)).toEqual([1, 2, 3]);
+    const rows = storedRows(host), calls = copy(host.launches);
+    const closing = host.history()[2];
+    expect(closing.outcome).toBe("gaps");
+    expect(closing.observation.checkout).toEqual(host.observedCandidate());
+    const action = cursor.action;
+    if (mode === "adversarial") {
+      const key = "invoke-human-1.l3.review.director-synthesis";
+      const original = closing.integratedReview.originals.find((entry: { key: string }) => entry.key === key);
+      expect(action).toMatchObject({ kind: "launched", role: "reviewer", key, runId: original.runId });
+      expect(readReviewOriginal(original)).toEqual(host.native.get(key)!.structuredOutput);
+      expect(calls.some(call => call.key === "invoke-human-1.l3.compliance")).toBe(false);
+    }
+    const usage = atCursor(host).P.preview.usage;
     host.setFailSave(); host.advance(10000);
     const recovered = await host.execute();
-    expect(recovered).toMatchObject({ status: "partial", loopsConsumed: 3 });
-    expect(host.calls).toEqual(calls);
+    const replayKey = mode === "adversarial" ? "invoke-human-1.l3.checkout.closing-replay.r1" : `${action.key}.closing-replay.r1`;
+    expect(recovered, host.native.get(replayKey)?.output ?? recovered.reason).toMatchObject({ status: "partial", loopsConsumed: 3, maxLoops: 3 });
+    expect(host.launches.slice(0, calls.length)).toEqual(calls);
+    expect(host.launches.slice(calls.length).map(call => call.key)).toEqual([replayKey]);
     expect(host.history().map((loop: any) => loop.number)).toEqual([1, 2, 3]);
-    expect(host.current().loop.usage).toEqual([]);
-    expect(host.current().usageTotals.tokens).toBe((host.history().slice(0, 2).reduce((sum: number, loop: any) => sum + (loop.usageSummary?.tokens ?? 0), 0)) + usage[2].reduce((sum: number, item: any) => sum + (item.tokens ?? 0), 0));
-    expect(host.current().startedAt).toBe(startedAt);
-    expect(host.history()[2].startedAt).toBe(loopStartedAt);
+    expect(host.current().action.kind).toBe("terminal");
+    expect(storedRows(host).slice(0, rows.length)).toEqual(rows);
+    expect(atCursor(host).P.preview.usage).toEqual(usage);
     expect(recovered.tokens).toEqual(output.tokens);
-    expect(recovered.elapsedMs).toBe(output.elapsedMs + 10000);
-    expect(recovered.loopReport.elapsedMs).toBe(output.loopReport.elapsedMs + 10000);
-    expect(host.hostCalls.filter(key => key === "inspect-loop-3")).toHaveLength(closes);
-    expect(host.history()[2]).toMatchObject({ phase: "finished", outcome: "gaps" });
+    // The single replay admission advances the fixture clock by 10 ms.
+    expect(recovered.elapsedMs).toBe(output.elapsedMs + 10010);
+    expect(recovered.loopReport.elapsedMs).toBe(output.loopReport.elapsedMs + 10010);
+    expect(host.launches.filter(call => call.agent === "pitako.checkout-observer")).toEqual(calls.filter(call => call.agent === "pitako.checkout-observer"));
+    expect(host.history()[2]).toEqual(closing);
     const recoveredReports = host.emits.slice(host.emits.indexOf(reports[2]) + 1).filter(value => value.type === "execution-loop");
     expect(recoveredReports).toHaveLength(2);
     expect(recovered.loopReport).toEqual(recoveredReports[1]);
@@ -2589,86 +2593,99 @@ describe("workflow-owned execute controller", () => {
 describe("workflow-owned execute controller", () => {
   test.each(["published", "admitted", "result-before-cursor"])("durable %s cut recovers original values without repeated completed edits or renewed slots", async phase => {
     const host = fixture();
-    cutAt(host, value => {
-      const loop = value.loop;
-      return phase === "published" ? loop?.plan?.stage === "published" : phase === "admitted"
-        ? loop?.phase === "implementation" : loop?.cursor === 1;
+    if (phase === "published" || phase === "admitted") host.setSaveObserver(value => {
+      const { action } = value;
+      if (action.kind === "launched" && (phase === "published"
+        ? action.role === "execution-director" && action.runId === host.native.get(action.key)?.runId
+        : action.role === "worker" && action.runId === null))
+        throw Error("Cut after recorded action save");
     });
-    const first = await host.execute(); expect(first.status).toBe("partial");
+    else cutAt(host, value => value.loop?.number === 1 && value.loop.cursor === 1);
+    const first = await host.execute(); expect(first.reason).toContain("Essential persistence failed");
     const firstWorkers = host.calls.filter(call => call.agent === "pitako.worker").length;
     expect(firstWorkers).toBe(phase === "result-before-cursor" ? 1 : 0);
-    host.setFailSave(); host.advance(10000);
-    expect((await host.execute()).status).toBe("complete");
+    host.setFailSave(); host.setSaveObserver(undefined); host.advance(10000);
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe("complete");
     expect(host.history()).toHaveLength(2);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(2);
     expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-    expect(host.current().startedAt).toBe(1000);
+    expect(atCursor(host).P.prompt.admission!.startedAt).toBe(1000);
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
   });
 
-  test.each(["direct-values", "direct-conflict", "absent-binding", "absent-witness", "cache-only", "lost-definition", "changed-binding", "changed-native", "changed-selection"])("recovery distinguishes %s using full originals and exact refs", async mode => {
+  test.each(["direct-values", "direct-conflict", "absent-binding", "absent-witness", "committed-selection", "lost-definition", "changed-binding", "changed-native", "changed-selection"])("recovery distinguishes %s using full originals and exact refs", async mode => {
     const host = fixture(undefined, { readOnly: true });
-    cutAt(host, value => mode == "cache-only" ? value.loop?.attempt?.stage === "intention" : value.loop?.plan?.stage === "published");
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    // Recover the full selection before apply; after admission loop.task is authoritative.
-    // Neither cut has launched a writer.
-    if (mode !== "cache-only" && mode !== "changed-native") removeCache(host);
-    if (mode === "lost-definition" || mode === "cache-only") {
-      host.native.delete("native-invoke-human-1.l1.director"); host.native.delete("invoke-human-1.l1.director");
-    }
-    if (mode === "absent-witness") for (const value of host.native.values()) delete value.results;
-    if (mode.startsWith("direct-")) for (const value of host.native.values()) {
-      if (!value.structuredOutput?.changes) continue;
-      const binding = copy(value.structuredOutput);
-      if (mode === "direct-conflict") binding.reason = "conflicting-native-binding";
-      value.output = JSON.stringify(binding);
-    }
-    // Only the unavailable-direct-value cases need the exceptional inspector.
-    // A file-only preview alone is not a reason to query again.
-    if (["absent-binding", "changed-binding", "changed-selection"].includes(mode))
-      host.setStatus(() => ({ ok: true, results: [] }));
-    if (mode === "changed-native") host.setStatus(ref => {
-      // An admitted complete cache does not require an optional inspector.
-      // Supply the actually conflicting native original at its exact producer.
-      const result = copy(host.native.get(ref)!);
-      if (result?.structuredOutput?.changes) {
-        result.output = JSON.stringify(result.structuredOutput);
-        result.structuredOutput.reason = "changed-but-same-selection";
+    const director = "invoke-human-1.l1.director", selection = "invoke-human-1.l1.selectionIO";
+    host.setRespond((request, normal) => {
+      const result = normal();
+      if (request.key === director && ["direct-values", "direct-conflict", "changed-binding"].includes(mode)) {
+        const binding = copy(result.structuredOutput);
+        if (mode === "direct-conflict") binding.reason = "conflicting-native-binding";
+        if (mode === "changed-binding") binding.changes = [];
+        result.output = JSON.stringify(binding);
       }
       return result;
     });
-    host.setRespond((request, normal) => {
-      const result = normal(); if (request.key.includes(".recover")) {
-        const value = result.structuredOutput;
-        if (mode === "absent-binding") Object.assign(value, { binding: "absent", comparison: "only-original" });
-        if (mode === "changed-binding") Object.assign(value, { status: "conflict", binding: "changed", comparison: "different-full-json" });
-        if (mode === "changed-selection" && value.original) {
-          value.original.select = "unknown-task";
-          Object.assign(value, { status: "conflict", binding: "changed", comparison: "different-full-json" });
-        }
-      } return result;
+    const committed = mode === "committed-selection";
+    if (committed) host.setFailSave(() => host.native.has(selection));
+    else host.setSaveObserver(cursor => {
+      if (cursor.action.key === director && cursor.action.runId)
+        throw Error("Cut after retaining the settled director");
     });
-    const output = await host.execute();
-    if (["direct-conflict", "changed-binding", "changed-native", "changed-selection"].includes(mode)) {
-      expect(output.status).toBe("blocked"); expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
-    } else {
-      expect(host.history().find((loop: any) => loop.kind === "task")?.results[0]?.status).toBe("complete");
-      expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-      expect(host.calls.filter(call => call.key === "invoke-human-1.l1.director")).toHaveLength(1);
-      expect(output.status).toBe("complete");
-      if (mode === "absent-binding") expect(host.records().find((record: any) => record.kind === "loop").body.plan.recoverySource.binding).toBe("absent");
+    const cut = await host.execute();
+    expect(cut.status).toBe("partial");
+    expect(cut.reason).toContain("Essential persistence failed");
+    host.setSaveObserver(undefined);
+    host.setFailSave();
+    const original = host.native.get(director)!;
+    const retained = copy(host.current());
+    expect(retained.action).toMatchObject({ kind: "launched", key: director, runId: original.runId });
+    const artifact = original.results![0]!.savedOutputPath!;
+    if (committed || mode === "lost-definition") rmSync(artifact);
+    if (committed) {
+      // A committed selection is authoritative even if its director's original file disappears.
+      expect(storeTipRows(host).some(row => row.opKey === `operation:${selection}`)).toBe(true);
     }
-    if (mode.startsWith("direct-")) expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+    if (mode === "changed-native" || mode === "changed-selection")
+      writeFileSync(artifact, JSON.stringify({ ...original.structuredOutput,
+        ...(mode === "changed-native" ? { reason: "changed-but-same-selection" } : { select: "unknown-task" }) }));
+    if (mode === "absent-witness") host.setStatus(ref => ref === original.runId
+      ? { ok: true, runId: ref, output: `Run: ${ref}\nState: complete`, results: [] }
+      : copy(host.native.get(ref) ?? { ok: false, state: "unknown", results: [] }));
+    const count = host.launches.length;
+    const output = await host.execute();
+    expect(host.statusCalls).toContain(original.runId!);
+    expect(host.launches[count]).toMatchObject({ agent: "pitako.loop-io", key: `${selection}.r1` });
+    expect(host.launches.filter(call => call.key === director)).toHaveLength(1);
+    expect(host.launches.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+    if (["direct-conflict", "changed-binding", "changed-native", "changed-selection", "lost-definition"].includes(mode)) {
+      expect(output.status).toBe("blocked");
+      expect(output.reason).toContain("Director selection integrity failure");
+      expect(host.launches.slice(count).map(call => call.key)).toEqual([`${selection}.r1`]);
+      expect(host.current()).toEqual(retained);
+      expect(readBacklog(host.root, "spec").backlog).toBeNull();
+    } else {
+      expect(output.status, output.reason).toBe("complete");
+      expect(host.launches.filter(call => call.agent === "pitako.worker").map(call => call.key))
+        .toEqual(["invoke-human-1.l1.t1.a1"]);
+      expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+      expect(storedRows(host).filter(row => row.opKey === `operation:${selection}`)).toHaveLength(1);
+    }
   });
 
   test.each(["running", "queued", "pending", "detached", "recovery", "stopped", "permission", "management"])("unresolved writer %s cannot be blindly redispatched or replaced in another slot", async mode => {
     const host = fixture(undefined, { readOnly: true });
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    const saved = host.history()[0].attempt;
-    expect(saved.stage).toBe("launched"); // The no-writer baseline persisted dispatch readiness before launch attachment.
-    expect(saved.launch).toBeUndefined();
+    const key = "invoke-human-1.l1.t1.a1";
+    cutAfterOriginal(host, key);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
+    const saved = copy(host.current());
+    expect(saved.loop.attempt.stage).toBe("launched");
+    expect(saved.action).toMatchObject({ kind: "launched", role: "worker", key, runId: null });
+    expect(storedRows(host).find(row => row.seq === saved.loop.attempt.intent.seq)).toMatchObject({
+      kind: "intent", digest: saved.loop.attempt.intent.digest, body: { key },
+    });
     host.setStatus(ref => {
       if (!ref.includes(".t1.a1")) return copy(host.native.get(ref) ?? { ok: true, results: [] });
       if (mode === "permission") throw Error("Blocked by pi-subagents permission rule: 'status' is denied.");
@@ -2678,55 +2695,77 @@ describe("workflow-owned execute controller", () => {
     const output = await host.execute(); expect(["blocked", "cancelled"]).toContain(output.status);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
-    expect(host.history()).toHaveLength(1);
+    expect(host.statusCalls).toContain(key);
+    expect(host.current()).toEqual(saved);
+    expect(host.history()).toHaveLength(0);
   });
 
   test("missing writer inventory continues only through checkpoint-first restoration of the selected task", async () => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true }); host.setLimit(1);
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
+    const first = "invoke-human-1.l1.t1.a1", successor = "invoke-human-1.l1.t1.a2";
+    cutAfterOriginal(host, first);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
+    const cut = copy(host.current()), prefix = storedRows(host, cut), admissions = host.launches.length;
+    expect(cut.action).toMatchObject({ kind: "launched", role: "worker", key: first, runId: null });
+    expect(readExecuteIntentContext(host.root, cut).intent).toMatchObject({ key: first, taskId: "change1", attempt: 1 });
     host.setStatus(ref => ref.includes(".t1.a1") ? { ok: true, results: [] } : copy(host.native.get(ref)!));
     host.setRespond((request, normal) => {
-      if (request.key === "invoke-human-1.l1.t1.a2") {
-        const restore = host.current().loop.attempt.restore;
-        expect(restore.producer.key).toBe("invoke-human-1.l1.t1.a1");
-        const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-        restoreCheckpoint(sources, restore.authority);
+      if (request.key === successor) {
+        expect(request.task).toContain(`"key":"${first}"`);
+        restoreRecordedAttempt(host, request.key, first);
       }
       return normal();
     });
     const output = await host.execute();
     expect(output.status, output.reason).toBe("partial");
     expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
-      .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
+      .toEqual([first, successor]);
+    const replay = host.launches.slice(admissions).filter(call => call.key.startsWith(`${first}.`));
+    expect(replay.map(({ key, agent }) => ({ key, agent }))).toEqual([
+      { key: `${first}.selection-replay.r1`, agent: "pitako.loop-io" },
+    ]);
+    expect(JSON.parse(replay[0]!.task)).toMatchObject({
+      expectedHead: cut.head, refs: { input: cut.action.input, uncertainWorker: cut.loop.attempt.intent },
+    });
+    expect(storedRows(host).slice(0, prefix.length)).toEqual(prefix);
+    expect(storedRows(host).filter(row => row.kind === "intent" && (row.body as CheckpointIntent).key === first))
+      .toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
     expect(host.calls.some(call => call.resume)).toBe(false);
-    expect(resolvedLoop(host.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+    expect(host.history()[0]?.results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
     expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
     expect(host.history()).toHaveLength(1);
   });
 
   test("dispatch-before-result can reconcile the exact settled original, without calling the writer key again", async () => {
-    const host = fixture(); cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    expect((await host.execute()).status).toBe("complete");
-    expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
-    expect(host.statusCalls).toContain("invoke-human-1.l1.t1.a1");
+    const host = fixture();
+    const key = "invoke-human-1.l1.t1.a1";
+    cutAfterOriginal(host, key);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
+    const count = host.launches.length;
+    const output = await host.execute();
+    expect(output.status, output.reason).toBe("complete");
+    expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual([key]);
+    expect(host.statusCalls).toContain(key);
+    expect(host.launches.slice(count).filter(call => call.key.startsWith(`${key}.recover`)).map(call => call.key)).toEqual([`${key}.recover.r1`]);
+    expect(host.history()[0].results[0].ref).toMatchObject({ key, runId: host.native.get(key)!.runId });
   });
 
   test("native status may echo its queried run ID without changing the frozen dispatch or original report", async () => {
     const host = fixture();
-    cutAt(host, value => value.loop?.attempt?.stage === "result");
-    expect((await host.executeNative()).status).toBe("partial");
-    const original = copy(host.native.get("native-invoke-human-1.l1.t1.a1"));
+    const key = "invoke-human-1.l1.t1.a1";
+    cutAt(host, value => value.action.kind === "pending" && value.action.op === "gate" && value.action.opKey === `${key}.gate`);
+    expect((await host.executeNative()).reason).toContain("Essential persistence failed");
+    const original = copy(host.native.get(key)!);
     host.setFailSave();
+    host.setStatus(ref => host.native.has(ref) ? { ...copy(host.native.get(ref)!), key: ref } : { ok: true, results: [] });
     expect((await host.executeNative()).status).toBe("complete");
-    expect(host.statusCalls).toContain("native-invoke-human-1.l1.t1.a1");
-    expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
+    expect(host.statusCalls).toContain(original.runId!);
+    expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
-    expect(host.history()[0].results[0].ref.key).toBe("invoke-human-1.l1.t1.a1");
-    expect(host.native.get("native-invoke-human-1.l1.t1.a1")).toEqual(original);
+    expect(host.history()[0].results[0].ref).toMatchObject({ key, runId: original.runId });
+    expect(host.native.get(key)).toEqual(original);
   });
 
   test.each(["native-original", "exact-fallback"])(
@@ -2742,24 +2781,22 @@ describe("workflow-owned execute controller", () => {
         if (request.agent === "pitako.execution-inspector") {
           expect(request).toMatchObject({ label: "Recover complete execution plan", phase: "recovery" });
           expect(request.task.startsWith(`${request.label}\n\nEXCEPTIONAL READ-ONLY`)).toBe(true);
-          expect(host.history()[0].recoveries[0]).toMatchObject({
-            subject: "loop-plan", phase: "loop-plan", stage: "intention",
-            source: { key: "invoke-human-1.l1.director" },
-          });
+          expect(host.current().action).toMatchObject({ kind: "launched", role: "execution-inspector", key: request.key });
+          expect(request.task).toContain(original.runId);
           Object.assign(result.structuredOutput, { status: "recovered", original: copy(original.structuredOutput),
             originalAvailable: true, binding: "absent", comparison: "only-original" });
         }
         return result;
       });
-      host.setStatus(ref => ref.endsWith("l1.director")
+      host.setStatus(ref => ref === original?.runId || ref === "invoke-human-1.l1.director"
         ? mode === "native-original" ? copy(original) : { ok: true, results: [] } : copy(host.native.get(ref)!));
       const output = await host.executeNative();
-      expect(output.status).toBe("complete");
+      expect(output.status, output.reason).toBe("complete");
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector"))
         .toHaveLength(mode === "native-original" ? 0 : 1);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
       expect(host.history()[0].plan.stage).toBe("admitted");
-      expect(host.history()[0].kind).toBe("task");
+      expect(host.history()[0].results[0]).toMatchObject({ taskId: "change1", status: "complete" });
       expect(host.history()).toHaveLength(2);
       expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(true);
     },
@@ -2768,25 +2805,25 @@ describe("workflow-owned execute controller", () => {
   test.each(["none", "before-intent", "before-launch", "before-result", "before-cursor", "after-cursor"])(
     "a missing worker report uses checkpoint-first continuation across %s without an inspector or repeated writer", async cut => {
       const host = fixture(undefined, { realCheckout: true, readOnly: true });
+      const initial = "invoke-human-1.l1.t1.a1", restored = "invoke-human-1.l1.t1.a2";
       host.setRespond((request, normal) => {
-        if (request.key === "invoke-human-1.l1.t1.a1") {
-          const result = normal(); // The original captured real preimages before losing its report.
-          delete result.structuredOutput;
-          return result;
+        if (request.key === initial) {
+          host.worker(request); // Capture real preimages without publishing a worker report.
+          return { ok: false, output: "", error: "Writer report unavailable" };
         }
-        if (request.key === "invoke-human-1.l1.t1.a2") {
-          const restore = host.current().loop.attempt.restore;
-          expect(restore.producer.key).toBe("invoke-human-1.l1.t1.a1");
-          const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-          restoreCheckpoint(sources, restore.authority);
+        if (request.key === restored) {
+          const receipt = restoreRecordedAttempt(host, request.key, initial);
+          const restoredRef = receipt.partialRef.replace(/restore\.json$/, "restored.json");
+          return host.result(request, { ...host.worker(request), restoreReceipt: { ...receipt, restoredRef } });
         }
         return normal();
       });
       if (cut !== "none") cutAt(host, value => {
         const loop = value.loop;
-        return cut === "before-intent" ? loop?.attempt?.restore?.undispatched === true
-          : cut === "before-launch" ? loop?.attempt?.key.endsWith(".a2") && !!loop.attempt.launch
-          : cut === "before-result" ? loop?.attempt?.key.endsWith(".a2") && loop.attempt.stage === "result"
+        const action = value.action;
+        return cut === "before-intent" ? loop?.attempt?.number === 2 && loop.attempt.stage === "intention"
+          : cut === "before-launch" ? action.kind === "launched" && action.key === restored && action.runId === null
+          : cut === "before-result" ? host.native.has(restored)
           : cut === "before-cursor" ? loop?.cursor === 1
           : loop?.number === 2;
       });
@@ -2798,6 +2835,7 @@ describe("workflow-owned execute controller", () => {
         host.setFailSave();
         output = await host.executeNative();
       }
+      expect(output.status, output.reason).toBe("complete");
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
       expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
         .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
@@ -2805,44 +2843,36 @@ describe("workflow-owned execute controller", () => {
       expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
       expect(host.calls.some(call => call.key.endsWith("review.director-prepare"))).toBe(true);
       expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(true);
-      expect(host.current().association.maxCycles).toBe(3);
-      expect(output.status).toBe("complete");
+      expect(host.current().budget).toMatchObject({ maxCycles: 3, consumedLoops: 2 });
     },
   );
 
-  test("intent committed before an uncertain launch cannot authorize a replacement observation", async () => {
+  test("an uncertain inspector launch cannot authorize a replacement observation", async () => {
     const host = fixture(undefined, { readOnly: true });
-    cutAt(host, value => value.loop?.plan?.stage === "published");
-    expect((await host.execute()).status).toBe("partial");
-    host.setFailSave();
-    host.setStatus(ref => ref.endsWith(".director") ? { ok: true, results: [] } : copy(host.native.get(ref)!));
+    host.setRespond((request, normal) => request.key.endsWith(".director")
+      ? { ...normal(), structuredOutput: undefined } : normal());
     const setter = host.state.set;
     host.state.set = async (key, value: any) => {
       await setter(key, value);
-      if (value.loop?.recoveries?.[0]?.stage === "intention")
+      if (value.action?.kind === "launched" && value.action.role === "execution-inspector" &&
+          value.action.runId === null)
         throw Error("Controlled interruption after committed intent");
     };
-    expect((await host.execute()).status).toBe("partial");
-    expect(host.history()[0].recoveries[0].stage).toBe("intention");
+    const interrupted = await host.execute();
+    expect(interrupted.reason).toContain("Controlled interruption after committed intent");
+    expect(host.current().action).toMatchObject({ kind: "launched", role: "execution-inspector", runId: null });
     host.state.set = setter;
     const output = await host.execute();
     expect(output.status).toBe("blocked");
-    expect(output.reason).toContain("settlement/result uncertain");
+    expect(output.reason).toContain("invoke-human-1.l1.recover1");
     expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
-    expect(host.history()).toHaveLength(1);
+    expect(host.history()).toHaveLength(0);
   });
 
-  // Rejects treating unresolved observation as ordinary loss, including the
-  // admitted-definition caller and a replay with the retained inspector value.
-  test.each(["published", "admitted"])("unresolved %s plan retains scope impediment without replacement dispatch", async stage => {
+  test("unresolved published plan retains scope impediment without replacement dispatch", async () => {
     const host = fixture();
     const reason = "Actor: artifact owner. Exact binding unreadable. Expansion needed: grant read access to that binding; do not change permissions here.";
-    if (stage === "admitted") {
-      cutAt(host, value => value.loop?.phase === "implementation");
-      expect((await host.executeNative()).status).toBe("partial");
-      host.setFailSave(); removeCache(host);
-    }
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.agent === "pitako.execution-director") delete result.structuredOutput;
@@ -2860,13 +2890,58 @@ describe("workflow-owned execute controller", () => {
         action: { actor: "evidence owner", started: false,
           operation: "resolve the concrete retained impediment; no replacement dispatch" } });
       expect(output.action.references).toContainEqual(expect.objectContaining({ agent: "pitako.execution-inspector" }));
-      expect(host.history()[0].recoveries[0]).toMatchObject({ disposition: "unresolved", stage: "observed",
+      const inspector = host.native.get("invoke-human-1.l1.recover1")!;
+      expect(host.current().action).toMatchObject({
+        kind: "launched", role: "execution-inspector", key: "invoke-human-1.l1.recover1", runId: inspector.runId,
+      });
+      expect(inspector.structuredOutput).toMatchObject({ status: "unresolved", reason,
         provenance: ["/native/binding/invoke-human-1.l1.director.json"] });
-      expect(host.history()).toHaveLength(1);
+      expect(host.current().halt).toEqual({ stage: "recovery", digest: canonicalDigest(output.loopReport.halt) });
+      expect(executeField(atCursor(host).P.control, "ledger")).toEqual({ count: 0, head: null });
+      expect(host.history()).toHaveLength(0);
       expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(1);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
     }
+    const inspector = host.native.get("invoke-human-1.l1.recover1")!;
+    const calls = host.launches.length, retained = copy(host.current());
+    const forged = "Unverified replacement impediment";
+    writeFileSync(inspector.results![0]!.savedOutputPath!, JSON.stringify({ ...inspector.structuredOutput, reason: forged }));
+    const conflicted = await host.executeNative();
+    expect(conflicted.status).toBe("blocked");
+    expect(String(conflicted.reason)).toContain("Conflicting complete retained analysis originals");
+    expect(String(conflicted.reason)).not.toContain(forged);
+    expect(host.current()).toEqual(retained);
+    expect(host.launches).toHaveLength(calls);
+  });
+
+  test("committed selection supplies the admitted plan after loss of its optional native body", async () => {
+    const host = fixture(); host.setLimit(1);
+    cutAt(host, value => value.loop?.phase === "implementation");
+    const interrupted = await host.executeNative();
+    expect(interrupted.reason).toContain("Essential persistence failed");
+    host.setFailSave();
+    const directorKey = "invoke-human-1.l1.director";
+    const director = host.native.get(directorKey)!;
+    const committed = storeTipRows(host).find(row => row.opKey === "operation:invoke-human-1.l1.selectionIO")!;
+    expect(committed).toMatchObject({ kind: "operation", body: {
+      operation: "selection", request: { plan: { ref: { key: directorKey, runId: director.runId } } },
+    } });
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+    const count = host.launches.length;
+    rmSync(director.results![0]!.savedOutputPath!);
+    host.setStatus(ref => ref === director.runId ? { runId: ref, ok: true, results: [],
+      output: `Run: ${ref}\nState: complete` } : copy(host.native.get(ref) ?? { ok: true, state: "unknown" }));
+    const resumed = await host.executeNative();
+    expect(resumed.status, resumed.reason).toBe("partial");
+    expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
+    expect(storedRows(host).filter(row => row.opKey === committed.opKey)).toEqual([committed]);
+    expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
+    expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
+    expect(host.launches.slice(count).filter(call => call.key.includes(".selectionIO")).map(call => call.key))
+      .toEqual(["invoke-human-1.l1.selectionIO.committed.r1"]);
+    expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
+      .toEqual(["invoke-human-1.l1.t1.a1"]);
   });
 
   test.each(["pending", "missing", "outside-scope", "conflicting-binding"])(
@@ -2897,16 +2972,19 @@ describe("workflow-owned execute controller", () => {
         expect(first.action.references).toContainEqual(expect.objectContaining({ agent: "pitako.execution-inspector" }));
         expect(first.actionRequired).not.toContain("consent");
       }
-      const saved = host.current();
-      saved.loop.recoveries[0].ref.key = "renamed-query";
-      saved.loop.recoveries[0].source.key = "renamed-director";
-      host.storage.set("invoke-human-1", saved);
+      const saved = copy(host.current());
+      const rows = storedRows(host);
+      const inspector = host.calls.find(call => call.agent === "pitako.execution-inspector")!;
+      expect(saved.action).toMatchObject({ kind: "launched", role: "execution-inspector", key: inspector.key });
+      host.setStatus(ref => ({ ...copy(host.native.get(ref)!), key: "renamed-query" }));
       expect((await host.executeNative()).status).toBe("blocked");
       expect(host.calls.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(1);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
       expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
-      expect(host.history()[0].recoveries).toHaveLength(1);
-      expect(host.current().association.maxCycles).toBe(3);
+      expect(host.history()).toHaveLength(0);
+      expect(host.current()).toEqual(saved);
+      expect(storeTipRows(host)).toEqual(rows);
+      expect(host.current().budget.maxCycles).toBe(3);
     },
   );
 
@@ -2932,12 +3010,13 @@ describe("workflow-owned execute controller", () => {
     ["unrelated output", "State: complete\nOutput: /native/running-stopped-recovery.txt", false],
   ])("installed wrapped status distinguishes %s from actual writer activity", async (mode, body, active) => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true });
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-        host.setRespond((request, normal) => {
+    const firstKey = "invoke-human-1.l1.t1.a1";
+    cutAfterOriginal(host, firstKey);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
+    expect(host.current().action).toMatchObject({ kind: "launched", role: "worker", key: firstKey, runId: null });
+    host.setRespond((request, normal) => {
       if (request.key === "invoke-human-1.l1.t1.a2") {
-        const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
+        restoreRecordedAttempt(host, request.key);
       }
       return normal();
     });
@@ -2952,7 +3031,8 @@ describe("workflow-owned execute controller", () => {
       return { ok: true, results: [], output: `Status target: run ${id}\nSpawn budget: unlimited\nActive async capacity: 0/unlimited used\n${header}\n${body}\nMode: single` };
     });
     const output = await host.execute();
-    expect(output.status).toBe(active ? "blocked" : "complete");
+    expect(output.status, output.reason).toBe(active ? "blocked" : "complete");
+    expect(host.statusCalls).toContain(firstKey);
     expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key.endsWith(".t1.a1"))).toHaveLength(1);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(active ? 1 : 2);
     if (active) expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
@@ -2961,22 +3041,11 @@ describe("workflow-owned execute controller", () => {
 
   test.each([["plan", "stopped"], ["writer", "stopped"], ["plan", "interrupted"], ["writer", "interrupted"]])("observed %s recovery %s preserves barriers without repeating work", async (phase, signal) => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true });
-    cutAt(host, value => phase === "plan" ? value.loop?.plan?.stage === "published" : !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    if (phase === "plan") removeCache(host);
-    host.setStatus(ref => {
-      if (phase === "writer" && !ref.includes(".t1.a1")) {
-        const settled = copy(host.native.get(ref)!);
-        return { ...settled, output: JSON.stringify(settled.structuredOutput) };
-      }
-      return { ok: true, results: [] };
-    });
     const kind = phase === "plan" ? "loop-plan" : "attempt-result";
     host.setRespond((request, normal) => {
-      if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
-        const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
-      }
+      if (phase === "plan" && request.key.endsWith(".director")) return { ...normal(), structuredOutput: undefined };
+      if (phase === "writer" && request.key.endsWith(".t1.a1"))
+        return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
       return (phase === "plan" ? request.phase === "recovery" && request.task.includes(`\n\nEXCEPTIONAL READ-ONLY ${kind}`) : request.key === "invoke-human-1.l1.t1.a2")
         ? { ...normal(), ok: false, [signal]: true } : normal();
     });
@@ -2985,73 +3054,49 @@ describe("workflow-owned execute controller", () => {
     expect(output.status, output.reason).toBe(technicalInterruption ? "partial" : "cancelled");
     if (technicalInterruption) {
       expect(output.reason).toContain("Restoration remains pending with no new checkpoint evidence");
-      const workers = host.calls.filter(call => call.agent === "pitako.worker");
-      expect((await host.execute()).status).toBe("partial");
+      const workers = host.calls.filter(call => call.agent === "pitako.worker"), cursor = copy(host.current());
+      const before = storedRows(host), calls = host.launches.length, observations = host.statusCalls.length;
+      expect(cursor.action).toMatchObject({ kind: "launched", role: "worker", op: "baseline",
+        key: "invoke-human-1.l1.t1.a2", runId: host.native.get("invoke-human-1.l1.t1.a2")!.runId });
+      const intent = before.find(row => row.seq === cursor.loop.attempt.intent.seq)!;
+      expect(intent).toMatchObject({ kind: "intent", digest: cursor.loop.attempt.intent.digest,
+        body: { key: cursor.action.key, attempt: 2 } });
+      const replay = await host.execute();
+      expect(replay).toMatchObject({ status: "partial", loopsConsumed: output.loopsConsumed, reason: output.reason });
+      expect(host.statusCalls.slice(observations)).toContain(cursor.action.runId);
+      const repeated = host.launches.slice(calls).filter(call => call.agent === "pitako.request-observer");
+      expect(repeated).toHaveLength(1);
+      expect(host.launches.slice(0, calls)).toContainEqual(repeated[0]!);
+      expect(host.launches.slice(calls).filter(call => call.agent !== "pitako.request-observer").map(({ key, agent }) => [key, agent])).toEqual([
+        ["invoke-human-1.l1.t1.a2.baseline-replay.r1", "pitako.loop-io"],
+      ]);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toEqual(workers);
+      expect(host.current()).toEqual(cursor);
+      expect(storeTipRows(host)).toEqual(before);
     }
     expect(host.calls.some(call => phase === "plan" ? call.phase === "recovery" && call.task.includes(`\n\nEXCEPTIONAL READ-ONLY ${kind}`) : call.key === "invoke-human-1.l1.t1.a2")).toBe(true);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(phase === "plan" ? 0 : 2);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
+    expect(host.current().halt?.digest).toBe(canonicalDigest(output.loopReport.halt));
   });
 
-  test.each(["stopped", "interrupted"])("a restoring writer %s before any effect is renewed once per current human resolution", async signal => {
-    const host = fixture(undefined, { realCheckout: true });
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    // A writer stopped before its first effect leaves the witness unchanged.
-    host.setHostResponse((key, value) => {
-      const loop = host.current()?.loop, attempt = loop?.attempt;
-      return !key.startsWith("inspect-") || !attempt ? value : { ...value, checkpointObservation: {
-        key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
-        evidence: digest("unchanged checkpoint observation") } };
-    });
-    host.setStatus(ref => {
-      if (!ref.includes(".t1.a1")) return copy(host.native.get(ref) ?? { ok: true, results: [] });
-      return { ok: true, results: [] };
-    });
-    // Every restoring writer stops before its first effect: no new preimages.
-    let restoring = true;
-    const atLaunch: any[] = [];
-    host.setRespond((request, normal) => {
-      if (request.agent !== "pitako.worker") return normal();
-      atLaunch.push(copy(host.current().loop));
-      if (restoring) return { ...host.result(request, null), ok: false, [signal]: true };
-      const saved = host.current(), restore = saved.loop.attempt.restore;
-      restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
-      return normal();
-    });
-    const workers = () => host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key.split(".").at(-1));
-    expect((await host.execute()).status).not.toBe("complete");
-    expect(workers()).toEqual(["a1", "a2"]);
-    // Replay without human input never renews the modifying route.
-    const replay = await host.execute();
-    expect(replay.status).not.toBe("complete");
-    expect(workers()).toEqual(["a1", "a2"]);
-    // One current human resolution naming the stopped restoration renews it once.
-    const first = { unblock: true, resolution: { loop: 1, text: "Restart the stopped restoration." } };
-    const renewed = await host.execute(first);
-    expect(renewed.status).not.toBe("complete");
-    expect(workers(), renewed.reason).toEqual(["a1", "a2", "a3"]);
-    expect(atLaunch.at(-1).halt).toBeUndefined();
-    expect(atLaunch.at(-1).attempt.restore.sourceKeys).toContain("invoke-human-1.l1.t1.a1");
-    // The consumed resolution cannot renew the next stopped restoration.
-    expect((await host.execute(first)).status).not.toBe("complete");
-    expect((await host.execute()).status).not.toBe("complete");
-    expect(workers()).toEqual(["a1", "a2", "a3"]);
-    restoring = false;
-    const output = await host.execute({ unblock: true, resolution: { loop: 1, text: "Restart it again." } });
-    expect(output.status, output.reason).toBe("complete");
-    expect(workers()).toEqual(["a1", "a2", "a3", "a4"]);
-    expect(atLaunch.at(-1).halt).toBeUndefined();
-  });
+
 
   test.each(["plan", "writer"])("native rejected %s status preserves causal cancellation, not its error wording", async phase => {
     const host = fixture();
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    if (phase === "plan") removeCache(host);
+    const child = phase === "plan" ? "invoke-human-1.l1.director" : "invoke-human-1.l1.t1.a1";
+    host.setSaveObserver(value => {
+      if (phase === "plan" ? value.action.key === child && value.action.runId
+        : value.action.opKey === `${child}.gate` && value.inFlight.some((ref: { key: string }) => ref.key === child))
+        throw Error("Cut after native producer was recorded");
+    });
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    host.setSaveObserver(undefined);
+    const runId = host.native.get(child)!.runId;
+    if (phase === "plan") expect(host.current().action).toMatchObject({ key: child, runId });
+    else expect(host.current().inFlight).toContainEqual({ key: child, runId, role: "worker" });
     host.setStatus(ref => {
-      if (phase === "writer" && !ref.includes(".t1.a1")) {
+      if (ref !== runId && ref !== child) {
         const settled = copy(host.native.get(ref)!);
         return { ...settled, output: JSON.stringify(settled.structuredOutput) };
       }
@@ -3060,21 +3105,22 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.executeNative();
     expect(output.status).toBe("cancelled");
-    expect(output.reason).toContain("Execution cancelled:");
-    expect(output.reason).toContain("stopped");
-    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
+    expect(output.reason).toBe("Positive native barrier: stopped");
+    expect(host.statusCalls).toContain(runId!);
+    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(phase === "plan" ? 0 : 1);
     expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
   });
 
   test.each(["stopped", "interrupted", "remembered-stop", "remembered-interruption", "permission"])("exact native status %s is classified without reattachment", async mode => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true });
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
+    const worker = "invoke-human-1.l1.t1.a1";
+    cutAfterOriginal(host, worker);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
+    const saved = copy(host.current()), before = host.launches.length;
+    expect(saved.action).toMatchObject({ kind: "launched", role: "worker", key: worker, runId: null });
+    expect(readExecuteIntentContext(host.root, saved).intent.key).toBe(worker);
     host.setRespond((request, normal) => {
-      if (request.key === "invoke-human-1.l1.t1.a2") {
-        const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
-      }
+      if (request.key === "invoke-human-1.l1.t1.a2") restoreRecordedAttempt(host, request.key);
       return normal();
     });
     host.setStatus(ref => {
@@ -3090,20 +3136,26 @@ describe("workflow-owned execute controller", () => {
     const observed = await host.execute();
     const interruption = ["interrupted", "remembered-interruption"].includes(mode);
     expect(observed.status).toBe(mode === "permission" ? "blocked" : interruption ? "complete" : "cancelled");
-    if (interruption) expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2")).toBe(true);
+    if (interruption) {
+      expect(host.launches.slice(before).filter(call => call.key.startsWith(`${worker}.`) && call.key.endsWith(".r1"))
+        .map(call => ({ key: call.key, agent: call.agent }))).toEqual([
+        { key: `${worker}.selection-replay.r1`, agent: "pitako.loop-io" },
+      ]);
+      expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 2, status: "complete" }));
+    } else {
+      expect(host.launches).toHaveLength(before);
+      expect(host.current()).toEqual(saved);
+    }
     expect(host.calls.some(call => call.key.endsWith(".resume"))).toBe(false);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(interruption ? 2 : 1);
   });
 
   test("model reason cannot impersonate an observed native cancellation", async () => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true });
-    cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
+    cutAfterOriginal(host, "invoke-human-1.l1.t1.a1");
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
     host.setRespond((request, normal) => {
-      if (request.key === "invoke-human-1.l1.t1.a2") {
-        const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
-      }
+      if (request.key === "invoke-human-1.l1.t1.a2") restoreRecordedAttempt(host, request.key);
       return normal();
     });
     host.setStatus(ref => {
@@ -3120,44 +3172,66 @@ describe("workflow-owned execute controller", () => {
   });
 
   test("a formerly active unresolved writer is re-observed, not converted into a historical universal hold", async () => {
-    const host = fixture(); cutAt(host, value => !!value.loop?.attempt?.launch);
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
+    const host = fixture(), key = "invoke-human-1.l1.t1.a1";
+    cutAfterOriginal(host, key);
+    expect((await host.execute()).reason).toContain("Essential persistence failed"); host.setFailSave();
     host.setStatus(ref => ref.includes(".t1.a1") ? { ok: true, state: "running" } : copy(host.native.get(ref)!));
     expect((await host.execute()).status).toBe("blocked");
+    const observations = host.statusCalls.length;
     const count = host.calls.filter(call => call.agent === "pitako.worker").length;
     host.setStatus(ref => copy(host.native.get(ref) ?? { ok: true, results: [] }));
     expect((await host.execute()).status).toBe("complete");
-    expect(host.calls.filter(call => call.key === "invoke-human-1.l1.t1.a1")).toHaveLength(1);
+    expect(host.statusCalls.slice(observations)).toContain(key);
+    expect(host.calls.filter(call => call.key === key)).toHaveLength(1);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(count);
   });
 
   test.each(["same", "changed"])("reused result is phase/candidate aware for %s candidate, not an automatic veto or success", async mode => {
-    const host = fixture(undefined, { realCheckout: true }); host.setRespond((request, normal) => ({ ...normal(), reused: true }));
-    expect((await host.execute()).status).toBe("complete");
-    const count = host.calls.length, tokens = (await host.execute()).tokens;
-    expect(host.calls).toHaveLength(count);
-    if (mode === "changed") {
-      host.changeCheckout(); expect((await host.execute()).loopsConsumed).toBe(3);
-      expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(3);
-    } else expect((await host.execute()).tokens).toEqual(tokens);
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(1);
+    host.setRespond((request, normal) => ({ ...normal(), reused: true }));
+    cutAfterOriginal(host, "invoke-human-1.l1.checkout");
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    const keys = host.launches.map(call => call.key), published = storeTipRows(host);
+    host.setFailSave();
+    if (mode === "changed") host.changeCheckout();
+    const replay = await host.execute();
+    expect(replay).toMatchObject({ status: mode === "changed" ? "partial" : "complete", loopsConsumed: 1, maxLoops: 1 });
+    expect(replay.loopReport.verification.compliance.status).toBe(mode === "changed" ? "stale" : "fulfilled");
+    expect(host.launches.map(call => call.key)).toEqual([...keys, "invoke-human-1.l1.compliance.closing-replay.r1"]);
+    expect(storedRows(host).slice(0, published.length)).toEqual(published);
   });
 
   test("replay of already completed review/compliance does not rerun gates or double tokens after a closing persistence cut", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); cutAt(host, value => value.loop?.phase === "finished");
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave();
-    const count = host.calls.length, tokens = (await host.execute()).tokens;
-    expect((await host.execute()).status).toBe("complete"); expect(host.calls).toHaveLength(count);
-    expect(host.current().loop.usage).toEqual([]); expect((await host.execute()).tokens).toEqual(tokens);
+    const host = fixture(undefined, { taskCount: 0 }); cutAt(host, value => value.action.kind === "terminal");
+    const first = await host.execute();
+    expect(first.status).toBe("partial");
+    expect(first.reason).toContain("Essential persistence failed");
+    const retained = host.current(), rows = storeTipRows(host), keys = host.launches.map(call => call.key);
+    expect(retained.action).toMatchObject({ kind: "launched", key: "invoke-human-1.l1.compliance" });
+    host.setFailSave();
+    const replay = await host.execute();
+    expect(replay.status, replay.reason).toBe("complete");
+    expect(host.launches.map(call => call.key)).toEqual([...keys, "invoke-human-1.l1.compliance.closing-replay.r1"]);
+    expect(replay.tokens).toEqual(first.tokens);
+    expect(storedRows(host).slice(0, rows.length)).toEqual(rows);
+    expect(host.current().action.kind).toBe("terminal");
+    expect(host.records().map((record: { kind: string }) => record.kind)).toEqual(["spec", "loop"]);
     expect(host.calls.filter(call => call.key === "invoke-human-1.l1.checkout")).toHaveLength(1);
   });
 
   test("candidate changed after closing persistence cut invalidates cached gates without a second close in that loop", async () => {
-    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); cutAt(host, value => value.loop?.phase === "finished");
-    expect((await host.execute()).status).toBe("partial"); host.setFailSave(); host.changeCheckout();
+    const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); cutAt(host, value => value.action.kind === "terminal");
+    const output = await host.execute();
+    expect(output.status).toBe("partial"); expect(output.reason).toContain("Essential persistence failed");
+    const published = storeTipRows(host).reverse().find(row => row.kind === "ledger")!;
+    expect(published).toBeDefined();
+    host.setFailSave(); host.changeCheckout();
     expect((await host.execute()).status).toBe("complete");
     expect(host.history()).toHaveLength(2);
     expect(host.calls.filter(call => call.key === "invoke-human-1.l1.checkout")).toHaveLength(1);
-    expect(host.history()[0].invalidated).toBe("candidate-changed-after-close");
+    expect(storedRows(host).find(row => row.seq === published.seq)).toEqual(published);
+    expect(host.history()[0].observation.checkout).not.toEqual(host.history()[1].observation.checkout);
+    expect(host.history()[1].observation.checkout).toEqual(host.observedCandidate());
   });
 
   test.each(["detached", "recovery"])("positive %s review observation survives the shared library boundary and blocks another writer", async field => {
@@ -3167,7 +3241,7 @@ describe("workflow-owned execute controller", () => {
     expect(output.status).toBe("blocked"); expect(output.reason).toContain(field);
     expect(host.calls.filter(call => call.key.endsWith(".compliance"))).toHaveLength(0);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
-    expect(host.history()).toHaveLength(1);
+    expectOpenHalt(host, output, "native-settlement");
   });
 
   test.each(["review", "compliance"])("native child capacity exhausted during %s preserves phase and refs without omitted phases, replacement mission or own budget", async phase => {
@@ -3179,17 +3253,20 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.execute(); expect(output.status).toBe("partial"); expect(output.loopsConsumed).toBe(1);
     expect(output.phase).toBe(phase); expect(output.reason).toContain("Run fan-out limit reached");
-    expect(host.history()[0].halt.code).toBe("capacity");
+    const halt = expectOpenHalt(host, output);
+    expect(halt.code).toBe("capacity");
     expect(output.loopReport.next).not.toContain("continue loop");
-    expect(host.current().loop.finalAttempt.gate.receipt.gates).toMatchObject([{ id: "full", status: "pass" }]);
+    const gate = host.native.get("invoke-human-1.l1.acceptance.gate")!;
+    expect(gate.ok).toBe(true);
+    expect(JSON.parse(gate.output!).gates).toMatchObject([{ id: "full", status: "pass" }]);
     if (phase === "review") expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
-    const count = host.calls.length, halt = copy(host.history()[0].halt);
+    const count = host.calls.length, cursor = copy(host.current());
     const replay = await host.execute();
     expect(replay.status).toBe("partial"); expect(replay.reason).toBe(output.reason);
     expect(replay.phase).toBe(phase); expect(replay.loopsConsumed).toBe(1);
     expect(replay.loopReport.halt).toEqual(halt);
     expect(replay.loopReport.pending[0].references).toContainEqual(halt.ref);
-    expect(host.history()[0].halt).toEqual(halt); expect(host.calls).toHaveLength(count);
+    expect(host.current()).toEqual(cursor); expect(host.calls).toHaveLength(count);
     expect(host.calls.every(call => !("maxSubagentSpawnsPerRun" in call))).toBe(true);
   });
 
@@ -3208,18 +3285,40 @@ describe("workflow-owned execute controller", () => {
     const output = await host.execute();
     expect(output.status).toBe("blocked"); expect(output.reason).toContain(reason);
     expect(output.loopsConsumed).toBe(1);
-    const halt = copy(host.history()[0].halt);
+    const halt = expectOpenHalt(host, output);
     expect(halt.code).toBe("semantic-block");
-    const phaseRecord = phase === "compliance" ? host.history()[0].compliance : host.history()[0].review;
-    const retained = JSON.stringify(phaseRecord);
-    expect(retained).toContain(`/native/output/invoke-human-1.l1.${phase === "compliance" ? "" : "review."}${phase}.json`);
+    const phaseKey = `invoke-human-1.l1.${phase === "compliance" ? "" : "review."}${phase}`;
+    const native = host.native.get(phaseKey)!;
+    const path = native.results![0]!.savedOutputPath ?? native.results![0]!.structuredOutputPath!;
+    expect(path).toEndWith(`${phaseKey}.json`);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual(native.structuredOutput);
+    expect(host.current().action).toMatchObject({ kind: "launched", key: phaseKey, runId: native.runId });
+    const cursor = copy(host.current()), rows = storedRows(host);
     const calls = host.calls.length, replay = await host.execute();
     expect(replay.reason).toBe(output.reason); expect(replay.status).toBe("blocked");
     expect(replay.phase).toBe(output.phase); expect(replay.loopsConsumed).toBe(1);
-    // Reference-only synthesis revalidates its required originals on disk.
-    expect(host.calls.slice(calls).map(call => ({ agent: call.agent, key: call.key }))).toEqual(
-      phase === "director-synthesis" ? [{ agent: "pitako.access-verifier", key: "invoke-human-1.l1.review.verify-synthesis.r1" }] : []);
-    expect(host.history()[0].halt).toEqual(halt);
+    // Reference-only synthesis revalidates its required originals without a verifier child.
+    expect(host.calls).toHaveLength(calls);
+    expect(expectOpenHalt(host, replay)).toEqual(halt);
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
+    if (phase === "director-synthesis") {
+      const original = host.calls.find(call => call.key === "invoke-human-1.l1.review.verify-synthesis")!;
+      const { items } = JSON.parse(original.task);
+      expect(items).toHaveLength(cursor.review.slots.filter((slot: { key: string }) => slot.key.includes(".independent-")).length);
+      for (const item of items) {
+        const slot = cursor.review.slots.find((slot: { key: string }) => slot.key === item.key);
+        expect(item.digest).toBe(slot.digest);
+        expect(canonicalDigest(JSON.parse(readFileSync(item.path, "utf8")))).toBe(slot.digest);
+      }
+      writeFileSync(items[0].path, JSON.stringify({ changed: true }));
+      const rejected = await host.execute();
+      expect(rejected.status).toBe("blocked");
+      expect(rejected.reason).toContain("Conflicting complete retained analysis originals");
+      expect(host.calls).toHaveLength(calls);
+      expect(host.current()).toEqual(cursor);
+      expect(storeTipRows(host)).toEqual(rows);
+    }
   });
 
   test.each(["director", "worker", "review", "compliance"])("returned native capacity receipt at %s retains its actual run reference", async phase => {
@@ -3230,11 +3329,13 @@ describe("workflow-owned execute controller", () => {
       ? { ...normal(), ok: false, error: reason } : normal());
     const output = await host.execute();
     expect(output.status).toBe("partial"); expect(output.reason).toContain(reason);
-    expect(host.history()[0].halt).toMatchObject({ code: "capacity", reason,
-      ref: { runId: `native-invoke-human-1.l1.${suffix}` } });
+    const halt = expectOpenHalt(host, output);
+    const key = `invoke-human-1.l1.${suffix}`;
+    expect(halt).toMatchObject({ code: "capacity", reason,
+      ref: { key, runId: host.native.get(key)!.runId } });
     const count = host.calls.length, replay = await host.execute();
-    expect(replay.loopReport.halt).toEqual(host.history()[0].halt);
-    expect(replay.loopReport.pending[0].references).toContainEqual(host.history()[0].halt.ref);
+    expect(replay.loopReport.halt).toEqual(halt);
+    expect(replay.loopReport.pending[0].references).toContainEqual(halt.ref);
     expect(replay.loopsConsumed).toBe(1); expect(host.calls).toHaveLength(count);
   });
 
@@ -3247,9 +3348,17 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.executeNative();
     expect(output.status).toBe("partial"); expect(output.reason).toBe(reason);
-    expect(host.history()[0].halt.code).toBe("capacity");
-    const count = host.calls.length;
-    expect((await host.executeNative()).reason).toBe(reason); expect(host.calls).toHaveLength(count);
+    const halt = expectOpenHalt(host, output), cursor = copy(host.current());
+    expect(halt).toMatchObject({ code: "capacity", ref: { key: "invoke-human-1.l1.compliance" } });
+    expect(cursor.action).toMatchObject({ kind: "launched", key: halt.ref.key, runId: null });
+    const launches = copy(host.launches), rows = storeTipRows(host);
+    const replay = await host.executeNative();
+    expect(replay.reason).toBe(reason);
+    expect(replay.loopReport.halt).toEqual(halt);
+    expect(replay.loopReport.pending[0].references).toEqual([halt.ref]);
+    expect(host.launches).toEqual(launches);
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
   });
 
   test.each(["compliance", "director-prepare"])("even an exact capacity receipt quoted by a successful %s is a semantic block", async phase => {
@@ -3262,7 +3371,7 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.execute();
     expect(output.status).toBe("blocked"); expect(output.reason).toContain(reason);
-    expect(host.history()[0].halt.code).toBe("semantic-block");
+    expect(expectOpenHalt(host, output).code).toBe("semantic-block");
   });
 
   test.each(["director-prepare", "independent-angle1-r1"])("thrown native permission receipt at %s crosses the shared review boundary as a barrier", async phase => {
@@ -3273,28 +3382,37 @@ describe("workflow-owned execute controller", () => {
     });
     const output = await host.execute();
     expect(output.status).toBe("blocked");
-    expect(host.history()[0].halt).toMatchObject({ code: "native-barrier", cause: "native permission denial" });
+    expect(expectOpenHalt(host, output, "permission")).toMatchObject({ code: "native-barrier", cause: "native permission denial" });
     expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
   });
 
   test("arbitrary native exception words are incomplete dispatch evidence, not a capacity certificate", async () => {
     const host = fixture(undefined, { taskCount: 0 });
+    const reason = "Investigate timeout, capacity, spawn and budget diagnostics ".padEnd(360, "界");
     host.setRespond((request, normal) => {
-      if (request.key.endsWith(".compliance")) throw Error("Investigate timeout, capacity, spawn and budget diagnostics");
+      if (request.key.endsWith(".compliance")) throw Error(reason + "not retained");
       return normal();
     });
     const output = await host.execute();
     expect(output.status).toBe("partial");
-    expect(host.history()[0].halt.code).toBe("native-dispatch");
-    const count = host.calls.length;
-    expect((await host.execute()).reason).toBe(output.reason); expect(host.calls).toHaveLength(count);
+    expect(expectOpenHalt(host, output)).toMatchObject({ code: "native-dispatch", reason });
+    const count = host.calls.length, rows = storeTipRows(host);
+    expect((await host.execute()).reason).toBe(reason);
+    const cursor = copy(host.current());
+    cursor.halt.reason = "changed diagnostic";
+    host.storage.set("pitako-execute", cursor);
+    const rejected = await host.execute();
+    expect(rejected.status).toBe("blocked");
+    expect(rejected.reason).toContain("halt digest integrity mismatch");
+    expect(host.calls).toHaveLength(count);
+    expect(host.current()).toEqual(cursor);
+    expect(storeTipRows(host)).toEqual(rows);
   });
 
   test.each(["worker-stop", "review-stop", "permission", "timeout"])("native %s is not green or an inferred invocation timeout cancellation", async mode => {
     const host = fixture(undefined, { realCheckout: true, readOnly: true, taskCount: mode === "review-stop" ? 0 : 1 }); host.setRespond((request, normal) => {
-      if (request.agent === "pitako.worker" && host.current().loop.attempt.restore) {
-        const saved = host.current(), restore = saved.loop.attempt.restore;
-        restoreCheckpoint(restore.sourceKeys.map((key: string) => saved.taskFrame.intents[key]), restore.authority);
+      if (request.agent === "pitako.worker" && request.key.endsWith(".a2") && mode === "timeout") {
+        restoreRecordedAttempt(host, request.key, "invoke-human-1.l1.t1.a1");
       }
       if (mode === "review-stop" && request.key.endsWith("director-prepare")) return { ...normal(), ok: false, stopped: true, error: "Observed Stop" };
       if (request.agent === "pitako.worker" && request.key.includes(".l1.")) {
@@ -3304,45 +3422,70 @@ describe("workflow-owned execute controller", () => {
       } return normal();
     });
     const output = await host.execute();
-    expect(output.status).toBe(mode.endsWith("stop") ? "cancelled" : mode === "timeout" ? "complete" : "blocked");
+    expect(output.status, output.reason).toBe(mode.endsWith("stop") ? "cancelled" : mode === "timeout" ? "complete" : "blocked");
     if (mode === "timeout") expect(output.loopsConsumed).toBe(2);
     else expect(host.calls.filter(call => call.key.endsWith(".director"))).toHaveLength(1);
   });
 
 
-  test.each(["before-director", "before-worker", "after-result"])("essential state failure %s halts new dispatch and retains frozen snapshot/descriptor/history", async phase => {
+  test.each(["before-director", "before-worker", "after-result"])("essential state failure %s halts dispatch at the retained cursor head", async phase => {
     const host = fixture(); host.storage.set("history", { retained: true });
-    cutAt(host, value => phase === "before-director" ? value.consumedLoops === 1 : phase === "before-worker"
-      ? value.loop?.attempt?.stage === "intention" : value.loop?.attempt?.stage === "result");
+    const worker = "invoke-human-1.l1.t1.a1";
+    cutAt(host, value => phase === "before-director" ? value.action.role === "execution-director" :
+      phase === "before-worker" ? value.action.role === "worker" && value.action.runId === null :
+        !!host.native.get(worker));
     const output = await host.execute(); expect(output.status).toBe("partial"); expect(output.reason).toContain("Essential persistence failed");
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(phase === "after-result" ? 1 : 0);
-    expect(host.current().association.digest).toBe(digest("COMPLETE IMMUTABLE SPECS")); expect(host.storage.get("history")).toEqual({ retained: true });
-    if (phase === "after-result") expect(host.history()[0].attempt).toMatchObject({
-      taskId: "change1", index: 0, number: 1, stage: "launched",
-      launch: { key: "invoke-human-1.l1.t1.a1", runId: "native-invoke-human-1.l1.t1.a1" },
-    });
+    const cursor = host.current();
+    expect(atCursor(host).P.prompt.admission!.association.digest).toBe(digest("COMPLETE IMMUTABLE SPECS"));
+    expect(host.storage.get("history")).toEqual({ retained: true });
+    expect(host.records().filter((record: { kind: string }) => record.kind === "unit")).toEqual([]);
+    if (phase === "after-result") {
+      expect(cursor.loop).toMatchObject({ taskId: "change1", cursor: 0, attempt: { number: 1, stage: "launched" } });
+      expect(cursor.action).toMatchObject({ kind: "launched", role: "worker",
+        key: worker, runId: null });
+      expect(host.native.get(worker)?.runId).toBeDefined();
+      expect(host.calls.some(call => call.key.startsWith(`${worker}.`) && call.phase?.startsWith("task-review"))).toBe(false);
+    }
   });
 
-  test("native envelope overflow in essential snapshot does not dispatch or prune unrelated state", async () => {
+  test("native envelope overflow blocks the director and does not prune unrelated state", async () => {
     const host = fixture("s".repeat(MAX_SPEC_BYTES)); host.storage.set("unrelated", { bytes: "h".repeat(MISSION_STATE_MAX_BYTES - 400) });
     const before = copy(host.storage.get("unrelated"));
-    expect((await host.execute()).reason).toContain("Essential persistence failed"); expect(host.calls).toHaveLength(0);
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    expect(host.launches.map(call => call.key)).toEqual(["invoke-human-1.l1.advance"]);
+    expect(host.current()).toBeUndefined();
     expect(host.storage.get("unrelated")).toEqual(before);
   });
 
   test("semantic progress preserves original elapsed waits and attributable token dedup, with missing metrics unavailable not zero", async () => {
     const host = fixture(); host.setRespond((request, normal) => {
       const result = normal(); if (request.key.endsWith(".director")) host.advance(5000);
-      if (request.agent === "pitako.worker") delete result.results; return result;
+      if (request.agent === "pitako.worker") Reflect.deleteProperty(result.results![0]!, "usage");
+      return result;
     });
     const output = await host.execute(); expect(output.elapsedMs).toBeGreaterThanOrEqual(5000);
+    expect(output.status, output.reason).toBe("complete");
     expect(output.tokens.coverage).toBe("partial"); expect(output.tokens.value).toBeGreaterThan(0);
     const progress = host.emits.filter(value => value.type === "execution-progress");
     expect(progress[0]).toMatchObject({ invocation: "human-1", loop: 1, loopsConsumed: 1, phase: "director", tokens: { value: null, coverage: "unavailable" } });
     expect(progress.find(value => value.phase === "implementation")).toMatchObject({ taskId: "change1", attempt: 1 });
-    const before = copy(output.tokens); host.advance(10000);
-    const replay = await host.execute(); expect(replay.tokens).toEqual(before); expect(replay.elapsedMs).toBe(output.elapsedMs + 10000);
-    expect(replay.loopReport.elapsedMs).toBe(output.loopReport.elapsedMs);
+    const rows = storedRows(host), usage = atCursor(host).P.preview.usage;
+    const entries: { id: string; tokens: number | null }[] =
+      host.history().flatMap((loop: { usage: { id: string; tokens: number | null }[] }) => loop.usage);
+    expect(entries.some(entry => entry.tokens === null)).toBe(true);
+    expect(new Set(entries.map(entry => entry.id)).size).toBe(entries.length);
+    expect(usage).toEqual({
+      tokens: output.tokens.value,
+      known: entries.filter(entry => entry.tokens !== null).length,
+      unknown: entries.filter(entry => entry.tokens === null).length,
+    });
+    const count = host.launches.length;
+    host.advance(10000);
+    expect((await host.execute()).status).toBe(output.status);
+    expect(host.launches).toHaveLength(count);
+    expect(storedRows(host)).toEqual(rows);
+    expect(atCursor(host).P.preview.usage).toEqual(usage);
   });
 
   test("a worker decision block reports concrete question, unrun analyses and no continuation announcement", async () => {
@@ -3356,27 +3499,19 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   });
 
-  test.each(["old-state", "unblock", "mission-path", "source-drift", "different-invocation"])("rejects %s without historical rewrites or slot renewal", async mode => {
+  test.each(["unblock", "mission-path", "source-drift"])("rejects %s without historical rewrites or slot renewal", async mode => {
     const host = fixture(); let before: any;
-    if (mode === "old-state") host.storage.set("pitako-execution", { unsettled: { invocation: "old" }, root: config.root });
-    if (["mission-path", "source-drift", "different-invocation"].includes(mode)) expect((await host.execute()).status).toBe("complete");
+    if (["mission-path", "source-drift"].includes(mode)) expect((await host.execute()).status).toBe("complete");
     before = copy(Object.fromEntries(host.storage)); const count = host.calls.length;
-    if (mode === "source-drift") host.setHostResponse((_key, value) => ({ ...value, binding: "f".repeat(64) }));
-    const output = await host.execute(mode === "unblock" ? { unblock: true } : mode === "mission-path" ? { missionPath: "/guessed/path" } : mode === "different-invocation" ? { invocation: "new-ID" } : {});
+    const output = await host.execute(mode === "unblock" ? { unblock: true }
+      : mode === "mission-path" ? { missionPath: "/guessed/path" }
+      : { preliminary: { binding: "f".repeat(64) } });
     expect(output.status).toBe("blocked"); expect(host.calls).toHaveLength(count); expect(Object.fromEntries(host.storage)).toEqual(before);
   });
 });
 
 
 describe("checkpoint-first interrupted selected-task continuation", () => {
-  // All selected backlog tasks have a checkpoint, including no-op/read-only work.
-  // Restoration uses real owned preimages; native resume is not a second writer route.
-  const restoreSelectedTask = (host: ReturnType<typeof fixture>) => {
-    const restore = host.current().loop.attempt.restore;
-    const sources = restore.sourceKeys.map((key: string) => host.current().taskFrame.intents[key]);
-    restoreCheckpoint(sources, restore.authority);
-  };
-
   test("an interrupted task restores before a fresh same-task worker and reaches final verification", async () => {
     const fx = fixture(undefined, { realCheckout: true, readOnly: true });
     fx.setRespond((request, normal) => {
@@ -3384,8 +3519,7 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
         ...normal(), ok: false, structuredOutput: undefined, state: "interrupted", results: [],
       };
       if (request.key.endsWith(".t1.a2")) {
-        expect(fx.current().loop.attempt.restore.producer.key).toBe("invoke-human-1.l1.t1.a1");
-        restoreSelectedTask(fx);
+        restoreRecordedAttempt(fx, request.key, "invoke-human-1.l1.t1.a1");
       }
       return normal();
     });
@@ -3402,42 +3536,73 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
 
   test.each(["before-restoration-launch", "before-result-save", "after-result-save"])("reconciles %s without repeating the interrupted or restored writer", async cut => {
     const fx = fixture(undefined, { realCheckout: true, readOnly: true }); fx.setLimit(1);
-    cutAt(fx, value => cut === "after-result-save" ? value.loop?.cursor === 1
-      : value.loop?.attempt?.key.endsWith(".a2") && (cut === "before-restoration-launch"
-        ? value.loop.attempt.restore?.undispatched === true : value.loop.attempt.stage === "result"));
+    const successor = "invoke-human-1.l1.t1.a2";
+    cutAt(fx, value => cut === "after-result-save" ? value.loop.cursor === 1
+      : cut === "before-restoration-launch"
+        ? value.action.key === successor && value.action.kind === "launched" && value.action.runId === null
+        : value.loop.attempt?.number === 2 && value.loop.attempt.stage === "result");
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
-      if (request.key.endsWith(".t1.a2")) restoreSelectedTask(fx);
+      if (request.key === successor) restoreRecordedAttempt(fx, request.key, "invoke-human-1.l1.t1.a1");
       return normal();
     });
     const first = await fx.executeNative();
     expect(first.status).toBe("partial");
     expect(first.reason).toContain("Essential persistence failed");
+    const count = fx.launches.length;
+    const retained = copy(fx.current());
+    const sealPath = path.join(fx.root, ".pi/subagents/checkpoints", successor, "unit.json");
+    const priorSeal = cut === "after-result-save" ? readFileSync(sealPath) : undefined;
     fx.setFailSave();
     const continued = await fx.executeNative();
     expect(continued.status, continued.reason).toBe("partial");
-    expect(resolvedLoop(fx.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+    expect(fx.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 2, status: "complete" }));
     expect(fx.calls.filter(call => call.agent === "pitako.worker").map(call => call.key))
       .toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a2"]);
     expect(fx.calls.some(call => call.resume)).toBe(false);
     expect(fx.history()).toHaveLength(1);
+    if (cut === "after-result-save") {
+      expect(retained.action).toMatchObject({ kind: "launched", key: `${successor}.task-synthesis` });
+      const added = fx.launches.slice(count);
+      expect(added.filter(call => call.key.includes(".review-recovery")).map(call => [call.key, call.agent]))
+        .toEqual([[`${successor}.task-synthesis.review-recovery.r1`, "pitako.loop-io"]]);
+      expect(added.some(call => call.agent === "pitako.checkpoint-sealer" || call.agent === "pitako.reviewer")).toBe(false);
+      const result = fx.history()[0].results.find((entry: any) => entry.taskId === "change1" && entry.attempt === 2);
+      expect(result.restore.receipt).toMatchObject({
+        checkpointRef: path.join(fx.root, ".pi/subagents/checkpoints/invoke-human-1.l1.t1.a1/manifest.json"),
+        restoredRef: path.join(fx.root, ".pi/subagents/checkpoints/invoke-human-1.l1.t1.a1/restored.json"),
+      });
+      expect(readFileSync(sealPath)).toEqual(priorSeal!);
+    }
   });
 
-  test("a pending restoration successor is observed, never replaced by another key", async () => {
+  test.each(["running", "stopped", "permission"])(
+    "a pending restoration successor observed as %s is never replaced by another key", async activity => {
     const fx = fixture(undefined, { realCheckout: true, readOnly: true }); fx.setLimit(1);
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
       if (request.key.endsWith(".t1.a2")) {
-        restoreSelectedTask(fx);
+        restoreRecordedAttempt(fx, request.key, "invoke-human-1.l1.t1.a1");
         return { ...normal(), ok: false, state: "running", structuredOutput: undefined, results: [] };
       }
       return normal();
     });
     expect((await fx.executeNative()).status).toBe("blocked");
-    fx.setStatus(ref => ref.endsWith(".t1.a2") ? { ok: true, state: "running" } : copy(fx.native.get(ref) ?? { ok: true, results: [] }));
+    const key = "invoke-human-1.l1.t1.a2", runId = fx.native.get(key)!.runId;
+    fx.setStatus(ref => {
+      if (ref !== key && ref !== runId) return copy(fx.native.get(ref) ?? { ok: true, results: [] });
+      if (activity === "permission") throw Error("Blocked by pi-subagents permission rule: 'status' is denied.");
+      return { ok: true, state: activity, runId };
+    });
     const callCount = fx.calls.length;
     const replay = await fx.executeNative();
-    expect(replay.status, replay.reason).toBe("blocked");
+    expect(replay.status, replay.reason).toBe(activity === "stopped" ? "cancelled" : "blocked");
+    if (activity !== "running") {
+      const halt = replay.loopReport.halt;
+      expect(halt).toMatchObject({ ref: { key, runId },
+        cause: activity === "stopped" ? "stopped" : "native permission denial" });
+      expectOpenHalt(fx, replay, "native-barrier");
+    }
     expect(fx.calls).toHaveLength(callCount);
     expect(fx.calls.filter(call => call.key.endsWith(".t1.a2"))).toHaveLength(1);
     expect(fx.calls.some(call => call.resume)).toBe(false);
@@ -3449,17 +3614,26 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
     fx.setRespond((request, normal) => {
       if (request.key.endsWith(".t1.a1")) return { ...normal(), ok: false, state: "interrupted", structuredOutput: undefined, results: [] };
       if (request.key.endsWith(".t1.a2")) {
-        restoreSelectedTask(fx);
+        restoreRecordedAttempt(fx, request.key, "invoke-human-1.l1.t1.a1");
         successor = normal();
         return { ...successor, ok: false, state: "running", structuredOutput: undefined, results: [] };
       }
       return normal();
     });
     expect((await fx.executeNative()).status).toBe("blocked");
-    fx.setStatus(ref => ref.endsWith(".t1.a2") ? copy(successor!) : copy(fx.native.get(ref) ?? { ok: true, results: [] }));
+    const key = "invoke-human-1.l1.t1.a2";
+    const { runId } = successor!;
+    expect(fx.current()).toMatchObject({ action: { kind: "launched", role: "worker", key, runId },
+      halt: { stage: "worker-activity" }, budget: { consumedLoops: 1, maxCycles: 1 } });
+    const request = fx.calls.find(call => call.key === key)!;
+    // Status alone is not a worker original. Publish the settled bytes under
+    // the same admitted identity, as the native child does on completion.
+    childResponse(key, request, { root: fx.root, workerRunId: runId }, undefined, 1, successor!.structuredOutput);
+    fx.setStatus(ref => ref === runId ? { ...copy(successor!), state: "complete" }
+      : copy(fx.native.get(ref) ?? { ok: true, results: [] }));
     const continued = await fx.executeNative();
     expect(continued.status, continued.reason).toBe("partial");
-    expect(resolvedLoop(fx.current()).results.find((result: any) => result.taskId === "change1" && result.status === "complete")?.status).toBe("complete");
+    expect(fx.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 2, status: "complete" }));
     expect(fx.calls.filter(call => call.key.endsWith(".t1.a2"))).toHaveLength(1);
     expect(fx.calls.some(call => call.resume)).toBe(false);
     expect(fx.history()).toHaveLength(1);
@@ -3511,43 +3685,51 @@ describe("compact admission", () => {
     const host = fixture(content); host.setLimit(10);
     host.setRespond((request, normal) => {
       if (request.agent !== "pitako.execution-director") return normal();
-      expect(host.current().association.digest).toBe(digest(content));
-      expect(host.current().association.maxCycles).toBe(10);
+      expect(atCursor(host).P.prompt.admission?.association.digest).toBe(digest(content));
+      expect(host.current().budget.maxCycles).toBe(10);
       expect(host.hostCalls).toEqual(["inspect-initial"]);
       expect(request.agent).toBe("pitako.execution-director");
       return { ok: false, error: "Controlled director rejection after admission" };
     });
     await host.execute();
-    expect(host.current().snapshot).toBeUndefined(); expect(host.current().association.digest).toBe(digest(content));
-    expect(JSON.stringify(Object.fromEntries(host.storage)).split(content).length).toBeLessThanOrEqual(2);
+    expect(atCursor(host).P.prompt.admission?.association.digest).toBe(digest(content));
+    expect([...host.storage.keys()]).toEqual(["pitako-execute"]);
+    expect(host.current()).not.toHaveProperty("snapshot");
+    expect(JSON.stringify(host.current())).not.toContain(JSON.stringify(content));
+    expect(Buffer.byteLength(JSON.stringify(Object.fromEntries(host.storage), null, 2))).toBeLessThanOrEqual(16384);
     expect(host.launches.map(call => call.agent)).toEqual(["pitako.loop-io", "pitako.execution-director"]);
   });
   test("later settings cannot replace the admitted budget and base changes preserve original bytes", async () => {
-    const host = fixture("ORIGINAL FULL SNAPSHOT");
-    host.setRespond(() => ({ ok: false, error: "Controlled rejection after admission" }));
-    await host.execute();
-    const original = copy(host.current().snapshot);
+    const content = "ORIGINAL FULL SNAPSHOT";
+    const host = fixture(content, { taskCount: 0 });
+    expect((await host.execute()).status).toBe("complete");
+    const original = copy(host.current());
+    const retainedSpec = () => host.records().find((record: { kind: string }) => record.kind === "spec")?.body;
+    expect(retainedSpec()).toEqual({ content, digest: digest(content) });
     host.setLimit(10);
-    await host.execute();
-    expect(host.current().association.maxCycles).toBe(3);
-    expect(host.current().snapshot).toEqual(original);
-    host.setHostResponse((key, value) => key === "inspect-initial" ? { ...value, binding: "b".repeat(64) } : value);
+    expect(await host.execute()).toMatchObject({ status: "complete", maxLoops: 3, loopsConsumed: 1 });
+    expect(host.current()).toEqual(original);
     const before = host.calls.length;
-    const output = await host.execute();
+    // Supply a different preliminary binding, just as a same-invocation resolve
+    // against changed spec bytes would.
+    const output = await host.execute({ preliminary: { binding: "b".repeat(64) } });
     expect(output.status).toBe("blocked");
-    expect(output.reason).toContain("restore reliable exact bytes");
-    expect(host.current().snapshot).toEqual(original);
+    expect(output.reason).toContain("Restore reliable exact bytes");
+    expect(host.current()).toEqual(original);
+    expect(retainedSpec()).toEqual({ content, digest: digest(content) });
     expect(host.calls).toHaveLength(before);
   });
-  test("essential snapshot save failure prevents every child", async () => {
+  test("the first cursor save failure prevents the first director after advance commits", async () => {
     const host = fixture();
-    host.setFailSave(value => !!value.association);
+    host.setFailSave(value => value.version === EXECUTE_STATE_VERSION);
     const output = await host.execute();
     expect(output.status).toBe("partial");
     expect(output.reason).toContain("Essential persistence failed");
-    expect(host.calls).toHaveLength(0);
+    expect(host.launches.map(call => call.key)).toEqual(["invoke-human-1.l1.advance"]);
     expect(host.hostCalls).toEqual(["inspect-initial"]);
     expect(host.current()).toBeUndefined();
+    const { store, scope } = executeStore(host.root, "human-1", false, 0);
+    expect(store.read(scope).P.control.operation).toMatchObject({ operation: "advance", key: "invoke-human-1.l1.advance" });
   });
 });
 
@@ -3556,6 +3738,7 @@ describe("native closing observations", () => {
   test("four host-free final closes interleaved with repair tasks preserve singleton implicit waiting and distinct evidence", async () => {
     // Closing evidence is the subject; real checkpoint sealing is covered by the sealer and recovery suites.
     const host = fixture(undefined, { readOnly: true }); host.setLimit(10);
+    const observations: { loop: number; ref: Result }[] = [];
     host.setRespond((request, normal) => {
       const result = normal();
       // Each of the first two loops stalls a distinct task, not the same task twice.
@@ -3579,108 +3762,169 @@ describe("native closing observations", () => {
         result.structuredOutput.requirements[0].status = "gap";
       }
       if (request.agent === "pitako.checkout-observer") {
-        const loop = host.history().at(-1);
-        expect(loop.observation).toMatchObject({ invocation: "human-1", loop: Number(request.key.match(/\.l(\d+)\./)![1]),
-          key: request.key, stage: "intention" });
-        expect(loop.closing).toBeUndefined();
+        const cursor = host.current();
+        const number = Number(request.key.match(/\.l(\d+)\./)![1]);
+        const complianceKey = `invoke-human-1.l${number}.compliance`;
+        const compliance = host.native.get(complianceKey)!;
+        expect(cursor.loop).toMatchObject({ phase: "closing", number, outcome: null });
+        const seed = storedRows(host).reverse().find(row => row.kind === "review-originals" &&
+          (row.body as { archiveSeed?: { complianceKey: string } }).archiveSeed?.complianceKey === complianceKey);
+        const { archiveSeed } = seed!.body as { archiveSeed: { input: { seq: number; digest: string } } };
+        expect(JSON.parse(request.task)).toEqual({
+          invocation: cursor.invocation, storeId: cursor.storeId, input: archiveSeed.input,
+          compliance: { key: complianceKey, runId: compliance.runId },
+        });
+        expect(atCursor(host).P.preview.closeReferences.some(reference => reference.loop === number)).toBe(false);
         expect(request).toMatchObject({ output: false, outputMode: "inline", cwd: host.root, context: "fresh" });
         expect(request.async).toBeUndefined(); expect(request.outputSchema).toBe(false);
         expect(request.task).not.toContain("IMMUTABLE");
+        observations.push({ loop: number, ref: result });
       }
       return result;
     });
     expect(await host.executeNative()).toMatchObject({ status: "complete", maxLoops: 10, loopsConsumed: 10 });
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer").map(call => call.key)).toEqual([4, 6, 8, 10].map(loop => `invoke-human-1.l${loop}.checkout`));
-    const refs = host.history().filter((loop: any) => loop.closing).map((loop: any) => loop.closing.ref);
-    expect(new Set(refs.map((ref: any) => ref.asyncDir)).size).toBe(4);
-    expect(new Set(refs.map((ref: any) => ref.externalAdapter.outputArtifacts.stdoutPath)).size).toBe(4);
-    expect(new Set(refs.map((ref: any) => ref.externalAdapter.outputArtifacts.stderrPath)).size).toBe(4);
+    expect(observations.map(item => item.loop)).toEqual([4, 6, 8, 10]);
+    expect(host.history().filter((loop: { kind: string }) => loop.kind === "final")
+      .map((loop: { number: number }) => loop.number)).toEqual([4, 6, 8, 10]);
+    const refs = observations.map(item => item.ref);
+    expect(new Set(refs.map(ref => ref.asyncDir)).size).toBe(4);
+    expect(new Set(refs.map(ref => ref.externalAdapter?.outputArtifacts?.stdoutPath)).size).toBe(4);
+    expect(new Set(refs.map(ref => ref.externalAdapter?.outputArtifacts?.stderrPath)).size).toBe(4);
     expect(host.hostCalls).toEqual(["inspect-initial"]);
   });
 
-  test.each(["intention", "receipt", "evidence"])("%s save cut retries publication without advancing an unconfirmed close", async cut => {
+  test.each(["before-publication", "after-publication", "before-terminal"])("%s cut resumes the final checkout without republishing", async cut => {
     const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
-    cutAt(host, value => {
-      const loop = value.loop;
-      return cut === "evidence" ? !!loop?.closing : loop?.observation?.stage === cut;
-    });
+    const checkoutKey = "invoke-human-1.l1.checkout", complianceKey = "invoke-human-1.l1.compliance";
+    const set = host.state.set;
+    if (cut === "before-publication") host.state.set = async (key, value: any) => {
+      await set(key, value);
+      if (value.loop?.phase === "closing") throw Error("Lost acknowledgement of the closing cursor save");
+    };
+    else if (cut === "after-publication") cutAfterOriginal(host, checkoutKey);
+    else cutAt(host, value => value.action.kind === "terminal");
     const output = await host.execute();
     expect(output.status).toBe("partial"); expect(output.reason).toContain("Essential persistence failed");
-    expect(host.current().loop.outcome).toBeUndefined();
-    const dispatched = host.calls.filter(call => call.agent === "pitako.checkout-observer");
-    expect(dispatched).toHaveLength(cut === "intention" ? 0 : cut === "receipt" ? 3 : 1);
-    host.setFailSave();
-    host.setStatus(ref => ({ ok: true, runId: ref, results: [], output: `Run: ${ref}\nState: complete` }));
-    expect((await host.execute()).status).toBe("complete");
-    const closing = host.current().loop.closing;
-    const expectedKey = `invoke-human-1.l1.checkout${cut === "intention" ? ".r2" : cut === "receipt" ? ".r3" : ""}`;
-    expect(closing.ref.runId).toBe(`native-${expectedKey}`);
-    expect(closing.ref.asyncDir).toBe(`/native/async/${expectedKey}`);
-    expect(closing.ref.externalAdapter.outputArtifacts).toEqual({ stdoutPath: `/native/async/${expectedKey}/stdout.log`, stderrPath: `/native/async/${expectedKey}/stderr.log` });
-    expect(closing.observation.checkout).toEqual(host.current().loop.candidate);
+    const cursor = host.current();
+    expect(cursor.loop).toMatchObject({ number: 1, phase: "closing", outcome: null });
+    expect(cursor.action).toMatchObject({ kind: "launched", role: "reviewer", key: complianceKey,
+      runId: host.native.get(complianceKey)!.runId });
+    const checkouts = () => host.launches.filter(call => call.agent === "pitako.checkout-observer").map(call => call.key);
+    expect(checkouts()).toEqual(cut === "before-publication" ? [] : [checkoutKey]);
+    const publication = storeTipRows(host).find(row => row.kind === "ledger");
+    expect(!!publication).toBe(cut !== "before-publication");
+    if (cut === "after-publication") expect(storedRows(host).some(row => row.digest === publication!.digest)).toBe(false);
+    host.setFailSave(); host.state.set = set;
+    const admissions = host.launches.length;
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe("complete");
+    expect(host.launches.slice(admissions).map(call => call.key)).toEqual(cut === "before-publication"
+      ? [checkoutKey, "invoke-human-1.l1.finishDrain"] : [`${complianceKey}.closing-replay.r1`]);
+    expect(checkouts()).toEqual([checkoutKey]);
+    if (publication) expect(storedRows(host).find(row => row.seq === publication.seq)).toEqual(publication);
+    const native = host.native.get(checkoutKey)!;
+    expect(native).toMatchObject({ runId: `native-${checkoutKey}`, asyncDir: `/native/async/${checkoutKey}`,
+      externalAdapter: { outputArtifacts: {
+        stdoutPath: `/native/async/${checkoutKey}/stdout.log`, stderrPath: `/native/async/${checkoutKey}/stderr.log`,
+      } } });
+    expect(host.history()[0].observation.checkout).toEqual(host.history()[0].candidate);
     expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
-    expect(host.current().ledger.count).toBe(2);
-    expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(cut === "receipt" ? 4 : 1);
+    expect(host.current().action).toEqual({ kind: "terminal" });
   });
 
-  test.each(["validated", "recovered"])("%s closing evidence after a save cut cannot certify a changed checkout", async mode => {
+  test.each(["admitted", "unadmitted"])("%s closing evidence after a save cut cannot certify a changed checkout", async mode => {
     const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(1);
-    cutAt(host, value => mode === "validated" ? !!value.loop?.closing :
-      value.loop?.observation?.stage === "receipt");
-    expect((await host.execute()).status).toBe("partial");
-    const retained = host.history()[0];
-    expect(retained.closing).toBeUndefined();
-    expect(!!retained.observation.validated).toBe(mode === "validated");
-    const originalCandidate = copy(retained.candidate);
+    const key = "invoke-human-1.l1.checkout";
+    if (mode === "admitted") cutAt(host, value => value.action.kind === "terminal");
+    else cutAfterOriginal(host, key);
+    const output = await host.execute();
+    expect(output.status).toBe("partial");
+    expect(output.reason).toContain("Essential persistence failed");
+    expect(host.current().loop.outcome).toBeNull();
+    const published = storeTipRows(host).reverse().find(row => row.kind === "ledger")!;
+    expect(published).toBeDefined();
+    expect(storedRows(host).some(row => row.digest === published.digest)).toBe(mode === "admitted");
+    const originalCandidate = copy(host.observedCandidate());
+    const admissions = host.launches.length;
     host.setFailSave(); host.changeCheckout();
+    expect(host.observedCandidate()).not.toEqual(originalCandidate);
     const resumed = await host.execute();
     expect(resumed.status).toBe("partial");
     expect(resumed.loopsConsumed).toBe(1);
     expect(resumed.maxLoops).toBe(1);
     expect(host.history()).toHaveLength(1);
-    expect(host.history()[0]).toMatchObject({ outcome: "gaps",
-      invalidated: "candidate-changed-after-close",
-      closing: { candidate: originalCandidate, sameCandidate: false, resumeCandidate: host.observedCandidate() } });
+    expect(host.history()[0].observation.checkout).toEqual(originalCandidate);
+    expect(storedRows(host).find(row => row.seq === published.seq)).toEqual(published);
     expect(resumed.loopReport.reason).toContain("Candidate changed");
-    expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(mode === "validated" ? 1 : 3);
+    expect(resumed.loopReport.verification.compliance.status).toBe("stale");
+    expect(host.launches.slice(admissions).map(call => call.key)).toEqual(["invoke-human-1.l1.compliance.closing-replay.r1"]);
+    expect(host.launches.filter(call => call.agent === "pitako.checkout-observer").map(call => call.key)).toEqual([key]);
   });
 
   test.each(["missing", "wrong-workspace", "oversized", "producer-conflict", "active"])(
     "save-cut replay reconciles %s evidence and preserves current native barriers", async mode => {
       const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
-      cutAt(host, value => !!value.loop?.closing);
-      expect((await host.execute()).status).toBe("partial");
+      const checkoutKey = "invoke-human-1.l1.checkout", replayKey = "invoke-human-1.l1.compliance.closing-replay.r1";
+      cutAfterOriginal(host, checkoutKey);
+      expect((await host.execute()).reason).toContain("Essential persistence failed");
+      const retained = copy(host.current()), published = storeTipRows(host).reverse().find(row => row.kind === "ledger");
+      expect(published).toBeDefined();
+      expect(storedRows(host).some(row => row.digest === published!.digest)).toBe(false);
       host.setFailSave();
-      const intention = host.history()[0].observation;
-      expect(intention.validated.checkout).toEqual(host.history()[0].candidate);
-      if (mode === "missing") delete intention.validated;
-      if (mode === "wrong-workspace") intention.validated.root = "/other";
-      if (mode === "oversized") intention.validated.extra = "x".repeat(61441);
-      host.setStatus(ref => ({ ok: true, runId: mode === "producer-conflict" ? "another-run" : ref,
-        results: [], output: `Run: ${ref}\nState: ${mode === "active" ? "running" : "complete"}` }));
+      host.setStatus(ref => {
+        const actual = copy(host.native.get(ref) ?? { ok: false, results: [] });
+        if (ref !== checkoutKey && ref !== host.native.get(checkoutKey)!.runId) return actual;
+        return { ...actual, ...(mode === "producer-conflict" ? { key: "invoke-human-1.l2.checkout" } : {}),
+          results: [], output: `Run: ${actual.runId}\nState: ${mode === "active" ? "running" : "complete"}` };
+      });
+      host.setLaunchRespond(async (request, normal) => {
+        const result = await normal();
+        if (request.key !== replayKey) return result;
+        if (mode === "wrong-workspace") {
+          const receipt = JSON.parse(result.output!);
+          receipt.P.prompt.closing.body.observation.root = "/other";
+          result.output = JSON.stringify(receipt);
+        }
+        if (mode === "oversized") result.output = JSON.stringify({ ...JSON.parse(result.output!), padding: "x".repeat(61441) });
+        return result;
+      });
+      const count = host.launches.length;
       const resumed = await host.execute();
       if (mode === "missing") {
-        expect(resumed.status).toBe("complete");
-        expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(2);
-        expect(host.records()).toHaveLength(2);
-        return;
+        expect(resumed.status, resumed.reason).toBe("complete");
+        expect(host.launches.slice(count).map(call => call.key)).toEqual([replayKey]);
+        expect(storedRows(host).find(row => row.seq === published!.seq)).toEqual(published);
+        expect(host.history()[0].observation.checkout).toEqual(host.history()[0].candidate);
+      } else {
+        expect(resumed.status).toBe("blocked");
+        expect(resumed.reason).toContain(mode === "producer-conflict" ? "producer identity changed" :
+          mode === "active" ? "native management activity" :
+            mode === "oversized" ? "Execute replay has no terminal receipt" : "Invalid closing replay workspace evidence");
+        expect(host.launches.slice(count).map(call => call.key)).toEqual(
+          ["active", "producer-conflict"].includes(mode) ? [] : [replayKey]);
+        expect(host.current()).toEqual(retained);
+        expect(host.history()).toEqual([]);
       }
-      expect(resumed.status).not.toBe("complete");
-      expect(resumed.reason).toContain(mode === "producer-conflict" ? "producer identity changed" :
-        mode === "active" ? "native management activity" :
-        "Invalid retained closing evidence");
-      expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(1);
-      expect(host.history()[0].outcome).toBeUndefined();
+      expect(host.launches.filter(call => call.agent === "pitako.checkout-observer").map(call => call.key)).toEqual([checkoutKey]);
     });
 
   test("an unavailable completion is retried against the ledger rather than halted", async () => {
     const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
-    cutAt(host, value => value.loop?.observation?.stage === "receipt");
-    expect((await host.execute()).status).toBe("partial");
-    host.setFailSave(); host.native.clear();
-    expect((await host.execute()).status).toBe("complete");
-    expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(4);
-    expect(host.statusCalls).toContain("invoke-human-1.l1.checkout.r2");
+    const key = "invoke-human-1.l1.checkout";
+    cutAfterOriginal(host, key);
+    expect((await host.execute()).reason).toContain("Essential persistence failed");
+    const original = host.launches.find(call => call.key === key)!;
+    const publication = storeTipRows(host).reverse().find(row => row.kind === "ledger")!;
+    expect(host.records()).toEqual([]);
+    host.setFailSave();
+    const runId = host.native.get(key)!.runId!;
+    host.setStatus(ref => ref === key || ref === runId ? { ok: true, state: "unknown" } : copy(host.native.get(ref)!));
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.reason).toBe("complete");
+    expect(host.launches.filter(call => call.agent === "pitako.checkout-observer")).toEqual([original, original]);
+    expect(host.statusCalls).toContain(runId);
+    expect(storedRows(host).find(row => row.seq === publication.seq)).toEqual(publication);
     expect(host.current().loop.outcome).toBe("complete");
     expect(host.records()).toHaveLength(2);
   });
@@ -3726,14 +3970,16 @@ describe("native closing observations", () => {
         if (mode === "partial-terminal") result.terminalOutcome = { state: "partial", reason: "timeout" };
         return result;
       });
+      const output = await host.execute();
+      expect(output.status).not.toBe("complete");
+      expect(host.current().loop.outcome).toBeNull();
+      // The controlled observer can commit before its native response is
+      // damaged. The root must not admit that close into its cursor head.
+      expect(host.history()).toEqual([]);
+      const calls = copy(host.launches);
       expect((await host.execute()).status).not.toBe("complete");
-      expect(host.history()[0].closing).toBeUndefined();
-      expect(host.history()[0].outcome).toBeUndefined();
-      const calls = host.calls.length;
-      expect((await host.execute()).status).not.toBe("complete");
-      const barriers = ["running", "rejected", "stopped"];
-      expect(host.calls).toHaveLength(calls + (barriers.includes(mode) ? 0 : 2));
-      expect(host.current().loop.outcome).toBeUndefined();
+      expect(host.launches).toEqual(calls);
+      expect(host.current().loop.outcome).toBeNull();
       expect(host.records()).toHaveLength(0);
     });
 
@@ -3745,8 +3991,12 @@ describe("native closing observations", () => {
     });
     const output = await host.execute();
     expect(output.status).toBe("partial"); expect(output.reason).toContain("2/2 used");
-    expect(host.history()[0].observation).toMatchObject({ stage: "intention", failure: { reason: "Active async run capacity exhausted: 2/2 used." } });
-    expect(host.history()[0].observation.ref).toBeUndefined();
-    expect(host.history()[0].closing).toBeUndefined();
+    const key = "invoke-human-1.l1.checkout";
+    expect(output.loopReport.halt).toMatchObject({ code: "capacity",
+      reason: "Active async run capacity exhausted: 2/2 used.", ref: { key } });
+    expect(output.loopReport.halt.ref.runId).toBeUndefined();
+    expect(host.current().inFlight.some((ref: any) => ref.key === key)).toBe(false);
+    expect(host.native.has(key)).toBe(false);
+    expect(host.history()).toEqual([]);
   });
 });

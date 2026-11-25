@@ -5,12 +5,14 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
-import { apply, backlogPath, boardView, currentHumanPostIds, gate, metricBefore, parseMetric, prepare, readBacklog, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type Progress, type Task } from "../skills/execute/loop.ts";
+import { apply, backlogPath, boardView, currentHumanPostIds, gate, metricBefore, parseMetric, prepare, readBacklog, readTaskGateWire, readWorkerOriginal, runCommand, topicOwner, updateProgress, validateBacklog, type Backlog, type GateInput, type GateReceipt, type Progress, type Task } from "../skills/execute/loop.ts";
 import { openBoard, viewEntry, BINDING_BAND_BYTES, GATE_RESERVE, viewBudget } from "../extensions/board/store.ts";
 import { recordContextPeak, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
+import { MAX_GATE_LOG_BYTES, PitakoStore } from "../extensions/pitako-store.ts";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
+import { childResponse } from "./fixtures/plan-execute-composition.ts";
 
 const { canonicalDigest } = createRequire(import.meta.url)("../extensions/canonical.mjs") as { canonicalDigest(value: unknown): string };
 
@@ -37,8 +39,22 @@ function initial(root: string, tasks = [task()]) {
   return { root, specId: "example", expectedDigest: null, key: "first", invocation: "exec1", loop: 1, authority,
     acceptance: [{ id: "full", command: "true", cwd: "." }], director: { select: tasks[0]!.id, reason: "Most important", changes: tasks.map(t => ({ kind: "add" as const, task: t, reason: "From spec" })) } };
 }
-function attempt(f: ReturnType<typeof fixture>, overrides: Partial<GateInput> = {}): GateInput {
-  return { ...f, invocation: "exec1", loop: 1, attempt: 1, key: "attempt1", task: task(), workerStatus: "complete", writerSettled: true, ...overrides };
+function attempt(f: ReturnType<typeof fixture>, overrides: Partial<GateInput> & { knowledge?: unknown } = {}): GateInput {
+  const { knowledge, ...options } = overrides;
+  const input: GateInput = { ...f, invocation: "exec1", loop: 1, attempt: 1, key: "attempt1", task: task(), workerStatus: "complete", writerSettled: true, ...options };
+  if (knowledge !== undefined || input.checkpoint) {
+    const checkpoint = input.checkpoint ?? { version: 2, key: input.key, taskId: input.task.id,
+      attempt: input.attempt, loop: input.loop, cursor: 0, phase: "implementation", planRef: null,
+      association: { root: f.root, commonDir: path.join(f.root, ".git"), missionId: "mission",
+        missionPath: path.join(f.root, ".pi/mission.json"), invocation: input.invocation,
+        source: path.join(f.root, "spec.md"), digest: authority.specDigest, maxCycles: 15, sourceRefs: [] } } satisfies CheckpointIntent;
+    const native = childResponse(checkpoint.key, { agent: "pitako.worker",
+      extensionBindings: { "pitako.checkpoint/1": checkpoint } }, { root: f.root }, undefined, 1,
+      { status: input.workerStatus, work: "Settled attempt", remaining: [], ...(knowledge !== undefined ? { knowledge } : {}) });
+    input.checkpoint = checkpoint;
+    input.worker = { key: checkpoint.key, runId: native.runId };
+  }
+  return input;
 }
 
 test("backlog schema errors name the file, preserve bytes and never repair human edits", () => {
@@ -53,6 +69,11 @@ test("backlog schema errors name the file, preserve bytes and never repair human
     { ...applied.backlog, tasks: [{ ...task(), history: Array(9).fill({ invocation: "e", loop: 1, event: "add", reason: "spec" }) }] }]) {
     expect(() => validateBacklog(bad)).toThrow();
   }
+  const tooMany = structuredClone(applied.backlog);
+  tooMany.tasks[0]!.gates = Array.from({ length: 17 }, (_, index) => ({
+    ...applied.backlog.tasks[0]!.gates[0]!, id: `gate${index}`,
+  }));
+  expect(() => validateBacklog(tooMany)).toThrow(`Task ${tooMany.tasks[0]!.id} has 17 gates; maximum is 16`);
 });
 
 test.each(["spec", "director", "final-phase", "human"] as const)("new %s origins enforce a UTF-8 byte cap", kind => {
@@ -258,8 +279,8 @@ test("metric uses the final nonempty stdout line regardless of exit code; counts
   for (const bad of ["", "\nNaN\n", "Infinity", "1\nno value"]) expect(parseMetric(bad)).toBeNull();
   const f = fixture(); const measured = { ...task(), metric: { command: "printf 'noise\\n0\\n\\n'; exit 1", unit: "errors", target: 0 } };
   const receipt = await gate(attempt(f, { task: measured, workerStatus: "continue" }));
-  expect(receipt.metric).toEqual({ value: 0, error: null }); expect(receipt.gates).toEqual([]);
-  const trailing = await runCommand(f.root, { id: "stdout", command: "printf '2\\n'; head -c 5000 /dev/zero | tr '\\0' '\\n'", cwd: ".", timeoutMs: 1000 }, path.join(f.root, ".pi/stdout.log"));
+  expect(receipt.metric).toEqual({ value: 0, error: null, logRef: expect.any(String) }); expect(receipt.gates).toEqual([]);
+  const trailing = await runCommand(f.root, { id: "stdout", command: "printf '2\\n'; head -c 5000 /dev/zero | tr '\\0' '\\n'", cwd: ".", timeoutMs: 1000 }, new PitakoStore(f.root));
   expect(parseMetric(trailing.stdout)).toBe(2);
   const sample = (value: number | null) => ({ value, fingerprint: "a".repeat(64), gatesPassed: 0, gatesTotal: 1 });
   let progress = updateProgress(empty, sample(18), 0); progress = updateProgress(progress, sample(8), 0);
@@ -376,10 +397,10 @@ test("gate classifies failures/errors, detects product mutation, ignores metadat
   const receipt = await gate(attempt(f, { task: t, knowledge: { findings: false, handoff: 42 } }));
   expect(receipt.gates.map(g => g.status)).toEqual(["pass", "fail", "error", "pass", "pass"]);
   expect(receipt.gates[1]!.exit).toBe(7); expect(receipt.mutated).toBe(true); expect(receipt.progress.nonImproving).toBe(1);
-  expect(statSync(receipt.gates[4]!.logRef).size).toBe(8 * 1024 * 1024);
+  expect(new PitakoStore(f.root).readBlob(receipt.gates[4]!.logRef)).toMatchObject({size: MAX_GATE_LOG_BYTES, originalSize: 9000000, truncated: true});
   for (const g of receipt.gates) expect(Buffer.byteLength(g.tail)).toBeLessThanOrEqual(2048);
   expect(Buffer.byteLength(JSON.stringify(receipt) + "\n")).toBeLessThanOrEqual(8192);
-  expect(readFileSync(receipt.gates[1]!.logRef, "utf8")).toBe("failure");
+  expect(new PitakoStore(f.root).readBlob(receipt.gates[1]!.logRef).bytes.toString("utf8")).toBe("failure");
   const ignored = await gate(attempt(f)); expect(ignored.mutated).toBe(false);
   let stalledTask = { ...task(), gates: [{ id: "fail", command: "false", cwd: ".", timeoutMs: 1000 }] };
   for (let i = 1; i <= 3; i++) {
@@ -395,7 +416,7 @@ test("a timed-out command kills its grandchild group and still produces a receip
   t.gates = [{ id: "timeout", command: "sleep 100 & child=$!; printf '%s\\n' \"$child\"; wait", cwd: ".", timeoutMs: 100 }];
   const receipt = await gate(attempt(f, { task: t })); expect(receipt.gates[0]!.status).toBe("timeout");
   expect(receipt.progress.nonImproving).toBe(1);
-  const pid = Number(readFileSync(receipt.gates[0]!.logRef, "utf8").trim()); expect(pid).toBeGreaterThan(0);
+  const pid = Number(new PitakoStore(f.root).readBlob(receipt.gates[0]!.logRef).bytes.toString("utf8").trim()); expect(pid).toBeGreaterThan(0);
   // A reparented zombie is settled, not a surviving running command.
   let state = ""; try { state = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1]!.split(" ")[0]!; } catch (error) { expect((error as NodeJS.ErrnoException).code).toBe("ENOENT"); }
   expect(["", "Z"]).toContain(state);
@@ -462,9 +483,8 @@ test("SIGTERM to the real loop-io gate kills its background grandchild", async (
         catch (error) { if ((error as NodeJS.ErrnoException).code !== "ESRCH") throw error; }
         released = settled(shellPid) && settled(grandchildPid);
       } else {
-        // After producer close, an absent command log proves runCommand never
-        // reached spawn (it opens this log first). Otherwise retain the root.
-        released = !existsSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1.gate/0.log"));
+        // Without command PIDs, only an unreserved gate proves no spawn.
+        released = !existsSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1.gate"));
       }
     } finally {
       if (!released) {
@@ -482,8 +502,8 @@ test.each(["prepare", "apply", "gate", "invalid"])("Node stdin adapter loads Boa
     const topic = (await prepare(f)).view.topicId, board = await openBoard(f.dbPath);
     try { board.post(repositoryIdentity(f.root), { topicId: topic, type: "DECISION", content: "Keep é and 日本語" }); }
     finally { board.close(); }
-    const prepared = invoke(operation === "prepare" ? { operation, ...f } : { operation, ...initial(f.root), dbPath: f.dbPath });
-    expect(prepared.status).toBe(0);
+    const prepared = invoke(operation === "prepare" ? { operation, invocation: "exec1", key: "prepare", ...f } : { operation, ...initial(f.root), dbPath: f.dbPath });
+    expect(prepared.status, prepared.stdout + prepared.stderr).toBe(0);
     const receipt = JSON.parse(prepared.stdout.trim());
     expect(receipt.view.topicId).toBeGreaterThan(0);
     expect(receipt).not.toHaveProperty("backlog");
@@ -496,7 +516,9 @@ test.each(["prepare", "apply", "gate", "invalid"])("Node stdin adapter loads Boa
     const lines = receipt.stdout.trim().split("\n"); expect(lines).toHaveLength(1); expect(Buffer.byteLength(receipt.stdout)).toBeLessThanOrEqual(8192);
     expect(JSON.parse(lines[0]!).gates[0].status).toBe("pass");
   } else {
-    const invalid = invoke({ operation: "prepare", ...f, root: tmpdir() }); expect(invalid.status).toBe(1); expect(invalid.stdout).toContain("actual cwd");
+    const invalid = invoke({ operation: "prepare", ...f, root: tmpdir() });
+    expect(invalid.status).toBe(1);
+    expect(JSON.parse(invalid.stdout)).toMatchObject({ code: "wrong-cwd" });
   }
 });
 
@@ -822,7 +844,7 @@ test.each(["identical", "candidate", "command", "cwd", "timeoutMs", "id", "new-i
     expect(readFileSync(path.join(f.root, "cache/runs"), "utf8")).toBe("run\n");
   } else {
     expect(next.reused).toBeUndefined();
-    expect(next.gates[0]!.logRef).not.toBe(first.gates[0]!.logRef);
+    expect(new PitakoStore(f.root).readBlob(next.gates[0]!.logRef).originalSize).toBeDefined();
     if (mode !== "cwd") expect(readFileSync(path.join(f.root, "cache/runs"), "utf8")).toBe("run\nrun\n");
   }
 });
@@ -882,6 +904,28 @@ test("shared binding band rejects prepare overflow and leaves room for the gate 
   expect(viewBudget(GATE_RESERVE)).toBe(6143);
   const f = fixture(), prepared = await prepare(f), board = await openBoard(f.dbPath);
   const workspace = repositoryIdentity(f.root), topicId = prepared.view.topicId;
+  fake!.set(f.root, ["rev-parse", "HEAD", "--abbrev-ref", "HEAD"], { stdout: `${"a".repeat(64)}\nmain\n`, stderr: "", status: 0 });
+  const input = attempt(f, { key: "attempt1.gate" });
+  // Gate IDs have no maximum in the backlog schema. Include long escaped IDs
+  // whose inline copies alone would consume more than the entire reserve.
+  input.task.gates = Array.from({ length: 16 }, (_, i) => ({
+    id: `gate-${i}-${"\u0001é".repeat(128)}`, command: `printf ${i}`, cwd: ".", timeoutMs: 2147483647,
+  }));
+  input.task.progress = { stalls: Number.MAX_SAFE_INTEGER, nonImproving: Number.MAX_SAFE_INTEGER - 1,
+    last5: Array.from({ length: 5 }, (_, i) => ({ fingerprint: `${i}`.repeat(64),
+      value: -2.2250738585072014e-308, best: -2.2250738585072014e-308,
+      gatesPassed: Number.MAX_SAFE_INTEGER, gatesTotal: Number.MAX_SAFE_INTEGER })) };
+  input.task.metric = { command: "true", unit: "count", target: 1 };
+  const launchGate = (request: GateInput) => {
+    const result = spawnSync(process.execPath, ["--preload", gitFakeBootstrap, path.resolve("skills/execute/loop-io.mjs")], {
+      cwd: f.root, input: JSON.stringify({ operation: "gate", ...request }), encoding: "utf8",
+    });
+    expect(result.status, result.stdout + result.stderr).toBe(0);
+    // The worker-backed operation adds a store projection outside the gate view budget.
+    const { head, P, storeId, ...wire } = JSON.parse(result.stdout);
+    expect(Buffer.byteLength(JSON.stringify(wire))).toBeLessThanOrEqual(viewBudget(0));
+    return readTaskGateWire(wire, request.task.gates);
+  };
   try {
     const base = board.post(workspace, { topicId, type: "DECISION", content: "x" });
     const prototype = { ...base, id: base.id + 1, metadata: { supersedes: base.id } };
@@ -889,9 +933,39 @@ test("shared binding band rejects prepare overflow and leaves room for the gate 
     const binding = board.post(workspace, { topicId, type: "DECISION", content: "x".repeat(padding + 1), metadata: prototype.metadata });
     expect(Buffer.byteLength(JSON.stringify([viewEntry(binding)]))).toBe(BINDING_BAND_BYTES);
     expect((await prepare(f)).view.posts).toEqual([viewEntry(binding)]);
-    const receipt = await gate(attempt(f));
-    expect(receipt.view.posts).toEqual([viewEntry(binding)]);
-    expect(Buffer.byteLength(JSON.stringify(receipt) + "\n")).toBeLessThanOrEqual(8192);
+    const fresh = launchGate(input);
+    expect(fresh.view.posts).toEqual([viewEntry(binding)]);
+    const store = new PitakoStore(f.root), scope = "exec:exec1.e0";
+    const original = store.readRecords(scope).records.find(row => row.opKey === "gate:attempt1.gate")!;
+    const { receiptDigest, ...body } = original.body as GateReceipt & { receiptDigest: string; identity: { attemptKey: string } };
+    expect(canonicalDigest(body)).toBe(receiptDigest);
+    expect(fresh.gates).toEqual(body.gates.map(g => ({ ...g, tail: "" })));
+    expect(body.gates.map(g => g.tail)).toEqual(input.task.gates.map((_, i) => String(i)));
+    expect(fresh.progress).toEqual(body.progress);
+    for (const [i, result] of fresh.gates.entries())
+      expect(store.readBlob(result.logRef).bytes.toString()).toBe(String(i));
+
+    // Exercise maximal result fields without waiting for real timeouts. Seed a
+    // verified diagnostic at a second key; the real gate path must replay it.
+    const replayInput = attempt(f, { ...input, attempt: 2, key: "maximal", knowledge: {} });
+    const contextPeak = Number.MAX_SAFE_INTEGER;
+    recordContextPeak(replayInput.checkpoint!, contextPeak);
+    const workerOriginal = readWorkerOriginal(replayInput, false).reference;
+    const metric = { value: null, logRef: body.metric!.logRef,
+      error: `Metric timeout: no finite value; ${body.metric!.logRef}` };
+    const max = { ...body, identity: { ...body.identity, attemptKey: replayInput.key,
+      workerOriginalDigest: canonicalDigest(workerOriginal) },
+      gates: body.gates.map(g => ({ ...g, status: "timeout", exit: 255, ms: 17280000000000000, tail: "" })),
+      workerOriginal, metric, contextPeak };
+    expect(store.commit(scope, store.readRecords(scope).head, "gate:maximal.gate", canonicalDigest(max.identity),
+      () => ({ kind: "gate", body: { ...max, receiptDigest: canonicalDigest(max) } })).outcome).toBe("appended");
+    const replay = launchGate({ ...replayInput, key: "maximal.gate.r1" });
+    expect(replay.view.posts).toEqual([viewEntry(binding)]);
+    expect(replay.gates).toEqual(max.gates);
+    expect(replay.progress).toEqual(max.progress);
+    expect(replay.contextPeak).toBe(contextPeak);
+    expect(replay.metric).toEqual(metric);
+    expect(store.readRecords(scope).records.filter(row => row.kind === "gate")).toHaveLength(2);
     const overflow = board.post(workspace, { topicId, type: "DECISION", content: binding.content + "x", metadata: { supersedes: binding.id } });
     expect(Buffer.byteLength(JSON.stringify([viewEntry(overflow)]))).toBeGreaterThan(BINDING_BAND_BYTES);
     expect(Buffer.byteLength(JSON.stringify([viewEntry(overflow)]))).toBeLessThan(8192);
@@ -928,7 +1002,8 @@ test("gate receipt carries the attempt's durable context peak, or explicit absen
   recordContextPeak(checkpoint, 1200); recordContextPeak(checkpoint, 800); recordContextPeak(checkpoint, 1500);
   const receipt = await gate(attempt(f, { checkpoint }));
   expect(receipt.contextPeak).toBe(1500);
-  expect(JSON.parse(readFileSync(path.join(f.root, ".pi/subagents/execute/exec1/gates/attempt1.gate/receipt.json"), "utf8")).contextPeak).toBe(1500);
+  expect(new PitakoStore(f.root).readRecords("exec:exec1.e0").records.find(row => row.opKey === "gate:attempt1.gate")?.body)
+    .toMatchObject({contextPeak: 1500});
   const next = { ...checkpoint, key: "worker-next", attempt: 2 };
   expect((await gate(attempt(f, { checkpoint: next, attempt: 2, key: "next-gate" }))).contextPeak).toBeNull();
 });

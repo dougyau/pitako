@@ -1,10 +1,13 @@
 import { expect, test } from "bun:test";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
 import path from "node:path";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
-import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { executeControllerFixture, nativeRunId } from "./fixtures/execute-workflow.ts";
 import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
+import { executeStore } from "../skills/execute/ledger.mjs";
+import { readExecuteIntentContext } from "../extensions/execute-intent.ts";
+import { canonicalDigest, canonicalJSON } from "../extensions/canonical.mjs";
+import { checkoutEvidence } from "../extensions/spec-plans.ts";
 
 const composition = realCheckoutCompositionFixture();
 const scripts = composition.scripts;
@@ -26,9 +29,16 @@ test("an incomplete attempt keeps grouped close and a folded baseline before rev
   expect(output.status, output.reason).toBe("partial");
   const workersCalls = host.launches.filter(call => call.agent === "pitako.worker");
   expect(workersCalls[1]!.task).toContain('"attempt":2');
-  const second = host.snapshots.find(state => state.loop?.attempt?.number === 2 && state.loop.attempt.checkpoint);
-  expect(second!.loop.attempt.checkpoint.progress.admitted.change1).toEqual(["continue"]);
-  expect(second!.loop.attempt.checkpoint.progress.previous).toBeNull();
+  const second = host.snapshots.find(state => state.loop?.attempt?.number === 2 && state.loop.attempt.intent);
+  const { intent } = readExecuteIntentContext(host.root, second);
+  expect(intent.progress!.admitted.change1).toEqual(["continue"]);
+  expect(intent.progress!.previous).toBeNull();
+  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io")) {
+    const input = JSON.parse(call.task), gate = input.operation === "close" ? input.gate : input.operation === "gate" ? input : null;
+    if (!gate?.checkpoint) continue;
+    expect(gate).not.toHaveProperty("knowledge");
+    expect(gate.worker).toEqual({ key: gate.checkpoint.key, runId: nativeRunId(gate.checkpoint.key) });
+  }
 });
 
 test("an observed no-journal pause keeps the previous unit in its next baseline", async () => {
@@ -41,9 +51,10 @@ test("an observed no-journal pause keeps the previous unit in its next baseline"
   });
   const output = await host.execute();
   expect(output.status, output.reason).toBe("partial");
-  const second = host.snapshots.find(state => state.loop?.number === 2 && state.loop.attempt?.number === 2 && state.loop.attempt.checkpoint);
-  expect(second!.loop.attempt.checkpoint.progress.admitted.change2).toEqual(["continue"]);
-  expect(second!.loop.attempt.checkpoint.progress.previous).toMatchObject({ taskId: "change1", attempt: 1 });
+  const second = host.snapshots.find(state => state.loop?.number === 2 && state.loop.attempt?.number === 2 && state.loop.attempt.intent);
+  const { intent } = readExecuteIntentContext(host.root, second);
+  expect(intent.progress!.admitted.change2).toEqual(["continue"]);
+  expect(intent.progress!.previous).toMatchObject({ taskId: "change1", attempt: 1 });
   // Measured zero controller processes + one shared runtime, plus two.
   expectProcessBudget([host.processes(), composition.processes()], 3);
 });
@@ -69,7 +80,7 @@ test.each(["step-order", "seal-kind", "after-candidate", "baseline-variant", "re
     return response;
   });
   expect((await host.execute()).status).toBe("blocked");
-  expect(host.current().lastConfirmed).toBeNull();
+  expect(host.records().filter((entry: any) => entry.kind === "unit")).toEqual([]);
   expect(host.launches.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
 });
 
@@ -99,9 +110,19 @@ test("capacity and positive activity prevent grouped redispatch", async () => {
   expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close")).toHaveLength(1);
 });
 
-test.each([false, true])("workflow admits actual grouped CLI projections and drains linked intentions (continuation: %s)", continuation => composition.ownWorkflow(async () => {
+async function groupedScenario(continuation: boolean, uninterrupted?: { root: string; launches: any[] }) {
   const host = fixture(undefined, { realCheckout: true });
   host.setLimit(1);
+  const storedInputs = new Map<string, any>();
+  host.setSaveObserver(() => {
+    const value = host.current();
+    const pending = value.action;
+    if (pending.kind === "pending" && ["advance", "selection", "close"].includes(pending.op))
+      storedInputs.set(pending.opKey, { operation: pending.op, key: pending.opKey,
+        root: value.root, invocation: value.invocation, storeId: value.storeId,
+        scope: `exec:${value.invocation}.e${value.epoch}`, expectedHead: value.head,
+        refs: { input: pending.input } });
+  });
   let workers = 0;
   host.setRespond((request, normal) => {
     const result = normal();
@@ -114,35 +135,60 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
     return result;
   });
   const entry = path.resolve("skills/execute/loop-io.mjs");
+  const metadata = { ...scripts, root: host.root, missionPath: path.join(host.root, ".pi/native-mission.json") };
+  const closeKey = "invoke-human-1.l1.t1.a1.close";
+  let replayedClose = false;
   host.setLaunchRespond(async (request, normal) => {
     if (request.agent === "pitako.checkpoint-sealer" ||
         request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
-      return scripts.runDeterministic(request.key, request, { ...scripts, root: host.root, inlineSealer: true }, undefined);
+      return scripts.runDeterministic(request.key, request, { ...metadata, inlineSealer: true }, undefined);
     if (request.agent !== "pitako.loop-io") return normal();
     const input = JSON.parse(request.task), dbPath = path.join(host.root, ".pi/board.db");
     if (!["advance", "selection", "close", "drain"].includes(input.operation)) return normal();
+    const originalClose = request.key === `${closeKey}.r1` ? host.native.get(closeKey) : null;
+    const retained = executeStore(host.root, "human-1");
+    const before = originalClose ? { checkout: checkoutEvidence(host.root),
+      ledger: canonicalJSON(host.records()), head: retained.store.readRecords(retained.scope).head } : null;
     for (const name of ["prepare", "apply", "gate"]) if (input[name]) input[name].dbPath = dbPath;
     for (const intention of input.intentions ?? []) if (intention.operation === "apply") intention.input.dbPath = dbPath;
-    // Keep stdin/stdout CLI coverage for advance and close, not a cold loader for every drain.
+    // Exercise stdin/stdout on advance and on both sides of the close cut.
+    // The uninterrupted close control uses the same operations in the warm fixture runtime.
     let observation: [number, string, string] | undefined;
-    if (input.operation === (continuation ? "close" : "advance") && workers <= 1) {
+    if ((!continuation && input.operation === "advance") ||
+        (uninterrupted && (request.key === closeKey || request.key === `${closeKey}.r1`))) {
       const child = Bun.spawn(["node", entry], { cwd: host.root,
-        env: { ...process.env, NODE_COMPILE_CACHE: path.join(host.root, ".pi/node-compile-cache") },
+        env: { ...process.env, PI_CODING_AGENT_DIR: path.join(host.root, ".pi/private-agent"),
+          NODE_COMPILE_CACHE: path.join(host.root, ".pi/node-compile-cache") },
         stdin: "pipe", stdout: "pipe", stderr: "pipe" });
       const lifecycle = composition.checkpointLifecycle(child, value => value);
       child.stdin.write(JSON.stringify(input)); child.stdin.end();
       observation = await lifecycle.result;
     } else {
       const response = await scripts.runDeterministic(request.key, { ...request, task: JSON.stringify(input) },
-        { ...scripts, root: host.root }, undefined);
+        metadata, undefined);
       observation = [response.results[0].exitCode, response.output + "\n", ""];
     }
     expect(observation).toBeDefined();
     const [exit, stdout, stderr] = observation!;
     expect(exit, stdout + stderr).toBe(0);
     const transport = JSON.parse(stdout);
+    if (originalClose) {
+      const original = JSON.parse(originalClose.output!);
+      expect(transport.digest).toBe(original.digest);
+      expect(transport.head).toEqual(original.head);
+      const committed = retained.store.read(retained.scope, original.head);
+      expect(canonicalJSON(transport.P)).toBe(canonicalJSON(committed.P));
+      expect(canonicalDigest(transport.P.prompt.execution.foldedContinuation))
+        .toBe(canonicalDigest(committed.P.prompt.execution!.foldedContinuation));
+      expect(checkoutEvidence(host.root)).toEqual(before!.checkout);
+      expect(canonicalJSON(host.records())).toBe(before!.ledger);
+      expect(retained.store.readRecords(retained.scope).head).toEqual(before!.head);
+      replayedClose = true;
+    }
     expect(Buffer.byteLength(stdout)).toBeLessThanOrEqual(61441);
-    expect(createHash("sha256").update(readFileSync(transport.path)).digest("hex")).toBe(transport.digest);
+    const row = retained.store.readRecords(retained.scope, transport.head).records.at(-1)!;
+    expect(row.kind).toBe("receipt");
+    expect(canonicalDigest(row.body)).toBe(transport.digest);
     const asyncDir = path.join(host.root, ".pi/native-groups", request.key);
     mkdirSync(asyncDir, { recursive: true });
     const stdoutPath = path.join(asyncDir, "stdout.log"), stderrPath = path.join(asyncDir, "stderr.log");
@@ -152,9 +198,65 @@ test.each([false, true])("workflow admits actual grouped CLI projections and dra
       output: stdout.slice(-65536), results: [{ exitCode: exit }] } as any;
   });
   // This case owns the CLI transport; native sandbox dispatch is covered by composition.
-  const output = await host.execute();
+  if (uninterrupted) host.setFailSave(() => host.native.has(closeKey));
+  let output = await host.execute();
+  if (uninterrupted) {
+    expect(output.reason).toContain("Essential persistence failed");
+    expect(host.launches.at(-1)!.key).toBe(closeKey);
+    expect(host.native.get(closeKey)?.ok).toBe(true);
+    const cut = host.launches.length;
+    host.setFailSave();
+    output = await host.execute();
+    const resumed = host.launches.slice(cut);
+    expect(resumed[0]?.key).toBe(`${closeKey}.r1`);
+    expect(JSON.parse(resumed[0]!.task)).toMatchObject({ key: closeKey, operation: "close", refs: { committed: true } });
+    expect(resumed.filter(call => /\.r\d+$/.test(call.key)).map(call => call.key)).toEqual([`${closeKey}.r1`]);
+    expect(replayedClose).toBe(true);
+    const originalIndex = uninterrupted.launches.findIndex(call => call.key === closeKey);
+    const normalize = (calls: any[], root: string) => {
+      const { store, scope } = executeStore(root, "human-1");
+      return canonicalJSON(calls).replaceAll(root, "<root>")
+        .replaceAll(store.readRecords(scope).identity.storeId, "<store-id>")
+        .replace(/[a-f0-9]{64}/g, "<root-bound-digest>");
+    };
+    expect(normalize(resumed.slice(1), host.root))
+      .toBe(normalize(uninterrupted.launches.slice(originalIndex + 1), uninterrupted.root));
+    expect(host.launches).toHaveLength(uninterrupted.launches.length + 1);
+    expect(host.launches.filter(call => call.agent && ["pitako.worker", "pitako.reviewer"].includes(call.agent)).map(call => call.key))
+      .toEqual(uninterrupted.launches.filter(call => call.agent && ["pitako.worker", "pitako.reviewer"].includes(call.agent)).map(call => call.key));
+  }
   expect(output.status, output.reason).toBe("partial");
   expect(output.reason).toContain("1 authorized loops consumed");
   expect(host.records().map((record: any) => record.kind)).toEqual(continuation ? ["spec", "unit", "unit", "loop"] : ["spec", "unit", "loop"]);
-  expect(host.current().intentions).toEqual([]);
+  const { store, scope } = executeStore(host.root, host.current().invocation);
+  const control = store.read(scope, host.current().head).P.control;
+  if (!("finishDrain" in control)) throw new Error("Expected committed final drain.");
+  expect(control.finishDrain).toEqual({
+    key: `invoke-human-1.l1.finishDrain${continuation ? ".v1" : ""}`, generation: continuation ? 1 : 0,
+  });
+  expect(new Set([...storedInputs.values()].map(input => input.operation)))
+    .toEqual(new Set(continuation ? ["advance", "selection", "close"] : ["advance", "selection"]));
+  for (const input of storedInputs.values()) {
+    expect(Object.keys(input).sort()).toEqual([
+      "expectedHead", "invocation", "key", "operation", "refs", "root", "scope", "storeId",
+    ]);
+    const prefix = store.read(scope, input.expectedHead);
+    expect(input.storeId).toBe(prefix.identity.storeId);
+    expect(input.scope).toBe(scope);
+    const row = prefix.records.find(row => row.seq === input.refs.input.seq);
+    expect(row?.digest).toBe(input.refs.input.digest);
+    expect(row?.kind).toBe("operation");
+    const body = row?.body;
+    if (!body || typeof body !== "object" || !("operation" in body) ||
+        !("request" in body) || !body.request || typeof body.request !== "object" || !("key" in body.request))
+      throw new Error("Expected committed operation request.");
+    expect(body.operation).toBe(input.operation);
+    expect(body.request.key).toBe(input.key);
+  }
+  return { root: host.root, launches: host.launches };
+}
+
+test.each([false, true])("workflow admits actual grouped CLI projections and drains linked intentions (continuation: %s)", continuation => composition.ownWorkflow(async () => {
+  const uninterrupted = await groupedScenario(continuation);
+  if (continuation) await groupedScenario(true, uninterrupted);
 }));

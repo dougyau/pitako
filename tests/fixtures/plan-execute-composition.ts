@@ -69,7 +69,7 @@ export function missionFiles(root: string) {
   const missionPath = path.join(root, "native.mission-1.json");
   const statePath = path.join(root, "native.mission-1", "state.json");
   mkdirSync(path.dirname(statePath), { recursive: true });
-  writeFileSync(missionPath, JSON.stringify({ schemaVersion: 1, id: "native.mission-1", title: "Fixture mission" }));
+  writeFileSync(missionPath, JSON.stringify({ schemaVersion: 1, id: "native.mission-1", title: "Fixture mission", cwd: root }));
   return { missionPath, statePath };
 }
 export function resourceWithAgentDir(agentDir: string) {
@@ -84,30 +84,43 @@ export const deterministicScripts = { verifier: path.resolve("extensions/access-
 // Controlled child boundary: actual root/review scripts execute in the native sandbox.
 // Responses implement schemas only; no provider or model obedience is certified.
 export function childResponse(key: string, request: any, metadata: any, checkout: any, completeLoop = 1, suppliedValue?: any): any {
+  const hash = require("node:crypto").createHash("sha256").update(key).digest("hex");
+  const nativeRunId = `${hash.slice(0,8)}-${hash.slice(8,12)}-4${hash.slice(13,16)}-8${hash.slice(17,20)}-${hash.slice(20,32)}`;
   const loop = Number(key.match(/\.l(\d+)\./)?.[1] ?? 1);
   if (request.agent === "pitako.request-observer") return { key, ok: true, agent: request.agent,
-    runId: `native-${key}`, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
+    runId: nativeRunId, artifactPaths: [], output: JSON.stringify({ version: 1, ok: true,
       invocation: JSON.parse(request.task).invocation, requests: [], next: null }), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0, usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] } as WorkflowScriptChildResult;
   if (request.agent === "pitako.access-verifier") {
-    // The real verifier over the actual published originals. Fixture mission
-    // records under /native are relocated beside the owned checkout metadata.
+    // Keep integrated review's verifier and publication on the same native mission.
     const input = JSON.parse(request.task), path = require("node:path"), fs = require("node:fs");
-    const missionPath = path.join(metadata.root, ".pi/subagents/native-missions", path.basename(input.missionPath));
+    const missionPath = metadata.association?.missionPath ?? (fs.existsSync(input.missionPath)
+      ? input.missionPath : path.join(metadata.root, ".pi/subagents/native-missions", path.basename(input.missionPath)));
     fs.mkdirSync(path.dirname(missionPath), { recursive: true });
     // The verifier uses absolute paths; no cold process or cwd change is needed.
     return (async () => {
       const { verifyGate } = await import(require("node:url").pathToFileURL(metadata.verifier ?? path.resolve("extensions/access-receipts.mjs")).href);
-      return { key, ok: true, agent: request.agent, runId: `native-${key}`,
-        output: JSON.stringify(verifyGate({ ...input, missionPath })), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
+      return { key, ok: true, agent: request.agent, runId: nativeRunId,
+        output: JSON.stringify(verifyGate({ ...input, missionPath }, metadata.root ?? process.cwd())), results: [{ index: 0, agent: request.agent!, task: request.task, exitCode: 0,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
     })();
   }
   if (request.agent === "pitako.loop-io") {
     const input = JSON.parse(request.task);
-    if (input.operation === "stateCapacity") return (async () => {
+    if (input.operation === "baseline" || input.operation === "reviewOriginals" && input.invocation) return (async () => {
+      if (process.cwd() !== metadata.root && metadata.runDeterministic)
+        return metadata.runDeterministic(key, request, metadata, checkout);
       const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
-      return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
-        output: JSON.stringify(runtime.stateCapacity(input)), results: [{ exitCode: 0 }] };
+      const { operation, ...params } = input;
+      return { key, ok: true, agent: request.agent, runId: nativeRunId,
+        output: JSON.stringify(await runtime.runOperation(operation, params)), results: [{ exitCode: 0 }] };
+    })();
+    if (input.operation === "gate" && input.refs) return (async () => {
+      const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
+      const { operation, ...stored } = input;
+      const resolved = runtime.resolveStoredGroupedInput(operation, stored);
+      if (resolved.replay) return { key, ok: true, agent: request.agent, runId: nativeRunId,
+        output: JSON.stringify(resolved.replay), results: [{ exitCode: 0 }] };
+      return childResponse(key, { ...request, task: JSON.stringify({ operation, ...resolved }) }, metadata, checkout);
     })();
     if (input.operation === "taskDelta" && process.cwd() !== metadata.root && metadata.runDeterministic)
       return metadata.runDeterministic(key, request, metadata, checkout);
@@ -125,19 +138,26 @@ export function childResponse(key: string, request: any, metadata: any, checkout
           cwd: metadata.root, input: JSON.stringify({ operation, ...params }), encoding: "utf8",
           env: { ...process.env, NODE_COMPILE_CACHE: metadata.root + "/.pi/node-compile-cache" },
         });
-        return { key, ok: command.status === 0, agent: request.agent, runId: `native-${key}`, ...artifacts,
+        return { key, ok: command.status === 0, agent: request.agent, runId: nativeRunId, ...artifacts,
           output: command.stdout, results: [{ exitCode: command.status }] };
       }
       const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO).href);
       try {
-        const reference = operation === "drain" ? await runtime.drain(params, metadata.groupedHooks)
-          : await runtime.grouped(operation, params, metadata.groupedHooks);
-        return { key, ok: true, agent: request.agent, runId: `native-${key}`, ...artifacts,
+        const { executeEpoch, withExecuteStore } = await import(new URL("./ledger.mjs",
+          require("node:url").pathToFileURL(metadata.loopIO)).href);
+        const reference = await withExecuteStore(params.root, params.invocation,
+          () => operation === "drain" ? runtime.drain(params, metadata.groupedHooks)
+            : runtime.grouped(operation, params, metadata.groupedHooks),
+          executeEpoch(params.invocation, params.key ?? params.intent?.key ?? key), params.storeId
+            ? { storeId: params.storeId, expectedHead: params.expectedHead } : undefined);
+        return { key, ok: true, agent: request.agent, runId: nativeRunId, ...artifacts,
           output: JSON.stringify(runtime.receiptTransport(reference)), results: [{ exitCode: 0 }] };
       } catch (error: any) {
-        return { key, ok: false, agent: request.agent, runId: `native-${key}`, ...artifacts, results: [{ exitCode: 1 }],
+        return { key, ok: false, agent: request.agent, runId: nativeRunId, ...artifacts, results: [{ exitCode: 1 }],
           output: JSON.stringify({ error: "loop-io", reason: error.message, selectionRejected: error.selectionRejected === true,
-            replayRejected: error.replayRejected === true, viewOverflow: error.viewOverflow === true }) };
+            ...(error.code ? { code: error.code, recovery: error.recovery } : {}),
+            replayRejected: error.replayRejected === true, viewOverflow: error.viewOverflow === true,
+            ...(error.rejectedDrain ? { rejectedDrain: error.rejectedDrain } : {}) }) };
       }
     })();
     // Reuse actual persistence/Board operations without a Node/TypeScript startup per call.
@@ -147,10 +167,10 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       const runtime = await import(require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")).href);
       const { operation, ...params } = input;
       try {
-        return { key, ok: true, agent: request.agent, runId: `native-${key}`,
-          output: JSON.stringify(runtime.taskDelta(params)), results: [{ exitCode: 0 }] };
+        return { key, ok: true, agent: request.agent, runId: nativeRunId,
+          output: JSON.stringify(await runtime.runOperation(operation, params)), results: [{ exitCode: 0 }] };
       } catch (error: any) {
-        return { key, ok: false, agent: request.agent, runId: `native-${key}`,
+        return { key, ok: false, agent: request.agent, runId: nativeRunId,
           output: JSON.stringify({ error: "loop-io", reason: error.message }), results: [{ exitCode: 1 }] };
       }
     })();
@@ -167,10 +187,10 @@ export function childResponse(key: string, request: any, metadata: any, checkout
         }
         const { backlog, ...receipt } = value;
         if (backlog) receipt.acceptance = backlog.acceptance;
-        return { key, ok: true, agent: request.agent, runId: `native-${key}`,
+        return { key, ok: true, agent: request.agent, runId: nativeRunId,
           output: JSON.stringify(receipt), results: [{ exitCode: 0 }] };
       } catch (error: any) {
-        return { key, ok: false, agent: request.agent, runId: `native-${key}`, results: [{ exitCode: 1 }],
+        return { key, ok: false, agent: request.agent, runId: nativeRunId, results: [{ exitCode: 1 }],
           output: JSON.stringify({ error: "loop-io", reason: error.message, selectionRejected: error.selectionRejected === true }) };
       }
     })();
@@ -178,7 +198,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       const command = require("node:child_process").spawnSync("node", [metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")], {
         cwd: metadata.root, input: JSON.stringify({ ...input, dbPath: metadata.boardPath ?? metadata.root + "/.pi/board.db" }), encoding: "utf8",
       });
-      return { key, ok: command.status === 0, agent: request.agent, runId: `native-${key}`,
+      return { key, ok: command.status === 0, agent: request.agent, runId: nativeRunId,
         output: command.stdout, results: [{ exitCode: command.status }] } as WorkflowScriptChildResult;
     }
     // Controlled command boundary; loop module tests own gate command execution.
@@ -187,12 +207,23 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     })) : [];
     const sample = { value: input.task.metric?.target ?? null, best: input.task.metric?.target ?? null,
       fingerprint: checkout.fingerprint, gatesPassed: gates.length, gatesTotal: input.task.gates.length };
-    return { key, ok: true, agent: request.agent, runId: `native-${key}`,
-      output: JSON.stringify({ before: checkout, after: checkout, mutated: false, gates,
+    let receipt = { before: checkout, after: checkout, mutated: false, gates,
         metric: input.task.metric ? { value: input.task.metric.target, error: null } : null,
         progress: { nonImproving: 0, last5: [...input.task.progress.last5, sample].slice(-5) }, stalled: false,
-        view: { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 } }),
-      results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
+        view: { topicId: 1, authority: "spec and frozen amendments > DECISION > FINDING > HANDOFF; code wins over any map", posts: [], omitted: 0 } };
+    if (metadata.gateReceipt) receipt = metadata.gateReceipt(input, receipt);
+    const response = (value: any) => ({ key, ok: true, agent: request.agent, runId: nativeRunId,
+      output: JSON.stringify(value),
+      results: [{ exitCode: 0 }] } as WorkflowScriptChildResult);
+    if (!input.worker && !input.key?.endsWith(".acceptance.gate")) return response(receipt);
+    return (async () => {
+      const base = require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs"));
+      const runtime = await import(base.href);
+      const { operation, ...params } = input;
+      if (!input.worker) return response(runtime.commitFinalGate(params, receipt));
+      const { readWorkerOriginal } = await import(new URL("./loop.ts", base).href);
+      return response(runtime.commitStoredGate(params, { ...receipt, workerOriginal: readWorkerOriginal(params).reference }));
+    })();
   }
   if (request.agent === "pitako.checkpoint-sealer") {
     const input = JSON.parse(request.task);
@@ -205,23 +236,23 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       require("node:child_process").execFileSync("node", [metadata.sealer ?? require("node:path").resolve("skills/execute/checkpoint.mjs"), "--seal-stdin"], {
         cwd: metadata.root, input: request.task, encoding: "utf8",
       }) : JSON.stringify({ v: 1, kind: input.kind, outcome: "observed", candidate: checkout });
-    return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+    return { key, ok: true, agent: request.agent, runId: nativeRunId, asyncDir: `/native/async/${key}`,
       output,
       externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } },
       results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
   }
   if (request.agent === "pitako.execution-ledger") {
     const pending = JSON.parse(request.task);
-    return { key, ok: true, agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`,
+    return { key, ok: true, agent: request.agent, runId: nativeRunId, asyncDir: `/native/async/${key}`,
       output: JSON.stringify({ count: Math.max(1, pending.expected.count) + 1, head: "c".repeat(64), ...(pending.record.kind === "loop" ? { summaries: [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: pending.record.body.plan?.rejection?.diagnostic ?? "" }] } : {}) }),
       externalAdapter: { outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } },
       results: [{ exitCode: 0 }] } as WorkflowScriptChildResult;
   }
   if (request.agent === "pitako.checkout-observer") {
-    const observation = (ledger: any, summaries: any[]) => ({ key, ok: true,
-    agent: request.agent, runId: `native-${key}`, asyncDir: `/native/async/${key}`, artifactPaths: [],
+    const observation = (ledger: any, summaries: any[], store?: any) => ({ key, ok: true,
+    agent: request.agent, runId: nativeRunId, asyncDir: `/native/async/${key}`, artifactPaths: [],
     output: JSON.stringify({ version: 1, ok: true, ledger, root: metadata.root, commonDir: metadata.commonDir,
-      summaries, checkout: { ...checkout } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
+      summaries, ...(store ? { store } : {}), checkout: { ...checkout } }), results: [{ index: 0, agent: request.agent, task: request.task ?? "", exitCode: 0,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }],
     externalAdapter: {
       adapter: { id: "external-cli", version: 1, executionMode: "one-shot-stdin" },
@@ -231,11 +262,24 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       nonResumableReason: "Fixed one-shot observer", outputArtifacts: { stdoutPath: `/native/async/${key}/stdout.log`, stderrPath: `/native/async/${key}/stderr.log` } } } satisfies WorkflowScriptChildResult);
     if (!request.task) return observation({ count: 2, head: "c".repeat(64) }, [{ loop, status: "gaps", gaps: "", review: "", compliance: "", rejection: "" }]);
     return (async () => {
-      const input = JSON.parse(request.task), { invocation, ...expected } = input.expected;
+      const raw = JSON.parse(request.task);
+      const base = require("node:url").pathToFileURL(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs"));
+      const { resolveClosingPublication } = await import(new URL("./closing.mjs", base).href);
+      const input = raw.input ? resolveClosingPublication(metadata.root, raw) : raw;
+      const { invocation, ...expected } = input.expected;
       const ledgerModule = await import(require("node:url").pathToFileURL(
         require("node:path").join(require("node:path").dirname(metadata.loopIO ?? require("node:path").resolve("skills/execute/loop-io.mjs")), "ledger.mjs")).href);
-      const ledger = ledgerModule.appendLedger(metadata.root, invocation, { expected, ...input.body });
-      return observation(ledger, ledgerModule.loopSummaries(metadata.root, invocation, ledger));
+      const observed = { version: 1, ok: true, root: metadata.root, commonDir: metadata.commonDir, checkout: { ...checkout } };
+      const body = { ...input.body.record.body, observation: observed };
+      const ledger = ledgerModule.appendLedger(metadata.root, invocation, { expected, ...input.body,
+        record: { ...input.body.record, body } });
+      const summaries = ledgerModule.loopSummaries(metadata.root, invocation, ledger);
+      const store = ledgerModule.ledgerProjection(metadata.root, invocation, ledger);
+      if (body.kind === "final") {
+        store.P.control = { ...store.P.control, ledger };
+        store.P.prompt = { ...store.P.prompt, admission: input.admission, closing: { body, summaries } };
+      }
+      return observation(ledger, summaries, store);
     })();
   }
   let value: any;
@@ -269,7 +313,7 @@ export function childResponse(key: string, request: any, metadata: any, checkout
   else if (key.endsWith("director-synthesis")) value = { status: "ready", reason: "No material gaps", memo: "Whole-result analysis",
     dispositions: [], screening: { verdict: "clear", reason: "Current candidate inspected", assessments: [] } };
   else if (key.endsWith(".compliance")) value = { status: loop >= completeLoop ? "fulfilled" : "gaps", reason: "Complete requirement inventory",
-    candidate: checkout, requirements: Array.from({ length: 17 }, (_, index) => ({ id: `criterion-${index + 1}`, source: `spec:criterion-${index + 1}`,
+    candidate: checkout, requirements: Array.from({ length: metadata.requirementCount ?? 17 }, (_, index) => ({ id: `criterion-${index + 1}`, source: `spec:criterion-${index + 1}`,
       reason: "Current source/check evidence", status: loop >= completeLoop ? "fulfilled" : "gap", evidence: ["src/entry.ts:1"], checks: ["/native/check.log"] })) };
   else throw Error(`Unexpected child ${key}`);
   const results: any[] = [];
@@ -280,7 +324,9 @@ export function childResponse(key: string, request: any, metadata: any, checkout
       ? JSON.parse(request.task.split("ESSENTIAL ORIGINALS (data): ")[1].split("\n")[0]) : [];
     for (const entry of required) {
       const original = JSON.parse(fs.readFileSync(entry.results.find((item: any) => item.savedOutputPath).savedOutputPath, "utf8"));
-      if (entry.association.key !== entry.key || entry.delivery !== "complete" || entry.runId !== `native-${entry.key}`)
+      const producerHash = require("node:crypto").createHash("sha256").update(entry.key).digest("hex");
+      const producerId = `${producerHash.slice(0,8)}-${producerHash.slice(8,12)}-4${producerHash.slice(13,16)}-8${producerHash.slice(17,20)}-${producerHash.slice(20,32)}`;
+      if (entry.association.key !== entry.key || entry.delivery !== "complete" || entry.runId !== producerId)
         throw Error("Wrong exact original envelope");
       const path = require("node:path");
       const canonical = new Function(fs.readFileSync(path.resolve(path.dirname(metadata.verifier ?? path.resolve("extensions/access-receipts.mjs")), "../skills/workflow-canonical.js"), "utf8") + ";return canonicalDigest;")();
@@ -299,7 +345,47 @@ export function childResponse(key: string, request: any, metadata: any, checkout
     fs.writeFileSync(structuredOutputPath, JSON.stringify(value));
     results.push({ structuredOutputPath, exitCode: 0 });
   }
-  return { key, ok: true, output: "", runId: `native-${key}`, agent: request.agent ?? "pitako.reviewer", artifactPaths: [], results, structuredOutput: value };
+  const agent = request.agent ?? (key.includes(".review.") ? "pitako.reviewer" : undefined);
+  if (agent === "pitako.worker" || metadata.association &&
+      (agent === "pitako.reviewer" || agent === "pitako.execution-inspector" ||
+        agent === "pitako.execution-director" && metadata.publishDirector)) {
+    const fs = require("node:fs"), path = require("node:path");
+    const intent = agent !== "pitako.worker" ? { association: metadata.association } : request.extensionBindings?.["pitako.checkpoint/1"] ??
+      { association: JSON.parse(request.task.match(/PRE-WRITE CHECKPOINT INTENTION \(not a backup until published\):\n([^\n]+)/)[1]).association };
+    const { missionPath, missionId } = intent.association, runId = agent === "pitako.worker" ? metadata.workerRunId ?? nativeRunId : nativeRunId;
+    const workflowRunId = metadata.workflowRunId ?? (agent !== "pitako.worker" ? require("node:crypto").randomUUID() : undefined);
+    const asyncDir = path.join(metadata.root, ".pi/native-originals", runId);
+    const savedOutputPath = path.join(asyncDir, `${key}.json`);
+    fs.mkdirSync(asyncDir, { recursive: true });
+    fs.writeFileSync(savedOutputPath, JSON.stringify(value));
+    const nativeOutcome = metadata.nativeOutcome?.(key);
+    fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({
+      runId, workflowKey: key, cwd: metadata.root, state: nativeOutcome?.stopped ? "stopped" : nativeOutcome ? "failed" : "complete",
+      ...(workflowRunId ? { parentWorkflowRunId: workflowRunId } : {}),
+      steps: [{ agent, exitCode: nativeOutcome ? 1 : 0, structuredOutput: value, ...nativeOutcome }],
+    }));
+    const producer = { key, runId, agent, workflowRunId, artifactPaths: [asyncDir, savedOutputPath] };
+    if (metadata.recordWorkflowChild) metadata.recordWorkflowChild(producer);
+    else {
+      const mission = fs.existsSync(missionPath) ? JSON.parse(fs.readFileSync(missionPath, "utf8")) : { id: missionId, workflowChildren: [] };
+      mission.workflowChildren = (mission.workflowChildren ?? []).filter((child: any) => child.runId !== runId);
+      mission.workflowChildren.push(producer);
+      fs.writeFileSync(missionPath, JSON.stringify(mission));
+    }
+    const settled = { key, ok: true, output: "", runId, agent, asyncDir,
+      artifactPaths: [asyncDir, savedOutputPath], results: workflowRunId
+        ? [{ ...results[0], ...(agent === "pitako.execution-inspector" ? { task: request.task } : {}),
+          savedOutputPath, exitCode: 0 }]
+        : [...results, { savedOutputPath, exitCode: 0 }], structuredOutput: value, ...nativeOutcome };
+    if (workflowRunId && agent !== "pitako.worker") {
+      const workflowDir = path.join(path.dirname(asyncDir), workflowRunId);
+      fs.mkdirSync(workflowDir, { recursive: true });
+      fs.appendFileSync(path.join(workflowDir, "workflow-children.jsonl"),
+        JSON.stringify({ type: "settle", key, result: settled }) + "\n");
+    }
+    return settled;
+  }
+  return { key, ok: true, output: "", runId: nativeRunId, agent: request.agent ?? "pitako.reviewer", artifactPaths: [], results, structuredOutput: value };
 }
 // Controlled child loading boundary: use the launch binding emitted by the real root,
 // never construct an intention or tool result. Factory registration and publication are real.
@@ -421,6 +507,7 @@ export function realCheckoutCompositionFixture() {
   const scripts = { ...deterministicScripts,
     runDeterministic: async (key: string, request: any, metadata: any, checkout: any) => {
       const result = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
+        ...(metadata.missionPath ? { missionPath: metadata.missionPath } : {}),
         root: metadata.root, key, request, metadata, checkout }, `async (input, _, respond) =>
           respond(input.key, input.request, input.metadata, input.checkout)`);
       if (!result || result[0] !== 0) throw Error(result?.[2] ?? "Deterministic fixture cancelled");
@@ -521,7 +608,10 @@ export function nativeCheckpointFixture({ workflowSettlements, checkpointCancell
         process.on('message',async ({input,harness})=>{
           const prior=process.env.PI_CODING_AGENT_DIR, cwd=process.cwd();
           try {
-            if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.loopIO=${JSON.stringify(path.resolve("skills/execute/loop-io.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};}
+            if(input.metadata){input.metadata.sealer=${JSON.stringify(path.resolve("skills/execute/checkpoint.mjs"))};input.metadata.loopIO=${JSON.stringify(path.resolve("skills/execute/loop-io.mjs"))};input.metadata.verifier=${JSON.stringify(path.resolve("extensions/access-receipts.mjs"))};
+              if(input.missionPath && require("node:fs").existsSync(input.missionPath))
+                input.metadata.association ??= { missionPath: input.missionPath, missionId: JSON.parse(require("node:fs").readFileSync(input.missionPath,"utf8")).id };
+            }
             process.chdir(input.root);process.env.PI_CODING_AGENT_DIR=input.agentDir;
             const {runWorkflowScript,loadExtensions}=input.sdk===false?{}:await sdk();
             if(input.metadata?.inlineSealer && input.sdk!==false)input.metadata.sealCheckpointRequest=(await import(input.module??input.checkpointModule)).sealCheckpointRequest;

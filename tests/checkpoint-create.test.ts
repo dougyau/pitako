@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, spyOn, test } from "bun:test";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import * as fs from "node:fs";
 import { tmpdir } from "node:os";
@@ -11,6 +12,9 @@ import { runToolCall } from "@earendil-works/pi-agent-core";
 import type { AssistantMessage, JsonObject } from "@earendil-works/pi-ai";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
+import { EXECUTE_CURSOR_KEY } from "../extensions/execute-cursor.ts";
+import { committedCursor } from "./fixtures/plan-execute-checkpoint-scenario.ts";
+import { canonicalDigest } from "../extensions/canonical.mjs";
 import pitako from "../extensions/index.ts";
 import { captureCheckpoint, applyCheckpoint, checkpointDirectory, checkpointEvidence, restoreCheckpoint, sealCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { setSessionProfile } from "../extensions/profile.ts";
@@ -19,6 +23,8 @@ import { createDefaultChildSessionFactory } from "../node_modules/pi-subagents/s
 import { resolvePiLaunchToolPlan } from "../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js";
 import { createMission, missionRecordPath, resolveMissionStoreLocation } from "../node_modules/pi-subagents/src/missions/store.js";
 import { createMissionWorkflowState } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
+import { inspect, observeCheckpoint } from "../skills/execute/inspect.ts";
+import { SPEC_SECTIONS } from "../extensions/spec-plans.ts";
 
 let fake: ReturnType<typeof gitFakeFixture>;
 beforeEach(() => { fake = gitFakeFixture(); });
@@ -44,7 +50,20 @@ function fixture() {
   const loop = { number: 1, kind: "task", task: { id: "owned" }, phase: "implementation", cursor: 0, manifest: ["owned"], results: [], plan: { stage: "admitted", ref: intent.planRef },
     attempt: { key: intent.key, taskId: "owned", index: 0, number: 1, stage: "intention", checkpoint: intent } };
   const record = { version: EXECUTE_STATE_VERSION, association, loop, consumedLoops: 1, tasks: {}, lastConfirmed: null };
-  const persist = () => state.set("invoke-fixture", record); persist();
+  const persist = () => {
+    const { cursor, persist: save } = committedCursor({ root, intent, record,
+      bindingKey: (loop.attempt as any).bindingKey, statePath: state.path });
+    cursor.version = record.version as 10;
+    cursor.associationDigest = canonicalDigest(record.association);
+    cursor.budget.consumedLoops = record.consumedLoops;
+    cursor.loop!.number = loop.number;
+    cursor.loop!.attempt!.number = loop.attempt.number;
+    cursor.loop!.attempt!.stage = loop.attempt.stage;
+    if (loop.attempt.key !== intent.key) cursor.loop!.attempt!.intent!.digest = "0".repeat(64);
+    if ((loop as any).halt) cursor.halt = { stage: "stop", digest: canonicalDigest((loop as any).halt) };
+    save();
+  };
+  persist();
   const binding = JSON.stringify({ "pitako.checkpoint/1": { association, key: intent.key } });
   let tool: any;
   const handlers = new Map<string, Function>();
@@ -56,6 +75,227 @@ function fixture() {
   return { root, intent, loop, record, persist, statePath: state.path, binding, call, tool, manager, handlers };
 }
 const paths = ["modified", "untracked", "absent"];
+
+
+
+test.each(["current", "admission-at-tip", "ahead", "binding", "missing-store"])(
+  "inspector admission reads the saved cursor's committed admission without settings or writes (%s)", async mode => {
+    const f = fixture();
+    const content = `---\npitako-spec: 1\nid: fixture\nstatus: complete\n---\n` +
+      SPEC_SECTIONS.map(section => `## ${section}\nAdmission fixture.\n`).join("");
+    f.intent.association.source = path.join(f.root, ".pitako/plans/fixture.md");
+    f.intent.association.digest = digest(content);
+    mkdirSync(path.dirname(f.intent.association.source), { recursive: true });
+    writeFileSync(f.intent.association.source, content);
+    const { store, scope, cursor, persist } = committedCursor(f);
+    const admission = { association: f.intent.association, admissionBinding: cursor.admissionBinding, amendments: [] };
+    const saved = store.commit(scope, cursor.head, "admission", canonicalDigest(admission),
+      () => ({ kind: "root-admission", body: admission }));
+    if (saved.outcome !== "appended" || !saved.head) throw new Error("Expected committed admission");
+    if (mode !== "admission-at-tip") cursor.head = saved.head;
+    if (mode === "ahead") cursor.head = { seq: saved.head.seq + 1, hash: "d".repeat(64) };
+    if (mode === "binding") cursor.admissionBinding = "d".repeat(64);
+    persist();
+    if (mode === "missing-store") rmSync(store.file);
+    const beforeState = readFileSync(f.statePath), before = existsSync(store.file) ? readFileSync(store.file) : undefined;
+    const context = { ...f.intent.association, admission: { sourceRefs: [], agentDir: path.join(f.root, "absent-settings") } };
+    const result = JSON.parse(await inspect([f.root, "fixture", "", "admission", JSON.stringify(context)]));
+    if (mode === "current") {
+      expect(result.error).toBeUndefined();
+      expect(result).not.toHaveProperty("admission");
+    } else {
+      expect(result).not.toHaveProperty("admission");
+      expect(result.storeFailure).toMatchObject({
+        code: mode === "ahead" ? "cursor-ahead" : mode === "missing-store" ? "store-unavailable" : "store-corrupt",
+        reason: expect.stringContaining(mode === "ahead" ? "Cursor head is absent" :
+          mode === "missing-store" ? "Store does not exist" : "Execute admission differs"),
+      });
+    }
+    expect(readFileSync(f.statePath)).toEqual(beforeState);
+    expect(existsSync(store.file)).toBe(before !== undefined);
+    if (before) expect(readFileSync(store.file)).toEqual(before);
+    expect(fs.readdirSync(path.dirname(store.file)).some(name => name.startsWith("pitako.db.v"))).toBe(false);
+  });
+
+test.each(["current", "resumed", "ahead", "association", "missing-store", "other-invocation"])(
+  "v10 inspector observes checkpoint originals only at cursor.head (%s)", async mode => {
+    const f = fixture();
+    const content = `---\npitako-spec: 1\nid: fixture\nstatus: complete\n---\n` +
+      SPEC_SECTIONS.map(section => `## ${section}\nCheckpoint observation fixture.\n`).join("");
+    f.intent.association.source = path.join(f.root, ".pitako/plans/fixture.md");
+    f.intent.association.digest = digest(content);
+    mkdirSync(path.dirname(f.intent.association.source), { recursive: true });
+    writeFileSync(f.intent.association.source, content);
+    const { store, scope, cursor, persist } = committedCursor(f);
+    captureCheckpoint(f.intent, paths);
+    const resumed = { ...f.intent, key: "invoke-fixture.l1.t1.a2", attempt: 2 };
+    const appended = store.commit(scope, cursor.head, "nextBaseline", canonicalDigest(resumed),
+      () => ({ kind: "intent", body: resumed }));
+    if (appended.outcome !== "appended" || !appended.head) throw new Error("Expected committed intent");
+    if (mode === "resumed") {
+      cursor.head = appended.head;
+      cursor.loop!.attempt!.number = 2;
+      cursor.loop!.attempt!.intent = { seq: appended.head.seq, digest: appended.head.hash };
+      cursor.action = { kind: "pending", op: "baseline", opKey: "baseline", input: cursor.loop!.attempt!.intent! };
+    }
+    if (mode === "ahead") cursor.head = { seq: 3, hash: "d".repeat(64) };
+    persist();
+    if (mode === "missing-store") rmSync(store.file);
+    const state = readFileSync(f.statePath), before = existsSync(store.file) ? readFileSync(store.file) : undefined;
+    const found = { root: f.root, commonDir: f.intent.association.commonDir,
+      selected: { source: f.intent.association.source,
+        digest: mode === "association" ? "d".repeat(64) : f.intent.association.digest } };
+    const context = { ...f.intent.association,
+      ...(mode === "other-invocation" ? { invocation: "another" } : {}) };
+    if (mode === "ahead" || mode === "association" || mode === "missing-store") {
+      expect(() => observeCheckpoint(found, context)).toThrow({
+        ahead: "Cursor head is absent", association: "Checkpoint observation association mismatch",
+        "missing-store": "Store does not exist",
+      }[mode]);
+    } else if (mode === "other-invocation") {
+      expect(observeCheckpoint(found, context)).toBeUndefined();
+    } else {
+      const intent = mode === "resumed" ? resumed : f.intent;
+      const expected = {
+        key: intent.key, taskId: intent.taskId, attempt: intent.attempt, loop: intent.loop, cursor: intent.cursor,
+        evidence: checkpointEvidence(mode === "resumed" ? [resumed, f.intent] : [f.intent], f.intent.progress!),
+      };
+      expect(observeCheckpoint(found, context)).toEqual(expected);
+      const metadata = JSON.parse(await inspect([f.root, "fixture", "", "metadata", JSON.stringify(context)]));
+      expect(metadata.checkpointObservation).toEqual(expected);
+    }
+    expect(readFileSync(f.statePath)).toEqual(state);
+    expect(existsSync(store.file)).toBe(before !== undefined);
+    if (before) expect(readFileSync(store.file)).toEqual(before);
+    expect(fs.readdirSync(path.dirname(store.file)).some(name => name.startsWith("pitako.db.v"))).toBe(false);
+  });
+
+test("v10 checkpoint_create reads committed intent/progress at cursor.head, not the newer store tip", async () => {
+  const f = fixture(), { store, scope, cursor } = committedCursor(f);
+  // The next baseline is already committed but its cursor save was lost.
+  const later = structuredClone(f.intent);
+  later.key = "invoke-fixture.l1.t1.a2"; later.attempt = 2;
+  const appended = store.commit(scope, cursor.head, "nextBaseline", canonicalDigest(later),
+    () => ({ kind: "intent", body: later }));
+  expect(appended.outcome).toBe("appended");
+  const before = readFileSync(store.file), state = readFileSync(f.statePath);
+  const captured = await f.call("pre", paths);
+  expect(captured).toMatchObject({ ok: true, status: "created" });
+  expect(artifact(captured.manifestRef).intent).toEqual(f.intent);
+  expect(readFileSync(f.statePath)).toEqual(state);
+  expect(readFileSync(store.file)).toEqual(before);
+  expect(store.read(scope).head!.seq).toBe(cursor.head.seq + 1);
+});
+
+test("v10 resumed hooks use the committed binding key while an in-flight worker waits", async () => {
+  const f = fixture(), { store, scope, cursor, persist } = committedCursor(f);
+  const resumed = structuredClone(f.intent);
+  resumed.key = "invoke-fixture.l1.t1.a2"; resumed.attempt = 2;
+  const committed = store.commit(scope, cursor.head, "nextBaseline", canonicalDigest(resumed),
+    () => ({ kind: "intent", body: resumed }));
+  if (committed.outcome !== "appended" || !committed.head) throw new Error("Expected committed intent");
+  const baseline = store.commit(scope, committed.head, "resumed-baseline", canonicalDigest({ resumed, binding: f.intent.key }),
+    () => ({ kind: "operation", body: { operation: "baseline", request: { intent: resumed,
+      continuation: { attempt: { bindingKey: f.intent.key } } } } }));
+  if (baseline.outcome !== "appended" || !baseline.head) throw new Error("Expected committed baseline");
+  cursor.head = baseline.head;
+  cursor.loop!.attempt!.number = 2;
+  cursor.loop!.attempt!.intent = { seq: committed.head.seq, digest: committed.head.hash };
+  cursor.action = { kind: "pending", op: "baseline", opKey: "baseline", input: cursor.loop!.attempt!.intent! };
+  cursor.inFlight = [{ key: resumed.key, role: "worker", runId: "11111111-1111-4111-8111-111111111111" }];
+  persist();
+  const before = readFileSync(store.file);
+  f.handlers.get("turn_end")!({}, { cwd: f.root, getContextUsage: () => ({ tokens: 700 }) });
+  expect(artifact(path.join(checkpointDirectory(resumed), "context-peak-700.json"))).toEqual({ intent: resumed, tokens: 700 });
+  // The old binding is valid only for retained native hooks, not a fresh capture call.
+  expect(await f.call("pre", paths)).toMatchObject({ ok: false });
+  expect(existsSync(path.join(checkpointDirectory(resumed), "manifest.json"))).toBe(false);
+  expect(readFileSync(store.file)).toEqual(before);
+});
+
+test.each(["valid", "committed-source", "changed-intent", "uncommitted-source", "ahead", "invalid", "missing-store"])(
+  "v10 sealer requires cursor-head committed originals (%s)", mode => {
+    const f = fixture(), { store, scope, cursor, persist } = committedCursor(f);
+    captureCheckpoint(f.intent, paths);
+    applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("completed").toString("base64"), mode: 0o644 } }]);
+    if (mode === "committed-source")
+      restoreCheckpoint(f.intent, { pending: true, stop: false, permissionDenied: false,
+        activeWriter: null, references: ["unknown writer"] });
+    // A newer tip must neither authorize different inputs nor stale this seal.
+    const later = { ...f.intent, key: mode === "uncommitted-source" ? `${f.intent.key}.recovered` : "invoke-fixture.l1.t1.a2",
+      attempt: mode === "uncommitted-source" ? 1 : 2 };
+    const committed = store.commit(scope, cursor.head, "nextBaseline", canonicalDigest(later),
+      () => ({ kind: "intent", body: later }));
+    expect(committed.outcome).toBe("appended");
+    cursor.loop!.attempt!.stage = "result";
+    cursor.action = { kind: "pending", op: "baseline", opKey: "baseline", input: cursor.loop!.attempt!.intent! };
+    if (mode === "ahead") cursor.head = { seq: 3, hash: "d".repeat(64) };
+    if (mode === "invalid") (cursor as any).tasks = {};
+    persist();
+    if (mode === "missing-store") rmSync(store.file);
+    const request = { v: 1, kind: "unit", intent: mode === "changed-intent"
+      ? { ...f.intent, planRef: { key: "uncommitted-plan" } } : f.intent,
+      // This source exists at the tip, but not at the cursor's head.
+      ...(mode === "uncommitted-source" ? { restoreSources: [later] } :
+        mode === "committed-source" ? { restoreSources: [f.intent] } : {}) };
+    const state = readFileSync(f.statePath), before = existsSync(store.file) ? readFileSync(store.file) : undefined;
+    const prefix = mode === "valid" || mode === "committed-source" ? store.read(scope, cursor.head).records : [];
+    const child = spawnSync(process.execPath, [path.join(repo, "skills/execute/checkpoint.mjs"), "--seal-stdin"], {
+      cwd: f.root, env: process.env, encoding: "utf8", input: JSON.stringify(request),
+    });
+    if (mode === "valid" || mode === "committed-source") {
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toMatchObject({
+        outcome: mode === "valid" ? "sealed" : "observed", kind: "unit",
+      });
+    } else if (mode === "ahead" || mode === "missing-store") {
+      expect(child.status, child.stderr).toBe(0);
+      expect(JSON.parse(child.stdout)).toMatchObject({
+        code: mode === "ahead" ? "cursor-ahead" : "store-unavailable",
+      });
+    } else {
+      expect(child.status, child.stderr).not.toBe(0);
+      const diagnostic = {
+        "changed-intent": "differs from its committed original",
+        "uncommitted-source": "lacks a cursor-head committed original",
+        invalid: "Invalid execute cursor schema",
+      }[mode];
+      expect(child.stderr).toContain(diagnostic!);
+    }
+    if (mode !== "valid" && mode !== "committed-source")
+      expect(existsSync(path.join(checkpointDirectory(f.intent), "unit.json"))).toBe(false);
+    expect(readFileSync(f.statePath)).toEqual(state);
+    expect(existsSync(store.file)).toBe(before !== undefined);
+    if (mode === "valid" || mode === "committed-source") {
+      // The deterministic sealer publishes its marker, but its progress read stays head-bound.
+      expect(store.read(scope, cursor.head).records).toEqual(prefix);
+      expect(store.read(scope).records.at(-1)?.kind).toBe("seal");
+    } else if (before) expect(readFileSync(store.file)).toEqual(before);
+    expect(fs.readdirSync(path.dirname(store.file)).some(name => name.startsWith("pitako.db.v"))).toBe(false);
+  });
+
+test.each(["ahead", "digest", "stopped", "outcome", "launch", "association", "invalid", "missing-store"])(
+  "v10 checkpoint_create rejects %s without publishing or repairing the store", async mode => {
+    const f = fixture(), { store, cursor, persist } = committedCursor(f);
+    if (mode === "ahead") {
+      cursor.head = { seq: 2, hash: "d".repeat(64) };
+      cursor.loop!.attempt!.intent = { seq: 2, digest: cursor.head.hash };
+    }
+    if (mode === "digest") cursor.loop!.attempt!.intent!.digest = "d".repeat(64);
+    if (mode === "stopped") cursor.halt = { stage: "stop", digest: "d".repeat(64) };
+    if (mode === "outcome") cursor.loop!.outcome = "gaps";
+    if (mode === "launch") cursor.action = { kind: "pending", op: "baseline", opKey: "baseline", input: cursor.loop!.attempt!.intent! };
+    if (mode === "association") cursor.associationDigest = "d".repeat(64);
+    if (mode === "invalid") (cursor as any).tasks = {};
+    persist();
+    if (mode === "missing-store") rmSync(store.file);
+    const before = existsSync(store.file) ? readFileSync(store.file) : undefined;
+    expect(await f.call("pre", paths)).toMatchObject({ ok: false, status: "failed" });
+    expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
+    expect(existsSync(store.file)).toBe(before !== undefined);
+    if (before) expect(readFileSync(store.file)).toEqual(before);
+    expect(fs.readdirSync(path.dirname(store.file)).some(name => name.startsWith("pitako.db.v"))).toBe(false);
+  });
 
 test("registered checkpoint_create captures actual WIP, untracked bytes, absence and admitted progress; repeats without overwrite", async () => {
   const f = fixture(), beforeState = readFileSync(f.statePath, "utf8");
@@ -110,6 +350,12 @@ test.each(["valid", "continuation", "foreign-admitted", "previous", "pending-bud
     if (mode === "stale") f.loop.attempt.stage = "result";
     f.persist();
     const beforeState = readFileSync(f.statePath, "utf8");
+    const observe = () => observeCheckpoint({ root: f.root, commonDir: f.intent.association.commonDir,
+      selected: { source: f.intent.association.source, digest: f.intent.association.digest } }, f.intent.association);
+    if (mode === "valid" || mode === "continuation")
+      expect(observe()).toMatchObject({ key: f.intent.key, evidence: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    else if (["foreign-admitted", "previous", "pending-budget", "seal-budget"].includes(mode))
+      expect(observe).toThrow("Confirmed unit lacks admitted pending-position provenance.");
     const outcome = await f.call("pre", paths), accepted = mode === "valid" || mode === "continuation";
     expect(outcome.ok).toBe(accepted);
     if (mode === "foreign-admitted") expect(outcome.error.message).toBe("Confirmed unit lacks admitted pending-position provenance.");
@@ -217,6 +463,7 @@ test.each(["missing", "malformed", "metadata-only", "association", "progress", "
     if (mode === "attempt") f.loop.attempt.key = "other";
     if (mode === "stopped") (f.loop as any).halt = { code: "stop", reason: "native Stop" };
     f.persist();
+    if (/^v\d+$/.test(mode)) writeFileSync(f.statePath, JSON.stringify({ "invoke-fixture": f.record }));
     if (mode === "missing") rmSync(f.statePath);
     if (mode === "malformed") writeFileSync(f.statePath, "{");
     if (mode === "metadata-only") {
@@ -225,7 +472,7 @@ test.each(["missing", "malformed", "metadata-only", "association", "progress", "
     }
     const result = await f.call("pre", paths);
     expect(result).toMatchObject({ ok: false, status: "failed" });
-    if (/^v\d+$/.test(mode)) expect(JSON.stringify(result)).toContain(`created by an incompatible Pitako contract ${mode}; start a new mission`);
+    if (/^v\d+$/.test(mode)) expect(JSON.stringify(result)).toContain("cursor");
     expect(existsSync(checkpointDirectory(f.intent))).toBe(false);
     expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   });
@@ -428,6 +675,6 @@ test("turn-end context peaks persist only maxima under the current attempt, with
   expect(existsSync(path.join(directory, "context-peak-400.json"))).toBe(false);
   expect(readFileSync(path.join(f.root, "modified"), "utf8")).toBe("prior uncommitted WIP\n");
   (f.loop.attempt as any).bindingKey = "stale"; f.persist();
-  expect(() => sample({}, ctx(1000))).toThrow("stale");
+  expect(() => sample({}, ctx(1000))).toThrow("differs from durable execution context");
   expect(existsSync(path.join(directory, "context-peak-1000.json"))).toBe(false);
 });

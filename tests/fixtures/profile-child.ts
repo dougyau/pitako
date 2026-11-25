@@ -15,6 +15,7 @@ import { createCapturedChildHooks } from "../../node_modules/pi-subagents/src/ru
 import type { ChildRuntimeConfig } from "../../node_modules/pi-subagents/src/runs/shared/child-runtime-config.js";
 import pitako from "../../extensions/index.ts";
 import fileSha256 from "../../extensions/file-sha256.ts";
+import pitakoStore from "../../extensions/pitako-store-tool.ts";
 import { readStack } from "../../extensions/stack.ts";
 import { RUNTIME_AGENT_REGISTER_EVENT, type RuntimeAgentRegistrationRequest } from "../../node_modules/pi-subagents/src/agents/runtime-agent-events.js";
 
@@ -84,6 +85,7 @@ try {
   } };
   let extensionPaths = plan.extensionArgs.filter(entry =>
     entry === path.join(root, "extensions/file-sha256.ts") ||
+    entry === path.join(root, "extensions/pitako-store-tool.ts") ||
     entry === path.join(root, "extensions/checkpoint-create.ts") ||
     entry === path.join(root, "extensions/dev-tools/index.ts"));
   if (mode === "foreground") {
@@ -97,6 +99,7 @@ try {
       assert.equal(request.version, 1);
       const script = { "pitako.loop-io": ["skills/execute/loop-io.mjs"], "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
         "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
+        "pitako.store-io": ["skills/review/store-io.mjs"],
         "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
         "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       assert.ok(script);
@@ -115,6 +118,7 @@ try {
     });
     pitako(pi);
     fileSha256(pi);
+    pitakoStore(pi);
     pi.registerTool({
       name: "ast_search", label: "AST Search", description: "controlled search", exposure: "deferred",
       parameters: Type.Object({}),
@@ -137,7 +141,7 @@ try {
       process.send({ ready: true });
       assert.equal(await Bun.stdin.text(), "run");
     }
-    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.architecture-ledger", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.loop-io", "pitako.request-observer"] : []);
+    assert.deepEqual([...registered].sort(), mode === "foreground" ? ["pitako.access-verifier", "pitako.architecture-ledger", "pitako.checkout-observer", "pitako.checkpoint-sealer", "pitako.execution-ledger", "pitako.loop-io", "pitako.request-observer", "pitako.store-io"] : []);
     await session.extensionRunner!.emit({ type: "agent_start" });
     assert.deepEqual(captured.toolDiagnostic()?.missing ?? [], []);
     if (mode === "foreground") {

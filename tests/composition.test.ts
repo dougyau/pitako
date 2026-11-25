@@ -43,6 +43,8 @@ describe("engineering-layer composition", () => {
     };
     handlers.get("session_start")!({}, ctx);
     try {
+      // Pi routes direct and nested codemode calls through this same boundary.
+      expect(handlers.get("tool_call")!({ toolName: "pitako_store", input: { op: "verify" } }, ctx)).toBeUndefined();
       const result = handlers.get("before_agent_start")!({ systemPrompt: "Pi base", messageType: "user", prompt: "Inspect sources" }, ctx);
       expect(result.systemPrompt).toBe(`Pi base\n\n${profileNote(profile)}`);
       for (const instruction of ["Pi-native tools and codemode need no T3 client",
@@ -255,7 +257,7 @@ describe("engineering-layer composition", () => {
     const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
     const retiredTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache", "vcc_recall",
       "memory_add", "memory_replace", "memory_remove", "memory_search", "session_search", "skill_manage"];
-    const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
+    const queries = ["git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "pitako_store", "codemode"];
     const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
     const roles = ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director"];
     expect(readdirSync(path.join(packageRoot(), "agents")).filter(file => file.endsWith(".md")).sort())
@@ -312,6 +314,7 @@ describe("engineering-layer composition", () => {
       for (const tool of queries) expect(plan.requiredChildTools).toContain(tool);
       expect(plan.extensionArgs).toContain(path.join(packageRoot(), provider.entry));
       expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/file-sha256.ts"));
+      expect(plan.extensionArgs).toContain(path.join(packageRoot(), "extensions/pitako-store-tool.ts"));
       if (role === "worker") {
         for (const tool of [...provider.tools, "file_sha256_save"]) expect(plan.requiredChildTools).toContain(tool);
         for (const tool of ["subagent", "bg_wait", "subagent_supervisor"]) expect(plan.requiredChildTools).not.toContain(tool);
@@ -484,7 +487,7 @@ describe("engineering-layer composition", () => {
       inheritProjectContext: true, inheritGlobalContext: false, inheritSkills: false,
     });
     expect(profile.tools).toEqual([
-      "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode",
+      "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "pitako_store", "codemode",
       "read", "grep", "find", "ls",
       "codegraph_search", "codegraph_callers", "codegraph_callees", "codegraph_impact",
       "codegraph_explore", "codegraph_node", "codegraph_status", "codegraph_files",
@@ -492,7 +495,7 @@ describe("engineering-layer composition", () => {
       "ast_search",
     ]);
     const providers = [
-      "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts",
+      "../extensions/dev-tools/index.ts", "../extensions/file-sha256.ts", "../extensions/pitako-store-tool.ts",
       "../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts",
       "../node_modules/pi-lsp-client/src/index.ts",
       "../node_modules/@nicknisi/pi-ast-grep/index.ts",

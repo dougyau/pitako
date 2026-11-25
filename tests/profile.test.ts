@@ -10,7 +10,7 @@ const introducedMutators = [
   "ssh_exec", "ssh_pull", "ssh_push", "py_lint", "py_format", "py_typecheck", "py_test", "py_uv",
   "cargo_check", "cargo_clippy", "cargo_fmt", "cargo_test", "cargo_build", "cargo_run", "cargo_doc", "cargo_bench", "cargo_add",
 ];
-const deterministicReads = ["ast_search", "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "codemode"];
+const deterministicReads = ["ast_search", "git_worktree_list", "git_status", "git_diff", "git_log", "git_show", "resource_snapshot", "file_sha256", "pitako_store", "codemode"];
 
 const available = [
   "read",
@@ -184,9 +184,9 @@ test("worker guidance routes execute writes away from hook-blocked tools and dir
   expect(worker).toContain("then apply them with `edit`, `write` or `apply_patch`.");
 });
 
-test("execute skill treats a human relaunch instruction as authorization, never as an unblock answer", () => {
+test("execute skill treats a human relaunch instruction as authorization, never as an answer to a terminal halt", () => {
   const skill = readFileSync(new URL("../skills/execute/SKILL.md", import.meta.url), "utf8").replace(/\s+/g, " ");
   expect(skill).toContain("An imperative human instruction to relaunch or continue is the authorization; do not ask again.");
   expect(skill).toContain("Act once on its settled result through the documented route below.");
-  expect(skill).toContain("Such an instruction never supplies an unblock, a resolution or a `needs-decision` answer, and never overrides a recorded Stop.");
+  expect(skill).toContain("Such an instruction never overrides a recorded Stop or answers a `needs-decision` halt.");
 });

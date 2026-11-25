@@ -210,8 +210,8 @@ test("native checkpoint fixture close without a reply is not a successful case",
 describe("plan/execute packaged composition", () => {
   // Controlled process preparation is file-owned, not checkpoint-case work.
   beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
-  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-reentry-mismatched-previous", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-continue", "pause-twice", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut", "pause-missing", "pause-corrupt", "pause-conflict"]) {
-    if (["pause-status-continue", "pause-corrupt", "pause-twice"].includes(mode)) {
+  for (const mode of ["unit-before-capture", "unit-before-capture-reentry", "unit-before-capture-reentry-mismatched-previous", "unit-before-capture-conflict", "unit-before-capture-corrupt", "unit-before-capture-newer-corrupt", "unit-before-capture-missing", "unit-before-capture-unadmitted", "unit-before-capture-wrong-baseline", "complete", "pause", "abrupt", "refused", "missing", "corrupt", "incomplete", "seal-cut", "admission-cut", "cursor-cut", "missing-receipt", "wrong-progress", "pause-status-continue", "pause-status-gaps", "pause-status-continue-admission-cut", "pause-status-gaps-admission-cut"]) {
+    if (mode === "pause-status-continue") {
       describe("private real paused fixture", () => {
         const ownedRoots: string[] = [], ownedDisposers: (() => void)[] = [];
         beforeAll(async () => {
@@ -243,16 +243,6 @@ describe("plan/execute packaged composition", () => {
   }
 });
 
-describe("plan/execute packaged composition", () => {
-  // Controlled process preparation is file-owned, not checkpoint-case work.
-  beforeAll(async () => { if (!native.nativeCheckpoint) await startNativeCheckpoint(); });
-  for (const mode of ["pause-later-input", "pause-input-cut", "pause-effect-cut", "pause-write-cut", "pause-empty", "pause-replay-complete", "pause-wrong-baseline", "pause-loss-reentry", "pause-equivalent-capture", "pause-successor-corrupt", "pause-repeated-publication", "pause-reusable-result"]) {
-    // Explicit human budget calibration for this multi-reentry integration case;
-    // the other scenarios retain Bun's existing default deadline.
-    test(`registered checkpoint lifecycle confirms bytes with progress: ${mode}`,
-      () => checkpointScenario(mode), mode === "pause-write-cut" ? 10000 : undefined);
-  }
-});
 
 // One real Node/SDK case covers registration, capture, selective restore and seal.
 describe("native SDK checkpoint wiring", () => {

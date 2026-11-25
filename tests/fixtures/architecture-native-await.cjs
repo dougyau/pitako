@@ -7,13 +7,15 @@ const path = require("node:path");
 async function main() {
   const { runWorkflowScript } = await import("../../node_modules/pi-subagents/src/workflows/scripted-workflow.js");
   const { appendLedger } = await import("../../skills/architecture/ledger.mjs");
+  const { architectureNativeSource } = await import("../../skills/architecture/native.mjs");
   const { canonicalDigest } = await import("../../extensions/canonical.mjs");
   const { verifyGate } = await import("../../extensions/access-receipts.mjs");
+  const { PitakoStore } = await import("../../extensions/pitako-store.ts");
   const root = mkdtempSync(path.join(tmpdir(), "pitako-architecture-await-"));
   // The named resource inlines the mission binding; the raw path alone refuses to run.
   const missionPath = path.join(root, "mission.json");
   writeFileSync(missionPath, "{}");
-  const raw = readFileSync(path.join(path.dirname(process.argv[2]), "../workflow-canonical.js"), "utf8") + "\n" + readFileSync(process.argv[2], "utf8");
+  const raw = readFileSync(path.join(path.dirname(process.argv[2]), "../workflow-canonical.js"), "utf8") + "\n" + architectureNativeSource + readFileSync(process.argv[2], "utf8");
   const launches = [], releases = [];
   const perspectives = [
     { id: "simple", label: "Simplicity", focus: "Compare complete designs." },
@@ -24,6 +26,8 @@ async function main() {
   try {
     for (const scenario of ["complete", "invalid-schema", "intention-failure"]) {
       const storage = new Map(), calls = [], steered = [];
+      let closedRound;
+      const consultation = `await-${scenario}`;
       let failedWrites = 0, releasePeer, peerChallenge;
       const peer = new Promise(resolve => { releasePeer = resolve; });
       releases.push(releasePeer);
@@ -31,7 +35,7 @@ async function main() {
       const result = await runWorkflowScript({
         script: source, timeoutMs: 2000,
         args: {
-          consultation: "await-regression", workDescription: "Compare persistence designs",
+          consultation, workDescription: "Compare persistence designs",
           planning: true, maxRounds: 2,
           currentDecision: {
             version: 1, brief: "Choose a complete persistence design", constraints: ["Read-only"],
@@ -42,7 +46,7 @@ async function main() {
           get: key => storage.get(key),
           set: (key, value) => {
             if (scenario === "intention-failure" &&
-                value.cursor.dispatches.some(item => item.key === "r1-simple" && item.boundary === "intended")) {
+                value.cursor.dispatches.some(item => item.key === "r1-simple" && item.terminal === null)) {
               failedWrites++;
               throw new Error("Controlled intention write failure");
             }
@@ -50,17 +54,21 @@ async function main() {
           },
         },
         launch: (key, request) => {
-          if (request.agent === "pitako.architecture-ledger") return Promise.resolve({ key, ok: true, agent: request.agent,
-            runId: `native-${key}`, output: JSON.stringify(appendLedger(JSON.parse(request.task))), artifactPaths: [], results: [] });
+          if (request.agent === "pitako.architecture-ledger") {
+            const observed = appendLedger(JSON.parse(request.task), process.argv[3]);
+            closedRound = observed.closedRound ?? closedRound;
+            return Promise.resolve({ key, ok: true, agent: request.agent,
+              runId: `native-${key}`, output: JSON.stringify(observed), artifactPaths: [], results: [] });
+          }
           // The real model-free verifier runs before each consuming gate's intention.
           if (request.agent === "pitako.access-verifier") return Promise.resolve({ key, ok: true, agent: request.agent,
-            runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))), artifactPaths: [],
+            runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task), process.argv[3])), artifactPaths: [],
             results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 0,
               usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] });
           const work = (async () => {
             calls.push(key);
-            const retained = storage.get("architecture-await-regression");
-            assert(retained.cursor.dispatches.some(item => item.key === key && item.boundary === "intended"),
+            const retained = storage.get("pitako-architecture");
+            assert(retained.cursor.dispatches.some(item => item.key === key && item.terminal === null),
               "Every launch must follow its persisted intention");
             if (key === "r2-recovery") await peer;
             for (const field of ["association", "delivery", "access"])
@@ -69,13 +77,19 @@ async function main() {
             const originals = references ? JSON.parse(references[1]) : [];
             if (key === "r2-recovery") originals.push(peerChallenge);
             for (const original of originals) {
+              if (original.store) {
+                const {scope, seq} = original.store;
+                const store = new PitakoStore(process.argv[3]);
+                store.verifyRecord(original.store, original.digest);
+                const row = store.readRecords(scope, {seq, hash: original.digest}).records.at(-1);
+                assert(row.body.originals[original.id], "Archived original is addressed by exact row and item ID");
+                continue;
+              }
               const exact = JSON.parse(readFileSync(original.path ?? original.savedOutputPath, "utf8"));
-              const admitted = storage.get("architecture-await-regression").originals.find(item => item[0] === original.id);
-              const dispatch = storage.get("architecture-await-regression").cursor.dispatches.find(item => item.originalId === original.id);
+              const current = storage.get("pitako-architecture");
+              const dispatch = current.cursor.dispatches.find(item => original.id === `${consultation}.v1.${item.key}.a${item.attempt}`);
               if (dispatch) assert.equal(dispatch.runId, `native-${dispatch.key}`);
-              if (admitted[4]) assert.equal(JSON.parse(admitted[4])[0], "complete");
-              assert.equal(canonicalDigest(exact), admitted[3]);
-              assert(!Object.hasOwn(admitted, "value"));
+              assert.equal(canonicalDigest(exact), dispatch?.digest ?? closedRound?.originals.find(item => item.id === original.id)?.digest);
             }
             let value;
             if (key.startsWith("director-doubts-")) value = {
@@ -123,8 +137,9 @@ async function main() {
           assert(calls.indexOf(`doubts-r${round}-0`) < calls.indexOf(`director-after-r${round}`));
           assert(calls.includes(`director-after-r${round}`));
         }
-        const retained = storage.get("architecture-await-regression");
-        assert(retained.cursor.dispatches.every(item => item.boundary === "confirmed"));
+        const retained = storage.get("pitako-architecture");
+        assert.deepEqual(retained.cursor.dispatches, []);
+        assert(!Object.hasOwn(retained, "originals"));
       } else {
         assert.equal(outcome.status, "failed", JSON.stringify(outcome));
         assert.equal(outcome.rounds, 1);

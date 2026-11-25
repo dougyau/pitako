@@ -44,6 +44,10 @@ root, `async: true`, and explicit `options: { mission: { title: "Plan <id>" } }`
 This dispatches initial independent Scout and researcher evidence. Return control
 after admission; interpret the full native returned value, not its preview.
 A failure or missing evidence is a blocker to the decisions that depend on it.
+Context is returned with native original references; this workflow writes no
+mission state key or store row. Read the published originals for full provider
+reports. A later architecture consultation uses its own store scope and
+access receipts, not `/plan` state.
 
 ## Grill, deliberate, resolve doubts
 
@@ -236,11 +240,12 @@ child settlement is uncertain. No historical engine or Board binding is resumed.
 
 Only one active consultation per mission at a time; D8 does not reserve concurrent consultations.
 
-Architecture reserves a derived **108306 pretty-printed bytes (<=112 KiB)** per
-consultation, rather than nearly the whole 256 KiB mission. The real initial-context
-reference envelope and consultation can coexist; genuinely oversized unrelated
-mission state still blocks before model dispatch. Roots are derived per original
-from the native saved path. Relative paths reconstruct that path exactly; digest
+Architecture writes one fixed mission-state key, `pitako-architecture`, with a
+current-round cursor of at most 16384 bytes. The byte limit applies only to that
+cursor; consultation history lives in the cwd-local store scope
+`arch:<consultation>`. The planning context workflow returns exact native result
+references without writing mission state. Roots are derived per original from
+the native saved path. Relative paths reconstruct that path exactly; digest
 pins, path normalization and traversal checks protect retained references.
 Limits are 8 factual, 64 human/experiment and 8 deliberation doubts per
 round, with doubt IDs at most 32 ASCII characters. Read full originals by verified
