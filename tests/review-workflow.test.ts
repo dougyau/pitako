@@ -1541,8 +1541,8 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   });
 
   test("terminal run-ID queries and matching optional native identity are not producer conflicts", async () => {
-    const host = fixture(key => ({ ...child(key), key: `native-${key}`, workflowKey: key, agent: "pitako.reviewer",
-      results: [{ key, workflowKey: key, runId: `native-${key}`, agent: "pitako.reviewer",
+    const host = fixture(key => ({ ...child(key), key: `native-${key}`, workflowKey: key, agent: pitakoReviewerAgent(key),
+      results: [{ key, workflowKey: key, runId: `native-${key}`, agent: pitakoReviewerAgent(key),
         savedOutputPath: "/native/mandatory/original.json", state: "complete" } as any],
     }));
     expect((await host.execute()).status).toBe("completed");

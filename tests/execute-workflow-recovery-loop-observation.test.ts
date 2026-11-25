@@ -955,7 +955,7 @@ describe("workflow-owned execute controller", () => {
     const host = fixture(); host.setLimit(1);
     const key = "invoke-human-1.l1.finishDrain";
     host.setLaunchRespond((request, normal) => request.key === key
-      ? { key, runId: `native-${key}`, agent: "pitako.loop-io", ok: false, stopped: true, output: "",
+      ? { key, runId: `native-${key}`, agent: request.agent, ok: false, stopped: true, output: "",
         results: [{ exitCode: -1, processSignal: "SIGTERM" }] } : normal());
     const stopped = await host.execute();
     expect(stopped.status).toBe("cancelled");

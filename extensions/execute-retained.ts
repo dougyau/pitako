@@ -73,7 +73,7 @@ export function readNativeSettlement(file: string, key: string, runId: string, a
 	}).filter(entry => entry.type === "settle" && entry.key === key && entry.result?.runId === runId);
 	if (!settlements.length) throw new NativeSettlementError("missing");
 	const settled = settlements.at(-1)?.result;
-	if (!record(settled) || pitakoAgentFamily(settled.agent) !== pitakoAgentFamily(agent) ||
+	if (!record(settled) || settled.agent !== agent ||
 		settled.key !== undefined && settled.key !== key && settled.key !== runId ||
 		settlements.some(entry => !isDeepStrictEqual(entry.result, settled)))
 		throw new NativeSettlementError("conflict");
@@ -83,28 +83,31 @@ export function readNativeSettlement(file: string, key: string, runId: string, a
 function readBoundStatus(root: string, admission: ReturnType<typeof readExecuteAdmission>["admission"]["association"],
 	producer: { key: string; runId: string | null }, agent: string) {
 	const mission = readJson(admission.missionPath);
+	const family = pitakoAgentFamily(agent);
 	const children = record(mission) && mission.id === admission.missionId && Array.isArray(mission.workflowChildren)
 		? mission.workflowChildren.filter(child => child.key === producer.key &&
-			(producer.runId === null || child.runId === producer.runId) && pitakoAgentFamily(child.agent) === pitakoAgentFamily(agent)) : [];
+			(producer.runId === null || child.runId === producer.runId)) : [];
+	const producerAgent = children[0]?.agent;
 	const runId = children.length === 1 ? children[0].runId : undefined;
 	const directories = children.length === 1 && Array.isArray(children[0].artifactPaths)
 		? children[0].artifactPaths.filter((file: unknown): file is string =>
 			typeof file === "string" && path.isAbsolute(file) && path.basename(file) === runId) : [];
-	if (typeof runId !== "string" || directories.length !== 1)
+	if (typeof runId !== "string" || directories.length !== 1 || !family || pitakoAgentFamily(producerAgent) !== family)
 		throw new Error("Retained halt native producer or path integrity failure.");
 	const directory = directories[0];
 	const status = readJson(safePath(path.join(directory, "status.json")));
 	if (!record(status) || status.runId !== runId || status.workflowKey !== producer.key ||
 		status.cwd !== root || typeof status.parentWorkflowRunId !== "string" ||
-		path.basename(status.parentWorkflowRunId) !== status.parentWorkflowRunId)
+		path.basename(status.parentWorkflowRunId) !== status.parentWorkflowRunId ||
+		Array.isArray(status.steps) && status.steps.some(step => step?.agent !== producerAgent))
 		throw new Error("Retained halt native status integrity failure.");
-	return { status, directory, runId,
+	return { status, directory, runId, agent: producerAgent,
 		journal: path.join(path.dirname(directory), status.parentWorkflowRunId, "workflow-children.jsonl") };
 }
 
 function readBoundSettlement(...args: Parameters<typeof readBoundStatus>) {
-	const { status, runId, journal } = readBoundStatus(...args);
-	return { timeoutMs: status.timeoutMs, result: readNativeSettlement(journal, args[2].key, runId, args[3]) };
+	const { status, runId, journal, agent } = readBoundStatus(...args);
+	return { timeoutMs: status.timeoutMs, result: readNativeSettlement(journal, args[2].key, runId, agent) };
 }
 
 function readHaltSettlement(...args: Parameters<typeof readBoundSettlement>) {
@@ -250,9 +253,9 @@ export function retainedExecuteHalt(root: string, value: ExecuteCursor) {
 		const agent = "pitako.checkout-observer";
 		function checkoutEvidence(ref: { key: string; runId: string }) {
 			try {
-				const { status, directory, runId, journal } = readBoundStatus(root, admission.association, ref, agent);
+				const { status, directory, runId, journal, agent: producerAgent } = readBoundStatus(root, admission.association, ref, agent);
 				try {
-					return { result: readNativeSettlement(journal, ref.key, runId, agent) };
+					return { result: readNativeSettlement(journal, ref.key, runId, producerAgent) };
 				} catch (error) {
 					if (error instanceof NativeSettlementError) {
 						if (error.kind !== "missing") throw error;
@@ -594,7 +597,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 			typeof file === "string" && path.isAbsolute(file)) : [];
 		const directories = paths.filter(file => path.basename(file) === child.runId);
 		const originals = paths.filter(file => path.basename(file) === `${subject.key}.json`);
-		return { key: subject.key, runId: child.runId, nativeState: child.status,
+		return { key: subject.key, runId: child.runId, agent: child.agent, nativeState: child.status,
 			asyncDir: directories.length === 1 ? directories[0] : undefined,
 			results: originals.map(file => ({ savedOutputPath: file })),
 			saved: saved.find(original => original.key === subject.key && original.runId === child.runId) };
@@ -603,13 +606,14 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		const identity = { key: ref.key, runId: ref.runId };
 		try {
 			if (ref.error) throw new Error(String(ref.error));
-			if (typeof ref.runId !== "string" || typeof ref.asyncDir !== "string" ||
+			if (typeof ref.runId !== "string" || typeof ref.agent !== "string" || typeof ref.asyncDir !== "string" ||
 				!path.isAbsolute(ref.asyncDir) || path.basename(ref.asyncDir) !== ref.runId)
 				throw new Error("Invalid retained analysis reference.");
 			const native = readJson(path.join(ref.asyncDir, "status.json"));
 			if (native !== undefined && (!record(native) || native.runId !== ref.runId ||
 				(native.cwd !== undefined && native.cwd !== root) ||
-				(native.workflowKey !== undefined && native.workflowKey !== ref.key)))
+				(native.workflowKey !== undefined && native.workflowKey !== ref.key) ||
+				Array.isArray(native.steps) && native.steps.some(step => step?.agent !== undefined && step.agent !== ref.agent)))
 				throw new Error("Retained native producer conflicts with its reference.");
 			const status = record(native) ? native : {};
 			const workerTimeout = ref.key === timedOutWorker?.key;
@@ -618,10 +622,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 					path.basename(status.parentWorkflowRunId) !== status.parentWorkflowRunId)
 					throw new Error("Native settlement reference unavailable.");
 				const journal = path.join(path.dirname(ref.asyncDir), status.parentWorkflowRunId, "workflow-children.jsonl");
-				const settled = readNativeSettlement(journal, String(ref.key), ref.runId,
-					isInterruption(ref.key) ? `pitako.${interrupted!.role}` :
-						isGate(ref.key) ? "pitako.loop-io" : isSealer(ref.key) ? "pitako.checkpoint-sealer" :
-						workerTimeout ? "pitako.worker" : "pitako.reviewer");
+				const settled = readNativeSettlement(journal, String(ref.key), ref.runId, ref.agent);
 				if (isInterruption(ref.key)) {
 					if (settled.key !== undefined && settled.key !== ref.key && settled.key !== ref.runId)
 						throw new Error("Native reviewer settlement key mismatch.");
@@ -679,7 +680,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 			if (saved?.digest !== undefined && canonicalDigest(original) !== saved.digest)
 				throw new Error("Conflicting complete retained analysis originals.");
 			if (bound && saved && /\.task-(reviewer|synthesis)$/.test(String(ref.key))) return undefined;
-			return { ...identity, ok: true, ...(status.state === "complete" ? { state: "complete" } : {}),
+			return { ...identity, agent: ref.agent, ok: true, ...(status.state === "complete" ? { state: "complete" } : {}),
 				...((synthesisHalt || cursor.halt?.stage === "timeout") &&
 					String(ref.key).includes(".review.") && publishedPath ? { path: publishedPath } : {}),
 				structuredOutput: original };

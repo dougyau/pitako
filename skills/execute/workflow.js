@@ -1029,7 +1029,7 @@ function renewAnalysisTimeout(cursor) {
       const cause = analysisBarrier(observed, ref.runId ?? ref.key);
       if (cause) throw nativeBarrier(cause, ref);
       if (!text(ref.runId) || observed?.runId !== ref.runId && !managementAnalysisState(observed, ref) ||
-          observed?.agent && ref.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent) ||
+          observed?.agent && ref.agent && observed.agent !== ref.agent ||
           observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
           !terminalAnalysis(observed, ref)) settled = false;
       retiredRefs.set(entry.key, ref);
@@ -1088,6 +1088,8 @@ function retainedReadOnlyOriginal(observed, ref, originals = inspectedAnalyses) 
   if (retainedBarrier) throw nativeBarrier(retainedBarrier);
   if (original?.error && original.error !== "Complete retained analysis original unavailable.")
     throw new Error(original.error);
+  if (observed?.agent && original?.agent && observed.agent !== original.agent)
+    throw new Error("Conflicting retained analysis producer agents.");
   if (observed?.structuredOutput && original?.ok && !same(observed.structuredOutput, original.structuredOutput))
     throw new Error("Conflicting complete retained analysis originals.");
   if (!observed?.structuredOutput && original) {
@@ -1799,7 +1801,7 @@ function loopIO(slot, input, owner = loop) {
           inFlight.set(childKey, { key: childKey, runId: observed.runId, role: "loop-io" });
         }
         const cause = barrier(observed, pending.ref?.runId ?? childKey);
-        if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: pitakoLoopAgent(input.operation) });
+        if (cause) throw nativeBarrier(cause, pending.ref ?? nativeReference(childKey, observed));
         pending.retry++; delete pending.ref; pending.dispatched = false;
         return save().then(run);
       });
@@ -2596,7 +2598,7 @@ function observePendingSealer() {
   if (!pending?.retry && !close?.dispatched) return Promise.resolve();
   // A grouped close consumes seal index 0; a later legacy re-seal is the newest producer.
   const closeKey = close && close.key + (close.retry ? `.r${close.retry}` : "");
-  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref?.key === closeKey ? close.ref : { key: closeKey, agent: pitakoLoopAgent("close") }
+  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref?.key === closeKey ? close.ref : { key: closeKey, agent: "pitako.loop-io" }
     : { key: sealerKey(loop.attempt.key, pending.retry - 1), agent: "pitako.checkpoint-sealer" };
   const key = ref.key;
   if (budgetRejected(key) || pending?.reconciled === key) return Promise.resolve();
@@ -2604,7 +2606,7 @@ function observePendingSealer() {
     const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? key);
     if (cause) throw nativeBarrier(cause, ref);
     if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
-        (observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent)))
+        (observed?.agent && (ref.runId ? observed.agent !== ref.agent : pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent))))
       throw new Error("Sealer producer/run identity conflicts with the pending seal.");
     if (loop.attempt.taskReview?.synthesis && ref.agent === "pitako.checkpoint-sealer" &&
         observed?.ok && observed.output?.trimStart().startsWith("{")) {
@@ -4133,7 +4135,7 @@ function observeGateRenewal(cursor, halt, resume) {
   return observeStatus(halt.ref.runId, true).then(observed => {
     if (observed?.runId && observed.runId !== halt.ref.runId ||
         observed?.key && ![halt.key, halt.ref.runId].includes(observed.key) ||
-        observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(halt.ref.agent))
+        observed?.agent && observed.agent !== halt.ref.agent)
       throw new Error("Gate timeout producer identity mismatch.");
     const cause = analysisBarrier(observed, halt.ref.runId);
     if (cause) throw nativeBarrier(cause, halt.ref);
@@ -4289,7 +4291,7 @@ function observeReviewerTimeoutStatus(runId) {
 function checkReviewerTimeoutIdentity(observed, ref) {
   if (observed?.runId && observed.runId !== ref.runId ||
       observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
-      observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent))
+      observed?.agent && ref.agent && observed.agent !== ref.agent)
     throw new Error("Task review timeout producer identity mismatch.");
 }
 function reviewerRenewalHalt(timeout, cause) {
@@ -4677,7 +4679,7 @@ function replayNativeInterruption(cursor, action, rebuild, capturedObservation) 
   }).then(observed => {
     if (observed?.runId && observed.runId !== action.runId ||
         observed?.key && ![action.key, action.runId].includes(observed.key) ||
-        observed?.agent && pitakoAgentFamily(observed.agent) !== action.role)
+        observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(`pitako.${action.role}`))
       throw new Error("Retained interruption producer integrity mismatch.");
     const current = statusBarrier ?? analysisBarrier(observed, action.runId);
     if (current && !["stopped", "interrupted", "native permission denial"].includes(current))
@@ -4848,7 +4850,7 @@ function admitEarlyAnalyses(originals, refs) {
       const cause = analysisBarrier(observed, runId);
       if (cause) throw nativeBarrier(cause, { key, runId });
       if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
-          observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer" || !analysisSettled(observed, reference) ||
+          observed?.agent && observed.agent !== result.agent || !analysisSettled(observed, reference) ||
           observed?.structuredOutput && canonicalDigest(clone(observed.structuredOutput)) !== digest)
         throw new Error(`Early analysis producer integrity mismatch for ${key}.`);
       analysisResults.set(key, result);
@@ -5249,9 +5251,10 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
           const original = metadata.retainedAnalyses.find(ref => ref.key === slot.key &&
             (!slot.runId || slot.runId === ref.runId));
           const valid = original?.ok && text(original.runId) && text(original.path) &&
+            pitakoAgentFamily(original.agent) === "reviewer" &&
             (!slot.digest || canonicalDigest(original.structuredOutput) === slot.digest);
           return { key: slot.key, stage: valid ? "receipt" : "intention",
-            ref: valid ? { key: slot.key, runId: original.runId, agent: pitakoReviewerAgent(slot.key) } : { key: slot.key } };
+            ref: valid ? { key: slot.key, runId: original.runId, agent: original.agent } : { key: slot.key } };
         });
         target.analysisCalls.push(call);
         // Preserve the saved sibling ownership until retirement succeeds.
@@ -5329,7 +5332,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       if (cause) throw nativeBarrier(cause, { key, runId });
       if (observed?.ok !== false || observed.runId !== runId ||
           observed.key && ![key, runId].includes(observed.key) ||
-          observed.agent && pitakoAgentFamily(observed.agent) !== role)
+          observed.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(`pitako.${role}`))
         throw new Error("Retained capacity producer identity or refusal is unavailable.");
       const halt = { status: "partial", ...nativeFailure(key, observed.error, observed) };
       if (halt.code !== "capacity" || canonicalDigest(halt) !== cursor.halt.digest)
@@ -5546,7 +5549,8 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
             observed.key && ![producer.key, observed.runId].includes(observed.key) ||
             observed.agent && pitakoAgentFamily(observed.agent) !== "reviewer")
           throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
-        if (observed.structuredOutput) reviewedNative.set(ref.key, canonicalDigest(clone(observed.structuredOutput)));
+        reviewedNative.set(ref.key, { agent: observed.agent,
+          ...(observed.structuredOutput ? { digest: canonicalDigest(clone(observed.structuredOutput)) } : {}) });
         return { key: ref.key, runId: observed.runId };
       }
       return observeStatus(ref.runId ?? ref.key, true).then(observed => {
@@ -5938,13 +5942,17 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
         const originals = execution.taskReviewRecovery?.originals;
         if (!originals || originals.length !== reviewRefs.length) throw new Error("Missing recovered task review originals.");
         restoredLoop.attempt.taskReview = {};
-        restoredLoop.analysisCalls = originals.map(({ reference, body }, index) => {
+        restoredLoop.analysisCalls = originals.map(({ reference, agent, body }, index) => {
+          const observed = reviewedNative.get(reference.key);
+          const producerAgent = agent ?? observed?.agent;
           if (reference.key !== reviewRefs[index].key || reference.runId !== reviewRefs[index].runId ||
               canonicalDigest(body) !== reference.digest ||
-              reviewedNative.has(reference.key) && reviewedNative.get(reference.key) !== reference.digest)
+              observed?.digest && observed.digest !== reference.digest ||
+              observed?.agent && observed.agent !== producerAgent ||
+              producerAgent && pitakoAgentFamily(producerAgent) !== "reviewer")
             throw new Error("Task review recovery original integrity mismatch.");
           restoredLoop.attempt.taskReview[index ? "synthesis" : "reviewer"] = clone(reference);
-          const original = { ok: true, key: reference.key, agent: pitakoReviewerAgent(reference.key),
+          const original = { ok: true, key: reference.key, agent: producerAgent,
             runId: reference.runId, structuredOutput: body, results: [{ savedOutputPath: reference.path }] };
           analysisResults.set(reference.key, original);
           return { key: reference.key, stage: "receipt", ref: nativeReference(reference.key, original) };
@@ -6095,11 +6103,11 @@ function checkEpochProducers(timeoutAction) {
   return refs.reduce((chain, ref) => chain.then(() => timeoutAction
     ? observeReviewerTimeoutStatus(ref.runId) : observeStatus(ref.runId, true)).then(observed => {
     if (timeoutAction?.runId === ref.runId)
-      checkReviewerTimeoutIdentity(observed, { ...ref, agent: "pitako.reviewer" });
+      checkReviewerTimeoutIdentity(observed, ref);
     const cause = (timeoutAction ? analysisBarrier : barrier)(observed, ref.runId);
     if (cause) throw nativeBarrier(cause, ref);
     if (observed?.runId !== ref.runId && !(observed?.runId === undefined && managementAnalysisState(observed, ref)) ||
-        observed.agent && pitakoAgentFamily(observed.agent) !== ref.role ||
+        observed.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(`pitako.${ref.role}`) ||
         !terminalAnalysis(observed, ref))
       throw new Error(`Store epoch recovery awaits exact terminal producer evidence for ${ref.key}.`);
   }), Promise.resolve());
@@ -7093,7 +7101,7 @@ Return structured_output after all owned journaled writes settle.`,
             const cause = analysisBarrier(observed, runId);
             if (cause) throw nativeBarrier(cause, { key, runId, agent });
             if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
-                observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(agent) || !analysisSettled(observed, { key, runId }))
+                observed?.agent && observed.agent !== agent || !analysisSettled(observed, { key, runId }))
               throw new Error("Renewed review access verifier producer integrity mismatch.");
             return [loop.replayedReviewAccess];
           })
@@ -7233,7 +7241,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
       const value = result?.structuredOutput;
       const complianceRef = loop.compliance?.ref;
       if (barrier(result)) throw nativeBarrier(barrier(result), nativeReference(complianceKey, result), result);
-      if (!result?.ok || !value)
+      if (!result?.ok || !value || pitakoAgentFamily(result.agent) !== "reviewer")
         throw new Error(`Compliance lacks a meaningful source/reason/current-evidence requirements inventory. ${excerpt(result?.error ?? result?.output ?? "")}`);
       // The judged candidate is workflow-known (it is in the prompt); never a model echo.
       // Native SDK originals may cross VM realms; hash their JSON value, not their prototype.
@@ -7245,7 +7253,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
         unresolved: Array.isArray(value?.requirements) ? value.requirements.filter(item => ["gap", "blocked"].includes(item?.status))
           .map(item => ({ id: item.id, source: item.source, status: item.status, reason: item.reason })) : [] };
       loop.compliance.ref = { ...complianceRef, ...loop.compliance.ref };
-      loop.compliance = closingCompliance(value, loop.compliance.original, candidate(loop.candidate), cancelledScope());
+      loop.compliance = closingCompliance(value, loop.compliance.original, result.agent, candidate(loop.candidate), cancelledScope());
       loop.closingPublication.compliance = { key: complianceKey, runId: result.runId };
       if (complianceKey !== loop.closingSeed.complianceKey)
         loop.closingSeed = { ...loop.closingSeed, complianceTimeoutMs: effectiveTimeouts().reviewerMs };

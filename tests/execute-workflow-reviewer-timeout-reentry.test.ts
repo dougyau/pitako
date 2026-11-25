@@ -636,6 +636,13 @@ test("after final-review replay, execute enters a new epoch when a later access 
   const host = fixture(undefined, { taskCount: 0 });
   host.setLimit(3);
   const synthesis = "invoke-human-1.l1.review.director-synthesis";
+  const priorVerifier = "invoke-human-1.l1.review.verify-synthesis";
+  const verifierRunId = nativeRunId(priorVerifier);
+  host.setLaunchRespond(async (request, normal) => {
+    const result = await normal();
+    return request.key === priorVerifier ? { ...result, agent: "pitako.access-verifier",
+      runId: verifierRunId, state: "complete" } : result;
+  });
   let retainedSynthesis = false;
   host.setSaveObserver(value => {
     if (value.action.key === synthesis && value.action.runId) retainedSynthesis = true;
@@ -645,6 +652,9 @@ test("after final-review replay, execute enters a new epoch when a later access 
   expect(host.current().action).toMatchObject({ key: synthesis, runId: nativeRunId(synthesis) });
   host.setFailSave();
   host.setSaveObserver(undefined);
+  const retained = copy(host.current());
+  retained.inFlight.push({ key: priorVerifier, runId: verifierRunId, role: "access-verifier" });
+  await host.state.set("pitako-execute", retained);
   // A checkout change at the end of the replayed loop requires another final review.
   host.setObservationResponse((key, observation) => key === "invoke-human-1.l1.checkout"
     ? { ...observation, checkout: { ...observation.checkout, fingerprint: "f".repeat(64) } } : observation);
@@ -678,6 +688,7 @@ test("after final-review replay, execute enters a new epoch when a later access 
   const relaunched = host.launches.slice(beforeReplay);
   expect(relaunched[0]?.key).toBe("invoke-human-1.l1.reviewOriginals.r1");
   expect(result.status, `${result.reason} (epoch ${host.current().epoch})`).toBe("complete");
+  expect(host.statusCalls).toContain(verifierRunId);
   expect(quarantine).toStartWith(`${store.file}.v2.`);
   expect(existsSync(quarantine!)).toBe(true);
   const { storeId } = store.verify();

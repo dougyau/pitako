@@ -200,14 +200,23 @@ test.each([4, 5])("native closing references ring rejects only last three loops 
 const checkoutDefects = ["producer", "publication", "exit", "save", "results", "stdout", "json",
   "keys", "root", "commonDir", "closeReference"];
 test.each([...[true, false].flatMap(committed =>
-  ["none", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
+  ["none", "legacy-compliance", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
     "compliance-unsettled", "compliance-no-journal", "compliance-truncated", "review-body", "review-missing"]
     .map(mutation => ({ committed, mutation }))),
+  ...["wrong-family-step", "same-family-step", "same-family-settlement"].map(mutation => ({ committed: false, mutation })),
   { committed: true, mutation: "closing-unsettled" },
   ...checkoutDefects.map(defect => ({ committed: false, mutation: `checkout-${defect}` }))])(
   "closing rebuilds identical bytes after a save cut; %j", async ({ committed, mutation }) => {
   const host = fixture(undefined, { taskCount: 0 });
   host.setLimit(1);
+  const legacy = mutation === "legacy-compliance";
+  const conflictingStep = mutation.endsWith("-step");
+  const conflictingSettlement = mutation === "same-family-settlement";
+  if (legacy) host.setLaunchRespond((request, normal) => {
+    // Emulate an old host recording this child under the original name.
+    if (request.key.endsWith(".compliance")) request.agent = "pitako.reviewer";
+    return normal();
+  });
   host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.execution-director") Object.assign(result.structuredOutput, { select: null, changes: [] });
@@ -259,7 +268,8 @@ test.each([...[true, false].flatMap(committed =>
   if (mutation === "compliance-body") writeFileSync(compliance.results![0]!.structuredOutputPath!,
     JSON.stringify({ ...compliance.structuredOutput, reason: "Changed during closing" }));
   if (mutation === "compliance-missing") unlinkSync(compliance.results![0]!.structuredOutputPath!);
-  if (["none", "compliance-producer", "compliance-settlement"].includes(mutation) || missingUsage) {
+  if (["none", "compliance-producer", "compliance-settlement"].includes(mutation) ||
+      conflictingStep || conflictingSettlement || missingUsage) {
     const missionPath = store.read(scope).P.prompt.admission!.association.missionPath;
     const mission = JSON.parse(readFileSync(missionPath, "utf8"));
     const child = mission.workflowChildren.find((child: any) => child.key === host.current().action.key);
@@ -269,12 +279,17 @@ test.each([...[true, false].flatMap(committed =>
     expect(status.steps[0]).not.toHaveProperty("usage");
     if (mutation === "compliance-producer")
       writeFileSync(statusFile, JSON.stringify({ ...status, workflowKey: "another-compliance" }));
-    if (mutation === "compliance-settlement" || missingUsage) {
+    if (conflictingStep) {
+      status.steps[0].agent = mutation === "same-family-step" ? "pitako.task-review" : "pitako.worker";
+      writeFileSync(statusFile, JSON.stringify(status));
+    }
+    if (mutation === "compliance-settlement" || conflictingSettlement || missingUsage) {
       const journal = path.join(path.dirname(directory), status.parentWorkflowRunId, "workflow-children.jsonl");
       const lines = readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
       for (const line of lines) if (line.type === "settle" && line.key === host.current().action.key) {
         if (mutation === "compliance-settlement")
           line.result.structuredOutput = { ...line.result.structuredOutput, reason: "Conflicting settlement" };
+        if (conflictingSettlement) line.result.agent = "pitako.task-review";
       }
       if (mutation === "compliance-no-journal") unlinkSync(journal);
       else {
@@ -312,7 +327,7 @@ test.each([...[true, false].flatMap(committed =>
     // The observer may have committed, but invalid terminal evidence cannot advance the root.
     expect(store.read(scope).records.filter(row => row.kind === "ledger")
       .flatMap((row: any) => row.body.entries)).toHaveLength(2);
-  } else if (mutation !== "none" && !missingUsage) {
+  } else if (mutation !== "none" && !legacy && !missingUsage) {
     expect(output.status).toBe("blocked");
     expect(output.reason).toContain("integrity");
     expect(store.read(scope).records).toEqual(beforeReplay);
@@ -320,6 +335,7 @@ test.each([...[true, false].flatMap(committed =>
     expect(output.status, output.reason).toBe("complete");
     expect(host.records()).toHaveLength(2);
     const archive = host.records().find((row: any) => row.kind === "loop")!.body;
+    expect(archive.compliance.ref.agent).toBe(legacy ? "pitako.reviewer" : "pitako.compliance");
     expect(archive.usage).toContainEqual({ id: `${compliance.runId}:0`,
       tokens: missingUsage && !committed ? null : 20 });
   }
@@ -331,7 +347,7 @@ test.each([...[true, false].flatMap(committed =>
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toEqual([request]);
     expect(canonicalJSON(store.read(scope).records.find(row => row.seq === published!.seq))).toBe(original!);
   } else {
-    expect(added.map(call => call.agent)).toEqual(mutation === "none" || missingUsage
+    expect(added.map(call => call.agent)).toEqual(mutation === "none" || legacy || missingUsage
       ? ["pitako.checkout-observer", "pitako.loop-drain"] : ["pitako.checkout-observer"]);
     expect(added[0].key).toBe("invoke-human-1.l1.checkout");
     expect(added[0].task).toBe(expectedRequest);

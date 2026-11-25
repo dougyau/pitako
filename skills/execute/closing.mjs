@@ -2,13 +2,12 @@ import { readFileSync } from "node:fs";
 import { canonicalDigest, sha256 } from "../../extensions/canonical.mjs";
 import { safePath } from "../../extensions/hash-ledger.mjs";
 import { executeStore } from "./ledger.mjs";
-import { pitakoReviewerAgent } from "../agent-names.mjs";
 // The ledger installs the owned Node TypeScript loader before this source closure.
 const { readNativeOriginal, readReviewOriginal } = await import("./loop.ts");
 const { verifyComplianceRenewal } = await import("../../extensions/execute-retained.ts");
 
 // Shared with the sandbox root: publication never depends on a root-only result body.
-export function closingCompliance(value, original, candidate, cancelledScope = []) {
+export function closingCompliance(value, original, agent, candidate, cancelledScope = []) {
   if (!["fulfilled", "gaps", "blocked"].includes(value?.status) ||
       typeof value.reason !== "string" || !value.reason.trim() ||
       !Array.isArray(value.requirements) || !value.requirements.length ||
@@ -27,7 +26,7 @@ export function closingCompliance(value, original, candidate, cancelledScope = [
     if (size > remaining || reason.length + point.length > 360) break;
     reason += point; remaining -= size;
   }
-  const result = { ref: { key: original.key, agent: pitakoReviewerAgent(original.key), runId: original.runId,
+  const result = { ref: { key: original.key, agent, runId: original.runId,
     results: [{ savedOutputPath: original.path }] }, ok: true, status: value.status, barrier: null,
     reused: false, terminal: null, candidate, original, reason,
     unresolved: value.requirements.filter(item => ["gap", "blocked"].includes(item.status))
@@ -86,7 +85,7 @@ export function resolveClosingPublication(root, request) {
       }
       const verified = readNativeOriginal(root, { association: admission.association }, request.compliance, "pitako.reviewer");
       compliance = closingCompliance(verified.value, { ...request.compliance,
-        path: verified.reference.path, digest: canonicalDigest(verified.value) }, seed.body.candidate,
+        path: verified.reference.path, digest: canonicalDigest(verified.value) }, verified.agent, seed.body.candidate,
         seed.body.cancelledScope);
       usage = verified.usage;
       if (verified.value.status === "blocked") throw new Error("blocked compliance cannot publish");

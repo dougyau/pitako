@@ -583,7 +583,8 @@ type SavedGateReceipt = GateReceipt & { identity: GateIdentity; receiptDigest: s
 
 /** Resolve only the exact native producer, never a key-only lookup or an inline root copy. */
 export function readWorkerOriginal(input: GateInput, accounting = true) {
-  return readNativeOriginal(input.root, input.checkpoint!, input.worker!, "pitako.worker", accounting);
+  const { agent, ...original } = readNativeOriginal(input.root, input.checkpoint!, input.worker!, "pitako.worker", accounting);
+  return original;
 }
 export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   worker: { key: string; runId: string }, agent: "pitako.worker" | "pitako.reviewer", accounting: boolean | "settlement" = true) {
@@ -594,6 +595,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   const children = mission.workflowChildren.filter((child: any) => child.key === worker.key && child.runId === worker.runId);
   const family = pitakoAgentFamily(agent);
   assert(children.length === 1 && pitakoAgentFamily(children[0].agent) === family, "Worker native producer identity mismatch");
+  const producerAgent: string = children[0].agent;
   const artifacts: unknown[] = children[0].artifactPaths;
   assert(Array.isArray(artifacts), "Worker native artifact references unavailable");
   const directories = artifacts.filter((file): file is string => text(file) && path.isAbsolute(file) && path.basename(file) === worker.runId);
@@ -603,7 +605,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   assert(native.runId === worker.runId && native.cwd === root && native.workflowKey === worker.key &&
     native.state === "complete" && Array.isArray(native.steps) && native.steps.length === 1, "Worker native status conflicts with its original");
   const step = native.steps[0];
-  assert(pitakoAgentFamily(step.agent) === family && step.exitCode === 0 && !step.stopped && !step.interrupted &&
+  assert(step.agent === producerAgent && step.exitCode === 0 && !step.stopped && !step.interrupted &&
     !step.detached && !step.timedOut && !step.outputSaveError && !step.outputPartial && !step.truncation,
   "Worker native original has a terminal barrier");
   const file = safePath(originals[0]!);
@@ -614,7 +616,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   // Status steps omit usage; the native workflow settlement retains the aggregate SingleResult.
   let usage, settled;
   if (accounting && (accounting === "settlement" || agent === "pitako.reviewer" && worker.key.endsWith(".compliance") ||
-      agent === "pitako.worker" && text(native.parentWorkflowRunId))) {
+      text(native.parentWorkflowRunId))) {
     assert(text(native.parentWorkflowRunId) && path.basename(native.parentWorkflowRunId) === native.parentWorkflowRunId,
       "Reviewer native workflow identity unavailable");
     const journal = safePath(path.join(path.dirname(directories[0]!), native.parentWorkflowRunId, "workflow-children.jsonl"));
@@ -623,12 +625,12 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
       if (entry?.type === "settle" && entry.key === worker.key && entry.result?.runId === worker.runId) {
-        settled = entry.result;
-        break;
+        assert(entry.result.agent === producerAgent, "Reviewer native settlement conflicts with its original");
+        settled ??= entry.result;
       }
     }
     if (settled) {
-      assert(settled.ok === true && pitakoAgentFamily(settled.agent) === family && settled.results?.length === 1 &&
+      assert(settled.ok === true && settled.results?.length === 1 &&
         settled.results[0].exitCode === 0 && canonicalDigest(settled.structuredOutput) === canonicalDigest(value),
       "Reviewer native settlement conflicts with its original");
       if (agent === "pitako.worker" && typeof settled.output === "string" && /^\s*\{/.test(settled.output)) {
@@ -640,7 +642,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
     }
   }
   if (accounting === "settlement") assert(settled, "Native analysis settlement unavailable");
-  return { value, ...(usage ? { usage } : {}), ...(accounting === "settlement" ? { settlement: settled } : {}),
+  return { value, agent: producerAgent, ...(usage ? { usage } : {}), ...(accounting === "settlement" ? { settlement: settled } : {}),
     reference: { ...worker, path: file, sha256: createHash("sha256").update(bytes).digest("hex") } };
 }
 

@@ -225,7 +225,7 @@ function nativeFinalDrain(admission, input) {
     throw new Error("Final drain native producer identity mismatch.");
   const status = JSON.parse(readFileSync(safePath(path.join(dirs[0], "status.json")), "utf8"));
   if (status.runId !== producer.runId || status.workflowKey !== producer.key || status.cwd !== input.root ||
-      status.parentWorkflowRunId !== child.workflowRunId || pitakoAgentFamily(status.steps?.[0]?.agent) !== "loop-io")
+      status.parentWorkflowRunId !== child.workflowRunId || status.steps?.length !== 1 || status.steps[0].agent !== child.agent)
     throw new Error("Final drain native status identity mismatch.");
   const settled = readNativeSettlement(path.join(path.dirname(dirs[0]), child.workflowRunId, "workflow-children.jsonl"),
     producer.key, producer.runId, child.agent);
@@ -286,7 +286,7 @@ function boundNativeProducer(association, fail) {
     const result = readNativeSettlement(journal, subject, child.runId, child.agent);
     if (status.runId !== child.runId || status.cwd !== association.root || status.workflowKey !== subject ||
         status.parentWorkflowRunId !== child.workflowRunId || status.steps?.length !== 1 ||
-        pitakoAgentFamily(status.steps[0].agent) !== pitakoAgentFamily(agent) || result.results?.length !== 1)
+        status.steps[0].agent !== child.agent || result.results?.length !== 1)
       throw fail(`native identity mismatch for ${subject}`);
     return { child, status, result, journal };
   };
@@ -1564,7 +1564,8 @@ export function resolveStoredGroupedInput(operation, input) {
         // Synthesis is already bound to its exact key, run, path and bytes by the review archive seed.
         if (!synthesis) {
           const verified = readNativeOriginal(input.root, { association: admission.association }, original, "pitako.reviewer");
-          if (verified.reference.path !== original.path || canonicalDigest(verified.value) !== original.digest)
+          if (verified.agent !== body.compliance.ref.agent ||
+              verified.reference.path !== original.path || canonicalDigest(verified.value) !== original.digest)
             throw new Error("compliance producer/path/digest mismatch");
         }
         for (const review of body.integratedReview?.originals ?? []) {
@@ -1616,7 +1617,7 @@ export function resolveStoredGroupedInput(operation, input) {
       const originals = reviews.map(review => {
         const original = readNativeOriginal(input.root, request.checkpoint, review, "pitako.reviewer");
         return { reference: { ...review, path: original.reference.path, digest: canonicalDigest(original.value) },
-          body: original.value };
+          agent: original.agent, body: original.value };
       });
       const execution = prefix.P.prompt.execution;
       const continuation = [execution?.continuation, execution?.foldedContinuation]
@@ -1803,7 +1804,12 @@ export function resolveStoredGroupedInput(operation, input) {
             !/^[a-f0-9]{64}$/.test(timeout.digest))
           throw new StoreError("store-corrupt", "Invalid gate timeout original reference");
         let original;
-        try { original = readNativeSettlement(timeout.path, timeout.key, timeout.runId, "pitako.loop-io"); }
+        try {
+          const { native } = boundNativeProducer(admission.association, message => new Error(message));
+          const { result, journal } = native(timeout.key, "pitako.loop-io", timeout.runId);
+          if (journal !== timeout.path) throw new Error("Native settlement path mismatch.");
+          original = result;
+        }
         catch (error) { throw new StoreError("store-corrupt", `Gate timeout original unavailable: ${error.message}`); }
         const generation = Number(timeout.key.match(/\.g([23])\.gate(?:\.r\d+)?$/)?.[1] ?? 1);
         const originalKey = `${worker.key}${generation > 1 ? `.g${generation}` : ""}.gate`;
