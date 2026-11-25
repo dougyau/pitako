@@ -48,7 +48,8 @@ const isHash = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value
 const keys = (value, names) => value && typeof value === "object" && !Array.isArray(value) && Object.keys(value).sort().join(",") === names;
 
 export function ledgerPath(root, invocation) {
-  if (!path.isAbsolute(root) || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(invocation) || invocation.includes(".."))
+  if (!path.isAbsolute(root) || typeof invocation !== "string" ||
+      !/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(invocation) || invocation.includes(".."))
     throw new Error("Invalid ledger root or invocation.");
   return safePath(path.join(root, ".pi/subagents/execute", invocation));
 }

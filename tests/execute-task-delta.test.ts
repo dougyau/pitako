@@ -1,5 +1,5 @@
 import { beforeAll, expect, test } from "bun:test";
-import { execFileSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { tmpdir } from "node:os";
@@ -38,10 +38,15 @@ function fixture() {
     effect();
     closeHookEffect(intent, seq);
   }
-  function deltaCLI() {
+  function cli(request: object) {
     budget.counts.loopIO++;
-    return JSON.parse(execFileSync("node", [entry], { cwd: root, encoding: "utf8",
-      input: JSON.stringify({ operation: "taskDelta", invocation: "delta", intents }) }));
+    const run = spawnSync("node", [entry], { cwd: root, encoding: "utf8", input: JSON.stringify(request) });
+    return { status: run.status, output: JSON.parse(run.stdout) };
+  }
+  function deltaCLI() {
+    const run = cli({ operation: "taskDelta", invocation: "delta", intents });
+    expect(run.status, JSON.stringify(run.output)).toBe(0);
+    return run.output;
   }
   async function delta() {
     const observed = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(), root,
@@ -51,7 +56,7 @@ function fixture() {
     expect(observed?.[0], observed?.[2]).toBe(0);
     return JSON.parse(observed![1]);
   }
-  return { root, intents, attempt, edit, delta, deltaCLI,
+  return { root, intents, attempt, edit, delta, deltaCLI, cli,
     processes: () => [budget.processes(), composition.processes()] };
 }
 
@@ -123,6 +128,28 @@ test("taskDelta CLI uses the checkpoint epoch without a top-level key and replay
   expect(f.deltaCLI()).toEqual(delta);
   expect(store.readRecords("exec:delta.e2").records.filter(row => row.kind === "task-delta")).toHaveLength(1);
   expect(store.readRecords("exec:delta.e0").records).toHaveLength(0);
+});
+
+test("repair-attempt baseline CLI takes its invocation from the checkpoint intent", () => {
+  const f = fixture(), first = f.attempt("invoke-delta.e2.l1.t1.a1");
+  const { baseline: _, ...unbound } = first;
+  const intent = { ...unbound, key: "invoke-delta.e2.l1.t1.a2", attempt: 2 };
+  // The workflow's baselineIO request carries the invocation only inside the intent.
+  const request = { operation: "baseline", root: f.root, intent, continuation: { attempt: { number: 2 } } };
+  const run = f.cli(request);
+  expect(run.status, JSON.stringify(run.output)).toBe(0);
+  expect(run.output.candidate).toEqual(captureBaseline({ intent }).candidate);
+  const store = new PitakoStore(f.root);
+  const rows = store.readRecords("exec:delta.e2").records;
+  const row = rows.find(row => row.seq === run.output.intent.seq)!;
+  expect([row.kind, row.opKey, row.digest]).toEqual(["intent", `intent:${intent.key}`, run.output.intent.digest]);
+  expect(rows.some(row => row.opKey === `operation:${intent.key}.baseline`)).toBe(true);
+  expect(f.cli(request).output).toEqual(run.output);
+  expect(store.readRecords("exec:delta.e2").records).toHaveLength(rows.length);
+  expect(store.readRecords("exec:delta.e0").records).toHaveLength(0);
+  const { invocation: __, ...association } = intent.association;
+  const missing = f.cli({ ...request, intent: { ...intent, association } });
+  expect([missing.status, missing.output.reason]).toEqual([1, "Invalid ledger root or invocation."]);
 });
 
 test("more than 200 net changes publish a deterministic digest-verified overflow reference", async () => {
