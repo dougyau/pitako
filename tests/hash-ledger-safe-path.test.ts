@@ -18,7 +18,8 @@ function fixture(name: string) {
   writeFileSync(path.join(dir, "real", "runs", "status.json"), "{}");
   return dir;
 }
-const only = (link: string) => (candidate: string, _stat: Stats) => candidate === link;
+// Keep trusting system links, so a temporary root under macOS /var still resolves.
+const only = (link: string): Trusted => (candidate, stat) => candidate === link || systemLink(candidate, stat);
 
 describe("safePath", () => {
   test("returns the absolute path when no component is a symlink", () => {
