@@ -21,6 +21,7 @@ import { T3_DISPLAY_NOTE, T3_EXTENSION_ENV } from "../extensions/host-display.ts
 import { profileNote } from "../extensions/profile.ts";
 import { packageRoot, readStack } from "../extensions/stack.ts";
 import { toolsForProfile } from "../extensions/profile.ts";
+import { PITAKO_REVIEWER_AGENTS } from "../skills/agent-names.mjs";
 
 function readRepo(relative: string): string {
   return readFileSync(path.join(packageRoot(), relative), "utf8");
@@ -134,7 +135,7 @@ describe("engineering-layer composition", () => {
             "supersedes", "Spec-by-sections delivery is deferred", `contract version (v${EXECUTE_STATE_VERSION})`])
             expect(body).toContain(instruction);
           const ceiling = readRepo("AGENTS.md");
-          for (const instruction of ["pitako.loop-io", "gitignored", "no command allow-list"])
+          for (const instruction of ["pitako.loop-*", "gitignored", "no command allow-list"])
             expect(ceiling).toContain(instruction);
           expect(body).not.toContain("node <helper> capture");
           expect(body).not.toContain("must first reconcile the\nexact native producer and prefer its result/continuation");
@@ -252,7 +253,18 @@ describe("engineering-layer composition", () => {
     }
   });
 
-  test("all eight profiles keep isolated extension plans and role ceilings without retired context providers", async () => {
+  test("reviewer role profiles are the reviewer profile under the names hosts display", () => {
+    const base = readRepo("agents/reviewer.md");
+    for (const agent of PITAKO_REVIEWER_AGENTS) {
+      const name = agent.slice("pitako.".length);
+      const profile = readRepo(`agents/${name}.md`);
+      const description = profile.match(/^description: (.+)$/m)?.[1];
+      expect(description).toBeTruthy();
+      expect(profile).toBe(base.replace(/^name: reviewer$/m, `name: ${name}`).replace(/^description: .+$/m, `description: ${description}`));
+    }
+  });
+
+  test("packaged profiles keep isolated extension plans and role ceilings without retired context providers", async () => {
     const parser = await import("../node_modules/pi-subagents/src/agents/frontmatter.js");
     const { resolvePiLaunchToolPlan } = await import("../node_modules/pi-subagents/src/runs/shared/child-tool-plan.js");
     const retiredTools = ["compress", "decompress", "search_context", "acp_status", "acp_cache", "vcc_recall",
@@ -261,7 +273,7 @@ describe("engineering-layer composition", () => {
     const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools")!;
     const roles = ["architect", "reviewer", "scout", "researcher", "evidence-auditor", "execution-inspector", "worker", "execution-director"];
     expect(readdirSync(path.join(packageRoot(), "agents")).filter(file => file.endsWith(".md")).sort())
-      .toEqual(roles.map(role => `${role}.md`).sort());
+      .toEqual([...roles, ...PITAKO_REVIEWER_AGENTS.map(name => name.slice("pitako.".length))].map(role => `${role}.md`).sort());
     for (const role of roles) {
       const { frontmatter, body } = parser.parseFrontmatter(readRepo(`agents/${role}.md`));
       const resolve = (raw?: string) => parser.parseFrontmatterList(raw)?.map(entry => path.resolve(packageRoot(), "agents", entry));

@@ -7,6 +7,7 @@ import { PitakoStore } from "../extensions/pitako-store.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 import { executeControllerFixture, closedInterruptedProducer, copy, cutAt, gaps, nativeRunId, type Result } from "./fixtures/execute-workflow.ts";
 import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const phases = [
@@ -156,7 +157,7 @@ test.each([
   if (phase.step === "final-review") {
     expect(loop.integratedReview.namespace).toContain(".g2.review.");
     expect([...host.storage.keys()].some(key => key.startsWith("review-"))).toBe(false);
-    expect(host.calls.some(call => call.agent === "pitako.access-verifier" && call.key.includes(".g2.review."))).toBe(true);
+    expect(host.calls.some(call => call.agent === "pitako.originals-verifier" && call.key.includes(".g2.review."))).toBe(true);
   }
 });
 
@@ -168,7 +169,7 @@ test.each(phases.flatMap(phase => ["error", "stop", "interrupted", "denial", "ac
     expect(host.current().halt?.stage).not.toBe("timeout");
     const count = host.calls.length;
     expect((await host.executeNative({ timeouts: { reviewerMs: 86400000 } })).status).not.toBe("complete");
-    expect(host.calls.slice(count).filter(call => call.agent !== "pitako.loop-io")).toHaveLength(0);
+    expect(host.calls.slice(count).filter(call => pitakoAgentFamily(call.agent) !== "loop-io")).toHaveLength(0);
   });
 
 test.each(phases)("$target: retirement save cuts preserve one fresh launch", async phase => {
@@ -212,7 +213,7 @@ test.each(phases)("$target: retirement save cuts preserve one fresh launch", asy
     expect(host.calls.filter(call => call.key === generation(sibling, 2))).toHaveLength(1);
     expect(host.history().find((loop: { number: number }) => loop.number === 1)!.integratedReview.namespace).toContain(".g2.review.");
     expect([...host.storage.keys()].some(key => key.startsWith("review-"))).toBe(false);
-    expect(host.calls.some(call => call.agent === "pitako.access-verifier" && call.key.includes(".g2.review."))).toBe(true);
+    expect(host.calls.some(call => call.agent === "pitako.originals-verifier" && call.key.includes(".g2.review."))).toBe(true);
     expect(host.native.get(sibling)?.runId).toBeUndefined();
     expect(host.history()[0]!.integratedReview.originals).toContainEqual(expect.objectContaining({
       key: generation(sibling, 2), runId: nativeRunId(generation(sibling, 2)),
@@ -374,14 +375,14 @@ test.each(phases.flatMap(phase =>
       expect(next.status, next.reason).toBe(generation === renewal ? "complete" : "partial");
     }
     const admissions = (host: ReturnType<typeof setup>) => host.launches.map(({ agent, key }) => `${agent}:${key}`).sort();
-    expect(admissions(host)).toEqual([...admissions(uninterrupted), "pitako.loop-io:invoke-human-1.l1.acceptance.gate.r1"].sort());
+    expect(admissions(host)).toEqual([...admissions(uninterrupted), "pitako.loop-gate:invoke-human-1.l1.acceptance.gate.r1"].sort());
     if (busyVerifier) {
-      const verifier = host.launches.filter(call => call.agent === "pitako.access-verifier" && call.key.includes(".g2.review."));
+      const verifier = host.launches.filter(call => call.agent === "pitako.originals-verifier" && call.key.includes(".g2.review."));
       expect(verifier.map(call => call.key)).toEqual([
         "invoke-human-1.l1.g2.review.verify-synthesis", "invoke-human-1.l1.g2.review.verify-synthesis.store.r1",
       ]);
       expect(verifier[1]!.task).toBe(verifier[0]!.task);
-      expect(host.launches.some(call => call.agent === "pitako.store-io")).toBe(false);
+      expect(host.launches.some(call => call.agent === "pitako.review-store")).toBe(false);
     }
     return;
   }
@@ -604,7 +605,7 @@ test("integrated review resumes past exhausted verifier keys on the final author
   let busy = true;
   const cached = new Map<string, { task: string; response: Result }>();
   host.setLaunchRespond((request, normal) => {
-    if (request.agent !== "pitako.access-verifier") return normal();
+    if (request.agent !== "pitako.originals-verifier") return normal();
     const prior = cached.get(request.key);
     if (prior) {
       expect(request.task).toBe(prior.task);
@@ -621,14 +622,14 @@ test("integrated review resumes past exhausted verifier keys on the final author
     reason: "Access verifier store-busy after three attempts at invoke-human-1.l1.review.synthesis.",
     action: { actor: "active root", operation: "replay" } });
   const key = "invoke-human-1.l1.review.verify-synthesis";
-  expect(host.launches.filter(call => call.agent === "pitako.access-verifier").map(call => call.key))
+  expect(host.launches.filter(call => call.agent === "pitako.originals-verifier").map(call => call.key))
     .toEqual([key, `${key}.store.r1`, `${key}.store.r2`]);
   expect(host.launches.some(call => call.key.endsWith(".director-synthesis") || call.key.endsWith(".compliance"))).toBe(false);
   busy = false;
   const resumed = await host.executeNative();
   expect(resumed.status, resumed.reason).toBe("complete");
   expect(host.verifications.map(call => call.key)).toEqual([`${key}.store.r3`]);
-  expect(host.launches.some(call => call.agent === "pitako.store-io")).toBe(false);
+  expect(host.launches.some(call => call.agent === "pitako.review-store")).toBe(false);
 });
 
 test("after final-review replay, execute enters a new epoch when a later access verifier quarantines the store", async () => {
@@ -685,5 +686,5 @@ test("after final-review replay, execute enters a new epoch when a later access 
   expect(relaunched.some(call => call.key === "invoke-human-1.e1.l3.advance")).toBe(true);
   expect(relaunched.some(call =>
     call.key === synthesis || call.key === "invoke-human-1.l2.review.director-synthesis")).toBe(false);
-  expect(host.launches.some(call => call.agent === "pitako.store-io")).toBe(false);
+  expect(host.launches.some(call => call.agent === "pitako.review-store")).toBe(false);
 });

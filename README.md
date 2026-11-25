@@ -144,9 +144,11 @@ or absence of an exception.
 ## Delegate through pi-subagents
 
 Use pi-subagents for authorized delegation. The `architecture` and `review`
-skills initiate their scripted workflows. Those scripts dispatch the packaged
-`pitako.architect` and `pitako.reviewer` profiles, which perform read-only
-reasoning without delegation.
+skills initiate their scripted workflows. Those scripts use the packaged
+`pitako.architect`, `pitako.review-director` and `pitako.review-angle` profiles
+for read-only reasoning without delegation. Role names identify the work in hosts
+such as T3 Code that display only the native agent name. `pitako.reviewer` remains
+available for manual delegation.
 
 ```text
 /skill:architecture <decision>

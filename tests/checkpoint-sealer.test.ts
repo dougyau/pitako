@@ -22,6 +22,7 @@ import type { ExecuteCursor } from "../extensions/execute-cursor.ts";
 import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
 import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
 import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 const sealerPrompt = "Fixed checkpoint sealer; stdin is a JSON {v, intent, kind, restoreSources?} request.";
 
 const roots: string[] = [];
@@ -414,7 +415,7 @@ test.each(["complete", "pause", "rejected"])("journal mismatch for %s blocks bef
   expect(output.status).toBe("blocked");
   expect(copy(host.current().halt)).toMatchObject({ stage: "checkpoint-integrity", digest: expect.any(String) });
   expect(output.loopReport.halt).toMatchObject({ code: "checkpoint-integrity",
-    ref: { agent: mode === "pause" ? "pitako.loop-io" : "pitako.checkpoint-sealer" } });
+    ref: { agent: mode === "pause" ? "pitako.loop-close" : "pitako.checkpoint-sealer" } });
   expect(output.reason).toContain("src/change1.ts");
   expect(output.reason).toContain("journaled sha256 absence");
   expect(output.reason).toContain("last step partially applied: false");
@@ -646,7 +647,7 @@ test("replay with a committed seal and worker original admits once without repea
   host.setFailSave();
   host.setStatus(ref => {
     const reviewer = host.native.get(ref);
-    if (reviewer?.agent === "pitako.reviewer") return copy(reviewer);
+    if (reviewer && pitakoAgentFamily(reviewer.agent) === "reviewer") return copy(reviewer);
     throw Error(`Status '${ref}' unavailable`);
   });
   const calls = host.calls.length;

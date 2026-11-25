@@ -68,15 +68,16 @@ export function reviewCursorContract() {
     const common = ["key", "agent", "runId", "workflowKey", "nativeKey", "state", "error",
       "exitCode", "stopped", "interrupted", "detached", "timedOut", "terminalOutcome", "recovery",
       "toolBudgetBlocked", "acceptance", "outputSaveError", "metadataSaveError", "artifactPaths", "outputReference"];
-    const verifierFlags = result.agent === "pitako.access-verifier"
+    const verifier = result.agent === "pitako.originals-verifier" || result.agent === "pitako.access-verifier";
+    const verifierFlags = verifier
       ? ["truncation", "transcriptError", "outputPartial", "processSignal"] : [];
     const pick = (value, fields) => Object.fromEntries(fields.filter(field => value[field] !== undefined).map(field => [field, value[field]]));
     return JSON.parse(JSON.stringify({
       ...pick(result, [...common, "ok", "asyncDir", "outputArtifactPath", "outputPathMapping", "nativeBarrier", "nativeFailure",
-        "structuredOutput", ...verifierFlags, ...(result.agent === "pitako.access-verifier" ? ["output"] : [])]),
+        "structuredOutput", ...verifierFlags, ...(verifier ? ["output"] : [])]),
       ...(Array.isArray(result.results) ? {results: result.results.map(item => pick(item,
         [...common, "index", "savedOutputPath", "structuredOutputPath", ...verifierFlags,
-          ...(result.agent === "pitako.access-verifier" ? ["nativeBarrier", "nativeFailure"] : [])]))} : {}),
+          ...(verifier ? ["nativeBarrier", "nativeFailure"] : [])]))} : {}),
     }));
   }
   function barrier(result) {

@@ -61,7 +61,7 @@ async function main() {
               runId: `native-${key}`, output: JSON.stringify(observed), artifactPaths: [], results: [] });
           }
           // The real model-free verifier runs before each consuming gate's intention.
-          if (request.agent === "pitako.access-verifier") return Promise.resolve({ key, ok: true, agent: request.agent,
+          if (request.agent === "pitako.originals-verifier") return Promise.resolve({ key, ok: true, agent: request.agent,
             runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task), process.argv[3])), artifactPaths: [],
             results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 0,
               usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] });

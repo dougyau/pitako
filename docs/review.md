@@ -5,16 +5,16 @@ review and its requirements.
 
 The [review skill](../skills/review/SKILL.md) creates a native mission and
 launches the named resource `pitako.review` (raw script paths fail). The resource
-runs `skills/review/workflow.js`, which dispatches the packaged `pitako.reviewer`
-profile for exactly two angles, each independently reviewed by both model slots
-(four children), followed directly by the unchanged synthesis. The fixed angle
+runs `skills/review/workflow.js`. `pitako.review-director` selects the angles
+and resumes its session for synthesis after both model slots independently
+review both angles (four `pitako.review-angle` children). The fixed angle
 is `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`, or
 `decision-fidelity` for `plan`; the director selects one distinct risk angle.
 Models use the [`pitako.review.*` settings](configuration.md#package-and-session-settings).
 Only a matching nonterminal `pitako-review` cursor freezes those settings. A
 different input replaces the one bounded cursor; an identical terminal pass is
 not restarted implicitly.
-Before synthesis, the model-free `pitako.access-verifier`
+Before synthesis, the model-free `pitako.originals-verifier`
 compares the canonical JSON digest of each published original with the digest
 admitted by the review and writes a no-clobber receipt in `access:review-<scopeId>`.
 Reviewers read the verified originals by path; a contradictory or unavailable
@@ -23,7 +23,7 @@ original blocks that phase with an explanation. Check receipts read-only with
 designated worktree using the mission path, namespace and gate.
 
 The cursor holds at most six reviewer settlement references and one verifier
-reference. The model-free `pitako.store-io` saves the final outcome once to the
+reference. The model-free `pitako.review-store` saves the final outcome once to the
 cwd-local SQLite store. It rechecks native journals and exact file digests and
 does not relaunch models or rerun the verifier. If the final cursor save was
 lost, the same operation key returns the committed result. Missing or altered

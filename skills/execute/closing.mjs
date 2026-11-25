@@ -2,6 +2,7 @@ import { readFileSync } from "node:fs";
 import { canonicalDigest, sha256 } from "../../extensions/canonical.mjs";
 import { safePath } from "../../extensions/hash-ledger.mjs";
 import { executeStore } from "./ledger.mjs";
+import { pitakoReviewerAgent } from "../agent-names.mjs";
 // The ledger installs the owned Node TypeScript loader before this source closure.
 const { readNativeOriginal, readReviewOriginal } = await import("./loop.ts");
 const { verifyComplianceRenewal } = await import("../../extensions/execute-retained.ts");
@@ -26,7 +27,7 @@ export function closingCompliance(value, original, candidate, cancelledScope = [
     if (size > remaining || reason.length + point.length > 360) break;
     reason += point; remaining -= size;
   }
-  const result = { ref: { key: original.key, agent: "pitako.reviewer", runId: original.runId,
+  const result = { ref: { key: original.key, agent: pitakoReviewerAgent(original.key), runId: original.runId,
     results: [{ savedOutputPath: original.path }] }, ok: true, status: value.status, barrier: null,
     reused: false, terminal: null, candidate, original, reason,
     unresolved: value.requirements.filter(item => ["gap", "blocked"].includes(item.status))

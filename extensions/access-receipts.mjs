@@ -52,7 +52,7 @@ export function accessAction(cause, resumable) {
     case "content-differs": return `Decide which version is authoritative. ${restore("Return the published file to the admitted value")} The workflow does not choose a version.`;
     case "output-save-error": return `Native publication failed, so no original can be verified. ${NEW_PASS[0].toUpperCase()}${NEW_PASS.slice(1)}; inspect the native run for the save error.`;
     case "retained-incompatible": return `The retained state belongs to an incompatible Pitako contract. ${NEW_PASS[0].toUpperCase()}${NEW_PASS.slice(1)}.`;
-    case "verifier-failed": return `Verification did not run; the original was not judged unavailable. Inspect the pitako.access-verifier run and resolve its failure, then ${resumable ? "resume" : NEW_PASS}.`;
+    case "verifier-failed": return `Verification did not run; the original was not judged unavailable. Inspect the pitako.originals-verifier run and resolve its failure, then ${resumable ? "resume" : NEW_PASS}.`;
     default: return NEW_PASS;
   }
 }

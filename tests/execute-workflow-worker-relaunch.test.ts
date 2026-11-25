@@ -6,6 +6,7 @@ import { canonicalDigest } from "../extensions/canonical.mjs";
 import { readFileSync } from "node:fs";
 import { resolveStoredGroupedInput } from "../skills/execute/loop-io.mjs";
 import { PitakoStore } from "../extensions/pitako-store.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 
@@ -64,7 +65,7 @@ test.each(["before", "after"])("gate timeout generations recover %s commit witho
   const host = fixture(); host.setLimit(1);
   host.setStatus(ref => ({ ...structuredClone(host.native.get(ref)!), state: "complete" }));
   host.setLaunchRespond(async (request, normal) => {
-    if (request.agent !== "pitako.loop-io" || !/\.a1(?:\.g2)?\.gate$/.test(request.key)) return normal();
+    if (pitakoAgentFamily(request.agent) !== "loop-io" || !/\.a1(?:\.g2)?\.gate$/.test(request.key)) return normal();
     const result = seam === "after" ? await normal() : host.result(request, {});
     const failure = { ...result, ok: false, key: request.key, agent: request.agent,
       results: result.results!.map(entry => ({ ...entry, timedOut: true, exitCode: 1 })) };
@@ -85,7 +86,7 @@ test.each(["before", "after"])("gate timeout generations recover %s commit witho
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   expect(host.launches.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
   expect(host.launches.filter(call => /\.recover/.test(call.key))).toHaveLength(0);
-  expect(host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     JSON.parse(call.task).operation === "gate").map(call => call.key))
     .toEqual(["invoke-human-1.l1.t1.a1.gate", "invoke-human-1.l1.t1.a1.g2.gate", "invoke-human-1.l1.t1.a1.g3.gate"]);
   expect(host.gateExecutions()).toBe(seam === "after" ? 3 : 1);

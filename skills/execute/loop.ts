@@ -8,6 +8,7 @@ import { checkoutEvidence } from "../../extensions/spec-plans.ts";
 import { repositoryIdentity } from "../../extensions/board/workspace.ts";
 import { EXECUTE_TASK_GATES_MAX } from "../../extensions/execute-cursor.ts";
 import { MAX_GATE_LOG_BYTES, PitakoStore } from "../../extensions/pitako-store.ts";
+import { pitakoAgentFamily } from "../agent-names.mjs";
 import { openBoard, viewEntry, viewBudget, GATE_RESERVE, BINDING_BAND_BYTES, BOARD_VIEW_AUTHORITY, type Board, type Post } from "../../extensions/board/store.ts";
 
 const require = createRequire(import.meta.url);
@@ -591,7 +592,8 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   const mission = JSON.parse(readFileSync(safePath(checkpoint.association.missionPath), "utf8"));
   assert(mission.id === checkpoint.association.missionId && Array.isArray(mission.workflowChildren), "Worker mission identity mismatch");
   const children = mission.workflowChildren.filter((child: any) => child.key === worker.key && child.runId === worker.runId);
-  assert(children.length === 1 && children[0].agent === agent, "Worker native producer identity mismatch");
+  const family = pitakoAgentFamily(agent);
+  assert(children.length === 1 && pitakoAgentFamily(children[0].agent) === family, "Worker native producer identity mismatch");
   const artifacts: unknown[] = children[0].artifactPaths;
   assert(Array.isArray(artifacts), "Worker native artifact references unavailable");
   const directories = artifacts.filter((file): file is string => text(file) && path.isAbsolute(file) && path.basename(file) === worker.runId);
@@ -601,7 +603,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   assert(native.runId === worker.runId && native.cwd === root && native.workflowKey === worker.key &&
     native.state === "complete" && Array.isArray(native.steps) && native.steps.length === 1, "Worker native status conflicts with its original");
   const step = native.steps[0];
-  assert(step.agent === agent && step.exitCode === 0 && !step.stopped && !step.interrupted &&
+  assert(pitakoAgentFamily(step.agent) === family && step.exitCode === 0 && !step.stopped && !step.interrupted &&
     !step.detached && !step.timedOut && !step.outputSaveError && !step.outputPartial && !step.truncation,
   "Worker native original has a terminal barrier");
   const file = safePath(originals[0]!);
@@ -626,7 +628,7 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
       }
     }
     if (settled) {
-      assert(settled.ok === true && settled.agent === agent && settled.results?.length === 1 &&
+      assert(settled.ok === true && pitakoAgentFamily(settled.agent) === family && settled.results?.length === 1 &&
         settled.results[0].exitCode === 0 && canonicalDigest(settled.structuredOutput) === canonicalDigest(value),
       "Reviewer native settlement conflicts with its original");
       if (agent === "pitako.worker" && typeof settled.output === "string" && /^\s*\{/.test(settled.output)) {

@@ -17,17 +17,18 @@ import { MAX_SPEC_BYTES, SPEC_SECTIONS, inspectionSnapshot, validateSpec } from 
 import { canonicalDigest, canonicalJSON, sha256 } from "../extensions/canonical.mjs";
 import { executeStore } from "../skills/execute/ledger.mjs";
 import { resolveStoredGroupedInput, commitFinalGate, commitStoredGate } from "../skills/execute/loop-io.mjs";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const acceptanceComposition = realCheckoutCompositionFixture();
 const { fixture } = executeControllerFixture(acceptanceComposition.fake);
 const acceptanceScripts = acceptanceComposition.scripts;
 function acceptanceCheckout(host: ReturnType<typeof fixture>, request: { agent?: string; key: string; task: string }) {
   if (request.agent === "pitako.checkpoint-sealer" ||
-      request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+      pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta")
     return acceptanceScripts.runDeterministic(request.key, request,
       { ...acceptanceScripts, root: host.root, inlineSealer: true }, undefined);
 }
-const isGate = (call: { agent?: string; task: string }) => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate";
+const isGate = (call: { agent?: string; task: string }) => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "gate";
 const isFinalGate = (call: { agent?: string; task: string }) => isGate(call) && JSON.parse(call.task).task?.id === "final-acceptance";
 const taskFixture = (realCheckout = false) => { const host = fixture(undefined, { realCheckout }); host.setLimit(1); return host; };
 function committed(host: ReturnType<typeof fixture>, cursor = host.current()) {
@@ -133,7 +134,7 @@ test.each(["intact", "id-conflict", "digest-conflict"])("compact selection recei
   }
   expect(host.launches.filter(call => call.key.startsWith(selectionKey)).map(call => call.key))
     .toEqual(mode === "intact" ? [selectionKey, `${selectionKey}.r1`] : [selectionKey]);
-  expect(host.calls.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "apply" && !JSON.parse(call.task).settle)).toHaveLength(1);
+  expect(host.calls.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "apply" && !JSON.parse(call.task).settle)).toHaveLength(1);
 });
 
 test("malformed knowledge does not reject an otherwise valid worker result", async () => {
@@ -235,13 +236,13 @@ test("a transport retry uses a new .rN close key and keeps the long explicit dea
     ? host.result(request, { status: "complete", work: "No writes needed", remaining: [] }) : normal());
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "close" && !failed) {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "close" && !failed) {
       failed = true; return { ...result, output: "Transport output unavailable" };
     }
     return result;
   });
   expect((await host.execute()).status).toBe("partial");
-  const calls = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close");
+  const calls = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "close");
   expect(calls[1]!.key).toBe(calls[0]!.key + ".r1");
   expect(calls.every(call => call.timeoutMs === 14400000)).toBe(true);
   expect(host.calls.filter(isGate)).toHaveLength(1);
@@ -358,7 +359,7 @@ test.each(["selection", "unknown-update", "reused-id"])("invalid director %s ret
 test.each(["conflict", "schema", "decisions"])("backlog %s halts without a writer", async mode => {
   const host = taskFixture();
   host.setRespond((request, normal) => {
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "prepare" && mode !== "conflict")
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "prepare" && mode !== "conflict")
       return { ok: false, agent: request.agent, runId: "native-prepare", output: JSON.stringify({ error: "loop-io",
         reason: mode === "schema" ? `${host.root}/.pitako/backlog/spec.json: Invalid tasks` : "DECISION overflow: ask the human to consolidate current Board decisions" }), results: [{ index: 0, agent: request.agent, task: request.task, exitCode: 1,
           usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 } }] };
@@ -500,7 +501,7 @@ test.each(["pass", "fail", "stale", "missing-log", "missing-review-receipt"])("f
       acceptanceRan = true;
       if (mode === "stale") host.changeCheckout(++driftVersion);
     }
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).recordGaps)
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).recordGaps)
       persistedRepairs = copy(readBacklog(host.root, "spec").backlog!.tasks);
     if (request.agent === "pitako.execution-director" && request.key.includes(".l3."))
       selectedRepair = result.structuredOutput.select;
@@ -509,7 +510,7 @@ test.each(["pass", "fail", "stale", "missing-log", "missing-review-receipt"])("f
   if (missingLog || missingReceipt) host.setLaunchRespond(async (request, normal) => {
     if (request.agent === "pitako.execution-director" && request.key.startsWith("invoke-human-1.e1."))
       throw new Error("Controlled cut after epoch admission");
-    if (request.agent !== "pitako.loop-io") return normal();
+    if (pitakoAgentFamily(request.agent) !== "loop-io") return normal();
     const input = JSON.parse(request.task);
     const gaps = input.intentions?.find((entry: { input: { recordGaps?: boolean } }) => entry.input.recordGaps)?.input;
     if (missingLog ? !gaps : input.operation !== "reviewOriginals" || !request.key.endsWith(".reviewOriginals")) return normal();
@@ -572,7 +573,7 @@ test.each(["pass", "fail", "stale", "missing-log", "missing-review-receipt"])("f
     expect(selectedRepair).toBe(pending[0]!.id);
     const repair = host.calls.find(call => call.agent === "pitako.worker" && call.key.includes(".l3."))!;
     expect(repair.task).toContain(pending[0]!.id);
-    const gapWrite = host.calls.findIndex(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).recordGaps);
+    const gapWrite = host.calls.findIndex(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).recordGaps);
     expect(gapWrite).toBeLessThan(host.calls.indexOf(director));
   } else expect(repairs).toEqual([]);
   // Measured 73 including IPC Git and one shared runtime, plus eight.
@@ -861,7 +862,7 @@ test.each(["review", "compliance"])("final-phase %s findings become durable task
   expect(host.calls.some(call => call.key.includes(".l2.review.") || call.key === "invoke-human-1.l2.compliance")).toBe(false);
   if (phase === "review") expect(host.calls.some(call => call.key === "invoke-human-1.l1.compliance")).toBe(false);
   const repair = host.calls.find(call => call.agent === "pitako.worker")!;
-  const gapWrite = host.calls.findIndex(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).recordGaps);
+  const gapWrite = host.calls.findIndex(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).recordGaps);
   expect(gapWrite).toBeLessThan(host.calls.indexOf(repair));
 });
 
@@ -1228,7 +1229,7 @@ test.each(["HUMAN + DECISION overflow: ask the human to consolidate", "Gate rece
 test("prepare binding overflow stops before any worker launch", async () => {
   const host = taskFixture();
   host.setRespond((request, normal) => {
-    if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "prepare") return normal();
+    if (pitakoAgentFamily(request.agent) !== "loop-io" || JSON.parse(request.task).operation !== "prepare") return normal();
     return { ...host.result(request, null), ok: false,
       output: JSON.stringify({ error: "loop-io", reason: "HUMAN + DECISION overflow: ask the human to consolidate", viewOverflow: true }) };
   });

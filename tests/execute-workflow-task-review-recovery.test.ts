@@ -5,6 +5,7 @@ import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/share
 import { copy, executeControllerFixture, type Result } from "./fixtures/execute-workflow.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { executeScope, executeStore } from "../skills/execute/ledger.mjs";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const reviewChildren = (key: string) => /\.task-(reviewer|synthesis)$/.test(key);
@@ -68,6 +69,15 @@ test.each(["reviewer", "synthesis"].flatMap(stage => ["Stop", "permission"].map(
   noUnit(host);
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("pending");
   const before = host.launches.length;
+  if (stage === "reviewer" && cause === "Stop") {
+    const ref = output.loopReport.halt.ref;
+    expect(ref.agent).toBe("pitako.reviewer"); // Stable retained digest, not the launch name.
+    expect(host.native.get(ref.runId)!.agent).toBe("pitako.task-review");
+    host.setStatus(target => {
+      const native = copy(host.native.get(target)!);
+      return target === ref.runId ? { ...native, agent: "pitako.reviewer" } : native;
+    });
+  }
   const resumed = await host.execute();
   expect(resumed.status, resumed.reason).toBe("cancelled");
   expect(resumed.reason).toBe(output.reason);
@@ -285,7 +295,7 @@ test.each(["disk-digest", "native-digest", "missing"])("replayed review original
   host.setFailSave();
   host.setStatus(ref => {
     const result = copy(host.native.get(ref) ?? { ok: false, state: "unknown" });
-    if (result.agent === "pitako.reviewer") { delete result.structuredOutput; result.state = "complete"; }
+    if (pitakoAgentFamily(result.agent) === "reviewer") { delete result.structuredOutput; result.state = "complete"; }
     return result;
   });
   if (defect === "missing") rmSync(path);

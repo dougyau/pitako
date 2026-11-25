@@ -14,6 +14,7 @@ import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, executeField, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
 import { childResponse, realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const recoveryComposition = realCheckoutCompositionFixture();
 const { fixture } = executeControllerFixture(recoveryComposition.fake);
@@ -130,7 +131,7 @@ describe("workflow-owned execute controller", () => {
     const host = fixture(undefined, { realCheckout: true }); host.setLimit(2);
     host.setRespond((request, normal) => {
       if (request.agent === "pitako.checkpoint-sealer" ||
-          request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+          pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta")
         return recoveryScripts.runDeterministic(request.key, request,
           { ...recoveryScripts, root: host.root, inlineSealer: true }, undefined);
       if (request.agent === "pitako.worker" && request.key.includes(".l1.t1."))
@@ -168,7 +169,7 @@ describe("workflow-owned execute controller", () => {
     const host = fixture(undefined, { realCheckout: true, taskCount: 2 }); host.setLimit(2);
     host.setRespond((request, normal) => {
       if (request.agent === "pitako.checkpoint-sealer" ||
-          request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta")
+          pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta")
         return recoveryScripts.runDeterministic(request.key, request,
           { ...recoveryScripts, root: host.root, inlineSealer: true }, undefined);
       // Write-free continuation: no capture, so its close observes and seals nothing.
@@ -209,7 +210,7 @@ describe("workflow-owned execute controller", () => {
       let committed: ReturnType<typeof storedRows> | undefined;
       let retained: ReturnType<typeof host.current>;
       host.setLaunchRespond(async (request, normal) => {
-        if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" || injected) return normal();
+        if (pitakoAgentFamily(request.agent) !== "loop-io" || JSON.parse(request.task).operation !== "drain" || injected) return normal();
         if (failure === "state-save") return normal();
         injected = true;
         retained = copy(host.current());
@@ -239,7 +240,7 @@ describe("workflow-owned execute controller", () => {
       if (committed) expect(storedRows(host).slice(0, committed.length)).toEqual(committed);
       expect(host.calls.filter(call => call.agent === "pitako.execution-ledger").map(call => call.key))
         .toEqual(["invoke-human-1.l1.seal1", "invoke-human-1.l1.gaps"]);
-      const drains = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+      const drains = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "drain");
       expect(drains.map(call => call.key)).toEqual(failure === "state-save" ? [drainKey] : [drainKey, `${drainKey}.r1`]);
       expect(new Set(drains.map(call => call.task)).size).toBe(1);
       expect(host.emits.some(item => item.type === "execution-progress" && ["blocked", "cancelled"].includes(item.status))).toBe(false);
@@ -251,7 +252,7 @@ describe("workflow-owned execute controller", () => {
   test("exhausted final drain attempts retain the input for identical reentry", async () => {
     const host = fixture(); host.setLimit(1);
     host.setLaunchRespond((request, normal) => {
-      if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain") throw Error("Filesystem temporarily unavailable");
+      if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "drain") throw Error("Filesystem temporarily unavailable");
       return normal();
     });
     const outcome = await host.execute();
@@ -261,7 +262,7 @@ describe("workflow-owned execute controller", () => {
     expect(pending).toMatchObject({ loop: { cursor: 0, taskId: "change1" },
       action: { kind: "launched", role: "reviewer", key: "invoke-human-1.l1.t1.a1.task-synthesis" } });
     expect(host.records()).toEqual([]);
-    const drains = () => host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain");
+    const drains = () => host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "drain");
     expect(drains()).toHaveLength(3);
     const models = host.calls.filter(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!));
     host.setLaunchRespond();
@@ -278,7 +279,7 @@ describe("workflow-owned execute controller", () => {
 
   test.each(["integrity", "stopped", "capacity"])("final drain does not retry %s evidence as a transport failure", async cause => {
     const host = fixture(); host.setLimit(1);
-    host.setLaunchRespond((request, normal) => request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "drain" ? normal() : ({
+    host.setLaunchRespond((request, normal) => pitakoAgentFamily(request.agent) !== "loop-io" || JSON.parse(request.task).operation !== "drain" ? normal() : ({
       key: request.key, agent: request.agent, runId: `native-${request.key}`, ok: false,
       // The exact loop-io CLI failure line for a real hash-ledger head mismatch.
       output: cause === "integrity" ? JSON.stringify({ error: "loop-io", reason: "Ledger head mismatch.", selectionRejected: false,
@@ -290,7 +291,7 @@ describe("workflow-owned execute controller", () => {
     expect(outcome.status).not.toBe("complete");
     expect(outcome.reason).toContain(cause === "integrity" ? "Execute ledger integrity failure: Ledger head mismatch."
       : cause === "stopped" ? "stopped" : "capacity exhausted");
-    expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(1);
+    expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "drain")).toHaveLength(1);
     if (cause === "stopped") {
       expectOpenHalt(host, outcome);
       expect(host.current()).toMatchObject({ loop: { cursor: 1, taskId: "change1" },
@@ -307,7 +308,7 @@ describe("workflow-owned execute controller", () => {
     "a stopped %s drain is terminal without another archiver dispatch", async kind => {
     const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
     const drainKey = "invoke-human-1.l1.finishDrain";
-    host.setLaunchRespond((request, normal) => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "drain"
+    host.setLaunchRespond((request, normal) => pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "drain"
       ? { key: request.key, runId: `native-${request.key}`, agent: request.agent, ok: false, stopped: true, output: "",
         results: [{ exitCode: -1, processSignal: "SIGTERM" }] } : normal());
     host.setRespond((request, normal) => {
@@ -927,7 +928,7 @@ describe("workflow-owned execute controller", () => {
     host.setStatus(ref => ref === producer.runId ? { ...producer, state: "complete" } : host.native.get(ref)!);
     const replay = await host.execute();
     expect(replay).toMatchObject({ status: "partial", loopsConsumed: 1, maxLoops: 1 });
-    expect(host.launches.slice(launches.length)[0]).toMatchObject({ key: "invoke-human-1.l1.selectionIO.r1", agent: "pitako.loop-io" });
+    expect(host.launches.slice(launches.length)[0]).toMatchObject({ key: "invoke-human-1.l1.selectionIO.r1", agent: "pitako.loop-selection" });
     expect(host.launches.filter(call => call.agent === "pitako.execution-director").map(call => call.key)).toEqual([cursor.action.key]);
     expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", status: "complete" }));
     expect(storedRows(host).slice(0, rows.length)).toEqual(rows);
@@ -1231,7 +1232,7 @@ describe("workflow-owned execute controller", () => {
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected" } });
     expect(await host.execute()).toMatchObject({ status: "partial", loopsConsumed: 1 });
-    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps"]);
+    expect(host.calls.filter(call => pitakoAgentFamily(call.agent) !== "loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps"]);
     expect(host.records().map((record: any) => record.kind)).toEqual(["spec", "loop"]);
   });
 
@@ -1308,7 +1309,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.history()).toHaveLength(1);
     expect(host.history()[0]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected" } });
     expect(atCursor(host).P.preview.planRejections.map(rejection => rejection.loop)).toEqual([1]);
-    expect(host.calls.filter(call => call.agent !== "pitako.loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps", "invoke-human-1.l1.nextAdvance.requests", "invoke-human-1.l2.director"]);
+    expect(host.calls.filter(call => pitakoAgentFamily(call.agent) !== "loop-io").map(call => call.key)).toEqual(["invoke-human-1.l1.advance.requests", "invoke-human-1.l1.director", "invoke-human-1.l1.director.d1", "invoke-human-1.l1.gaps", "invoke-human-1.l1.nextAdvance.requests", "invoke-human-1.l2.director"]);
     expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
   });
 
@@ -1436,7 +1437,7 @@ describe("workflow-owned execute controller", () => {
   ].map(invalid => ({ invalid })))("apply rejects incompatible dependency metadata %j", async ({ invalid }) => {
     const host = fixture(undefined, { taskCount: 2 }); host.setLimit(2);
     host.setRespond((request, normal) => {
-      const selectionApply = request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "apply";
+      const selectionApply = pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "apply";
       const file = readBacklog(host.root, "spec").path;
       const before = existsSync(file) ? readFileSync(file, "utf8") : null;
       const result = normal();
@@ -1457,7 +1458,7 @@ describe("workflow-owned execute controller", () => {
   test.each(["unknown", "self", "unfinished", "cycle"])("%s backlog dependency cannot dispatch a writer", async mode => {
     const host = fixture(undefined, { taskCount: 2 }); host.setLimit(2);
     host.setRespond((request, normal) => {
-      const selectionApply = request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "apply";
+      const selectionApply = pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "apply";
       const file = readBacklog(host.root, "spec").path;
       const before = existsSync(file) ? readFileSync(file, "utf8") : null;
       const result = normal();
@@ -1513,7 +1514,7 @@ describe("workflow-owned execute controller", () => {
     if (cut === "before-cursor") {
       expect(host.launches.slice(cutLaunches).filter(call => call.key.startsWith("invoke-human-1.l1.t1.a2."))
         .map(({ key, agent }) => ({ key, agent }))).toEqual([
-        { key: "invoke-human-1.l1.t1.a2.task-synthesis.review-recovery.r1", agent: "pitako.loop-io" },
+        { key: "invoke-human-1.l1.t1.a2.task-synthesis.review-recovery.r1", agent: "pitako.loop-gate" },
       ]);
       expect(storedRows(host).slice(0, committedPrefix.length)).toEqual(committedPrefix);
     }
@@ -1757,8 +1758,8 @@ describe("workflow-owned execute controller", () => {
     expect(replay.maxLoops).toBe(limit);
     expect(host.launches.slice(0, admissions.length)).toEqual(admissions);
     expect(host.launches.slice(admissions.length).map(({ key, agent }) => ({ key, agent }))).toEqual([
-      { key: `${closeKey}.r1`, agent: "pitako.loop-io" }, // the only extra admission
-      { key: "invoke-human-1.l1.finishDrain", agent: "pitako.loop-io" },
+      { key: `${closeKey}.r1`, agent: "pitako.loop-close" }, // the only extra admission
+      { key: "invoke-human-1.l1.finishDrain", agent: "pitako.loop-drain" },
     ]);
     expect(storeTipRows(host).slice(0, before.length)).toEqual(before);
     expect(host.hostCalls.filter(key => key === "execute-settings")).toHaveLength(reads);
@@ -1783,7 +1784,7 @@ describe("workflow-owned execute controller", () => {
     const sourceRefs = [{ path: "/stable/.pitako/plans/inherited.md", digest: "f".repeat(64) }];
     expect((await host.execute({ sourceRefs })).status).toBe("complete");
     expect(atCursor(host).P.prompt.admission?.association.sourceRefs).toEqual(sourceRefs);
-    for (const request of host.calls.filter(call => !call.resume && call.agent !== "pitako.loop-io" && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.access-verifier")) {
+    for (const request of host.calls.filter(call => !call.resume && pitakoAgentFamily(call.agent) !== "loop-io" && call.agent !== "pitako.checkout-observer" && call.agent !== "pitako.execution-ledger" && call.agent !== "pitako.request-observer" && call.agent !== "pitako.checkpoint-sealer" && call.agent !== "pitako.originals-verifier")) {
       expect(request.task).toContain("SELECTED SNAPSHOT INTACT");
       for (const ref of sourceRefs) {
         expect(request.task).toContain(JSON.stringify(ref.path));
@@ -1881,7 +1882,7 @@ describe("workflow-owned execute controller", () => {
     const host = fixture("FULL SPECS", { findings: true });
     host.setRespond((request, normal) => {
       const result = normal();
-      if (request.agent !== "pitako.access-verifier") return result;
+      if (request.agent !== "pitako.originals-verifier") return result;
       const child = { ...result.results![0]!, exitCode: 1, ...(mode === "stopped" ? { stopped: true } : {}) };
       return mode === "stopped" ? { ...result, ok: false, stopped: true, output: "", results: [child] }
         : { ...result, ok: false, error: "verifier exited 1", output: "", results: [child] };
@@ -1903,15 +1904,15 @@ describe("workflow-owned execute controller", () => {
     });
     // A scoped-defect finding returned as ready reaches synthesis instead of stopping execute.
     expect((await host.execute()).status).toBe("complete");
-    const verifiers = host.calls.filter(call => call.agent === "pitako.access-verifier");
+    const verifiers = host.calls.filter(call => call.agent === "pitako.originals-verifier");
     // Only synthesis consumes independent originals.
     expect(verifiers.map(call => call.key)).toEqual(["synthesis"].map(gate => `invoke-human-1.l2.review.verify-${gate}`));
     expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
-    expect(host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier")).toHaveLength(6);
-    for (const call of host.calls.filter(item => item.key.includes(".review.") && item.agent !== "pitako.access-verifier"))
+    expect(host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.originals-verifier")).toHaveLength(6);
+    for (const call of host.calls.filter(item => item.key.includes(".review.") && item.agent !== "pitako.originals-verifier"))
       expect(call.task).toContain("Return status blocked only when missing material context prevents this review phase.");
     expect(host.calls.filter(call => call.key.includes(".review.") && call.resume)).toHaveLength(1);
-    const requests = host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.access-verifier");
+    const requests = host.calls.filter(call => call.key.includes(".review.") && call.agent !== "pitako.originals-verifier");
     expect(new Set(requests.map(request => request.phase))).toEqual(new Set([
       "review-prepare", "review-independent", "review-synthesis",
     ]));
@@ -2282,7 +2283,7 @@ describe("workflow-owned execute controller", () => {
     expect(host.records().find((record: any) => record.kind === "loop").body.results).toEqual([expect.objectContaining({ status: "rejected",
       rejection: "Worker returned an invalid work/status/remaining contract." })]);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
-    expect(host.calls.some(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
+    expect(host.calls.some(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
   });
 
   test.each(["wrong-producer", "wrong-nested-producer", "failed-exit", "wrong-key", "binding-conflict", "native-ok-only"])(
@@ -2308,7 +2309,7 @@ describe("workflow-owned execute controller", () => {
         expect(workers[1]!.task).toContain("CHECKPOINT FALLBACK");
         expect(readBacklog(host.root, "spec").backlog!.tasks.find(task => task.id === "change1")!.status).not.toBe("done");
       }
-      expect(host.calls.some(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
+      expect(host.calls.some(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "gate")).toBe(false);
       expect(host.calls.some(call => call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
     });
 
@@ -2354,7 +2355,7 @@ describe("workflow-owned execute controller", () => {
     expect((await host.execute()).status).toBe("complete");
     expect(host.calls.filter(call => call.key.endsWith(".compliance")).map(call => call.key)).toEqual(["invoke-human-1.l3.compliance"]);
     const synthesis = host.calls.findIndex(call => call.key === "invoke-human-1.l1.review.director-synthesis");
-    expect(host.calls[synthesis + 1]!.agent).toBe("pitako.loop-io");
+    expect(host.calls[synthesis + 1]!.agent).toBe("pitako.loop-review-originals");
     expect(host.calls[synthesis + 1]!.key).toBe("invoke-human-1.l1.reviewOriginals");
     const nextDirector = host.calls.findIndex(call => call.key === "invoke-human-1.l2.director");
     const beforeDirector = host.calls.slice(synthesis + 1, nextDirector);
@@ -2657,7 +2658,7 @@ describe("workflow-owned execute controller", () => {
     const count = host.launches.length;
     const output = await host.execute();
     expect(host.statusCalls).toContain(original.runId!);
-    expect(host.launches[count]).toMatchObject({ agent: "pitako.loop-io", key: `${selection}.r1` });
+    expect(host.launches[count]).toMatchObject({ agent: "pitako.loop-selection", key: `${selection}.r1` });
     expect(host.launches.filter(call => call.key === director)).toHaveLength(1);
     expect(host.launches.filter(call => call.agent === "pitako.execution-inspector")).toHaveLength(0);
     if (["direct-conflict", "changed-binding", "changed-native", "changed-selection", "lost-definition"].includes(mode)) {
@@ -2722,7 +2723,7 @@ describe("workflow-owned execute controller", () => {
       .toEqual([first, successor]);
     const replay = host.launches.slice(admissions).filter(call => call.key.startsWith(`${first}.`));
     expect(replay.map(({ key, agent }) => ({ key, agent }))).toEqual([
-      { key: `${first}.selection-replay.r1`, agent: "pitako.loop-io" },
+      { key: `${first}.selection-replay.r1`, agent: "pitako.loop-selection" },
     ]);
     expect(JSON.parse(replay[0]!.task)).toMatchObject({
       expectedHead: cut.head, refs: { input: cut.action.input, uncertainWorker: cut.loop.attempt.intent },
@@ -3068,7 +3069,7 @@ describe("workflow-owned execute controller", () => {
       expect(repeated).toHaveLength(1);
       expect(host.launches.slice(0, calls)).toContainEqual(repeated[0]!);
       expect(host.launches.slice(calls).filter(call => call.agent !== "pitako.request-observer").map(({ key, agent }) => [key, agent])).toEqual([
-        ["invoke-human-1.l1.t1.a2.baseline-replay.r1", "pitako.loop-io"],
+        ["invoke-human-1.l1.t1.a2.baseline-replay.r1", "pitako.loop-baseline"],
       ]);
       expect(host.calls.filter(call => call.agent === "pitako.worker")).toEqual(workers);
       expect(host.current()).toEqual(cursor);
@@ -3139,7 +3140,7 @@ describe("workflow-owned execute controller", () => {
     if (interruption) {
       expect(host.launches.slice(before).filter(call => call.key.startsWith(`${worker}.`) && call.key.endsWith(".r1"))
         .map(call => ({ key: call.key, agent: call.agent }))).toEqual([
-        { key: `${worker}.selection-replay.r1`, agent: "pitako.loop-io" },
+        { key: `${worker}.selection-replay.r1`, agent: "pitako.loop-selection" },
       ]);
       expect(host.history()[0].results).toContainEqual(expect.objectContaining({ taskId: "change1", attempt: 2, status: "complete" }));
     } else {
@@ -3565,8 +3566,8 @@ describe("checkpoint-first interrupted selected-task continuation", () => {
       expect(retained.action).toMatchObject({ kind: "launched", key: `${successor}.task-synthesis` });
       const added = fx.launches.slice(count);
       expect(added.filter(call => call.key.includes(".review-recovery")).map(call => [call.key, call.agent]))
-        .toEqual([[`${successor}.task-synthesis.review-recovery.r1`, "pitako.loop-io"]]);
-      expect(added.some(call => call.agent === "pitako.checkpoint-sealer" || call.agent === "pitako.reviewer")).toBe(false);
+        .toEqual([[`${successor}.task-synthesis.review-recovery.r1`, "pitako.loop-gate"]]);
+      expect(added.some(call => call.agent === "pitako.checkpoint-sealer" || pitakoAgentFamily(call.agent) === "reviewer")).toBe(false);
       const result = fx.history()[0].results.find((entry: any) => entry.taskId === "change1" && entry.attempt === 2);
       expect(result.restore.receipt).toMatchObject({
         checkpointRef: path.join(fx.root, ".pi/subagents/checkpoints/invoke-human-1.l1.t1.a1/manifest.json"),
@@ -3697,7 +3698,7 @@ describe("compact admission", () => {
     expect(host.current()).not.toHaveProperty("snapshot");
     expect(JSON.stringify(host.current())).not.toContain(JSON.stringify(content));
     expect(Buffer.byteLength(JSON.stringify(Object.fromEntries(host.storage), null, 2))).toBeLessThanOrEqual(16384);
-    expect(host.launches.map(call => call.agent)).toEqual(["pitako.loop-io", "pitako.execution-director"]);
+    expect(host.launches.map(call => call.agent)).toEqual(["pitako.loop-advance", "pitako.execution-director"]);
   });
   test("later settings cannot replace the admitted budget and base changes preserve original bytes", async () => {
     const content = "ORIGINAL FULL SNAPSHOT";

@@ -3,6 +3,7 @@ import { writeFileSync } from "node:fs";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { cancelledScope, readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture, cutAt, copy, type ControllerHost } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const request = (kind = "cancel", taskId = "change1") => ({ v: 1, requestId: `request-${taskId}`, invocation: "human-1",
@@ -195,7 +196,7 @@ test("execute observes a new request immediately before a useful retry", async (
   host.setRespond((call, normal) => {
     if (call.agent === "pitako.request-observer")
       return page(call, arrivedDuringGate ? [request()] : []);
-    if (call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate") {
+    if (pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "gate") {
       const result = normal(); arrivedDuringGate = true; return result;
     }
     if (call.agent === "pitako.worker" && call.key.endsWith(".t1.a1"))
@@ -320,7 +321,7 @@ test("cancellation CAS preserves a concurrent human backlog edit", async () => {
   let human = "";
   host.setRespond((call, normal) => {
     if (call.agent === "pitako.request-observer") return page(call, [request()]);
-    if (call.agent === "pitako.loop-io" && JSON.parse(call.task).cancellations) {
+    if (pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).cancellations) {
       const state = readBacklog(host.root, "spec");
       state.backlog!.tasks[0]!.goal = "Human edited goal";
       human = JSON.stringify(state.backlog); writeFileSync(state.path, human);

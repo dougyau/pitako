@@ -149,7 +149,7 @@ Preserve `results[].savedOutputPath`, returned reference objects and textual
 `outputReference` paths. Generic artifact references or `structuredOutputPath`
 alone do not prove mandatory publication; `runs.status` previews are not originals.
 
-Each consuming gate first dispatches the model-free `pitako.access-verifier` once
+Each consuming gate first dispatches the model-free `pitako.originals-verifier` once
 over the union of its required originals. The workflow computes canonical
 SHA-256 of each complete structured value at confirmation (pure JS UTF-8, sorted
 JSON keys), without a pinning child. The next consuming gate verifies that

@@ -11,6 +11,7 @@ import { spawnSync } from "node:child_process";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { runInNewContext } from "node:vm";
 import { readBacklog } from "../skills/execute/loop.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 const { summarizeLoops, executeStore, executeProjection, fullExecuteProjection } = await import("../skills/execute/ledger.mjs");
 const { resolveStoredGroupedInput, recoverStoredWorker } = await import("../skills/execute/loop-io.mjs");
 
@@ -44,7 +45,7 @@ test.each(["before-close", "after-close", "saved-close"] as const)("a pending wo
   let closeOutput: string | undefined;
   if (seam === "after-close") host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (request.agent === "pitako.loop-io" && request.key.endsWith(".close")) {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && request.key.endsWith(".close")) {
       committed = true; closeOutput = result.output;
     }
     return result;
@@ -72,7 +73,7 @@ test.each(["before-close", "after-close", "saved-close"] as const)("a pending wo
   expect(host.statusCalls).toContain(worker.runId!);
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
   expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(1);
-  const closes = host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  const closes = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     JSON.parse(call.task).operation === "close");
   expect(closes).toHaveLength(seam === "before-close" ? 1 : 2);
   expect(closes[0]!.key).toBe(`${worker.key}.close`);
@@ -131,7 +132,7 @@ test.each([
     expect(request.task).toContain(`read it from ${host.root}/.pitako/backlog/spec.json;`);
   const recoveries = host.launches.filter(call => call.key.endsWith(".recover.r1"));
   expect(recoveries).toHaveLength(1);
-  expect(recoveries[0]!.agent).toBe("pitako.loop-io");
+  expect(recoveries[0]!.agent).toBe("pitako.loop-close");
   expect(host.launches.filter(call => !call.key.endsWith(".recover.r1")).map(call => call.agent))
     .toEqual(uninterrupted.launches.map(call => call.agent));
   expect(unitBodies(host)).toEqual(unitBodies(uninterrupted));
@@ -501,7 +502,7 @@ test.each([2, 3].flatMap(attempt => ["pending", "committed", "saved"].flatMap(se
   const nativeAdmissions = (value: typeof host) => new Set(value.launches
     .filter(call => value.native.has(call.key)).map(call => call.key)).size;
   expect(nativeAdmissions(host)).toBe(nativeAdmissions(uninterrupted) + 1);
-  expect(host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     host.native.has(call.key) && !uninterrupted.launches.some(expected => expected.key === call.key))).toHaveLength(1);
   expect([...new Map(host.calls.filter(call => !recoveries.some(recovery => recovery.key === call.key))
     .map(call => [call.key, call.agent])).values()]).toEqual(uninterrupted.calls.map(call => call.agent));
@@ -544,7 +545,7 @@ test.each([{ attempt: 1 }, { attempt: 2 }, { attempt: 3 }])(
   expect(cursor).toBeDefined();
   expect(cursor.loop.attempt.number).toBe(attempt);
   if (attempt > 1) {
-    const close = host.launches.find(call => call.agent === "pitako.loop-io" &&
+    const close = host.launches.find(call => pitakoAgentFamily(call.agent) === "loop-io" &&
       call.key.endsWith(`.a${attempt - 1}.close`))!;
     const input = JSON.parse(close.task);
     // Attempt 2 follows reference-input close; attempt 3 follows full-input close.
@@ -572,7 +573,7 @@ test.each([{ attempt: 1 }, { attempt: 2 }, { attempt: 3 }])(
   expect(workers[1]).toEqual(original);
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(attempt);
   const predecessor = attempt === 1 ? "selection" : "close";
-  const recoveries = host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  const recoveries = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     /\.r\d+$/.test(call.key) && JSON.parse(call.task).operation === predecessor);
   expect(recoveries).toHaveLength(1);
   expect(JSON.parse(recoveries[0]!.task).operation).toBe(predecessor);
@@ -625,7 +626,7 @@ test.each(["before-commit", "after-commit", "before-model-dispatch"])("initial a
     expect(cursor).not.toHaveProperty("currentView");
     expect(JSON.stringify(cursor)).not.toContain(ruling);
   }
-  const advances = host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "advance")
+  const advances = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "advance")
     .map(call => call.key);
   if (seam === "after-commit") {
     expect(advances).toEqual(["invoke-human-1.l1.advance", "invoke-human-1.l1.advance.r1"]);
@@ -795,7 +796,7 @@ test.each(["selection", "close", "baselineIO"])("the %s worker launch saves its 
   });
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "baseline") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "baseline") {
       const receipt = JSON.parse(result.output!);
       const { store, scope } = executeStore(host.root, "human-1");
       const { P, identity } = store.read(scope, receipt.head);
@@ -829,7 +830,7 @@ test.each(["selection", "close", "baselineIO"])("the %s worker launch saves its 
   expect(settledWorkers.every(value =>
     value.inFlight.filter((ref: any) => ref.role === "worker").length === 1)).toBe(true);
   expect(host.current().inFlight.filter((ref: any) => ref.role === "worker")).toEqual([]);
-  const baselines = host.launches.filter(call => call.agent === "pitako.loop-io" &&
+  const baselines = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" &&
     JSON.parse(call.task).operation === "baseline");
   expect(baselines).toHaveLength(path === "baselineIO" ? 1 : 0);
 });
@@ -838,7 +839,7 @@ test("the root refuses a baseline without a committed intent before worker dispa
   const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "baseline") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "baseline") {
       const receipt = JSON.parse(result.output!);
       delete receipt.intent;
       result.output = JSON.stringify(receipt);
@@ -894,7 +895,7 @@ test("at least three heavy attempts close gaps and advance with only a bounded e
   const output = await host.execute();
   expect(host.launches.filter(call => /\.l1\.t1\.a\d+$/.test(call.key)).length).toBeGreaterThanOrEqual(3);
   expect(host.history()[0]?.outcome, output.reason).toBe("gaps");
-  for (const call of host.calls.filter(call => call.agent === "pitako.loop-io")) {
+  for (const call of host.calls.filter(call => pitakoAgentFamily(call.agent) === "loop-io")) {
     const output = host.native.get(call.key)?.output;
     if (output) expect(Buffer.byteLength(output)).toBeLessThanOrEqual(61440);
   }
@@ -1149,15 +1150,15 @@ test.each(Object.entries(cuts))("transition replays after the %s essential save 
     const uninterrupted = transitionFixture(true).host;
     await uninterrupted.execute();
     expect(host.launches.length).toBe(uninterrupted.launches.length + 1);
-    expect(host.launches.filter(call => call.agent === "pitako.loop-io" && /\.r\d+$/.test(call.key))).toHaveLength(1);
-    expect(host.launches.filter(call => ["pitako.worker", "pitako.execution-director", "pitako.reviewer"].includes(call.agent!))
+    expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && /\.r\d+$/.test(call.key))).toHaveLength(1);
+    expect(host.launches.filter(call => ["worker", "execution-director", "reviewer"].includes(pitakoAgentFamily(call.agent) ?? ""))
       .map(call => call.key)).toEqual(uninterrupted.launches
-        .filter(call => ["pitako.worker", "pitako.execution-director", "pitako.reviewer"].includes(call.agent!)).map(call => call.key));
+        .filter(call => ["worker", "execution-director", "reviewer"].includes(pitakoAgentFamily(call.agent) ?? "")).map(call => call.key));
     expect(host.current().loop.taskId).toBe(uninterrupted.current().loop.taskId);
     expect(host.current().budget.consumedLoops).toBe(uninterrupted.current().budget.consumedLoops);
     // Independent roots necessarily bind their own paths and backlog/ledger hashes.
     const modelRequests = (value: typeof host) => JSON.stringify(value.launches.filter(call =>
-      ["pitako.worker", "pitako.execution-director", "pitako.reviewer"].includes(call.agent!)))
+      ["worker", "execution-director", "reviewer"].includes(pitakoAgentFamily(call.agent) ?? "")))
       .replaceAll(value.root, "<root>")
       .replace(/(CURRENT BACKLOG DIGEST: \\")[a-f0-9]{64}/g, "$1<root-bound>")
       .replace(/admitted backlog digest [a-f0-9]{64}/g, "admitted backlog digest <root-bound>")
@@ -1258,7 +1259,7 @@ test("final selection retains one acceptance history and delivers it to review a
   }
   // This is the actual integrated-review root, not the isolated persistState boundary above.
   expect(host.calls.some(call => call.key.includes(".review."))).toBe(true);
-  expect(host.launches.some(call => call.agent === "pitako.store-io")).toBe(false);
+  expect(host.launches.some(call => call.agent === "pitako.review-store")).toBe(false);
   expect([...host.storage.keys()]).toEqual([EXECUTE_CURSOR_KEY]);
   expect(host.snapshots.length).toBeGreaterThan(0);
   for (const value of host.snapshots) validateExecuteCursor(EXECUTE_CURSOR_KEY, value);

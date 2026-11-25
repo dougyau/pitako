@@ -7,7 +7,10 @@ const { fixture } = executeControllerFixture();
 test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer before the next director", async source => {
   const host = fixture(undefined, { taskCount: 0, findings: source === "review" });
   host.setRespond((request, normal) => {
-    if (source === "compliance" && request.key === "invoke-human-1.l1.compliance") return gaps(normal());
+    if (source === "compliance" && request.key === "invoke-human-1.l1.compliance") {
+      expect(request).toMatchObject({ agent: "pitako.compliance", model: host.current().models.r1 });
+      return gaps(normal());
+    }
     if (source === "review" && request.key === "invoke-human-1.l1.review.director-synthesis") {
       const result = normal();
       result.structuredOutput.screening.verdict = "material-gaps";
@@ -17,9 +20,10 @@ test.each(["compliance", "review"])("%s gaps reaches a fresh read-only reviewer 
     }
     if (request.key.endsWith(".demand-observation")) {
       expect(host.current().action).toMatchObject({ kind: "launched", key: request.key, role: "reviewer" });
-      expect(request).toMatchObject({ agent: "pitako.reviewer", context: "fresh", phase: "director",
+      // The frozen first review model decides, not an agent override.
+      expect(request).toMatchObject({ agent: "pitako.demand-observer", context: "fresh", phase: "director",
+        model: host.current().models.r1,
         skill: ["verify-behavior", "ponytail", "ponytail-review", "rust-best-practices", "rust-review", "scope-discipline"] });
-      expect(request).not.toHaveProperty("model");
       expect(request.task).toContain(`"kind":"${source}"`);
       expect(request.task).toContain(source === "compliance"
         ? '"key":"invoke-human-1.l1.compliance"' : '"key":"invoke-human-1.l1.review.director-synthesis"');

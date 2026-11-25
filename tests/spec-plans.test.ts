@@ -37,7 +37,7 @@ function installedResources(base: string) {
   for (const file of ["package.json", "skills/execute/inspect.mjs", "skills/execute/ledger.mjs", "skills/execute/loader.mjs", "skills/execute/inspect.ts",
     "skills/execute/loop.ts", "skills/execute/loop-io.mjs", "skills/execute/observe.mjs", "skills/execute/closing.mjs", "skills/execute/halt-evidence.mjs",
     "skills/architecture/ledger.mjs", "skills/architecture/native.mjs", "extensions/access-receipts.mjs",
-    "skills/review/store-io.mjs", "skills/review/cursor.mjs", "skills/review/synthesis.mjs", "skills/review/workflow.js", "skills/workflow-canonical.js",
+    "skills/review/store-io.mjs", "skills/review/cursor.mjs", "skills/review/synthesis.mjs", "skills/review/workflow.js", "skills/workflow-canonical.js", "skills/agent-names.mjs",
     "extensions/board/store.ts", "extensions/board/author.ts", "extensions/git-port.ts", "extensions/dev-tools/core/process.ts",
     "extensions/execute-cursor.ts", "extensions/execute-progress.ts", "extensions/execute-intent.ts", "extensions/pitako-store.ts", "extensions/board/sqlite.ts",
     "extensions/spec-plans.ts", "extensions/execute-retained.ts", "extensions/canonical.mjs", "extensions/hash-ledger.mjs", "extensions/execute-checkpoint.ts", "extensions/execute-state.ts", "extensions/board/workspace.ts", "extensions/board/paths.ts", "extensions/errors.ts"]) {

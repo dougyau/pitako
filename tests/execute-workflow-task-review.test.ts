@@ -9,6 +9,7 @@ import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { EXECUTE_CURSOR_KEY, executeCursorSchema, validateExecuteCursor } from "../extensions/execute-cursor.ts";
 import { reviewCursorContract } from "../skills/review/cursor.mjs";
 import { copy, executeControllerFixture, maximalCursor } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 
@@ -94,7 +95,7 @@ test.each([false, true])("file-writing task is reviewed before unit admission (n
   host.setLimit(1);
   let consumedWorker = false;
   host.setRespond((request, normal) => {
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate") {
       const input = JSON.parse(request.task), worker = input.worker ?? input.refs.worker;
       expect(host.current().inFlight).toContainEqual({ ...worker, role: "worker" });
       consumedWorker = true;
@@ -109,10 +110,10 @@ test.each([false, true])("file-writing task is reviewed before unit admission (n
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   const children = host.launches.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key));
   expect(children.map(call => [call.key, call.agent, call.model])).toEqual([
-    ["invoke-human-1.l1.t1.a1.task-reviewer", "pitako.reviewer", "openai-codex/gpt-6.1-sol:xhigh"],
-    ["invoke-human-1.l1.t1.a1.task-synthesis", "pitako.reviewer", "anthropic/claude-opus-5-5:high"],
+    ["invoke-human-1.l1.t1.a1.task-reviewer", "pitako.task-review", "openai-codex/gpt-6.1-sol:xhigh"],
+    ["invoke-human-1.l1.t1.a1.task-synthesis", "pitako.task-synthesis", "anthropic/claude-opus-5-5:high"],
   ]);
-  for (const name of ["execution-director", "worker", "reviewer"]) {
+  for (const name of ["execution-director", "worker", "task-review", "task-synthesis"]) {
     const { frontmatter } = parseFrontmatter(readFileSync(path.resolve(`agents/${name}.md`), "utf8"));
     const declared = Array.isArray(frontmatter.skills) ? frontmatter.skills : String(frontmatter.skills).split(/,\s*/);
     const launched = host.launches.filter(call => call.agent === `pitako.${name}`);
@@ -169,7 +170,7 @@ test.each(invalidDiffs)("invalid task delta diff: $name", async ({ patch }) => {
   const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta") {
       const delta = JSON.parse(result.output!);
       const diff = { ...delta.diff, ...patch };
 
@@ -187,7 +188,7 @@ test.each(["missing", "null", "empty-touched", "empty-touched-missing"])("diff c
   const host = fixture(); host.setLimit(1);
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "taskDelta") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "taskDelta") {
       const delta = JSON.parse(result.output!);
       if (contradiction === "missing") delete delta.diff;
       else if (contradiction === "null") delta.diff = null;
@@ -259,7 +260,7 @@ test.each(["complete", "continue", "blocked"])("no-write %s task dispatches no r
   const output = await host.execute();
   expect(output.status, output.reason).toBe(status === "blocked" ? "blocked" : "partial");
   expect(host.launches.filter(call => /\.task-(reviewer|synthesis)$/.test(call.key))).toHaveLength(0);
-  expect(host.launches.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "close"))
+  expect(host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io" && JSON.parse(call.task).operation === "close"))
     .toHaveLength(host.launches.filter(call => call.agent === "pitako.worker").length);
 });
 
@@ -280,7 +281,7 @@ test("failed gates are not reviewed before continuing to a reviewed completion",
   let failed = false;
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate" && !failed) {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate" && !failed) {
       failed = true;
       const receipt = JSON.parse(result.output!);
       receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1;

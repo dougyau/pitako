@@ -7,6 +7,7 @@ import { executionStatePath } from "./execute-state.ts";
 import { EXECUTE_CURSOR_KEY, type ExecuteCursor } from "./execute-cursor.ts";
 import { readExecuteAdmission, readExecuteProgress } from "./execute-progress.ts";
 import { canonicalDigest } from "./canonical.mjs";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 import { StoreError } from "./pitako-store.ts";
 import { readWorkerOriginal } from "../skills/execute/loop.ts";
 import { planConflictReason, checkpointMismatchReason, settledBarrier, inspectorConflictReason, viewOverflowReason, checkpointWitnessIssue } from "../skills/execute/halt-evidence.mjs";
@@ -72,7 +73,7 @@ export function readNativeSettlement(file: string, key: string, runId: string, a
 	}).filter(entry => entry.type === "settle" && entry.key === key && entry.result?.runId === runId);
 	if (!settlements.length) throw new NativeSettlementError("missing");
 	const settled = settlements.at(-1)?.result;
-	if (!record(settled) || settled.agent !== agent ||
+	if (!record(settled) || pitakoAgentFamily(settled.agent) !== pitakoAgentFamily(agent) ||
 		settled.key !== undefined && settled.key !== key && settled.key !== runId ||
 		settlements.some(entry => !isDeepStrictEqual(entry.result, settled)))
 		throw new NativeSettlementError("conflict");
@@ -84,7 +85,7 @@ function readBoundStatus(root: string, admission: ReturnType<typeof readExecuteA
 	const mission = readJson(admission.missionPath);
 	const children = record(mission) && mission.id === admission.missionId && Array.isArray(mission.workflowChildren)
 		? mission.workflowChildren.filter(child => child.key === producer.key &&
-			(producer.runId === null || child.runId === producer.runId) && child.agent === agent) : [];
+			(producer.runId === null || child.runId === producer.runId) && pitakoAgentFamily(child.agent) === pitakoAgentFamily(agent)) : [];
 	const runId = children.length === 1 ? children[0].runId : undefined;
 	const directories = children.length === 1 && Array.isArray(children[0].artifactPaths)
 		? children[0].artifactPaths.filter((file: unknown): file is string =>
@@ -137,7 +138,8 @@ export function verifyComplianceRenewal(root: string, association: Parameters<ty
 function nativeHaltWitness(native: Record<string, unknown>, key: string, agent: string) {
 	const cause = settledBarrier(native);
 	if (typeof native.runId === "string" && cause && !["running", "queued", "pending"].includes(cause))
-		return { ref: { key, runId: native.runId, agent }, cause, originalDigest: canonicalDigest(native) };
+		// The verified settlement names the producer's actual role agent.
+		return { ref: { key, runId: native.runId, agent: typeof native.agent === "string" ? native.agent : agent }, cause, originalDigest: canonicalDigest(native) };
 }
 
 function readCheckpointWitness(root: string, missionPath: string, missionId: string,
@@ -351,9 +353,9 @@ export function retainedExecuteHalt(root: string, value: ExecuteCursor) {
 		const producer = [...cursor.inFlight].reverse().find(ref => ref.role === "checkpoint-sealer" ||
 			ref.role === "loop-io" && /\.close(?:\.r\d+)?$/.test(ref.key));
 		if (producer) {
-			const agent = `pitako.${producer.role}`;
-			const ref = { key: producer.key, runId: producer.runId, agent };
-			const native = readHaltSettlement(root, admission.association, ref, agent);
+			const native = readHaltSettlement(root, admission.association, producer, `pitako.${producer.role}`);
+			// The halt names the producer's actual role agent, as the workflow recorded it.
+			const ref = { key: producer.key, runId: producer.runId, agent: native.agent };
 			if (native.ok !== true || typeof native.output !== "string" || Buffer.byteLength(native.output) > 61440)
 				throw new Error("Checkpoint halt native receipt integrity failure.");
 			const receipt = JSON.parse(native.output.trim().split("\n").at(-1)!);
@@ -579,13 +581,13 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		const matches = children.filter(child => child.key === subject.key &&
 			(pending || (subject.runId ? child.runId === subject.runId : parents.has(child.workflowRunId))));
 		if (pending && matches.length && (matches.length !== 1 ||
-			matches[0]!.agent !== "pitako.reviewer" || typeof matches[0]!.runId !== "string" || !matches[0]!.runId))
+			pitakoAgentFamily(matches[0]!.agent) !== "reviewer" || typeof matches[0]!.runId !== "string" || !matches[0]!.runId))
 			throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
 		if (matches.length !== 1 || !["pitako.reviewer", "pitako.execution-inspector",
 			...(isInterruption(subject.key) ? [`pitako.${interrupted!.role}`] : []),
 			...(isSealer(subject.key) ? ["pitako.checkpoint-sealer"] : []),
 			...(subject.key === timedOutWorker?.key ? ["pitako.worker"] : []),
-			...(isGate(subject.key) ? ["pitako.loop-io"] : [])].includes(String(matches[0]!.agent)))
+			...(isGate(subject.key) ? ["pitako.loop-io"] : [])].map(pitakoAgentFamily).includes(pitakoAgentFamily(matches[0]!.agent)))
 			return { ...subject, error: `Retained native producer unavailable or ambiguous (${matches.length} matches for ${subject.key}/${subject.runId}).` };
 		const child = matches[0]!;
 		const paths = Array.isArray(child.artifactPaths) ? child.artifactPaths.filter((file): file is string =>

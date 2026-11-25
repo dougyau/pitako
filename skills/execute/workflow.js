@@ -183,7 +183,7 @@ function settledNativeHalt(witness) {
 }
 function retainSettledNativeHalt(witness) {
   const { key: producer, runId, agent } = witness.ref;
-  retainHaltProducer({ key: producer, runId }, agent.slice("pitako.".length));
+  retainHaltProducer({ key: producer, runId }, pitakoAgentFamily(agent));
   loop.halt = settledNativeHalt(witness);
 }
 function retainHaltProducer({ key, runId }, role) {
@@ -193,7 +193,7 @@ function retainHaltProducer({ key, runId }, role) {
 function loopIOViewOverflow(receipt, ref) {
   const reason = viewOverflowReason(receipt);
   if (!reason) return;
-  const producer = ref?.runId && ref.agent === "pitako.loop-io" ? { key: ref.key, runId: ref.runId } : null;
+  const producer = ref?.runId && pitakoAgentFamily(ref.agent) === "loop-io" ? { key: ref.key, runId: ref.runId } : null;
   const diagnostic = excerpt(producer ? reason : `Board view overflow native original integrity failure: ${reason}`);
   throw Object.assign(new Error(diagnostic), { viewOverflowHalt: {
     status: "blocked", code: "view-overflow", reason: diagnostic,
@@ -217,11 +217,13 @@ function closingInterruptionHalt(action, cause) {
   const cancelled = ["stopped", "interrupted"].includes(cause) || /\.task-(reviewer|synthesis)$/.test(action.key);
   return { status: cancelled ? "cancelled" : "blocked", code: "native-barrier", cause,
     reason: `${cancelled ? "Execution cancelled: " : ""}${nativeBarrier(cause).message}`,
+    // The digest uses the cursor's family, which is unchanged across the rename.
     ref: { key: action.key, runId: action.runId, agent: `pitako.${action.role ?? "reviewer"}` } };
 }
 function loopIOHalt(action, cause) {
   return { status: ["stopped", "interrupted"].includes(cause) ? "cancelled" : "blocked",
     code: "native-barrier", cause, reason: nativeBarrier(cause).message,
+    // Replay rebuilds this from key and runId alone, so it names the family, not the operation.
     ref: { key: action.key, runId: action.runId, agent: "pitako.loop-io" } };
 }
 function restorationPendingFailure(ref, interrupted) {
@@ -261,12 +263,12 @@ function dispatch(requests) {
       return save();
     }
   }).then(() => {
-    const models = requests.filter(request => !["pitako.loop-io", "pitako.access-verifier",
-      "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.checkout-observer"].includes(request.agent));
+    const models = requests.filter(request => !["loop-io", "originals-verifier",
+      "request-observer", "checkpoint-sealer", "checkout-observer"].includes(pitakoAgentFamily(request.agent)));
     if (!models.length || !invocation?.head) return;
     const request = models[0];
     dispatchedAction = { kind: "launched", key: request.key, runId: null,
-      role: (request.agent ?? (request.key.includes(".review.") ? "pitako.reviewer" : "pitako.worker")).replace(/^pitako\./, "") };
+      role: pitakoAgentFamily(request.agent) ?? (request.key.includes(".review.") ? "reviewer" : "worker") };
     if (dispatchedAction.role === "worker" && loop?.task)
       dispatchedAction.gateTimeoutMs = gateOperationTimeout(gateTaskFor(loop.task));
     return save();
@@ -275,8 +277,8 @@ function dispatch(requests) {
     return retainNativeCall(runs.all(requests));
   }).then(results => {
     results.forEach((result, index) => {
-      const request = requests[index], role = (request.agent ??
-        (request.key.includes(".review.") ? "pitako.reviewer" : "pitako.worker")).replace(/^pitako\./, "");
+      const request = requests[index], role = pitakoAgentFamily(request.agent) ??
+        (request.key.includes(".review.") ? "reviewer" : "worker");
       if (dispatchedAction?.key === request.key && text(result.runId))
         dispatchedAction.runId = result.runId;
       // A settled worker is still an input until its consuming writer commits.
@@ -309,7 +311,7 @@ function dispatch(requests) {
     if (error?.spawnBudgetExhausted) throw error;
     if (error?.nativeBarrier || !calledNative) throw error;
     const { key, agent } = requests[0];
-    const nativeDispatch = { key, role: (agent ?? "pitako.reviewer").replace(/^pitako\./, "") };
+    const nativeDispatch = { key, role: pitakoAgentFamily(agent) ?? "reviewer" };
     if (/^Blocked by pi-subagents permission rule:/.test(String(error?.message ?? error)))
       throw Object.assign(nativeBarrier("native permission denial", { key }), { nativeDispatch });
     const cause = nativeFailure(key, error);
@@ -541,7 +543,7 @@ function executeCursor() {
     stage: value.stage ?? value.code ?? "halted", digest: canonicalDigest(value),
   } : null;
   const replay = { op: operation.operation, opKey: operation.key, input };
-  const timedOutReviewer = loop?.halt?.code === "timeout" && loop.halt.ref?.agent === "pitako.reviewer" &&
+  const timedOutReviewer = loop?.halt?.code === "timeout" && pitakoAgentFamily(loop.halt.ref?.agent) === "reviewer" &&
     text(loop.halt.ref.runId) ? loop.halt.ref : null;
   const action = timedOutReviewer
     ? { kind: "launched", role: "reviewer", key: timedOutReviewer.key, runId: timedOutReviewer.runId, input }
@@ -1027,7 +1029,7 @@ function renewAnalysisTimeout(cursor) {
       const cause = analysisBarrier(observed, ref.runId ?? ref.key);
       if (cause) throw nativeBarrier(cause, ref);
       if (!text(ref.runId) || observed?.runId !== ref.runId && !managementAnalysisState(observed, ref) ||
-          observed?.agent && ref.agent && observed.agent !== ref.agent ||
+          observed?.agent && ref.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent) ||
           observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
           !terminalAnalysis(observed, ref)) settled = false;
       retiredRefs.set(entry.key, ref);
@@ -1320,11 +1322,13 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
   const scopeDiscipline = ["pitako.execution-director", "pitako.worker"].includes(agent) || demandObservation;
   return dispatcher([{
     key: childKey, ...(resume ? { resume } : { agent, context: "fresh" }), label, phase: display.phase, cwd: config.root,
+    // Reviewer roles take the frozen first review model; no agent override decides it.
+    ...(!resume && pitakoAgentFamily(agent) === "reviewer" ? { model: invocation.reviewModels.r1.model } : {}),
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
     skill: [...new Set([
       "verify-behavior", "ponytail",
       ...(agent === "pitako.worker" ? ["rust-best-practices", "rust-review", "rust-port"] : []),
-      ...(agent === "pitako.reviewer" ? ["ponytail-review", "rust-best-practices", "rust-review"] : []),
+      ...(pitakoAgentFamily(agent) === "reviewer" ? ["ponytail-review", "rust-best-practices", "rust-review"] : []),
       ...(scopeDiscipline ? ["scope-discipline"] : []),
     ])],
     task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
@@ -1384,7 +1388,7 @@ function backlogAuthority() {
 }
 const LOOP_IO_CONTROL = { needsAttentionAfterMs: 1_800_000 };
 function loopIORequest(childKey, input, timeoutMs) {
-  return { key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
+  return { key: childKey, agent: pitakoLoopAgent(input.operation), cwd: config.root, context: "fresh", output: false,
     outputMode: "inline", outputSchema: false, reads: false, progress: false,
     control: LOOP_IO_CONTROL, ...(["close", "gate"].includes(input.operation) &&
       (input.gate || timeoutMs !== undefined) ? { timeoutMs: timeoutMs ?? gateOperationTimeout(input.gate.task) } : {}),
@@ -1392,7 +1396,7 @@ function loopIORequest(childKey, input, timeoutMs) {
       ? canonicalJSON(input) : JSON.stringify(input) };
 }
 function terminalLoopIOResult(result, childKey, operation) {
-  return result.ok && result.agent === "pitako.loop-io" && text(result.runId) &&
+  return result.ok && pitakoAgentFamily(result.agent) === "loop-io" && text(result.runId) &&
     (result.key === undefined || result.key === childKey) && result.state === undefined && !result.terminalOutcome &&
     (!["advance", "selection", "close", "drain"].includes(operation) ||
       text(result.asyncDir) && text(result.externalAdapter?.outputArtifacts?.stdoutPath) &&
@@ -1795,7 +1799,7 @@ function loopIO(slot, input, owner = loop) {
           inFlight.set(childKey, { key: childKey, runId: observed.runId, role: "loop-io" });
         }
         const cause = barrier(observed, pending.ref?.runId ?? childKey);
-        if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: "pitako.loop-io" });
+        if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: pitakoLoopAgent(input.operation) });
         pending.retry++; delete pending.ref; pending.dispatched = false;
         return save().then(run);
       });
@@ -1925,7 +1929,7 @@ function observeDemands() {
   const verified = retained.length && !loop.demandOriginalsVerified
     ? loopIO("demandOriginals", { operation: "reviewOriginals", originals: retained }) : Promise.resolve();
   const childKey = demandKey();
-  return verified.then(() => collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
+  return verified.then(() => collect(childKey, pitakoReviewerAgent(childKey), { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
 INDIVIDUAL READ-ONLY DEMAND OBSERVATION, not product review or a future plan.
 Read and apply scope-discipline. Read exact full originals and relevant causal references below.
 For compact references, read the path and verify its SHA-256; missing or changed bytes block with the expected digest.
@@ -2592,7 +2596,7 @@ function observePendingSealer() {
   if (!pending?.retry && !close?.dispatched) return Promise.resolve();
   // A grouped close consumes seal index 0; a later legacy re-seal is the newest producer.
   const closeKey = close && close.key + (close.retry ? `.r${close.retry}` : "");
-  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref?.key === closeKey ? close.ref : { key: closeKey, agent: "pitako.loop-io" }
+  const ref = close?.dispatched && (pending?.retry ?? 0) <= 1 ? close.ref?.key === closeKey ? close.ref : { key: closeKey, agent: pitakoLoopAgent("close") }
     : { key: sealerKey(loop.attempt.key, pending.retry - 1), agent: "pitako.checkpoint-sealer" };
   const key = ref.key;
   if (budgetRejected(key) || pending?.reconciled === key) return Promise.resolve();
@@ -2600,7 +2604,7 @@ function observePendingSealer() {
     const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? key);
     if (cause) throw nativeBarrier(cause, ref);
     if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
-        (observed?.agent && observed.agent !== ref.agent))
+        (observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent)))
       throw new Error("Sealer producer/run identity conflicts with the pending seal.");
     if (loop.attempt.taskReview?.synthesis && ref.agent === "pitako.checkpoint-sealer" &&
         observed?.ok && observed.output?.trimStart().startsWith("{")) {
@@ -2639,7 +2643,7 @@ function verifyAttempt(descriptor, task, value, reuse) {
         if (cause) throw nativeBarrier(cause, pending.ref);
         if (pending.ref?.runId && status?.runId && pending.ref.runId !== status.runId ||
             status?.key && ![gateKey, pending.ref?.runId].includes(status.key) ||
-            status?.agent && status.agent !== "pitako.loop-io")
+            status?.agent && pitakoAgentFamily(status.agent) !== "loop-io")
           throw new Error("Gate producer/run identity conflicts with the retained intention.");
         if (status?.ok && status.output) return status;
         if (nativeTimeout(status)) return status;
@@ -2718,7 +2722,7 @@ function verifyAttempt(descriptor, task, value, reuse) {
       if (finalGate) receipt = finalReceipt;
       if (descriptor !== loop.finalAttempt)
         receipt = readTaskGateWire(receipt, gateTask.gates, committedGate?.P.prompt.execution?.worker?.reference);
-      const terminal = result?.ok && result.agent === "pitako.loop-io" && text(result.runId) &&
+      const terminal = result?.ok && pitakoAgentFamily(result.agent) === "loop-io" && text(result.runId) &&
         (result.key === undefined || result.key === gateKey) && !result.state && !result.terminalOutcome &&
         Array.isArray(result.results) && result.results.length === 1 && result.results[0].exitCode === 0 &&
         failures.every(item => !item.error && !item.outputSaveError && !item.metadataSaveError && !item.transcriptError &&
@@ -3120,7 +3124,7 @@ Finish with structured_output.`;
       const childKey = `${generationKey(descriptor.key, `task-${stage}`)}.task-${stage}`;
       if (review[stage]) return;
       const prior = stage === "synthesis" ? review.reviewer : null;
-      return analysisDispatch([{ key: childKey, agent: "pitako.reviewer", context: "fresh",
+      return analysisDispatch([{ key: childKey, agent: pitakoReviewerAgent(childKey), context: "fresh",
         cwd: config.root, label: `Task ${stage}: ${task.id}`, phase: `task-${stage}`,
         model: invocation[stage === "reviewer" ? "taskReviewer" : "taskSynthesis"],
         output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
@@ -3711,7 +3715,7 @@ function finish(status, reason, drained = false) {
         retainSettledNativeHalt(error.settlementHalt);
         return save().then(() => finish(loop.halt.status, loop.halt.reason, true));
       }
-      if (error.nativeBarrier && error.nativeReference?.agent === "pitako.loop-io" && error.nativeReference.runId)
+      if (error.nativeBarrier && pitakoAgentFamily(error.nativeReference?.agent) === "loop-io" && error.nativeReference.runId)
         loop.halt = loopIOHalt(error.nativeReference, error.nativeBarrier);
       else if (error.nativeBarrier) loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
         code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
@@ -3889,7 +3893,7 @@ function replayClosingCursor(cursor) {
         if (observation.error) throw new Error(`Closing barrier native original integrity failure: ${observation.error}`);
         capture(observation);
         const witness = observation.haltOriginal?.closingBarriers?.find(item =>
-          item.ref.key === producer.key && item.ref.agent === agent &&
+          item.ref.key === producer.key && pitakoAgentFamily(item.ref.agent) === pitakoAgentFamily(agent) &&
           (!runId || item.ref.runId === runId) && item.cause === cause);
         if (observation.binding !== cursor.admissionBinding || !witness || !text(witness.ref.runId) ||
             !/^[a-f0-9]{64}$/.test(witness.originalDigest))
@@ -3902,7 +3906,7 @@ function replayClosingCursor(cursor) {
     return observeStatus(target, true).then(observed => {
       if (producer.runId && observed?.runId && observed.runId !== producer.runId ||
           observed?.key && ![producer.key, target, observed.runId].includes(observed.key) ||
-          observed?.agent && observed.agent !== agent)
+          observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(agent))
         throw new Error(`Closing producer identity changed for ${producer.key}.`);
       const cause = classify(observed, observed?.runId ?? target) ?? classify(observed, target);
       return cause ? barrierFromOriginal(cause, producer.runId ?? observed?.runId) : observed;
@@ -4129,7 +4133,7 @@ function observeGateRenewal(cursor, halt, resume) {
   return observeStatus(halt.ref.runId, true).then(observed => {
     if (observed?.runId && observed.runId !== halt.ref.runId ||
         observed?.key && ![halt.key, halt.ref.runId].includes(observed.key) ||
-        observed?.agent && observed.agent !== halt.ref.agent)
+        observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(halt.ref.agent))
       throw new Error("Gate timeout producer identity mismatch.");
     const cause = analysisBarrier(observed, halt.ref.runId);
     if (cause) throw nativeBarrier(cause, halt.ref);
@@ -4159,7 +4163,7 @@ function replayGateTimeout(cursor) {
     const settled = original?.gate;
     if (!settled || canonicalDigest(settled) !== original.witnessDigest ||
         !/^[a-f0-9]{64}$/.test(original.digest) || !nativeTimeout(settled) ||
-        settled.key !== producer.key || settled.runId !== producer.runId || settled.agent !== "pitako.loop-io")
+        settled.key !== producer.key || settled.runId !== producer.runId || pitakoAgentFamily(settled.agent) !== "loop-io")
       throw new Error("Gate timeout original producer integrity mismatch.");
     const ref = nativeReference(producer.key, settled);
     const generation = Number(producer.key.match(/\.g(\d+)\.gate(?:\.r\d+)?$/)?.[1] ?? 1);
@@ -4245,7 +4249,7 @@ function replayFinalGateTimeout(cursor) {
         !same(packet.head, cursor.head) || packet.storeId !== cursor.storeId ||
         !same(action.input, saved.selectionInput) ||
         !original?.gate || canonicalDigest(original.gate) !== original.witnessDigest ||
-        original.gate.agent !== "pitako.loop-io" || analysisBarrier(original.gate, producer.runId) ||
+        pitakoAgentFamily(original.gate.agent) !== "loop-io" || analysisBarrier(original.gate, producer.runId) ||
         nativeTimeout(original.gate))
       throw new Error("Final acceptance timeout original integrity mismatch.");
     const restored = restoreFinalAcceptance(cursor, { ...saved, head: packet.head, P: packet.P,
@@ -4285,7 +4289,7 @@ function observeReviewerTimeoutStatus(runId) {
 function checkReviewerTimeoutIdentity(observed, ref) {
   if (observed?.runId && observed.runId !== ref.runId ||
       observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
-      observed?.agent && observed.agent !== ref.agent)
+      observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(ref.agent))
     throw new Error("Task review timeout producer identity mismatch.");
 }
 function reviewerRenewalHalt(timeout, cause) {
@@ -4335,7 +4339,7 @@ function replayReviewerTimeout(cursor) {
       throw new Error(`Task review timeout projection differs from its cursor head/input: packet=${!!packet}, store=${packet?.storeId === cursor.storeId}, head=${same(packet?.head, cursor.head)}, input=${canonicalJSON(packet?.P?.control.operation?.input ?? null)} expected=${canonicalJSON(cursor.action.input)}.`);
     if (!settled || canonicalDigest(settled) !== original.digest || !nativeTimeout(settled) ||
         settled.key !== undefined && settled.key !== cursor.action.key || settled.runId !== cursor.action.runId ||
-        settled.agent !== "pitako.reviewer")
+        pitakoAgentFamily(settled.agent) !== "reviewer")
       throw new Error(`Task review timeout producer integrity mismatch: ${cursor.action.key}; ${original?.error ?? `settled=${!!settled}, timeout=${nativeTimeout(settled)}, key=${settled?.key}, run=${settled?.runId}, agent=${settled?.agent}`}.`);
     const demand = cursor.action.key.endsWith(".demand-observation");
     const generation = Number(cursor.action.key.match(/\.g([23])\.(?:task-|demand-observation$)/)?.[1] ?? 1);
@@ -4400,7 +4404,7 @@ function replayReviewerTimeout(cursor) {
             item.key === slot.key && item.runId === slot.runId);
           const result = original?.settlement;
           if (!result || canonicalDigest(result) !== original.digest || !result.ok ||
-              result.key !== undefined && result.key !== slot.key || result.runId !== slot.runId || result.agent !== "pitako.reviewer" ||
+              result.key !== undefined && result.key !== slot.key || result.runId !== slot.runId || pitakoAgentFamily(result.agent) !== "reviewer" ||
               !result.structuredOutput)
             throw new Error("Task review timeout sibling original integrity mismatch.");
           const path = result.results?.find(item => text(item.savedOutputPath))?.savedOutputPath;
@@ -4510,7 +4514,7 @@ function replayInitialAdvance({ storeId, input }, previous) {
       const cause = analysisBarrier(observed, observed?.runId ?? producer) ?? analysisBarrier(observed, producer);
       if (cause) throw nativeBarrier(cause, { key: producer, runId: observed?.runId });
       if (observed?.key && ![producer, observed.runId].includes(observed.key) ||
-          observed?.agent && observed.agent !== "pitako.loop-io")
+          observed?.agent && pitakoAgentFamily(observed.agent) !== "loop-io")
         throw new Error("Initial advance replay producer identity mismatch.");
       // A transport retry can have admitted the original params before the cut.
       return index && !observed?.runId && !managementAnalysisState(observed, { key: producer })
@@ -4593,7 +4597,7 @@ function replayDirectorSelection(cursor, inspection, observedDirector) {
       const selectionBarrier = analysisBarrier(selected, producer.runId ?? producer.key);
       if (selectionBarrier) throw nativeBarrier(selectionBarrier, producer);
       if (producer.runId && selected?.runId !== producer.runId && !managementAnalysisState(selected, producer) ||
-          selected?.agent && selected.agent !== "pitako.loop-io")
+          selected?.agent && pitakoAgentFamily(selected.agent) !== "loop-io")
         throw new Error("Selection replay producer identity mismatch.");
       return replaySelection(producer);
     });
@@ -4673,7 +4677,7 @@ function replayNativeInterruption(cursor, action, rebuild, capturedObservation) 
   }).then(observed => {
     if (observed?.runId && observed.runId !== action.runId ||
         observed?.key && ![action.key, action.runId].includes(observed.key) ||
-        observed?.agent && observed.agent !== `pitako.${action.role}`)
+        observed?.agent && pitakoAgentFamily(observed.agent) !== action.role)
       throw new Error("Retained interruption producer integrity mismatch.");
     const current = statusBarrier ?? analysisBarrier(observed, action.runId);
     if (current && !["stopped", "interrupted", "native permission denial"].includes(current))
@@ -4734,7 +4738,7 @@ function replayFinalAcceptance(cursor, early) {
   return observeStatus(producer.runId ?? producer.key, true).then(observed => {
     const cause = analysisBarrier(observed, producer.runId ?? producer.key);
     if (cause) throw nativeBarrier(cause, nativeReference(producer.key, observed));
-    if (observed?.agent && observed.agent !== "pitako.loop-io" ||
+    if (observed?.agent && pitakoAgentFamily(observed.agent) !== "loop-io" ||
         observed?.key && ![producer.key, producer.runId].includes(observed.key) ||
         producer.runId && observed?.runId && observed.runId !== producer.runId)
       throw new Error("Final acceptance replay producer integrity mismatch.");
@@ -4836,7 +4840,7 @@ function admitEarlyAnalyses(originals, refs) {
     throw new Error("Early analysis replay receipt lacks its exact producers.");
   return Promise.all(originals.map(({ reference, digest, result }) => {
     const { key, runId, path, sha256 } = reference;
-    if (!result.ok || !text(runId) || result.runId !== runId || result.agent !== "pitako.reviewer" ||
+    if (!result.ok || !text(runId) || result.runId !== runId || pitakoAgentFamily(result.agent) !== "reviewer" ||
         !/^[a-f0-9]{64}$/.test(sha256) || canonicalDigest(clone(result.structuredOutput)) !== digest ||
         !result.results?.some(item => item.savedOutputPath === path || item.structuredOutputPath === path))
       throw new Error(`Early analysis replay receipt integrity mismatch for ${key}.`);
@@ -4844,7 +4848,7 @@ function admitEarlyAnalyses(originals, refs) {
       const cause = analysisBarrier(observed, runId);
       if (cause) throw nativeBarrier(cause, { key, runId });
       if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
-          observed?.agent && observed.agent !== "pitako.reviewer" || !analysisSettled(observed, reference) ||
+          observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer" || !analysisSettled(observed, reference) ||
           observed?.structuredOutput && canonicalDigest(clone(observed.structuredOutput)) !== digest)
         throw new Error(`Early analysis producer integrity mismatch for ${key}.`);
       analysisResults.set(key, result);
@@ -4880,7 +4884,7 @@ function replayDemandObservation(cursor) {
       if (cause) throw nativeBarrier(cause, { key: action.key, runId });
       if (observed?.runId && action.runId && observed.runId !== action.runId ||
           observed?.key && ![action.key, runId].includes(observed.key) ||
-          observed?.agent && observed.agent !== "pitako.reviewer")
+          observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer")
         throw new Error("Demand replay producer identity mismatch.");
       return runId;
     });
@@ -4921,7 +4925,7 @@ function replayDemandObservation(cursor) {
       if (renewal?.timeout) {
         const ref = renewal.timeout;
         if (ref.key !== action.key || (runId && ref.runId !== runId) || !text(ref.runId) ||
-            ref.agent !== "pitako.reviewer" || !nativeTimeout(ref))
+            pitakoAgentFamily(ref.agent) !== "reviewer" || !nativeTimeout(ref))
           throw new Error("Renewed demand timeout producer integrity mismatch.");
         const halt = analysisTimeoutHalt({ key: action.key, timeoutMs: renewal.launchedMs }, ref, generation);
         return persistState(stateKey, { ...cursor, action: { ...action, runId: ref.runId },
@@ -4955,7 +4959,7 @@ function replayFinalReview(cursor) {
     const cause = analysisBarrier(observed, runId);
     if (cause) throw nativeBarrier(cause, { key: synthesisKey, runId });
     if (observed?.runId && observed.runId !== runId ||
-        observed?.agent && observed.agent !== "pitako.reviewer" ||
+        observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer" ||
         observed?.key && ![synthesisKey, runId].includes(observed.key))
       throw new Error("Final review replay producer integrity mismatch.");
     return observeStatus(request.key, true);
@@ -5111,7 +5115,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
     return host(config.inspections[0]).then(observation => {
       const original = capture(observation).metadata.retainedAnalyses.find(ref => ref.key === key && ref.runId === runId);
       const settled = original?.settlement;
-      if (!settled || settled.runId !== runId || settled.agent !== "pitako.reviewer" ||
+      if (!settled || settled.runId !== runId || pitakoAgentFamily(settled.agent) !== "reviewer" ||
           settled.key !== undefined && settled.key !== key || canonicalDigest(settled) !== original.digest ||
           settled.ok && settled.structuredOutput || analysisBarrier(settled, key))
         throw new Error("Retained task review model failure original integrity mismatch.");
@@ -5205,7 +5209,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       const settled = original?.settlement;
       if (observation.binding !== cursor.admissionBinding || !settled || canonicalDigest(settled) !== original.digest ||
           settled.key !== undefined && settled.key !== key || settled.runId !== runId ||
-          settled.agent !== "pitako.reviewer" || !nativeTimeout(settled) ||
+          pitakoAgentFamily(settled.agent) !== "reviewer" || !nativeTimeout(settled) ||
           !Number.isSafeInteger(original.launchedMs) || original.launchedMs < 1 || original.launchedMs > 86400000)
         throw new Error("Final review timeout original integrity mismatch.");
       const generation = Number(key.match(/\.g([23])\.(?:review\.|compliance$)/)?.[1] ?? 1);
@@ -5247,7 +5251,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
           const valid = original?.ok && text(original.runId) && text(original.path) &&
             (!slot.digest || canonicalDigest(original.structuredOutput) === slot.digest);
           return { key: slot.key, stage: valid ? "receipt" : "intention",
-            ref: valid ? { key: slot.key, runId: original.runId, agent: "pitako.reviewer" } : { key: slot.key } };
+            ref: valid ? { key: slot.key, runId: original.runId, agent: pitakoReviewerAgent(slot.key) } : { key: slot.key } };
         });
         target.analysisCalls.push(call);
         // Preserve the saved sibling ownership until retirement succeeds.
@@ -5270,7 +5274,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       if (cause) throw nativeBarrier(cause, ref);
       if (nativeTimeout(observed) || observed?.runId && observed.runId !== runId ||
           observed?.key && ![key, runId].includes(observed.key) ||
-          observed?.agent && observed.agent !== "pitako.reviewer")
+          observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer")
         throw new Error("Retained review original producer integrity mismatch.");
       return host(config.inspections[0]).then(observation => {
         const { metadata } = capture(observation);
@@ -5304,7 +5308,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
             if (cause) throw nativeBarrier(cause, slot);
             if (observed?.runId && observed.runId !== slot.runId ||
                 observed?.key && ![slot.key, slot.runId].includes(observed.key) ||
-                observed?.agent && observed.agent !== "pitako.reviewer" || nativeTimeout(observed))
+                observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer" || nativeTimeout(observed))
               throw new Error("Retained synthesis original producer integrity mismatch.");
             const original = metadata.retainedAnalyses.find(item => item.key === slot.key && item.runId === slot.runId);
             const result = retainedReadOnlyOriginal(observed, slot, metadata.retainedAnalyses);
@@ -5325,7 +5329,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       if (cause) throw nativeBarrier(cause, { key, runId });
       if (observed?.ok !== false || observed.runId !== runId ||
           observed.key && ![key, runId].includes(observed.key) ||
-          observed.agent && observed.agent !== `pitako.${role}`)
+          observed.agent && pitakoAgentFamily(observed.agent) !== role)
         throw new Error("Retained capacity producer identity or refusal is unavailable.");
       const halt = { status: "partial", ...nativeFailure(key, observed.error, observed) };
       if (halt.code !== "capacity" || canonicalDigest(halt) !== cursor.halt.digest)
@@ -5395,7 +5399,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       const cause = analysisBarrier(observed, producer.runId ?? opKey);
       if (cause) throw nativeBarrier(cause, producer);
       if (producer.runId && observed?.runId !== producer.runId && !managementAnalysisState(observed, producer) ||
-          observed?.agent && observed.agent !== "pitako.loop-io")
+          observed?.agent && pitakoAgentFamily(observed.agent) !== "loop-io")
         throw new Error("Committed selection producer identity mismatch.");
       return replayLoopIO(`${opKey}.committed.r1`, { operation: "selection", key: opKey,
         root: cursor.root, invocation: cursor.invocation, storeId: cursor.storeId,
@@ -5421,7 +5425,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       if (cause) throw nativeBarrier(cause, ref);
       const management = managementAnalysisState(observed, ref);
       if (producer && (observed?.runId !== producer.runId && !management ||
-          observed.agent && observed.agent !== "pitako.loop-io"))
+          observed.agent && pitakoAgentFamily(observed.agent) !== "loop-io"))
         throw new Error("Grouped replay producer identity mismatch.");
       if (producer && !terminalAnalysis(observed, ref) && management !== "passed")
         throw new Error("Grouped replay awaits exact terminal producer evidence.");
@@ -5540,7 +5544,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
         if (!observed?.ok || !text(observed.runId) || producer.runId && observed.runId !== producer.runId ||
             !observed.structuredOutput && !analysisSettled(observed, producer) ||
             observed.key && ![producer.key, observed.runId].includes(observed.key) ||
-            observed.agent && observed.agent !== "pitako.reviewer")
+            observed.agent && pitakoAgentFamily(observed.agent) !== "reviewer")
           throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
         if (observed.structuredOutput) reviewedNative.set(ref.key, canonicalDigest(clone(observed.structuredOutput)));
         return { key: ref.key, runId: observed.runId };
@@ -5707,7 +5711,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
     return observeStatus(childKey, true).then(observed => {
       const cause = analysisBarrier(observed, childKey);
       if (cause) throw nativeBarrier(cause, { key: childKey, runId: observed.runId });
-      if (observed?.agent && observed.agent !== "pitako.loop-io" ||
+      if (observed?.agent && pitakoAgentFamily(observed.agent) !== "loop-io" ||
           observed?.key && ![childKey, observed.runId].includes(observed.key))
         throw new Error("Gate replay producer identity mismatch.");
       const ref = { key: childKey, runId: observed?.runId };
@@ -5940,7 +5944,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
               reviewedNative.has(reference.key) && reviewedNative.get(reference.key) !== reference.digest)
             throw new Error("Task review recovery original integrity mismatch.");
           restoredLoop.attempt.taskReview[index ? "synthesis" : "reviewer"] = clone(reference);
-          const original = { ok: true, key: reference.key, agent: "pitako.reviewer",
+          const original = { ok: true, key: reference.key, agent: pitakoReviewerAgent(reference.key),
             runId: reference.runId, structuredOutput: body, results: [{ savedOutputPath: reference.path }] };
           analysisResults.set(reference.key, original);
           return { key: reference.key, stage: "receipt", ref: nativeReference(reference.key, original) };
@@ -6095,7 +6099,7 @@ function checkEpochProducers(timeoutAction) {
     const cause = (timeoutAction ? analysisBarrier : barrier)(observed, ref.runId);
     if (cause) throw nativeBarrier(cause, ref);
     if (observed?.runId !== ref.runId && !(observed?.runId === undefined && managementAnalysisState(observed, ref)) ||
-        observed.agent && observed.agent !== `pitako.${ref.role}` ||
+        observed.agent && pitakoAgentFamily(observed.agent) !== ref.role ||
         !terminalAnalysis(observed, ref))
       throw new Error(`Store epoch recovery awaits exact terminal producer evidence for ${ref.key}.`);
   }), Promise.resolve());
@@ -6205,7 +6209,7 @@ try {
         await persistState(stateKey, held);
         return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
       }
-      if (error.nativeReference?.agent === "pitako.loop-io" && error.nativeReference.runId &&
+      if (pitakoAgentFamily(error.nativeReference?.agent) === "loop-io" && error.nativeReference.runId &&
           retainedCursor.action.kind === "pending" && ["close", "drain", "gate"].includes(retainedCursor.action.op) &&
           error.nativeReference.key.replace(/\.r\d+$/, "") === retainedCursor.action.opKey &&
           ["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) && !retainedCursor.halt) {
@@ -6220,7 +6224,7 @@ try {
         const halt = settledNativeHalt(error.settlementHalt), { key, runId, agent } = halt.ref;
         const held = { ...retainedCursor, halt: { stage: "native-settlement", digest: canonicalDigest(halt) },
           inFlight: [...retainedCursor.inFlight.filter(item => item.key !== key),
-            { key, runId, role: agent.slice("pitako.".length) }] };
+            { key, runId, role: pitakoAgentFamily(agent) }] };
         await persistState(stateKey, held);
         return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
       }
@@ -7082,14 +7086,14 @@ Return structured_output after all owned journaled writes settle.`,
       // Replay reconciles each retained call; repeating a key is not observation.
       // Normally dispatch the model-free access verifier directly. A renewed
       // synthesis intention already has a verifier; observe its verified receipt instead.
-      const reviewRuns = { all: requests => (requests.every(request => request.agent === "pitako.access-verifier")
+      const reviewRuns = { all: requests => (requests.every(request => request.agent === "pitako.originals-verifier")
         ? loop.replayedReviewAccess && requests.length === 1 && requests[0].key === loop.replayedReviewAccess.key
           ? observeStatus(loop.replayedReviewAccess.runId, true).then(observed => {
             const { key, runId, agent } = loop.replayedReviewAccess;
             const cause = analysisBarrier(observed, runId);
             if (cause) throw nativeBarrier(cause, { key, runId, agent });
             if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
-                observed?.agent && observed.agent !== agent || !analysisSettled(observed, { key, runId }))
+                observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(agent) || !analysisSettled(observed, { key, runId }))
               throw new Error("Renewed review access verifier producer integrity mismatch.");
             return [loop.replayedReviewAccess];
           })
@@ -7188,7 +7192,7 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       if (!loop.replayedFinalReview) await reconcileAnalysis();
       const completedReview = loop.integratedReview;
       const complianceKey = `${generationKey(`${key}.l${loop.number}`, "compliance")}.compliance`;
-      const result = await collect(complianceKey, "pitako.reviewer",
+      const result = await collect(complianceKey, pitakoReviewerAgent(complianceKey),
         { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
 INDIVIDUAL READ-ONLY WHOLE-SPEC COMPLIANCE ANALYSIS. You are ONE fresh analyst, not a council,
 director checklist, implementation worker or final presentation agent. No delegation, writes or tests.
@@ -7454,7 +7458,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
         (!error.nativeReference || error.nativeReference.key === dispatchedAction.key && !error.nativeReference.runId))
       loop.halt = noRunHalt(dispatchedAction, { stage, reason: excerpt(reason) });
     if (["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) &&
-        dispatchedAction?.kind === "pending" && ref.agent === "pitako.loop-io" && ref.runId &&
+        dispatchedAction?.kind === "pending" && pitakoAgentFamily(ref.agent) === "loop-io" && ref.runId &&
         ref.key.replace(/\.r\d+$/, "") === dispatchedAction.opKey)
       loop.halt = loopIOHalt(ref, error.nativeBarrier);
     if (["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) &&

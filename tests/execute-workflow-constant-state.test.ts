@@ -5,6 +5,7 @@ import { executeControllerFixture, copy, gaps, source } from "./fixtures/execute
 import { readBacklog } from "../skills/execute/loop.ts";
 import { digest } from "../extensions/spec-plans.ts";
 import { EXECUTE_CURSOR_KEY, EXECUTE_CURSOR_MAX_BYTES, validateExecuteCursor } from "../extensions/execute-cursor.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 const { executeStore, canonicalJSON, executeProjection, fullExecuteProjection } = await import("../skills/execute/ledger.mjs");
 
 const { fixture } = executeControllerFixture();
@@ -325,18 +326,18 @@ test.each([...[true, false].flatMap(committed =>
   // Board topic 208 HUMAN #3415(f): one recovery read, no model or publication replay.
   const added = host.launches.slice(launches);
   if (committed) {
-    expect(added.map(call => call.agent)).toEqual(["pitako.loop-io"]);
+    expect(added.map(call => call.agent)).toEqual(["pitako.loop-advance"]);
     expect(added[0].key).toMatch(/\.r\d+$/);
     expect(host.calls.filter(call => call.agent === "pitako.checkout-observer")).toEqual([request]);
     expect(canonicalJSON(store.read(scope).records.find(row => row.seq === published!.seq))).toBe(original!);
   } else {
     expect(added.map(call => call.agent)).toEqual(mutation === "none" || missingUsage
-      ? ["pitako.checkout-observer", "pitako.loop-io"] : ["pitako.checkout-observer"]);
+      ? ["pitako.checkout-observer", "pitako.loop-drain"] : ["pitako.checkout-observer"]);
     expect(added[0].key).toBe("invoke-human-1.l1.checkout");
     expect(added[0].task).toBe(expectedRequest);
     expect(added.some(call => /\.r\d+$/.test(call.key))).toBe(false);
   }
-  expect(added.some(call => call.agent === "pitako.reviewer")).toBe(false);
+  expect(added.some(call => pitakoAgentFamily(call.agent) === "reviewer")).toBe(false);
   for (const cursor of host.snapshots) {
     validateExecuteCursor(EXECUTE_CURSOR_KEY, cursor);
     expect(Buffer.byteLength(JSON.stringify({ [EXECUTE_CURSOR_KEY]: cursor }, null, 2)))
@@ -357,7 +358,7 @@ test("admission amendments reach every phase without the director copying them i
   expect(admitted.amendments).toEqual(amendments);
   expect(host.current()).not.toHaveProperty("amendments");
   // The model-free access verifier receives only originals to compare, not model context.
-  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key) && call.agent !== "pitako.access-verifier");
+  const phases = host.calls.filter(call => /\.director$|\.t\d+\.a\d+$|\.compliance$|\.review\./.test(call.key) && call.agent !== "pitako.originals-verifier");
   for (const pattern of [/\.director$/, /\.t\d+\.a\d+$/, /\.compliance$/, /\.review\./])
     expect(phases.some(call => pattern.test(call.key))).toBe(true);
   for (const call of phases) expect(call.task, call.key).toContain(JSON.stringify(amendments));
@@ -392,7 +393,7 @@ test("selection keeps Board views in the store and delivers them without retaini
   }
   let settlements = 0;
   // Settlement is drained with the grouped transport, not retained inline.
-  for (const call of host.launches.filter(call => call.agent === "pitako.loop-io")) {
+  for (const call of host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io")) {
     const input = JSON.parse(call.task);
     const keys = new Set((input.intentions ?? []).filter((entry: any) => entry.operation === "apply").map((entry: any) => entry.key));
     const output = host.native.get(call.key)?.output;
@@ -421,7 +422,7 @@ test.each(["cancellation", "finalGaps"])("%s projections discard their unused vi
   });
   expect((await host.execute()).status).toBe("partial");
   // Read the published drain, not the removed inline v9 receipt slot.
-  const receipts = host.launches.filter(call => call.agent === "pitako.loop-io").flatMap(call => {
+  const receipts = host.launches.filter(call => pitakoAgentFamily(call.agent) === "loop-io").flatMap(call => {
     const output = host.native.get(call.key)?.output;
     if (!output) return [];
     const transport = JSON.parse(output).projection;
@@ -461,7 +462,7 @@ test("a final review with production-sized originals and native metadata retains
     `/native/sessions/--long-session-directory-name-for-a-production-sized-run--/subagent-artifacts/${key}/debug-${index}.jsonl`);
   host.setLaunchRespond(async (request, normal) => {
     const result = await normal();
-    if (!request.key.includes(".review.") || request.agent !== "pitako.reviewer") return result;
+    if (!request.key.includes(".review.") || pitakoAgentFamily(request.agent) !== "reviewer") return result;
     const acceptance = { status: "not-required", evidenceStatus: "not-required", explicit: false,
       effectiveAcceptance: { level: "none", explicit: false, inferredReason: ["declared read-only acceptance role"],
         criteria: [], evidence: [], verify: [], stopRules: [] },

@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { readBacklog } from "../skills/execute/loop.ts";
 import { executeControllerFixture } from "./fixtures/execute-workflow.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
 const snapshots = (host: ReturnType<typeof fixture>) => host.emits.filter(value => value.schema === "pitako.execute-todo");
@@ -91,7 +92,7 @@ test("execute todo renders saved metric series, gate receipts and stall through 
       task.gates = Array.from({length:5}, (_,index)=>({...task.gates[0],id:`focused-${index}`}));
       task.progress.last5 = [{value:18,best:18,fingerprint:"0".repeat(64),gatesPassed:0,gatesTotal:5}];
     }
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate" && gates++ === 0) {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate" && gates++ === 0) {
       const receipt = JSON.parse(result.output!);
       receipt.metric = {value:8,error:null};
       receipt.gates.forEach((gate: any,index: number)=>{gate.status=index<3?"pass":"fail";gate.exit=index<3?0:1;});
@@ -114,7 +115,7 @@ test("legacy selected tasks use their ID in todo subjects and worker labels", as
   const host = fixture(undefined, { readOnly: true });
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "apply") {
+    if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "apply") {
       const receipt = JSON.parse(result.output!);
       if (receipt.selected) { delete receipt.selected.title; result.output = JSON.stringify(receipt); }
     }

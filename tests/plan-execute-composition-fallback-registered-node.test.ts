@@ -15,6 +15,7 @@ import { planExecute, checkout, missionFiles, childResponse, registeredCheckpoin
 import { prepare, apply, readBacklog } from "../skills/execute/loop.ts";
 import { captureCheckpoint, restoreCheckpoint } from "../extensions/execute-checkpoint.ts";
 import { readExecuteIntentContext } from "../extensions/execute-intent.ts";
+import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const composition = realCheckoutCompositionFixture();
 const { execFileSync } = composition;
@@ -70,6 +71,7 @@ describe("plan/execute packaged composition", () => {
         if (!process.versions.bun) await import(input.loopLoader);
         const { readExecuteIntentContext } = await import(input.intentModule);
         const { readExecuteAdmission } = await import(input.progressModule);
+        const { pitakoAgentFamily } = await import(new URL("../skills/agent-names.mjs", input.intentModule).href);
         const directors = new Map<string, any>();
         const legacyResponse = response;
         response = ((key: string, request: any, metadata: any, checkout: any) => {
@@ -149,7 +151,7 @@ describe("plan/execute packaged composition", () => {
           },
           launch: async (key: string, request: any) => {
             calls.push(key);
-            if (request.agent === "pitako.loop-io") {
+            if (pitakoAgentFamily(request.agent) === "loop-io") {
               const { operation } = JSON.parse(request.task);
               if (!cut && ["intention-cut", "stale-producer"].includes(input.mode) &&
                   key.endsWith(".a2.baseline")) {
@@ -166,7 +168,7 @@ describe("plan/execute packaged composition", () => {
             // results get their actual post-write identity below.
             const needsCandidate = request.agent === "pitako.checkout-observer" || key.endsWith(".compliance") || request.agent === "pitako.worker" && key.includes(".t2.");
             const result = await response(key, request, input.metadata, needsCandidate ? candidate() : undefined);
-            if (request.agent === "pitako.reviewer") {
+            if (pitakoAgentFamily(result.agent) === "reviewer") {
               originals.set(key, result);
               originals.set(result.runId, result);
             }
@@ -397,7 +399,7 @@ describe("plan/execute packaged composition", () => {
         stderr: "", durationMs: 0, outputPath: "/controlled/inspection.json" }),
       launch: async (key: string, request: any) => {
         calls.push(key);
-        if (request.agent === "pitako.loop-io") {
+        if (pitakoAgentFamily(request.agent) === "loop-io") {
           const { operation, ...data } = JSON.parse(request.task);
           if (["advance", "selection", "close", "drain", "taskDelta"].includes(operation)) {
             return await childResponse(key, request, metadata, checkout);
@@ -503,7 +505,7 @@ describe("plan/execute packaged composition", () => {
       },
       launch: async (key: string, request: any) => {
         calls.push(key);
-        if (request.agent === "pitako.loop-io") {
+        if (/^pitako\.loop-/.test(request.agent)) {
           const { operation, ...data } = JSON.parse(request.task);
           if (["advance", "selection", "close", "drain", "taskDelta"].includes(operation)) {
             metadata.groupedHooks = { afterStep: (step: string) => {
@@ -675,8 +677,8 @@ describe("plan/execute packaged composition", () => {
         launch: async (key, request) => {
           calls.push(key);
           if (request.agent === "pitako.checkout-observer") publications.push(JSON.parse(String(request.task)));
-          if (["pitako.loop-io", "pitako.request-observer", "pitako.checkout-observer",
-            "pitako.access-verifier", "pitako.checkpoint-sealer"].includes(String(request.agent))) {
+          if (["loop-io", "request-observer", "checkout-observer",
+            "originals-verifier", "checkpoint-sealer"].includes(pitakoAgentFamily(request.agent) ?? "")) {
             const input = JSON.parse(String(request.task));
             const response: any = input.operation === "advance" && mode === "decision-overflow"
               ? { key, agent: request.agent, runId: `native-${key}`, ok: false, output: JSON.stringify({
@@ -1062,6 +1064,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
         const {readExecuteIntentContext} = await import(pathToFileURL(input.packageRoot + "/extensions/execute-intent.ts"));
         const {executeProjection} = await import(pathToFileURL(input.packageRoot + "/skills/execute/ledger.mjs"));
         const {executionResource} = await import(pathToFileURL(input.packageRoot + "/extensions/plan-execute.ts"));
+        const {pitakoAgentFamily} = await import(pathToFileURL(input.packageRoot + "/skills/agent-names.mjs"));
         const response = eval('(' + input.response + ')');
         const storage = new Map(), calls = [], statuses = [], originals = new Map();
         let cut = input.mode.includes("cut"), pendingResult, reentry = false;
@@ -1082,7 +1085,7 @@ test.each(["complete", "receipt-save-cut", "result-save-cut", "seal-save-cut", "
             calls.push({key, resume:request.resume, agent:request.agent});
             if (request.resume) throw Error("v6 backlog task must use checkpoint-first continuation");
             let result;
-            if (request.agent === "pitako.loop-io") {
+            if (pitakoAgentFamily(request.agent) === "loop-io") {
               result = await response(key, request, input.metadata, input.checkout);
             } else {
               result = await response(key, request, input.metadata, input.checkout);

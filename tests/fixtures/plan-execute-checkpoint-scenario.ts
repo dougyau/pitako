@@ -219,7 +219,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           },
           launch: async (key: string, request: any) => {
             calls.push(key);
-            if (request.agent === "pitako.loop-io") {
+            if (/^pitako\.loop-/.test(request.agent ?? "")) {
               let grouped = JSON.parse(request.task);
               if (grouped.operation === "close" && grouped.refs) {
                 const runtime = await import(input.metadata.loopIO);
@@ -290,15 +290,15 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
             if (!unitMode && !pauseMode && input.mode !== "abrupt-continue" && request.task?.includes("CHECKPOINT FALLBACK (same pending task"))
               return { key, ok: false, output: "", artifactPaths: [], error: "Blocked by pi-subagents permission rule: restoration denied in lifecycle fixture" };
             // Grouped operations observe their own checkout; do not duplicate it for every launch.
-            if (request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate")
+            if (/^pitako\.loop-/.test(request.agent ?? "") && JSON.parse(request.task).operation === "gate")
               gateCandidate = candidate();
             // Controlled review children write only excluded metadata after the final gate.
             const needsCandidate = key.endsWith(".compliance") || request.agent === "pitako.checkout-observer" ||
-              request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate";
-            if (key.endsWith(".compliance") || request.agent === "pitako.reviewer")
+              /^pitako\.loop-/.test(request.agent ?? "") && JSON.parse(request.task).operation === "gate";
+            if (key.endsWith(".compliance") || /^pitako\.(?:reviewer|review-director|review-angle|task-review|task-synthesis|compliance|demand-observer)$/.test(request.agent ?? ""))
               input.metadata.association = progress().association;
             const result = await response(key, request, input.metadata, needsCandidate ? gateCandidate : undefined);
-            if (request.agent === "pitako.loop-io" && ["close", "taskDelta"].includes(JSON.parse(request.task).operation) && !result.ok) {
+            if (/^pitako\.loop-/.test(request.agent ?? "") && ["close", "taskDelta"].includes(JSON.parse(request.task).operation) && !result.ok) {
               const failure = JSON.parse(result.output);
               if (input.mode === "corrupt") sealError = failure.reason;
             }

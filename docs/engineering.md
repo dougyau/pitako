@@ -27,9 +27,9 @@ and model changes without taking over upstream hooks.
 Navigation uses pi-lsp-client and pi-codegraph. The direct `@nicknisi/pi-ast-grep`
 entry adds syntax search and single-file rewrites through an external ast-grep CLI.
 Analysis blocks `ast_rewrite` at the call boundary, including previews and
-codemode calls, while retaining `ast_search`. Architect, reviewer, and scout
-allow only `ast_search`; the worker also allows `ast_rewrite`. These four roles
-explicitly load the extension alongside LSP/CodeGraph.
+codemode calls, while retaining `ast_search`. Architect, reviewer (including
+its variants), and scout allow only `ast_search`; the worker also allows
+`ast_rewrite`. These profiles load the extension alongside LSP/CodeGraph.
 `extensions/todo.ts` is the single Pi entry for the vendored, commit-pinned
 rpiv-todo fork in `vendor/rpiv-todo/`. Pi's default tool exposure makes `todo`
 available to both the model and codemode. The single
@@ -86,7 +86,7 @@ Their future treatment belongs to the migration of plan and execute.
 
 ## Cwd-local workflow store
 
-Foreground and all eight child profiles load `extensions/pitako-store-tool.ts`.
+The foreground and all packaged child profiles load `extensions/pitako-store-tool.ts`.
 `pitako_store` is read-only, including analysis and nested codemode calls: it
 never creates, repairs or quarantines a store. `head`, `records`, `record`
 (by `seq`), `ledger` (record kind `ledger`), `receipts` (kind `receipt`),
@@ -309,7 +309,7 @@ Available capacity/doctor information retains its provenance: it is context, not
 a reservation or guaranteed effective limit. Unknown capacity stays unknown.
 Each implementation attempt spends one extra slot on the root checkpoint sealer
 (5 per implementation attempt, 4 per verification attempt), and each execute review
-spends one `pitako.access-verifier` slot before synthesis over the four independent
+spends one `pitako.originals-verifier` slot before synthesis over the four independent
 originals (two angles mirrored across two model slots). Measured locally on a real
 four-angle review, one verifier process took about 40-50 ms (Node startup about
 26 ms) with 33-125 KB of stdin, well under its explicit 1 MiB ceiling; native
@@ -390,7 +390,7 @@ This is design direction only: no worktrees, concurrency, integration engine or
 commit policy are implemented here.
 
 The root invokes the real shared adversarial phases, then exactly one fresh
-reviewer-profile full-spec compliance analyst only on clear screening. Both
+`pitako.compliance` full-spec analyst only on clear screening. Both
 receive complete specs and the same candidate with no own writer active.
 Material gaps end the loop and go to another director; no global repair phase
 follows review. Native closing compares the candidate with check/analysis evidence.
@@ -403,9 +403,13 @@ and calls `designatedWorkspace`/`checkoutEvidence` on actual cwd without reading
 the spec. All stdout is bounded before emission below 65,536 bytes, emitting
 complete failure JSON instead of a truncated success.
 
-The same registration owns the model-free fixed external CLIs
-`pitako.execution-ledger`, `pitako.architecture-ledger`, and `pitako.store-io`.
-Standalone review normally calls `pitako.store-io` once, at final save. Its sole state key
+The same registration owns model-free runtime agents, including
+`pitako.execution-ledger`, `pitako.architecture-ledger`, `pitako.review-store`,
+`pitako.originals-verifier` and the per-operation `pitako.loop-*` agents.
+The latter share `skills/execute/loop-io.mjs`. Retained reviewer and loop-io
+producer checks accept legacy names in the same family; receipt digests still
+verify the original bytes.
+Standalone review normally calls `pitako.review-store` once, at final save. Its sole state key
 is `pitako-review`, capped at 16,384 pretty-printed UTF-8 bytes. The writer
 reconstructs the outcome from exact native settlements, verifies published
 originals and access receipts, and commits one record at `review:<scopeId>`.
@@ -413,8 +417,8 @@ The stable operation key replays that record if the terminal cursor save was
 lost. A relaunch missing settlements makes one read-only recovery observation
 of the exact native journal before dispatch. Recovered results are reused;
 a retained Stop holds without further children or a final write. Execute's
-integrated review still uses `reviewOriginals` on loop-io and never invokes
-`pitako.store-io`. `/plan` writes no key.
+integrated review uses `pitako.loop-review-originals` and never invokes
+`pitako.review-store`. `/plan` writes no key.
 
 The writer checks on-disk review ownership before committing; the SQLite fence
 does not make native `state.set` conditional. If another scope's terminal

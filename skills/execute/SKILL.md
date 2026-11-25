@@ -45,7 +45,7 @@ gaps. A missing checkpoint cannot be reconstructed from HEAD plus fingerprint.
 
 Capture actual affected-file bytes, including earlier WIP, before modifying.
 After journaled writes settle, return a decision-only worker report. The root uses
-`pitako.loop-io close` for attempts not receiving task review, or the standalone
+`pitako.loop-close` for attempts not receiving task review, or the standalone
 checkpoint sealer after eligible task review. A `unit` requires a valid complete
 report, passing gates, an unchanged candidate and any required review admission;
  otherwise the seal is `pause`; workers never call unit/pause or echo receipts,
@@ -240,7 +240,7 @@ not the per-loop director. Execute-owned analysis dispatch defaults to
 `REVIEWER_TIMEOUT_MS = 14400000` (four hours): task reviewer/synthesis, inherited
 demand observation, compliance and final review, including resumed synthesis.
 Workers also default to four hours per attempt. This does not change standalone
-`/review` or `pre-pr`, reviewer profiles, director/inspector/access-verifier
+`/review` or `pre-pr`, reviewer profiles, director/inspector/originals-verifier
 deadlines or non-close loop-io deadlines.
 
 Supply optional `args.timeouts` on launch or relaunch:
@@ -410,7 +410,7 @@ Directors neither edit nor run checks, delegate, supervise or keep private TODOs
 ### Persistent backlog and workflow gates
 
 `.pitako/backlog/<spec-id>.json` persists across invocations. Only the workflow
-through `pitako.loop-io` writes it, with expected-digest compare-and-swap,
+through the relevant `pitako.loop-*` agent writes it, with expected-digest compare-and-swap,
 temp-file/fsync/rename and keyed idempotent replay. Task IDs are never reused;
 done/obsolete tombstones remain. There is no reopen: final-phase gaps are new
 tasks. Humans may edit between loops; invalid schema halts naming the file/error,
@@ -533,10 +533,10 @@ across the slot's attempts, so write-then-revert tasks are reviewed even with no
 net change. Tasks with no journaled write, failed gates, or `continue`/`blocked`
 results dispatch no review children and keep the existing grouped close path.
 
-One read-only `pitako.reviewer` child answers completeness against `expectedResult`
+One read-only `pitako.task-review` child answers completeness against `expectedResult`
 (including every admitted finding path for corrections), correctness without
 introducing failures, and scope against the task goal/specRefs and spec Scope and
-Exclusions. A second read-only `pitako.reviewer` child performs strict synthesis,
+Exclusions. A second read-only `pitako.task-synthesis` child performs strict synthesis,
 rechecking findings against source and rescoring. Each question has an anchored
 0–10 score and verdict; scores below 10 require concrete findings. The brief
 contains the task, delta reference, observed gate results and deterministic
@@ -741,9 +741,10 @@ Missing or inaccessible essentials block dependent conclusions. Architecture's
 ambiguous-dispatch rules do not replace execute writer recovery/checkpoints.
 `clear`, `material-gaps`, `blocked` screening gives reasons and
 consequences; include is not blocking priority, completed is not acceptance.
-Only clear screening launches exactly ONE fresh reviewer-profile compliance
-analyst. This analyst derives a meaningful inventory of ALL obligations from the
-complete selected specs (not director tasks or fixed criterion counts/IDs),
+Only clear screening launches exactly ONE fresh `pitako.compliance` analyst.
+It and the `pitako.demand-observer` for inherited demands use the frozen
+`pitako.review.r1` model. The compliance analyst derives a meaningful inventory
+of ALL obligations from the complete selected specs (not director tasks or fixed criterion counts/IDs),
 including actual acceptance criteria and requirements elsewhere, with sources,
 reasons and current candidate/check/evidence refs. Missing obligations are gaps;
 an empty or entirely not-applicable inventory cannot justify fulfillment. The
@@ -782,7 +783,7 @@ No capacity overrides or private budget replace native limits.
 
 The projection derives idempotent cancel/delete requests from main todo state in
 `todo:<invocation>` using keyed requests that do not change the execute head. Before every worker dispatch, retry
-or continuation, grouped `pitako.loop-io` operations run the model-free request
+or continuation, grouped `pitako.loop-*` operations run the model-free request
 observer in-process. The standalone `pitako.request-observer` profile retains
 `observe.mjs --requests` for recovery and other workflows. The workflow persists observed
 cancellation and dependent cascades before acting or emitting; replays are no-ops.

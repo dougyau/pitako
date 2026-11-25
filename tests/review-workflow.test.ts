@@ -20,6 +20,7 @@ import { PitakoStore, StoreError } from "../extensions/pitako-store.ts";
 import { openSqliteSync } from "../extensions/board/sqlite.ts";
 import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
+import { pitakoAgentFamily, pitakoReviewerAgent } from "../skills/agent-names.mjs";
 
 let git: ReturnType<typeof gitFakeFixture>;
 beforeEach(() => { git = gitFakeFixture(); });
@@ -135,7 +136,7 @@ function fixture(
     if (result.runId) {
       const fingerprint = createHash("sha256").update(workflowRunParamsFingerprint({...request})).digest("hex");
       mission.workflowChildren.push({workflowRunId, key, runId: result.runId,
-        status: result.ok ? "completed" : result.stopped ? "stopped" : "failed", agent: request.agent ?? "pitako.reviewer"});
+        status: result.ok ? "completed" : result.stopped ? "stopped" : "failed", agent: request.agent ?? pitakoReviewerAgent(key) ?? "pitako.reviewer"});
       writeFileSync(missionFile, JSON.stringify(mission));
       appendFileSync(journal(), JSON.stringify({type: "start", key, fingerprint, runId: result.runId}) + "\n" +
         JSON.stringify({type: "settle", key, fingerprint, result}) + "\n");
@@ -168,7 +169,7 @@ function fixture(
   const storeReceipts = new Map<string, { task: string; result: Result }>();
   let beforeStore: (() => void) | undefined;
   function dispatch(key: string, request: Request): Promise<Result> {
-    if (request.agent === "pitako.store-io") return Promise.resolve().then(async () => {
+    if (request.agent === "pitako.review-store") return Promise.resolve().then(async () => {
       const input = JSON.parse(request.task);
       if (input.op === "observe-review") {
         observations.push(key);
@@ -213,7 +214,7 @@ function fixture(
       return result;
     });
     // The real model-free verifier runs over the actual published temp files.
-    if (request.agent === "pitako.access-verifier") return Promise.resolve().then(() => {
+    if (request.agent === "pitako.originals-verifier") return Promise.resolve().then(() => {
       if (replaying && recovered.has(key)) return {...recovered.get(key)!, reused: true};
       const failure = beforeVerify?.(key, request);
       if (failure) return witnessed(key, request, {...failure, runId: failure.runId ?? `native-${key}`});
@@ -564,7 +565,7 @@ describe("review scripted workflow", () => {
 
   test("maximum execute prefix and risk angle keep mirrored keys within the native limit", async () => {
     const prefix = `invoke-${"x".repeat(64)}.l100.review.`;
-    const risk = { ...angles[0], id: "r".repeat(29) };
+    const risk = { ...angles[0], id: `risk_${"r".repeat(24)}` };
     const host = fixture(key => {
       const local = key.slice(prefix.length);
       return child(local, local === "director-prepare" ? { angles: [risk] }
@@ -581,6 +582,7 @@ describe("review scripted workflow", () => {
       `independent-${risk.id}-r1`, `independent-${risk.id}-r2`, "director-synthesis",
     ].map(key => prefix + key));
     expect(host.calls[3]!.key).toHaveLength(128);
+    expect(host.calls[3]!.request.agent).toBe("pitako.review-angle");
     for (const { key } of [...host.calls, ...host.verifications])
       expect(key).toMatch(/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/);
   });
@@ -703,7 +705,7 @@ describe("review scripted workflow", () => {
         args: { ...args, target: { ...args.target, kind } },
         state: host.state,
         launch: async (key, request) => {
-          if (request.agent === "pitako.reviewer" || request.resume) calls.push(key);
+          if (pitakoAgentFamily(request.agent) === "reviewer" || request.resume) calls.push(key);
           return { key, output: "", ...await host.dispatch(key, request as unknown as Request) } as any;
         },
         status: async () => { throw new Error("Unexpected status query"); },
@@ -754,8 +756,10 @@ describe("review scripted workflow", () => {
     expect(result.status).toBe("completed");
     const independent = host.calls.filter(call => call.key.startsWith("independent-"));
     expect(independent).toHaveLength(4);
+    // Hosts such as T3 display the agent name, so each review role has its own.
+    expect(host.calls.find(call => call.key === "director-prepare")?.request.agent).toBe("pitako.review-director");
     for (const { request } of independent) {
-      expect(request.agent).toBe("pitako.reviewer");
+      expect(request.agent).toBe("pitako.review-angle");
       expect(request.context).toBe("fresh");
       expect(request.task).toContain(JSON.stringify(args.target));
       expect(request.task).toContain(args.brief);

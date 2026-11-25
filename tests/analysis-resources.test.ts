@@ -71,8 +71,8 @@ test("session registration adds the verifier and both named resources, disposing
     if (previous === undefined) delete process.env.PI_CODING_AGENT_DIR;
     else process.env.PI_CODING_AGENT_DIR = previous;
   }
-  expect(disposed).toContain("pitako.access-verifier");
-  expect(disposed).toContain("pitako.store-io");
+  expect(disposed).toContain("pitako.originals-verifier");
+  expect(disposed).toContain("pitako.review-store");
   for (const name of ["pitako.review", "pitako.architecture"])
     expect(resolveWorkflowResource(name, { missionId: "native.mission-1", missionPath, consultation: "c" }, sessionId)).toMatchObject({ ok: false });
 });
