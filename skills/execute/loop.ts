@@ -581,6 +581,12 @@ type GateIdentity = { attemptKey: string; commandsDigest: string; workerStatus: 
   workerOriginalDigest?: string; after: GateReceipt["after"] };
 type SavedGateReceipt = GateReceipt & { identity: GateIdentity; receiptDigest: string };
 
+export function nativeSettlementMatchesAgent(settlement: Record<string, unknown>, agent: string) {
+  return settlement.agent === agent &&
+    !(Array.isArray(settlement.results) && settlement.results.some(result =>
+      record(result) && result.agent !== undefined && result.agent !== agent));
+}
+
 /** Resolve only the exact native producer, never a key-only lookup or an inline root copy. */
 export function readWorkerOriginal(input: GateInput, accounting = true) {
   const { agent, ...original } = readNativeOriginal(input.root, input.checkpoint!, input.worker!, "pitako.worker", accounting);
@@ -610,9 +616,10 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
   "Worker native original has a terminal barrier");
   const file = safePath(originals[0]!);
   const bytes = readFileSync(file), value = JSON.parse(bytes.toString("utf8"));
+  const digest = canonicalDigest(value);
   // Checkpoint recovery may downgrade the root's admitted status; the native original stays unchanged.
   assert(record(value) && record(step.structuredOutput) &&
-    canonicalDigest(value) === canonicalDigest(step.structuredOutput), "Worker native original digest mismatch");
+    digest === canonicalDigest(step.structuredOutput), "Worker native original digest mismatch");
   // Status steps omit usage; the native workflow settlement retains the aggregate SingleResult.
   let usage, settled;
   if (accounting && (accounting === "settlement" || agent === "pitako.reviewer" && worker.key.endsWith(".compliance") ||
@@ -625,18 +632,19 @@ export function readNativeOriginal(root: string, checkpoint: CheckpointIntent,
       let entry;
       try { entry = JSON.parse(line); } catch { continue; }
       if (entry?.type === "settle" && entry.key === worker.key && entry.result?.runId === worker.runId) {
-        assert(entry.result.agent === producerAgent, "Reviewer native settlement conflicts with its original");
+        const result = entry.result;
+        assert(nativeSettlementMatchesAgent(result, producerAgent) && result.ok === true &&
+          Array.isArray(result.results) && result.results.length === 1 && result.results[0]?.exitCode === 0 &&
+          canonicalDigest(result.structuredOutput) === digest,
+        "Reviewer native settlement conflicts with its original");
         settled ??= entry.result;
       }
     }
     if (settled) {
-      assert(settled.ok === true && settled.results?.length === 1 &&
-        settled.results[0].exitCode === 0 && canonicalDigest(settled.structuredOutput) === canonicalDigest(value),
-      "Reviewer native settlement conflicts with its original");
       if (agent === "pitako.worker" && typeof settled.output === "string" && /^\s*\{/.test(settled.output)) {
         let binding;
         try { binding = JSON.parse(settled.output); } catch { throw new Error("Invalid complete worker binding JSON."); }
-        assert(canonicalDigest(binding) === canonicalDigest(value), "Changed/conflicting worker binding.");
+        assert(canonicalDigest(binding) === digest, "Changed/conflicting worker binding.");
       }
       usage = settled.results[0].usage;
     }

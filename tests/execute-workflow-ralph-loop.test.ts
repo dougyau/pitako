@@ -1089,7 +1089,8 @@ test.each(["missing", "changed"])("a compact review demand blocks on a %s origin
 });
 
 
-test.each(["before", "after"])("consumed review compaction survives a %s persistence cut without replaying reviewers", async cut => {
+test.each(["before", "after", "conflicting-agent"])("consumed review compaction replays %s without replaying reviewers", async mode => {
+  const cut = mode === "before" ? "before" : "after";
   const template = "---\npitako-spec: 1\nid: spec\nstatus: complete\n---\n" +
     SPEC_SECTIONS.map(section => `## ${section}\nAgreed ${section}.\n`).join("");
   const content = template + "\\".repeat(MAX_SPEC_BYTES - Buffer.byteLength(template));
@@ -1137,7 +1138,19 @@ test.each(["before", "after"])("consumed review compaction survives a %s persist
   const before = host.launches.length, hostReads = host.hostCalls.length;
   host.setFailSave(undefined);
   if (cut === "after") await host.state.set("pitako-execute", retained);
+  if (mode === "conflicting-agent") host.setStatus(ref => {
+    const result = host.native.get(ref);
+    return ref === retained.action.runId ? { ...result!, agent: "pitako.review-angle" }
+      : result ?? { ok: false, state: "unknown" };
+  });
   const output = await host.execute();
+  if (mode === "conflicting-agent") {
+    expect(output.status, output.reason).toBe("blocked");
+    expect(output.reason).toContain("Final review replay producer integrity mismatch");
+    expect(host.launches.slice(before).map(call => call.key)).toEqual([`${publicationKey}.r1`]);
+    expect(host.current()).toEqual(retained);
+    return;
+  }
   expect(output.status, output.reason).toBe("complete");
   expect(host.calls.filter(call => call.key.includes(".review."))).toHaveLength(reviewers);
   expect(host.launches.slice(before).map(call => call.key)).toEqual([

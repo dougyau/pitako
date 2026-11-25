@@ -203,7 +203,8 @@ test.each([...[true, false].flatMap(committed =>
   ["none", "legacy-compliance", "compliance-body", "compliance-missing", "compliance-producer", "compliance-settlement",
     "compliance-unsettled", "compliance-no-journal", "compliance-truncated", "review-body", "review-missing"]
     .map(mutation => ({ committed, mutation }))),
-  ...["wrong-family-step", "same-family-step", "same-family-settlement"].map(mutation => ({ committed: false, mutation })),
+  ...["wrong-family-step", "same-family-step", "same-family-settlement", "nested-agent", "failed-then-ok"]
+    .map(mutation => ({ committed: false, mutation })),
   { committed: true, mutation: "closing-unsettled" },
   ...checkoutDefects.map(defect => ({ committed: false, mutation: `checkout-${defect}` }))])(
   "closing rebuilds identical bytes after a save cut; %j", async ({ committed, mutation }) => {
@@ -212,6 +213,8 @@ test.each([...[true, false].flatMap(committed =>
   const legacy = mutation === "legacy-compliance";
   const conflictingStep = mutation.endsWith("-step");
   const conflictingSettlement = mutation === "same-family-settlement";
+  const nestedAgent = mutation === "nested-agent";
+  const duplicateSettlement = mutation === "failed-then-ok";
   if (legacy) host.setLaunchRespond((request, normal) => {
     // Emulate an old host recording this child under the original name.
     if (request.key.endsWith(".compliance")) request.agent = "pitako.reviewer";
@@ -269,7 +272,7 @@ test.each([...[true, false].flatMap(committed =>
     JSON.stringify({ ...compliance.structuredOutput, reason: "Changed during closing" }));
   if (mutation === "compliance-missing") unlinkSync(compliance.results![0]!.structuredOutputPath!);
   if (["none", "compliance-producer", "compliance-settlement"].includes(mutation) ||
-      conflictingStep || conflictingSettlement || missingUsage) {
+      conflictingStep || conflictingSettlement || nestedAgent || duplicateSettlement || missingUsage) {
     const missionPath = store.read(scope).P.prompt.admission!.association.missionPath;
     const mission = JSON.parse(readFileSync(missionPath, "utf8"));
     const child = mission.workflowChildren.find((child: any) => child.key === host.current().action.key);
@@ -283,13 +286,22 @@ test.each([...[true, false].flatMap(committed =>
       status.steps[0].agent = mutation === "same-family-step" ? "pitako.task-review" : "pitako.worker";
       writeFileSync(statusFile, JSON.stringify(status));
     }
-    if (mutation === "compliance-settlement" || conflictingSettlement || missingUsage) {
+    if (mutation === "compliance-settlement" || conflictingSettlement || nestedAgent || duplicateSettlement || missingUsage) {
       const journal = path.join(path.dirname(directory), status.parentWorkflowRunId, "workflow-children.jsonl");
       const lines = readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
       for (const line of lines) if (line.type === "settle" && line.key === host.current().action.key) {
         if (mutation === "compliance-settlement")
           line.result.structuredOutput = { ...line.result.structuredOutput, reason: "Conflicting settlement" };
         if (conflictingSettlement) line.result.agent = "pitako.task-review";
+        if (nestedAgent) line.result.results[0].agent = "pitako.task-review";
+      }
+      if (duplicateSettlement) {
+        const index = lines.findIndex(line => line.type === "settle" && line.key === child.key);
+        expect(index).toBeGreaterThanOrEqual(0);
+        const failed = copy(lines[index]);
+        failed.result.ok = false;
+        failed.result.results[0].exitCode = 1;
+        lines.splice(index, 0, failed);
       }
       if (mutation === "compliance-no-journal") unlinkSync(journal);
       else {

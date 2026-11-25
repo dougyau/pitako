@@ -210,7 +210,7 @@ describe("workflow-owned execute controller", () => {
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.phase?.startsWith("review-")) Object.assign(result.results![0]!, {
-        workflowKey: request.key, runId: result.runId, agent: "pitako.reviewer",
+        workflowKey: request.key, runId: result.runId,
         state: "complete",
       });
       return result;

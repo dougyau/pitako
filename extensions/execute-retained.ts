@@ -9,7 +9,7 @@ import { readExecuteAdmission, readExecuteProgress } from "./execute-progress.ts
 import { canonicalDigest } from "./canonical.mjs";
 import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 import { StoreError } from "./pitako-store.ts";
-import { readWorkerOriginal } from "../skills/execute/loop.ts";
+import { nativeSettlementMatchesAgent, readWorkerOriginal } from "../skills/execute/loop.ts";
 import { planConflictReason, checkpointMismatchReason, settledBarrier, inspectorConflictReason, viewOverflowReason, checkpointWitnessIssue } from "../skills/execute/halt-evidence.mjs";
 import type { ExecuteIntentBody } from "./execute-intent.ts";
 const { safePath } = createRequire(import.meta.url)("./hash-ledger.mjs") as { safePath(file: string): string };
@@ -73,7 +73,7 @@ export function readNativeSettlement(file: string, key: string, runId: string, a
 	}).filter(entry => entry.type === "settle" && entry.key === key && entry.result?.runId === runId);
 	if (!settlements.length) throw new NativeSettlementError("missing");
 	const settled = settlements.at(-1)?.result;
-	if (!record(settled) || settled.agent !== agent ||
+	if (!record(settled) || !nativeSettlementMatchesAgent(settled, agent) ||
 		settled.key !== undefined && settled.key !== key && settled.key !== runId ||
 		settlements.some(entry => !isDeepStrictEqual(entry.result, settled)))
 		throw new NativeSettlementError("conflict");
@@ -586,11 +586,13 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		if (pending && matches.length && (matches.length !== 1 ||
 			pitakoAgentFamily(matches[0]!.agent) !== "reviewer" || typeof matches[0]!.runId !== "string" || !matches[0]!.runId))
 			throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
-		if (matches.length !== 1 || !["pitako.reviewer", "pitako.execution-inspector",
-			...(isInterruption(subject.key) ? [`pitako.${interrupted!.role}`] : []),
+		const allowed = isInterruption(subject.key) ? [`pitako.${interrupted!.role}`] : [
+			"pitako.reviewer", "pitako.execution-inspector",
 			...(isSealer(subject.key) ? ["pitako.checkpoint-sealer"] : []),
 			...(subject.key === timedOutWorker?.key ? ["pitako.worker"] : []),
-			...(isGate(subject.key) ? ["pitako.loop-io"] : [])].map(pitakoAgentFamily).includes(pitakoAgentFamily(matches[0]!.agent)))
+			...(isGate(subject.key) ? ["pitako.loop-io"] : [])];
+		const family = pitakoAgentFamily(matches[0]?.agent);
+		if (matches.length !== 1 || !family || !allowed.map(pitakoAgentFamily).includes(family))
 			return { ...subject, error: `Retained native producer unavailable or ambiguous (${matches.length} matches for ${subject.key}/${subject.runId}).` };
 		const child = matches[0]!;
 		const paths = Array.isArray(child.artifactPaths) ? child.artifactPaths.filter((file): file is string =>
@@ -632,7 +634,7 @@ function retainedProjection(root: string, source: string, digest: string, contex
 						item[cause] === true || item.state === cause ||
 						cause === "stopped" && record(item.terminalOutcome) &&
 							["stopped", "cancelled"].includes(String(item.terminalOutcome.reason))));
-					return { ...identity, cause: cause ?? null, path: journal, digest: canonicalDigest(settled) };
+					return { ...identity, agent: ref.agent, cause: cause ?? null, path: journal, digest: canonicalDigest(settled) };
 				}
 				if (isTimeout(ref.key) || workerTimeout)
 					return { ...identity, settlement: settled, launchedMs: status.timeoutMs, digest: canonicalDigest(settled) };

@@ -349,8 +349,12 @@ describe("workflow-owned execute controller", () => {
     expect(host.calls).toHaveLength(effects);
   });
 
-  test("a post-publication persistence cut resumes identical bytes before moving the cursor", async () => {
+  test.each(["named", "legacy"])("a post-publication persistence cut preserves %s task review archive bytes", async mode => {
     const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
+    if (mode === "legacy") host.setLaunchRespond((request, normal) => {
+      if (/\.task-(reviewer|synthesis)$/.test(request.key)) request.agent = "pitako.reviewer";
+      return normal();
+    });
     host.setFailSave(value => value.action.kind === "terminal");
     const outcome = await host.execute();
     expect(outcome.status).toBe("partial");
@@ -363,11 +367,19 @@ describe("workflow-owned execute controller", () => {
     const unit = committed.flatMap(row => row.kind === "ledger"
       ? (row.body as { entries: ReturnType<typeof host.records> }).entries : []).find(entry => entry.kind === "unit");
     expect(unit).toBeDefined();
+    const archive = committed.flatMap(row => row.kind === "ledger"
+      ? (row.body as { entries: ReturnType<typeof host.records> }).entries : []).find(entry => entry.kind === "loop");
+    expect(archive?.body.analysisCalls).toEqual(["reviewer", "synthesis"].map(stage => {
+      const key = `invoke-human-1.l1.t1.a1.task-${stage}`;
+      const agent = mode === "legacy" ? "pitako.reviewer" : stage === "reviewer" ? "pitako.task-review" : "pitako.task-synthesis";
+      return { key, stage: "receipt", ref: { key, agent, runId: host.native.get(key)!.runId } };
+    }));
     host.setFailSave();
     expect((await host.execute()).status).toBe("partial");
     expect(storedRows(host).slice(0, committed.length)).toEqual(committed);
     expect(storedRows(host).filter(row => row.kind === "ledger")).toEqual(committed.filter(row => row.kind === "ledger"));
     expect(host.records()[1]).toEqual(unit);
+    expect(host.records().at(-1)).toEqual(archive);
     expect(host.calls.filter(call => call.key.endsWith(".t1.a1"))).toHaveLength(1);
   });
 
@@ -1001,7 +1013,7 @@ describe("workflow-owned execute controller", () => {
 
 
 
-  test.each(["settled", "missing-original", "permission"])(
+  test.each(["settled", "missing-original", "wrong-family", "nested-agent", "permission"])(
     "historical worker %s never redispatches after a terminal native halt", async mode => {
       const host = fixture(undefined, { realCheckout: true }); host.setLimit(1);
       const target = "invoke-human-1.l1.t1.a1";
@@ -1017,11 +1029,28 @@ describe("workflow-owned execute controller", () => {
         runId: host.native.get(target)!.runId });
       expect(cursor.halt.digest).toBe(canonicalDigest(initial.loopReport.halt));
       const rows = storeTipRows(host);
-      if (mode === "missing-original") {
+      const invalid = ["missing-original", "wrong-family", "nested-agent"].includes(mode);
+      if (invalid) {
         const mission = JSON.parse(readFileSync(initial.missionPath, "utf8"));
         const child = mission.workflowChildren.find((item: { key: string }) => item.key === target);
         const dir = child.artifactPaths.find((file: string) => path.basename(file) === child.runId);
-        rmSync(path.join(path.dirname(dir), child.workflowRunId, "workflow-children.jsonl"));
+        const journal = path.join(path.dirname(dir), child.workflowRunId, "workflow-children.jsonl");
+        if (mode === "missing-original") rmSync(journal);
+        else {
+          const entries = readFileSync(journal, "utf8").trim().split("\n").map(line => JSON.parse(line));
+          const settled = entries.find(entry => entry.type === "settle" && entry.key === target).result;
+          if (mode === "wrong-family") {
+            child.agent = "pitako.task-review";
+            writeFileSync(initial.missionPath, JSON.stringify(mission));
+            const statusFile = path.join(dir, "status.json");
+            const status = JSON.parse(readFileSync(statusFile, "utf8"));
+            status.steps[0].agent = child.agent;
+            writeFileSync(statusFile, JSON.stringify(status));
+            settled.agent = child.agent;
+          }
+          settled.results[0].agent = "pitako.task-review";
+          writeFileSync(journal, entries.map(entry => JSON.stringify(entry)).join("\n") + "\n");
+        }
       }
       host.setStatus(ref => {
         const response = copy(host.native.get(ref)!);
@@ -1030,7 +1059,7 @@ describe("workflow-owned execute controller", () => {
         return response;
       });
       const replay = await host.executeNative();
-      if (mode === "missing-original") {
+      if (invalid) {
         expect(replay.status).toBe("blocked");
         expect(replay.reason).toContain("native original integrity failure");
       } else {

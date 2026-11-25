@@ -930,7 +930,7 @@ function finalReviewRequest(cursor) {
     storeId, scope: `exec:${invocation}.e${epoch}`, expectedHead: { seq: action.input.seq, hash: action.input.digest },
     refs: { input: { seq: action.input.seq, digest: action.input.digest }, originals, reviewerMs: timeouts.reviewerMs } };
 }
-function admitFinalReview(receipt, request, target) {
+function admitFinalReview(receipt, request, target, observedAgent) {
   const seed = receipt.P?.prompt.closingSeed;
   if (receipt.storeId !== request.storeId || !same(seed?.input, request.refs.input) ||
       !same(seed.body.integratedReview.originals.map(({ key, runId }) => ({ key, runId })),
@@ -938,6 +938,9 @@ function admitFinalReview(receipt, request, target) {
       request.refs.originals.some(ref => ref.digest && seed.digests[ref.key] !== ref.digest))
     throw new Error("Final review publication receipt integrity mismatch.");
   const synthesis = seed.body.integratedReview.originals.at(-1);
+  if (observedAgent !== undefined && !seed.body.review.references.some(ref =>
+      ref.key === synthesis.key && ref.runId === synthesis.runId && ref.agent === observedAgent))
+    throw new Error("Final review replay producer integrity mismatch.");
   Object.assign(target, {
     candidate: candidate(seed.body.candidate),
     closingSeed: seed, review: seed.body.review, integratedReview: seed.body.integratedReview,
@@ -3484,7 +3487,7 @@ function loopArchive(frozen) {
         /\.task-(?:reviewer|synthesis)$/.test(call.key) && call.stage === "receipt" && call.ref.runId
           // The unit links the exact originals. Debug paths and observation-only
           // metadata from native status must not alter replayed archive bytes.
-          ? { key: call.key, stage: call.stage, ref: { key: call.key, agent: "pitako.reviewer", runId: call.ref.runId } }
+          ? { key: call.key, stage: call.stage, ref: { key: call.key, agent: call.ref.agent, runId: call.ref.runId } }
           : call)
       : field === "startedAt" ? committedLoopOpen(loop.number)
       : frozen && field === "usage" ? frozen[field] : loop[field];
@@ -4673,13 +4676,14 @@ function replayNativeInterruption(cursor, action, rebuild, capturedObservation) 
     throw new Error("Retained interruption admission integrity mismatch.");
   if (!action.runId) throw new Error("Retained interruption lacks its exact native original.");
   let statusBarrier;
+  const family = pitakoAgentFamily(`pitako.${action.role}`);
   return observeStatus(action.runId, true).catch(error => {
     if (!["stopped", "native permission denial"].includes(error.nativeBarrier)) throw error;
     statusBarrier = error.nativeBarrier;
   }).then(observed => {
     if (observed?.runId && observed.runId !== action.runId ||
         observed?.key && ![action.key, action.runId].includes(observed.key) ||
-        observed?.agent && pitakoAgentFamily(observed.agent) !== pitakoAgentFamily(`pitako.${action.role}`))
+        observed?.agent !== undefined && pitakoAgentFamily(observed.agent) !== family)
       throw new Error("Retained interruption producer integrity mismatch.");
     const current = statusBarrier ?? analysisBarrier(observed, action.runId);
     if (current && !["stopped", "interrupted", "native permission denial"].includes(current))
@@ -4688,9 +4692,12 @@ function replayNativeInterruption(cursor, action, rebuild, capturedObservation) 
       const { metadata } = capture(observation);
       const settlement = metadata.retainedAnalyses.find(ref => ref.key === action.key && ref.runId === action.runId);
       if (observation.binding !== cursor.admissionBinding ||
+          !family || pitakoAgentFamily(settlement?.agent) !== family ||
           !["stopped", "interrupted", "native permission denial"].includes(settlement?.cause) ||
           !text(settlement.path) || !/^[a-f0-9]{64}$/.test(settlement.digest ?? ""))
         throw new Error("Retained interruption native original integrity failure: missing or invalid settlement.");
+      if (observed?.agent !== undefined && observed.agent !== settlement.agent)
+        throw new Error("Retained interruption producer integrity mismatch.");
       const halt = rebuild(action, settlement.cause);
       if (canonicalDigest(halt) !== cursor.halt.digest || current && current !== halt.cause ||
           !current && ["passed", "complete", "completed"].includes(managementAnalysisState(observed, action) ?? observed?.state))
@@ -4961,15 +4968,15 @@ function replayFinalReview(cursor) {
     const cause = analysisBarrier(observed, runId);
     if (cause) throw nativeBarrier(cause, { key: synthesisKey, runId });
     if (observed?.runId && observed.runId !== runId ||
-        observed?.agent && pitakoAgentFamily(observed.agent) !== "reviewer" ||
+        observed?.agent !== undefined && pitakoAgentFamily(observed.agent) !== "reviewer" ||
         observed?.key && ![synthesisKey, runId].includes(observed.key))
       throw new Error("Final review replay producer integrity mismatch.");
-    return observeStatus(request.key, true);
-  }).then(observed => {
-    const cause = analysisBarrier(observed, request.key);
-    if (cause) throw nativeBarrier(cause, { key: request.key, runId: observed?.runId });
-    return replayLoopIO(`${request.key}.r1`, request);
-  }).then(({ receipt }) => {
+    return observeStatus(request.key, true).then(publication => {
+      const cause = analysisBarrier(publication, request.key);
+      if (cause) throw nativeBarrier(cause, { key: request.key, runId: publication?.runId });
+      return replayLoopIO(`${request.key}.r1`, request);
+    }).then(({ receipt }) => ({ receipt, observedAgent: observed?.agent }));
+  }).then(({ receipt, observedAgent }) => {
     const { head, P } = receipt, admission = P?.prompt.admission;
     const gate = P?.prompt.closingSeed?.body.finalAttempt.gate;
     if (!admission || !gate || receipt.storeId !== cursor.storeId ||
@@ -4979,7 +4986,7 @@ function replayFinalReview(cursor) {
         !same(P.control.operation?.input, cursor.action.input))
       throw new Error("Final review replay store integrity mismatch.");
     const restored = { ...clone(P.prompt.closingSeed.body), phase: "compliance" };
-    admitFinalReview(receipt, request, restored);
+    admitFinalReview(receipt, request, restored, observedAgent);
     if (restored.review.verdict !== "clear") restored.phase = "review";
     const checkout = candidate(receipt.checkout);
     if (!same(candidate(gate.receipt.after), checkout))
