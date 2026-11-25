@@ -22,9 +22,9 @@ function fixture() {
     ...Array.from({ length: 205 }, (_, index) => `new-${String(index).padStart(3, "0")}`)] });
   writeFileSync(path.join(root, "product"), "original");
   const intents: CheckpointIntent[] = [];
-  function attempt() {
+  function attempt(key?: string) {
     const number = intents.length + 1;
-    const intent: CheckpointIntent = { version: 2, key: `worker.a${number}`, taskId: "one", attempt: number,
+    const intent: CheckpointIntent = { version: 2, key: key ?? `worker.a${number}`, taskId: "one", attempt: number,
       loop: 1, cursor: 0, phase: "implementation", planRef: { key: "director" },
       association: { root, commonDir: path.join(root, ".git"),
         missionId: "mission", missionPath: path.join(root, ".pi/mission.json"), invocation: "delta",
@@ -41,7 +41,7 @@ function fixture() {
   function deltaCLI() {
     budget.counts.loopIO++;
     return JSON.parse(execFileSync("node", [entry], { cwd: root, encoding: "utf8",
-      input: JSON.stringify({ operation: "taskDelta", invocation: "delta", key: "slot.delta", intents }) }));
+      input: JSON.stringify({ operation: "taskDelta", invocation: "delta", intents }) }));
   }
   async function delta() {
     const observed = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(), root,
@@ -110,6 +110,19 @@ test("net delta includes deletions and mode-only changes relative to dispatch WI
   });
   // This case retains real stdin/stdout CLI transport; repeated cases reuse IPC.
   expect(f.deltaCLI().netChanged).toEqual(["prior-wip", "product"]);
+});
+
+test("taskDelta CLI uses the checkpoint epoch without a top-level key and replays its stored diff", () => {
+  const f = fixture(), first = f.attempt("invoke-delta.e2.l1.t1.a1");
+  f.edit(first, ["product"], () => writeFileSync(path.join(f.root, "product"), "changed"));
+  const delta = f.deltaCLI();
+  expect(delta.netChanged).toEqual(["product"]);
+  expect(delta.diff.store.scope).toBe("exec:delta.e2");
+  const store = new PitakoStore(f.root);
+  store.verifyRecord(delta.diff.store, delta.diff.digest);
+  expect(f.deltaCLI()).toEqual(delta);
+  expect(store.readRecords("exec:delta.e2").records.filter(row => row.kind === "task-delta")).toHaveLength(1);
+  expect(store.readRecords("exec:delta.e0").records).toHaveLength(0);
 });
 
 test("more than 200 net changes publish a deterministic digest-verified overflow reference", async () => {
