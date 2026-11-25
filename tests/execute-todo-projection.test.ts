@@ -11,6 +11,12 @@ import { createTodoCommit, type TodoCommit } from "../vendor/rpiv-todo/index.ts"
 import { getState, getSyncSequences, evictSession, replaceState } from "../vendor/rpiv-todo/state/store.ts";
 import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
 import type { Task } from "../vendor/rpiv-todo/tool/types.ts";
+import { readTodoRecords, type TodoRecordKind } from "../extensions/pitako-store.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
+
+const todoRows = (root: string, kind: TodoRecordKind = "request") =>
+  readTodoRecords(root, "invocation", kind) as Record<string, any>[];
+const todoBytes = (root: string, kind: TodoRecordKind = "request") => JSON.stringify(todoRows(root, kind));
 
 function snapshot(extra: Partial<ExecuteTodoSnapshot> = {}): ExecuteTodoSnapshot {
   return {schema:"pitako.execute-todo",v:1,seq:1,invocation:"invocation",loop:1,maxLoops:3,
@@ -78,7 +84,9 @@ describe("execute todo pure projection", () => {
 
   test("main cancellation marker is added and removed, requests re-derive, and step cancellation stays sticky", () => {
     const f=fixture(); const root=mkdtempSync(path.join(tmpdir(),"pitako-projection-requests-"));
+    const fake=gitFakeFixture();
     try {
+      fake.fakeRepo(root);
       let state=f.apply(snapshot(),[worker()]);
       const plan=state.tasks.find(t=>t.metadata?.key==="exec:run:task:1:t1")!;
       expect(f.commit(f.sid,undefined,[{action:"cancel",params:{id:plan.id}}]).error).toBeUndefined();
@@ -86,10 +94,9 @@ describe("execute todo pure projection", () => {
       expect(state.tasks.find(t=>t.id===plan.id)?.subject).toBe("Build (cancelación pedida)");
       const requests=deriveExecuteTodoRequests("run",snapshot(),state);
       expect(requests).toMatchObject([{v:1,invocation:"invocation",taskId:"t1",kind:"cancel",origin:"model"}]);
-      appendExecuteTodoRecords(root,"invocation","requests.jsonl",requests);
-      appendExecuteTodoRecords(root,"invocation","requests.jsonl",deriveExecuteTodoRequests("run",snapshot(),state));
-      const file=path.join(root,".pi/subagents/execute/invocation/requests.jsonl");
-      expect(readFileSync(file,"utf8").trim().split("\n")).toHaveLength(1);
+      appendExecuteTodoRecords(root,"invocation","request",requests);
+      appendExecuteTodoRecords(root,"invocation","request",deriveExecuteTodoRequests("run",snapshot(),state));
+      expect(todoRows(root)).toEqual(requests);
       const step=state.tasks.find(t=>t.parentId===plan.id)!;
       expect(f.commit(f.sid,undefined,[{action:"cancel",params:{id:step.id}}]).error).toBeUndefined();
       expect(f.apply(snapshot(),[worker()]).tasks.find(t=>t.id===step.id)?.status).toBe("cancelled");
@@ -98,7 +105,7 @@ describe("execute todo pure projection", () => {
       expect(state.tasks.find(t=>t.id===plan.id)).toMatchObject({subject:"Build",status:"completed"});
       expect(deriveExecuteTodoRequests("run",done,state)[0]?.requestId).toBe(requests[0].requestId);
       expect(f.commit(f.sid,undefined,[{action:"delete",params:{id:step.id}}]).error).toBeUndefined();
-    } finally {f.close();rmSync(root,{recursive:true,force:true});}
+    } finally {fake.dispose();f.close();rmSync(root,{recursive:true,force:true});}
   });
 
   test("Q6 closes unfinished steps immediately before completing the parent, including missed child reads", () => {
@@ -204,6 +211,9 @@ describe("execute todo pure projection", () => {
 // Controlled public RPC boundary: no dependency runtime, providers or UI needed.
 function runtimeFixture() {
   const root=mkdtempSync(path.join(tmpdir(),"pitako-projection-runtime-"));
+  const fake = gitFakeFixture();
+  fake.fakeRepo(root);
+  fake.set(root,["rev-parse","--git-path","info/exclude"],{stdout:".git/info/exclude\n",stderr:"",status:0});
   const bus=new EventEmitter(), steers: unknown[]=[];
   const events = {
     emit:(name:string,data:unknown)=>{bus.emit(name,data);},
@@ -253,13 +263,23 @@ function runtimeFixture() {
     noSnapshot:()=>{snapshotRuns=[];},
     close:async()=>{await fire("session_shutdown"); evictSession(sid);
       try { expect(existsSync(path.join(foreground,".pi"))).toBe(false); }
-      finally { rmSync(root,{recursive:true,force:true}); }}};
+      finally { fake.dispose(); rmSync(root,{recursive:true,force:true}); }}};
 }
 
 describe("execute todo registration and reconciliation",()=>{
   test("reload defers historical runs until RPC is ready without warnings or TODO writes",async()=>{
     const f=runtimeFixture();
     try {
+      // Display progress comes only from native emits, not legacy state or a store tip.
+      const missionPath=path.join(f.root,"missions","mission.json");
+      const statePath=path.join(f.root,"missions","mission","state.json");
+      const database=path.join(f.root,".pi","pitako","pitako.db");
+      mkdirSync(path.dirname(statePath),{recursive:true});
+      const missionState=JSON.stringify({"invoke-invocation":{version:9},"pitako-execute":{version:10,head:{seq:999,hash:"0".repeat(64)}}});
+      writeFileSync(statePath,missionState);
+      const statusPath=path.join(f.root,"main","status.json");
+      const run=JSON.parse(readFileSync(statusPath,"utf8"));
+      writeFileSync(statusPath,JSON.stringify({...run,missionId:"mission",missionPath}));
       const notes=SessionManager.inMemory(f.root);
       notes.appendCustomMessageEntry("subagent-notify","Done",false,{runs:[{runId:"run"},{runId:"historical"}]});
       Object.assign(f.ctx.sessionManager,{getBranch:()=>notes.getBranch()});
@@ -277,6 +297,8 @@ describe("execute todo registration and reconciliation",()=>{
       expect(rows.find(t=>t.metadata?.key==="exec:run:task:1:t1")?.status).toBe("in_progress");
       expect(rows.filter(t=>t.parentId)).toHaveLength(2);
       expect(f.warnings()).toEqual([]);
+      expect(readFileSync(statePath,"utf8")).toBe(missionState);
+      expect(existsSync(database)).toBe(false);
     } finally {await f.close();}
   });
 
@@ -402,8 +424,7 @@ describe("execute todo registration and reconciliation",()=>{
       expect(f.commit(f.sid,undefined,[{action:"cancel",params:{id:step.id}}]).error).toBeUndefined();
       await f.fire("tool_result",{toolName:"todo"});
       expect(f.steers).toMatchObject([{id:"child",mode:"steer"}]);
-      const file=path.join(f.root,".pi/subagents/execute/invocation/step-receipts.jsonl");
-      expect(JSON.parse(readFileSync(file,"utf8").trim())).toMatchObject({origin:"model",todoId:1,receipt:{ok:true,state:"delivered"}});
+      expect(todoRows(f.root,"step-receipt")[0]).toMatchObject({origin:"model",todoId:1,receipt:{ok:true,state:"delivered"}});
       await f.fire("tool_result",{toolName:"todo"});
       expect(f.steers).toHaveLength(1);
       expect(getState(f.sid).tasks.find(t=>t.id===step.id)?.status).toBe("cancelled");
@@ -471,11 +492,10 @@ describe("execute todo registration and reconciliation",()=>{
       f.addRun("middle",s,{...predecessor("run"),...(!middleHasSnapshot ? {emits:[]} : {})});
       const finalDir=f.addRun("successor",s,predecessor("middle"));
       f.setRuns([{id:"successor"}]);
-      const requests=path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl");
       const append=f.pi.appendEntry;
       f.pi.appendEntry=((type:string,data:any)=>{
         if(data.tasks?.some((t:Task)=>t.owner==="execute:run" && t.metadata?.protected && t.status==="deleted"))
-          expect(readFileSync(requests,"utf8").trim().split("\n").map(line=>JSON.parse(line).kind).sort()).toEqual(["cancel","delete"]);
+          expect(todoBytes(f.root).trim().split("\n").map(line=>JSON.parse(line).kind).sort()).toEqual(["cancel","delete"]);
         append(type,data);
       }) as ExtensionAPI["appendEntry"];
       await f.fire("session_start");
@@ -503,14 +523,14 @@ describe("execute todo registration and reconciliation",()=>{
         await f.fire("tool_result",{toolName:"todo"});
       } finally {clearTimeout(timer);f.pi.appendEntry=appendLive;}
       expect(visible(getState(f.sid).tasks).find(t=>t.subject==="Reused live")?.parentId).toBe(parent.id);
-      const bytes=readFileSync(requests,"utf8"), count=f.captured.entries.length;
+      const bytes=todoBytes(f.root), count=f.captured.entries.length;
       f.setRuns([{id:"successor"},{id:"middle"},{id:"run"}]);
       f.events.emit("subagent:child-status",{runId:"run"});
       f.events.emit("subagent:jobs-changed",{runId:"middle"});
       await f.fire("tool_result",{toolName:"todo"});
       await f.fire("session_start");
       expect(f.captured.entries).toHaveLength(count);
-      expect(readFileSync(requests,"utf8")).toBe(bytes);
+      expect(todoBytes(f.root)).toBe(bytes);
       const settled={...s,seq:3,active:null,tasks:s.tasks.map(t=>({...t,status:"completed" as const}))};
       writeFileSync(path.join(finalDir,"status.json"),JSON.stringify({cwd:f.root,runId:"successor",workflow:{...predecessor("middle"),emits:[s,settled]},steps:[{runId:"child",workflowKey:"work.t1.a1"}]}));
       await f.fire("tool_result",{toolName:"subagent"});
@@ -526,11 +546,11 @@ describe("execute todo registration and reconciliation",()=>{
       const finalCount=f.captured.entries.length;
       await f.fire("session_start");
       expect(f.captured.entries).toHaveLength(finalCount);
-      expect(readFileSync(requests,"utf8")).toBe(bytes);
+      expect(todoBytes(f.root)).toBe(bytes);
     } finally {await f.close();}
   });
 
-  for (const legacy of [false,true]) test(`retired predecessor requests stay unchanged when its successor is unreadable after reconnect (legacy: ${legacy})`,async()=>{
+  test("retired predecessor requests stay unchanged when its successor is unreadable after reconnect",async()=>{
     const f=runtimeFixture();
     try {
       await f.fire("session_start");
@@ -541,26 +561,20 @@ describe("execute todo registration and reconciliation",()=>{
       await f.fire("session_start");
       // Retirement hides the predecessor and purges its tombstones once journaled.
       expect(getState(f.sid).tasks.some(t=>retired.some(old=>old.id===t.id))).toBe(false);
-      appendExecuteTodoRecords(f.root,"invocation","requests.jsonl",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"unrelated",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
-      const requests=path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl");
-      const bytes=readFileSync(requests,"utf8");
-      // Legacy snapshots kept retirement tombstones and had no retirement journal yet.
-      if (legacy) expect(f.commit(f.sid,"execute:run",[{action:"sync",owner:"execute:run",seq:1000,
-        rows:retired.map(t=>({key:String(t.metadata?.key),subject:t.subject,status:"deleted" as const,metadata:t.metadata}))}]).error).toBeUndefined();
-      if (legacy) rmSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),{force:true});
+      appendExecuteTodoRecords(f.root,"invocation","request",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"unrelated",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
+      const bytes=todoBytes(f.root);
       // session_start clears cached lineage; only the predecessor's status remains readable.
       rmSync(path.join(successor,"status.json"));
       f.setRuns([{id:"run"}]);
       await f.fire("session_start");
-      expect(readFileSync(requests,"utf8")).toBe(bytes);
-      const retirement=path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl");
-      const retirementBytes=readFileSync(retirement,"utf8");
-      expect(retirementBytes.trim().split("\n").map(line=>JSON.parse(line))).toMatchObject([{v:1,invocation:"invocation",runId:"run"}]);
+      expect(todoBytes(f.root)).toBe(bytes);
+      const retirementBytes=todoBytes(f.root,"retired-run");
+      expect(todoRows(f.root,"retired-run")).toMatchObject([{v:1,invocation:"invocation",runId:"run"}]);
       // A previously unseen phase recreates a live row; a later refresh must still ignore retirement deletes.
       f.writeMain(snapshot({seq:2,phases:[...snapshot().phases,{name:"review",subject:"Review",status:"in_progress"}]}));
       await f.fire("tool_result",{toolName:"subagent"});
       await f.fire("tool_result",{toolName:"subagent"});
-      expect(readFileSync(requests,"utf8")).toBe(bytes);
+      expect(todoBytes(f.root)).toBe(bytes);
       // Real capacity pruning removes the old protected phase and task tombstones.
       const count=1000-visible(getState(f.sid).tasks).length;
       expect(f.commit(f.sid,"execute:pressure",[{action:"sync",owner:"execute:pressure",seq:1,rows:Array.from({length:count},(_,id)=>({key:`pressure:${id}`,subject:"Pressure",status:"completed" as const}))}]).error).toBeUndefined();
@@ -568,9 +582,9 @@ describe("execute todo registration and reconciliation",()=>{
       expect(f.commit(f.sid,"execute:pressure",[{action:"sync",owner:"execute:pressure",seq:2,rows:[]}]).error).toBeUndefined();
       await f.fire("session_start");
       await f.fire("tool_result",{toolName:"subagent"});
-      expect(readFileSync(requests,"utf8")).toBe(bytes);
-      expect(readFileSync(requests,"utf8").trim().split("\n").map(line=>JSON.parse(line)).some(record=>record.taskId==="t1")).toBe(false);
-      expect(readFileSync(retirement,"utf8")).toBe(retirementBytes);
+      expect(todoBytes(f.root)).toBe(bytes);
+      expect(todoRows(f.root).some(record=>record.taskId==="t1")).toBe(false);
+      expect(todoBytes(f.root,"retired-run")).toBe(retirementBytes);
     } finally {await f.close();}
   });
 
@@ -579,14 +593,13 @@ describe("execute todo registration and reconciliation",()=>{
     try {
       f.writeChild({parentWorkflowRunId:"foreign"});
       await f.fire("session_start");
-      appendExecuteTodoRecords(f.root,"invocation","requests.jsonl",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"unrelated",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
-      const requests=path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl");
+      appendExecuteTodoRecords(f.root,"invocation","request",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"unrelated",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
       if (cancelFirst) {
         const task=getState(f.sid).tasks.find(t=>t.metadata?.key==="exec:run:task:1:t1")!;
         expect(f.commit(f.sid,undefined,[{action:"cancel",params:{id:task.id}}]).error).toBeUndefined();
         await f.fire("tool_result",{toolName:"todo"});
       }
-      const requestBytes=readFileSync(requests,"utf8");
+      const requestBytes=todoBytes(f.root);
       const empty=snapshot({tasks:[],active:null});
       const successor=f.addRun("successor",empty,{reusedFrom:"run"});
       f.setRuns([{id:"successor"}]);
@@ -596,7 +609,7 @@ describe("execute todo registration and reconciliation",()=>{
       await f.fire("tool_result",{toolName:"subagent"});
       await f.fire("tool_result",{toolName:"subagent"});
       await f.fire("session_start");
-      expect(readFileSync(requests,"utf8")).toBe(requestBytes);
+      expect(todoBytes(f.root)).toBe(requestBytes);
       expect(getState(f.sid).tasks.find(t=>t.metadata?.key==="exec:successor:task:1:t1")).toMatchObject({status:"in_progress",subject:cancelFirst ? "Build (cancelación pedida)" : "Build"});
     } finally {await f.close();}
   });
@@ -627,7 +640,7 @@ describe("execute todo registration and reconciliation",()=>{
       await f.fire("session_start");
       expect(visible(getState(f.sid).tasks).some(t=>t.metadata?.taskId==="t2")).toBe(false);
       expect(f.captured.entries).toHaveLength(transferred);
-      const requests=readFileSync(path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl"),"utf8").trim().split("\n").map(line=>JSON.parse(line));
+      const requests=todoRows(f.root);
       expect(requests.map(r=>r.kind)).toEqual(cancelFirst ? ["cancel","delete"] : ["delete"]);
       expect(requests.at(-1)).toMatchObject({taskId:"t2",kind:"delete",origin:"model"});
       // Q8 remains sticky after the finished summary's tombstone is pruned too.
@@ -638,12 +651,10 @@ describe("execute todo registration and reconciliation",()=>{
       const summary=getState(f.sid).tasks.find(t=>t.owner==="execute:successor" && t.metadata?.summary && t.status!=="deleted")!;
       expect(summary).toMatchObject({status:"completed",metadata:{loop:1}});
       expect(f.commit(f.sid,undefined,[{action:"delete",params:{id:summary.id}}]).error).toBeUndefined();
-      const directory=path.join(f.root,".pi/subagents/execute/invocation");
-      const ledger=path.join(directory,"000000.json"); writeFileSync(ledger,"owned ledger sentinel");
-      const requestBytes=readFileSync(path.join(directory,"requests.jsonl"),"utf8");
+      const requestBytes=todoBytes(f.root);
       await f.fire("tool_result",{toolName:"todo"});
-      const guard=path.join(directory,"summary-deletions.jsonl"), guardBytes=readFileSync(guard,"utf8");
-      expect(JSON.parse(guardBytes.trim())).toMatchObject({v:1,invocation:"invocation",runId:"successor",loop:1});
+      const guardBytes=todoBytes(f.root,"summary-deletion");
+      expect(todoRows(f.root,"summary-deletion")[0]).toMatchObject({v:1,invocation:"invocation",runId:"successor",loop:1});
       // Other runs and loops still get their first summaries, even in the same invocation.
       f.addRun("other",snapshot({active:null,outcome:"complete"}));
       f.addRun("later",snapshot({loop:2,active:null,outcome:"complete"}));
@@ -665,12 +676,11 @@ describe("execute todo registration and reconciliation",()=>{
       await f.fire("session_start");
       expect(f.captured.entries).toHaveLength(count);
       expect(visible(getState(f.sid).tasks).filter(t=>t.metadata?.summary)).toEqual(retained);
-      expect(readFileSync(guard,"utf8")).toBe(guardBytes);
+      expect(todoBytes(f.root,"summary-deletion")).toBe(guardBytes);
       const observed=JSON.parse(execFileSync("node",[path.resolve("skills/execute/observe.mjs"),"--requests"],{
         cwd:f.root,input:JSON.stringify({invocation:"invocation",cursor:0}),encoding:"utf8"}));
       expect(observed).toEqual({version:1,ok:true,invocation:"invocation",requests,next:null});
-      expect(readFileSync(path.join(directory,"requests.jsonl"),"utf8")).toBe(requestBytes);
-      expect(readFileSync(ledger,"utf8")).toBe("owned ledger sentinel");
+      expect(todoBytes(f.root)).toBe(requestBytes);
     } finally {await f.close();}
   });
 
@@ -687,10 +697,8 @@ describe("execute todo registration and reconciliation",()=>{
       expect(f.commit(f.sid,"execute:reserve",[{action:"sync",owner:"execute:reserve",seq:1,rows:[{key:"reserve",subject:"Reserve",status:"deleted"}]}]).error).toBeUndefined();
       expect(f.commit(f.sid,undefined,[{action:"create",params:{tasks:Array.from({length:997},()=>({subject:"Main"}))}}]).error).toBeUndefined();
       expect(getState(f.sid).tasks).toHaveLength(1000);
-      appendExecuteTodoRecords(f.root,"invocation","requests.jsonl",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"t1",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
-      const directory=path.join(f.root,".pi/subagents/execute/invocation");
-      const requestFile=path.join(directory,"requests.jsonl"), requestBytes=readFileSync(requestFile,"utf8");
-      const ledger=path.join(directory,"000000.json"); writeFileSync(ledger,"owned ledger sentinel");
+      appendExecuteTodoRecords(f.root,"invocation","request",[{requestId:"existing",kind:"cancel",...{v:1,invocation:"invocation",taskId:"t1",origin:"model",at:"2026-11-03T00:00:00Z"}}]);
+      const requestBytes=todoBytes(f.root);
       const observe=()=>execFileSync("node",[path.resolve("skills/execute/observe.mjs"),"--requests"],{
         cwd:f.root,input:JSON.stringify({invocation:"invocation",cursor:0}),encoding:"utf8"});
       const observerBytes=observe();
@@ -714,14 +722,13 @@ describe("execute todo registration and reconciliation",()=>{
       await todoResult;
       expect(getState(f.sid).tasks.some(t=>t.id===summary.id)).toBe(false);
       expect(visible(getState(f.sid).tasks).some(t=>t.owner==="execute:finished")).toBe(false);
-      const guard=path.join(directory,"summary-deletions.jsonl"), guardBytes=readFileSync(guard,"utf8");
-      expect(JSON.parse(guardBytes.trim())).toMatchObject({v:1,invocation:"invocation",runId:"finished",loop:1});
+      const guardBytes=todoBytes(f.root,"summary-deletion");
+      expect(todoRows(f.root,"summary-deletion")[0]).toMatchObject({v:1,invocation:"invocation",runId:"finished",loop:1});
       await f.fire("session_start");
       expect(visible(getState(f.sid).tasks).some(t=>t.owner==="execute:finished")).toBe(false);
-      expect(readFileSync(guard,"utf8")).toBe(guardBytes);
-      expect(readFileSync(requestFile,"utf8")).toBe(requestBytes);
+      expect(todoBytes(f.root,"summary-deletion")).toBe(guardBytes);
+      expect(todoBytes(f.root)).toBe(requestBytes);
       expect(observe()).toBe(observerBytes);
-      expect(readFileSync(ledger,"utf8")).toBe("owned ledger sentinel");
     } finally {off?.(); await todoResult; await f.close();}
   });
 
@@ -736,13 +743,13 @@ describe("execute todo registration and reconciliation",()=>{
       await f.fire("session_start");
       expect(visible(getState(f.sid).tasks).filter(t=>t.owner?.startsWith("execute:")&&t.status==="in_progress").map(t=>t.owner).sort()).toEqual(["execute:different","execute:relaunch"]);
       expect(visible(getState(f.sid).tasks).some(t=>t.owner==="execute:run"||t.owner?.startsWith("worker:run:"))).toBe(false);
-      expect(readFileSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),"utf8")).toContain('"runId":"run"');
+      expect(todoRows(f.root,"retired-run")).toMatchObject([{runId:"run"}]);
       const count=f.captured.entries.length;
       await f.fire("session_start");expect(f.captured.entries).toHaveLength(count);
     } finally {await f.close();}
   });
 
-  test("a halted run cancels its open rows with the reason, and its unblock relaunch neither inherits nor duplicates them",async()=>{
+  test("a halted run cancels its open rows with the reason, and its replacement run neither inherits nor duplicates them",async()=>{
     const f=runtimeFixture();
     try {
       await f.fire("session_start");
@@ -762,7 +769,7 @@ describe("execute todo registration and reconciliation",()=>{
       const rows=visible(getState(f.sid).tasks);
       expect(rows.map(t=>[t.owner,t.subject,t.status])).toEqual([
         ["execute:relaunch","Loop 1/3 · Plan","completed"],["execute:relaunch","Build","in_progress"]]);
-      expect(existsSync(path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl"))).toBe(false);
+      expect(todoRows(f.root)).toEqual([]);
       const count=f.captured.entries.length;
       await f.fire("session_start");expect(f.captured.entries).toHaveLength(count);
       expect(f.warnings()).toEqual([]);
@@ -789,7 +796,7 @@ describe("execute todo registration and reconciliation",()=>{
       f.setRuns([{id:"relaunch"}]);
       await f.fire("session_start");
       expect(visible(getState(f.sid).tasks).map(t=>t.owner)).toEqual(["execute:relaunch","execute:relaunch"]);
-      expect(readFileSync(path.join(f.root,".pi/subagents/execute/invocation/retired-runs.jsonl"),"utf8")).toContain('"runId":"run"');
+      expect(todoRows(f.root,"retired-run")).toMatchObject([{runId:"run"}]);
       expect(f.warnings()).toEqual([]);
       // Real failures still warn.
       writeFileSync(path.join(f.root,"relaunch","status.json"),"{");
@@ -832,10 +839,8 @@ describe("execute todo registration and reconciliation",()=>{
       expect(existsSync(path.join(f.ctx.cwd,".pi"))).toBe(false);
       f.writeMain(snapshot({seq:2,active:null,tasks:[{...snapshot().tasks[0],status:"completed"}]}));
       await f.fire("tool_result",{toolName:"todo"});
-      const file=path.join(f.root,".pi/subagents/execute/invocation/requests.jsonl");
-      const lines=readFileSync(file,"utf8").trim().split("\n");
-      expect(lines).toHaveLength(1);expect(JSON.parse(lines[0])).toMatchObject({taskId:"t1",origin:"model"});
-      await f.fire("session_start");expect(readFileSync(file,"utf8").trim().split("\n")).toHaveLength(1);
+      expect(todoRows(f.root)).toMatchObject([{taskId:"t1",origin:"model"}]);
+      await f.fire("session_start"); expect(todoRows(f.root)).toHaveLength(1);
     } finally {await f.close();}
   });
 });

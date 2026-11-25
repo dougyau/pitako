@@ -93,6 +93,12 @@
       "tools": ["file_sha256", "file_sha256_save"]
     },
     {
+      "id": "pitako-store",
+      "spec": "pitako",
+      "entry": "extensions/pitako-store-tool.ts",
+      "tools": ["pitako_store"]
+    },
+    {
       "id": "pitako-access-receipts",
       "spec": "pitako",
       "entry": "extensions/access-receipt-verify.ts",

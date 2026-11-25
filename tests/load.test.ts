@@ -6,6 +6,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, test } from "bun:test
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import devTools from "../extensions/dev-tools/index.ts";
 import fileSha256 from "../extensions/file-sha256.ts";
+import pitakoStore from "../extensions/pitako-store-tool.ts";
 import accessReceiptVerify from "../extensions/access-receipt-verify.ts";
 import checkpointCreate from "../extensions/checkpoint-create.ts";
 import pitako from "../extensions/index.ts";
@@ -36,6 +37,7 @@ function loadProfileExtensions(pi: ExtensionAPI, codex: (pi: ExtensionAPI) => vo
     ["./extensions/profile-policy.ts", profilePolicy],
     ["./extensions/dev-tools/index.ts", devTools],
     ["./extensions/file-sha256.ts", fileSha256],
+    ["./extensions/pitako-store-tool.ts", pitakoStore],
     ["./extensions/access-receipt-verify.ts", accessReceiptVerify],
     ["./extensions/checkpoint-create.ts", checkpointCreate],
   ]);
@@ -67,6 +69,7 @@ function observerRegistrationEvents() {
       expect(request.version).toBe(1);
       const script = { "pitako.loop-io": ["skills/execute/loop-io.mjs"], "pitako.checkout-observer": ["skills/execute/observe.mjs"], "pitako.execution-ledger": ["skills/execute/ledger.mjs"],
         "pitako.architecture-ledger": ["skills/architecture/ledger.mjs"],
+        "pitako.store-io": ["skills/review/store-io.mjs"],
         "pitako.request-observer": ["skills/execute/observe.mjs", "--requests"], "pitako.checkpoint-sealer": ["skills/execute/checkpoint.mjs", "--seal-stdin"],
         "pitako.access-verifier": ["extensions/access-receipts.mjs", "--verify-stdin"] }[request.name];
       expect(script).toBeDefined();
@@ -241,7 +244,7 @@ describe("Pitako resources and policy", () => {
       await host.start();
       const provider = readStack(packageRoot()).required.find(({ id }) => id === "pitako-dev-tools");
       expect(provider).toBeDefined();
-      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "access_receipt_verify", "checkpoint_create"]);
+      expect(host.registeredTools).toEqual(["apply_patch", ...provider!.tools, "file_sha256", "file_sha256_save", "pitako_store", "access_receipt_verify", "checkpoint_create"]);
       for (const name of provider!.tools) expect(host.active).toContain(name);
       for (const name of ["file_sha256", "file_sha256_save", "ast_search", "ast_rewrite"]) expect(host.active).toContain(name);
       expect(host.registeredCommands).toEqual(["pitako"]);

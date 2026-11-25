@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { closeSync, constants, existsSync, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, statSync, watch, writeSync, type FSWatcher } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
 import path from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PROJECTION_ACTOR, replayFromBranch, type CommitOperation, type TodoCommit } from "../vendor/rpiv-todo/index.ts";
@@ -7,6 +7,8 @@ import { applyTaskPurge, applyTaskSync } from "../vendor/rpiv-todo/state/state-r
 import { getState, getSyncSequences } from "../vendor/rpiv-todo/state/store.ts";
 import type { TaskState } from "../vendor/rpiv-todo/state/state.ts";
 import type { SyncRow, Task, TaskStatus } from "../vendor/rpiv-todo/tool/types.ts";
+import { canonicalDigest } from "./canonical.mjs";
+import { PitakoStore, readTodoRecords, type TodoRecordKind } from "./pitako-store.ts";
 
 type DisplayRow = { subject: string; status: Exclude<TaskStatus, "deleted">; reason?: string };
 export type ExecuteTodoSnapshot = {
@@ -137,78 +139,44 @@ export function deriveExecuteTodoRequests(runId: string, snapshot: ExecuteTodoSn
   });
 }
 
-// These append-only files are separate from the execute ledger and never alter its chain.
-function requestDirectory(root: string, invocation: string) {
-  if (!path.isAbsolute(root) || !invocationId(invocation)) throw new Error("Invalid execute todo request location");
-  const directory = path.join(root,".pi/subagents/execute",invocation);
-  let current = path.parse(directory).root;
-  for (const part of directory.slice(current.length).split(path.sep)) {
-    current = path.join(current,part);
-    if (!existsSync(current)) mkdirSync(current);
-    const stat = lstatSync(current);
-    if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("Unsafe execute todo request directory");
-  }
-  return directory;
-}
-export function appendExecuteTodoRecords(root: string, invocation: string, name: "requests.jsonl"|"step-receipts.jsonl"|"summary-deletions.jsonl"|"retired-runs.jsonl", records: readonly {requestId:string; kind?:string}[]) {
+// Keyed appends never move the execute root's head.
+export function appendExecuteTodoRecords(root: string, invocation: string, kind: TodoRecordKind, records: readonly {requestId:string; kind?:string; at?:unknown; receipt?:unknown}[]) {
   if (!records.length) return;
-  const file = path.join(requestDirectory(root,invocation),name);
-  const fd = openSync(file,constants.O_CREAT|constants.O_APPEND|constants.O_RDWR|constants.O_NOFOLLOW|constants.O_NONBLOCK,0o600);
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error("Execute todo records must be a regular file");
-    const bytes = readFileSync(fd,"utf8");
-    const existing = new Set(bytes.split("\n").filter(Boolean).map(line => {
-      const row: unknown = JSON.parse(line);
-      if (!object(row) || !text(row.requestId,256)) throw new Error("Invalid execute todo request record");
-      return `${row.requestId}\0${row.kind === "delete" ? "delete" : ""}`;
-    }));
-    for (const record of records) {
-      // Cancel and delete share execution identity, but delete also durably hides the row.
-      const key = `${record.requestId}\0${record.kind === "delete" ? "delete" : ""}`;
-      if (!existing.has(key)) { writeSync(fd,JSON.stringify(record)+"\n"); existing.add(key); }
-    }
-    fsyncSync(fd);
-  } finally { closeSync(fd); }
+  if (!path.isAbsolute(root) || !invocationId(invocation)) throw new Error("Invalid execute todo request location");
+  const store = new PitakoStore(root, () => null);
+  for (const body of records) {
+    // Cancel and delete share execution identity, but delete also durably hides the row.
+    const key = canonicalDigest([kind, body.requestId, body.kind === "delete"]);
+    const { at, receipt, ...request } = body;
+    const result = store.commit(`todo:${invocation}`, undefined, key, canonicalDigest(request), () => ({ kind, body }));
+    if (!["appended", "replay"].includes(result.outcome)) throw new Error(`Execute todo ${result.outcome}`);
+  }
 }
 
 /** Retirement is display-only and must survive pruning and unreadable successor status. */
 function readRetiredExecuteTodoRuns(root: string, invocation: string): Set<string> {
-  const file = path.join(requestDirectory(root,invocation),"retired-runs.jsonl");
   const retired = new Set<string>();
-  if (!existsSync(file)) return retired;
-  const fd = openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error("Execute todo records must be a regular file");
-    for (const line of readFileSync(fd,"utf8").split("\n").filter(Boolean)) {
-      const row: unknown = JSON.parse(line);
-      if (!object(row) || row.v !== 1 || row.invocation !== invocation || !text(row.runId,256) ||
-          row.requestId !== digest(`${invocation}\0retired:${row.runId}`)) throw new Error("Invalid execute todo retirement record");
-      retired.add(row.runId);
-    }
-  } finally { closeSync(fd); }
+  for (const row of readTodoRecords(root, invocation, "retired-run")) {
+    if (!object(row) || row.v !== 1 || row.invocation !== invocation || !text(row.runId,256) ||
+        row.requestId !== digest(`${invocation}\0retired:${row.runId}`)) throw new Error("Invalid execute todo retirement record");
+    retired.add(row.runId);
+  }
   return retired;
 }
 
 /** Read durable hiding decisions even after capacity pruning removes every display tombstone. */
 function readExecuteTodoDeletions(root: string, snapshot: ExecuteTodoSnapshot, lineage: readonly string[], state: TaskState): Set<string> {
-  const file = path.join(requestDirectory(root,snapshot.invocation),"requests.jsonl");
   const deleted = new Set<string>();
-  if (!existsSync(file)) return deleted;
-  const fd = openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error("Execute todo records must be a regular file");
-    const keys = new Map(snapshot.tasks.map(task => [task.id,new Set([
-      ...lineage.map(run => digest(`${snapshot.invocation}\0${taskKey(run,snapshot.loop,task.id)}`)),
-      ...state.tasks.filter(t => lineage.some(run => t.owner === `execute:${run}`) && t.metadata?.loop === snapshot.loop && t.metadata?.taskId === task.id && text(t.metadata?.requestKey))
-        .map(t => digest(`${snapshot.invocation}\0${t.metadata!.requestKey}`)),
-    ])]));
-    for (const line of readFileSync(fd,"utf8").split("\n").filter(Boolean)) {
-      const row: unknown = JSON.parse(line);
-      if (!object(row) || row.v !== 1 || row.invocation !== snapshot.invocation || !planId(row.taskId) ||
-          !["cancel","delete"].includes(row.kind) || !text(row.requestId,256)) throw new Error("Invalid execute todo request record");
-      if (row.kind === "delete" && keys.get(row.taskId)?.has(row.requestId)) deleted.add(row.taskId);
-    }
-  } finally { closeSync(fd); }
+  const keys = new Map(snapshot.tasks.map(task => [task.id,new Set([
+    ...lineage.map(run => digest(`${snapshot.invocation}\0${taskKey(run,snapshot.loop,task.id)}`)),
+    ...state.tasks.filter(t => lineage.some(run => t.owner === `execute:${run}`) && t.metadata?.loop === snapshot.loop && t.metadata?.taskId === task.id && text(t.metadata?.requestKey))
+      .map(t => digest(`${snapshot.invocation}\0${t.metadata!.requestKey}`)),
+  ])]));
+  for (const row of readTodoRecords(root, snapshot.invocation, "request")) {
+    if (!object(row) || row.v !== 1 || row.invocation !== snapshot.invocation || !planId(row.taskId) ||
+        !["cancel","delete"].includes(row.kind) || !text(row.requestId,256)) throw new Error("Invalid execute todo request record");
+    if (row.kind === "delete" && keys.get(row.taskId)?.has(row.requestId)) deleted.add(row.taskId);
+  }
   return deleted;
 }
 
@@ -218,7 +186,7 @@ function recordDeletedExecuteTodoSummaries(root: string, state: TaskState, roots
     if (!task.owner?.startsWith("execute:") || task.status !== "deleted" || task.metadata?.summary !== true ||
         !invocationId(task.metadata.invocation) || !positive(task.metadata.loop)) continue;
     const invocation = task.metadata.invocation, runId = task.owner.slice(8), loop = task.metadata.loop;
-    appendExecuteTodoRecords(roots.get(invocation) ?? root,invocation,"summary-deletions.jsonl",[
+    appendExecuteTodoRecords(roots.get(invocation) ?? root,invocation,"summary-deletion",[
       {requestId:digest(`${invocation}\0exec:${runId}:summary:${loop}`),...{v:1,invocation,runId,loop}},
     ]);
   }
@@ -226,20 +194,13 @@ function recordDeletedExecuteTodoSummaries(root: string, state: TaskState, roots
 
 /** Display-only records never enter the execution request observer's input. */
 function deletedExecuteTodoSummary(root: string, snapshot: ExecuteTodoSnapshot, lineage: readonly string[]): boolean {
-  const file = path.join(requestDirectory(root,snapshot.invocation),"summary-deletions.jsonl");
-  if (!existsSync(file)) return false;
-  const fd = openSync(file,constants.O_RDONLY|constants.O_NOFOLLOW|constants.O_NONBLOCK);
-  try {
-    if (!fstatSync(fd).isFile()) throw new Error("Execute todo records must be a regular file");
-    let deleted = false;
-    for (const line of readFileSync(fd,"utf8").split("\n").filter(Boolean)) {
-      const row: unknown = JSON.parse(line);
-      if (!object(row) || row.v !== 1 || row.invocation !== snapshot.invocation || !text(row.runId,256) || !positive(row.loop) ||
-          row.requestId !== digest(`${snapshot.invocation}\0exec:${row.runId}:summary:${row.loop}`)) throw new Error("Invalid execute todo summary deletion record");
-      if (row.loop === snapshot.loop && lineage.includes(row.runId)) deleted = true;
-    }
-    return deleted;
-  } finally { closeSync(fd); }
+  let deleted = false;
+  for (const row of readTodoRecords(root, snapshot.invocation, "summary-deletion")) {
+    if (!object(row) || row.v !== 1 || row.invocation !== snapshot.invocation || !text(row.runId,256) || !positive(row.loop) ||
+        row.requestId !== digest(`${snapshot.invocation}\0exec:${row.runId}:summary:${row.loop}`)) throw new Error("Invalid execute todo summary deletion record");
+    if (row.loop === snapshot.loop && lineage.includes(row.runId)) deleted = true;
+  }
+  return deleted;
 }
 
 /** One registrar in the todo entry's module graph, usable in TUI, RPC and print. */
@@ -410,7 +371,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
         } catch (error) { warn(error); }
       }
       if (epoch !== generation) return;
-      // Unblock and budget relaunches are new top-level runs without native links. One invocation
+      // Budget relaunches are new top-level runs without native links. One invocation
       // has one live root, so the newest run of an invocation succeeds the earlier ones.
       const relaunches = new Map<string,string[]>();
       for (const [runId,{run}] of runs) {
@@ -461,7 +422,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
       function retire(runId: string, invocation: string) {
         const retired = retiredRuns(invocation);
         if (retired.has(runId)) return;
-        appendExecuteTodoRecords(rootFor(invocation),invocation,"retired-runs.jsonl",[
+        appendExecuteTodoRecords(rootFor(invocation),invocation,"retired-run",[
           {requestId:digest(`${invocation}\0retired:${runId}`),...{v:1,invocation,runId}},
         ]);
         retired.add(runId);
@@ -479,7 +440,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
         try {
           const snapshot = latest.get(runId)!;
           if (canDeriveRequests(runId,snapshot))
-            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"request",deriveExecuteTodoRequests(runId,snapshot,state()));
         } catch (error) { warn(error); return; }
       }
       for (const [runId,{run,prior}] of runs) {
@@ -525,7 +486,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
           const workers = [...cache.workers.values()];
           if (epoch !== generation) return;
           if (canDeriveRequests(runId,snapshot))
-            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"requests.jsonl",deriveExecuteTodoRequests(runId,snapshot,state()));
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"request",deriveExecuteTodoRequests(runId,snapshot,state()));
           // Persist best-effort steer receipts; terminal main steps remain sticky regardless of delivery.
           for (const worker of workers) for (const step of worker.tasks) {
             if (snapshot.active?.taskId !== worker.taskId || snapshot.active.attempt !== worker.attempt) continue;
@@ -533,13 +494,13 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
             const main = state().tasks.find(t => t.metadata?.key === key);
             if (!main || !["cancelled","deleted"].includes(main.status) || terminal(step.status) || state().tasks.some(t => t.id === main.parentId && t.status === "deleted")) continue;
             const requestId = digest(`${key}\0${main.status}`);
-            const receiptFile = path.join(requestDirectory(rootFor(snapshot.invocation),snapshot.invocation),"step-receipts.jsonl");
-            if (existsSync(receiptFile) && readFileSync(receiptFile,"utf8").split("\n").filter(Boolean).some(line => JSON.parse(line).requestId === requestId)) continue;
+            if (readTodoRecords(rootFor(snapshot.invocation), snapshot.invocation, "step-receipt")
+                .some(row => object(row) && row.requestId === requestId)) continue;
             let receipt: unknown;
             try { receipt = await rpc("steer",{id:childIds.get(workerOwner(runId,worker.taskId,worker.attempt)),message:`Main-session model requested ${main.status === "deleted" ? "delete" : "cancel"} of todo step ${step.id}. Display only: this never drops required work or checks.`,mode:"steer"}); }
             catch (error) { receipt = {state:"failed",reason:String(error).slice(0,240)}; }
             if (epoch !== generation) return;
-            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"step-receipts.jsonl",[{requestId, ...{v:1,origin:"model",taskId:worker.taskId,todoId:step.id,receipt}}]);
+            appendExecuteTodoRecords(rootFor(snapshot.invocation),snapshot.invocation,"step-receipt",[{requestId, ...{v:1,origin:"model",taskId:worker.taskId,todoId:step.id,receipt}}]);
           }
           if (epoch !== generation) return;
           const family = lineage(runId);

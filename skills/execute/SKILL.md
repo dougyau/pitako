@@ -120,21 +120,19 @@ It is bound to the concrete request and inspection and remains original evidence
 Before snapshot capture, retain only the request/operation observation, not an
 invented snapshot or admitted association. Perfect classification or an inaccessible
 failed host receipt is NOT a prerequisite to reconstructing state. A checkpointed
-Stop remains observed history, not a fabricated new receipt or permanent veto.
+Stop is terminal for this invocation.
 
-For a retained host transport failure with unknown cause, ordinary reentry can
-perform one bounded read-only reconstruction without `--unblock`. It saves the
-exact observation and intention before inspection and admission after validating
-the immutable state. Transient native lock/I/O or transport failures retry the
+Transient native lock/I/O or transport failures retry the
 fixed pure inspection at most three times, sequentially through `inspect-initial`,
 `inspect-initial.r1` and `inspect-initial.r2`, with the identical command. Unused
 aliases consume no host calls or child spawns. Deterministic failures, Stop,
 refusal and positive pending activity never use a retry alias. After the cap,
-the halt names the repeated cause. A pending or failed reconstruction is not a fresh route;
-changing a key does not authorize another inspection. Original observations remain
-retained. This does not settle interrupted writers or pending recovery queries.
+the halt names the repeated cause. A committed host failure without a native
+original retains its bounded diagnostic bound to the halted action and inspection
+command. Relaunch verifies the store and the diagnostic without rerunning the
+inspection. This does not settle interrupted writers or pending recovery queries.
 Observed Stop, permission denial or positive pending activity still blocks automatic
-replacement; explicit current input and native reconciliation remain necessary.
+replacement; never retry around an observed barrier.
 
 State saves likewise retry transient lock/I/O errors at most three times, without
 dispatch or state mutation between attempts. Each attempt writes the identical
@@ -145,54 +143,33 @@ invalid JSON and other deterministic errors halt immediately with their cause;
 the retry-cap halt names the repeated error. No retry clears a recorded Stop,
 native refusal or human-needed barrier, or discards unpublished evidence.
 
-On an explicit CURRENT HUMAN continuation request, pass `unblock:true` with
-`resolution:{loop,text}` through the registered route, retaining the same native
-missionId, missionPath, invocation, sources and worktree. `loop` names the interrupted
-loop (0 only for a retained pre-admission request); `text` is the actual nonempty
-current human input, not an agent answer, historical memo or bypass flag. A bare
-`--unblock` is not authority. Retain the input, original question/halt and exact
-producer references durably before observation. Replays reconcile that same record,
-not apply it twice. This is input
-to a supported native continuation, NOT a generic restart of a terminal root.
+A Stop, native barrier, needs-decision, repeated-acceptance failure or other
+human-needed halt is terminal. Relaunch after the first committed cursor only
+rebuilds and digest-checks that halt from its exact originals, without children,
+advance, or conversion to gaps. Missing or changed originals are integrity failures.
+After a fix or ruling, post it as Board HUMAN and start a **new invocation on the
+same worktree and backlog**. There is no `--unblock` route; launch inputs
+`unblock` and `resolution` are rejected by name.
 
-Under that current request a fresh bounded read-only inspection may reconstruct
-mission association, snapshot/limit, Git/WIP and phase using existing grants and
-current native policy. Historical ambiguous host text alone neither proves activity
-nor settlement. Positive pending activity prevents replacement. Restore essential
-persistence before effects. Observe pertinent writer intentions best-effort
-for checkpoint restoration;
-missing inventory neither proves settlement nor blocks it. Reconcile exact
-analysis/inspector intentions before reusing their results; do not replace queries.
-Before admitting a recovered result, reconcile its relevant retained
-`loop.recoveries`, including `loop-plan`, `attempt-result` and
-`interrupted-operation` subjects. Observe the saved inspector key/run, validate its
-complete value and provenance, and persist admission. Rescuing every query/result
-is not a prerequisite to confirmed checkpoint restoration. A newly available original
-or a closed original producer does not settle a separately launched inspector.
-Never rename a payload recovery to `interrupted-operation` to replace it. A
-completed, already consumed historical observation is not an all-history gate.
-
-A worker blocked result retains its question/halt and checkpoint. Useful current
-human input continues the same pending task without repeating its director or
-renewing a loop slot. Invalid director selection instead ends the loop as gaps.
-A recorded Stop requires an actual later human continuation request before effects;
-preserve its record, never reuse an old answer for a later Stop or question.
-Current denial remains binding. Reuse a valid immediately available original,
-without promoting interrupted work to success. Otherwise restore from the last
-confirmed reconstructible checkpoint after best-effort pertinent-writer observation;
-missing historical receipts do not require another inspector or redundant consent.
-Do not blindly relaunch a pending query, reuse a writer key or renew a consumed slot.
-The resolution does not authorize a later Stop/denial or a subsequent loop's
-question. Scope gaps, no-new-corrective-input exhaustion and current native Stop,
-permission, capacity and persistence barriers remain. No grants, settings, sources,
-dependencies, slots or retained originals change.
+A Stop before the first store COMMIT leaves no Pitako state, so relaunching
+the same invocation starts admission fresh. The fixed `inspect-initial` grant
+still re-observes native denial; the zero-child hold starts at the first committed cursor.
 
 Use the public native workflow/mission operations under their actual policy.
 Unknown or unobservable native trust is neither approval nor denial. Never
 require marker trust certificates, coerce user overrides, edit settings or
 bypass actual native refusal, Stop, permission or pertinent activity barriers.
 Profile inspection is optional diagnosis, not an exact child-selection certificate
-or mandatory preflight ceremony. The director and worker load and apply Ponytail FULL without weakening required scope, boundaries or checks. The director is read-only planning, the worker
+or mandatory preflight ceremony. Execute children receive their declared profile
+skills plus workflow additions; task reviewers, synthesis and integrated review
+retain Ponytail and Ponytail Review. The director and worker load and apply
+Ponytail FULL without weakening required scope, boundaries or checks.
+Integrated review uses the enclosing in-memory loop and puts its bounded
+sub-cursor in `pitako-execute`; it does not use a separate review key. The enclosing save
+owns both review references and the synthesis pointer. A clear/material-gaps review resumes
+original-reference conversion without admitting another verifier or reviewer,
+and the loop archive retains the snapshot before the next loop replaces it.
+The director is read-only planning, the worker
 is the nondelegating writer with normal tools and CodeGraph/LSP/Codex (edit/write
 fallback), and reviewer/exceptional inspector are read-only. Missing required
 providers are unmet prerequisites, not fabricated passes.
@@ -256,7 +233,7 @@ human decisions and Stop, then present native progress and the full result
 (read its exact native artifact if preview truncates). No extra model or final
 validation turn is required.
 
-## Coordinator timeouts (v9)
+## Coordinator timeouts (v10)
 
 The coordinator is the foreground session launching/relaunching `pitako.execute`,
 not the per-loop director. Execute-owned analysis dispatch defaults to
@@ -266,7 +243,7 @@ Workers also default to four hours per attempt. This does not change standalone
 `/review` or `pre-pr`, reviewer profiles, director/inspector/access-verifier
 deadlines or non-close loop-io deadlines.
 
-Supply optional `args.timeouts` on launch, relaunch or human unblock:
+Supply optional `args.timeouts` on launch or relaunch:
 `{reviewerMs?, workerMs?, gateFloorMs?}`. Values are safe integer milliseconds in
 `1..86400000`; unknown keys, fractions and other invalid values are rejected in
 resource resolution, the launch hook and the script guard before state reads or
@@ -339,37 +316,16 @@ of subprocess quiescence; timeout/Stop races and tool-deadline evidence remain
 limits. Never infer settlement from the timeout alone.
 
 Timeout input is not HUMAN authority or invocation cancellation. It never
-answers a needs-decision question, substitutes for `--unblock` human text, clears
-Stop, native denial, currentBarrier, state-capacity, spawn budget or other
+answers a needs-decision question or clears Stop, native denial, spawn budget or other
 barriers, or renews consumed slots. No installed-copy hotfix is changed by this
 contract.
-
-### Whole-file state capacity
-
-Before **each worker dispatch**, a fresh loop-io stat accounts for the entire
-pretty-printed native mission state (including unrelated keys). If
-`U + S + sum(K) + R > 262144`, no writer launches: execute saves a
-`state-capacity` halt, drains pending seals and returns `blocked` with the
-accounting and **use a new mission**. An identical rerun stays blocked.
-U is unrelated state, S is execute's framed retained state, K itemizes known
-seal/close/gate/native-reference reservations, and R is the maximal-fixture
-residual reserve. This is not a native spawn-capacity halt. Timeout overrides
-cannot clear it. There is no added capacity check before the director, at
-admission or for final loops without a worker, nor a guarantee of unlimited
-attempts or loops fitting one mission.
-
-Preserve the old mission's evidence and sealed work when arranging an authorized
-new mission. The in-flight sealed task may not have backlog settlement and may
-be selected again; do not treat a capacity block as task completion, discard
-history or silently create a fresh authorization.
 
 ## Native root process continuation
 
 An imperative human instruction to relaunch or continue is the authorization;
 do not ask again. If a run is active, neither stop it nor start a second root.
 Act once on its settled result through the documented route below. Such an
-instruction never supplies an unblock, a resolution or a `needs-decision` answer,
-and never overrides a recorded Stop.
+Such an instruction never overrides a recorded Stop or answers a `needs-decision` halt.
 
 A named `/execute` launch cannot set `maxSubagentSpawnsPerRun`. To raise the
 cap globally, set it in `~/.pi/agent/extensions/subagent/config.json` (for example
@@ -383,8 +339,7 @@ invocation as a NEW top-level run using the launch call above, with the same
 missionId/missionPath, root, sourceRefs, amendments and immutable snapshot.
 Do not ask the human, create a mission, change settings or use native `resume`:
 resume retains the exhausted `maxSubagentSpawnsPerRun` budget (default 64).
-Do not carry `unblock`/`resolution` as new input; the saved disposition already
-survives reentry. This relaunch is neither human continuation nor unblock authority.
+This relaunch is technical recovery only, not human continuation.
 Recorded Stop/refusal and other human-needed barriers return unchanged without
 dispatch. The root uses ordinary frozen-source/digest/association admission and
 reconciles saved intentions, seals and retries; no admitted work or loop slot is
@@ -435,11 +390,7 @@ unknown interruption reason alone is not a recorded Stop. An exhausted budget
 is not renewed by resume. Do not change native launch records, settings, grants,
 models or immutable originals to force eligibility.
 
-Process continuation is distinct from `--unblock`: that input delivers the real
-human answer to the retained question/impediment in the same invocation. Keep its
-original loop and durable answer, do not repeat the completed director, reuse an
-old answer for a later question or spend the same slot twice. `--unblock` does
-not make an ineligible terminal native root resumable. Except for the explicit
+Human-needed halts require a new invocation. Except for the explicit
 `budget-exhausted` top-level relaunch or an eligible `timeout` halt under the
 coordinator contract above, a retained native launch
 must still be resumed through a supported public operation; no helper supervisor,
@@ -481,10 +432,11 @@ the grouped close below (save close intention → request observation → gate �
 seal), reusing a matching gate receipt. No writer is active during gates. The workflow measures the metric every attempt; focused gates run when
 the worker reports complete or the
 task has no metric. Commands have timeouts and process-group termination, bounded
-receipt tails and full logs under `.pi/subagents/execute/<invocation>/gates/`.
+receipt tails and digest-addressed logs in SQLite. Read `logRef` with
+`pitako_store` (`op:"blob"`); logs over 1 MiB retain both ends and mark truncation.
 Mutation outside `.pi/`, `.pitako/` and gitignored outputs fails the gate.
 `loop-io` has no command allow-list; its effects are limited to `.pitako/backlog/`,
-Board posts, `.pi/` logs/receipts/metadata, seal files under
+Board posts, store-backed logs/receipts/metadata, seal files under
 `.pi/subagents/checkpoints`, execution-ledger records and gitignored gate build
 outputs, never product edits. It runs only after the worker settles, with no
 writer active.
@@ -500,14 +452,11 @@ digests and Board `postOnce` replay checks.
 
 A pending intention never holds a second copy of state the workflow can rebuild.
 The admitted spec is cited by digest. A loop/gaps intention keeps the frozen
-body identity and frozen usage, resolution and cancelled-scope inputs, and the
+body identity and frozen usage and cancelled-scope inputs, and the
 drain rebuilds identical bytes from the retained loop. A changed source field
 fails closed with no replacement record. A unit body keeps its own result. It
 cites an earlier result already sealed by its own unit record by key and
-checkpoint digest, and archives only unsealed earlier results in full. When
-the indented invocation state already exceeds 192 KiB, the workflow drains the
-pending intentions before it queues the loop archive. This decision is saved
-once per loop.
+checkpoint digest, and archives only unsealed earlier results in full.
 
 - `advance`: drain → prepare → request observation.
 - `selection`: a separate launch after the director; drain → apply selection →
@@ -535,49 +484,40 @@ adds another reviewed attempt. This arithmetic excludes retries (including `.d1`
 director/selection retries), pagination, cancellations, recovery and final
 review/compliance flows; it is not a bound on exceptional runs.
 
-Each sub-step has a key and result-digest marker under the invocation's `.pi/`
-metadata. Same-key relaunches and `.rN` retries verify completed markers and
+Each sub-step has a key and result-digest marker in the worktree's SQLite
+store. Same-key relaunches and `.rN` retries verify completed markers and
 publications, skip completed effects and resume the first incomplete step.
-Recovery accepts grouped loop-io references as well as legacy sealer/ledger
-references. The standalone `pitako.checkpoint-sealer`, `pitako.execution-ledger`
-and `pitako.request-observer` profiles remain available for recovery and other
-workflows. Stop, permission and capacity barriers and no blind redispatch remain
-unchanged.
+The deterministic `pitako.checkpoint-sealer`, `pitako.execution-ledger` and
+`pitako.request-observer` profiles still handle their respective operations;
+execution ledger records are no longer published to a file ledger.
+Stop, permission and capacity barriers remain in force; do not blindly
+redispatch a writer.
 
-Gate receipts are atomic and never overwritten, under
-`gates/<attemptKey>.gate/`; fresh reruns use `.rN` directories. Reuse without
+Gate receipts are committed no-clobber records. The gate directory reserves
+external execution; fresh reruns use `.rN` reservations, not log or receipt files. Reuse without
 spawning commands requires an intact receipt with matching attempt key, commands
 digest (`id`, `command`, `cwd`, `timeoutMs` and metric command), worker status,
 progress-input digest and after candidate (HEAD/fingerprint), with the current
 candidate equal to that after candidate. Otherwise the gate runs fresh.
 
-Per HUMAN ruling #2391 (topic #197), grouped advance/selection/close and trailing
-drain print a final stdout line `{path, digest, projection}`. Full receipts stay
-on disk. The compact projection carries the fields the workflow validates and
-stores: seal outcome/kind/candidate/paths (at most 10)/capturedPaths, gate statuses,
-mutation flag and after candidate, request observations, ledger heads/results and
-apply projections. Large seal data, gate stdout/stderr tails and logs stay on
-disk by reference/digest. The stdout JSON has a 61,440-byte (60 KiB) hard cap:
-overflow fails closed with a bounded error, never truncation. The sandbox has no
-file API; the workflow validates the projection and stores `{path, digest}` plus
-its existing compact projections. Each later loop-io launch verifies the on-disk
-digests of receipts it references before reuse. This is not universally
-digest-only storage: admission temporarily retains validated compact projections.
-Advance reduces the grouped receipt to `{path, digest}` and removes its input
-before saving currentView/preparedNext; preparedNext and loop.prepare omit view.
-The current view and selected apply projection remain available to the sandbox.
-Prepare and nested drain apply projections omit duplicated acceptance/history;
-nested applies omit view and non-final task gate receipts omit view (the fresh
-Board view travels outside the retained gate). Selection apply retains the
-acceptance/history copy, also held on the final loop for its
-prompts; final-attempt gate view is retained. Full on-disk receipts are unchanged
-and digest-verified, never reconstructed from previews.
+Grouped advance, selection, close and drain return the receipt reference, the
+committed store head and bounded projections. The root has no file API: it uses
+the projection in memory without saving receipt bodies, Board views or backlog
+copies in mission state. Loop-io verifies the committed bodies and original
+references before reuse. Gate logs still stay on disk by reference. The stdout
+JSON has a 61440-byte (60 KiB) hard cap: overflow fails closed, never truncates
+the evidence.
 
 ### Worker results and continuation
 
 Worker results are `{work, status, remaining, knowledge:{findings, handoff}}`;
 no per-check evidence or candidate identities. Advisory knowledge defects never
-reject work. The workflow chooses unit only for complete plus passing focused
+reject an otherwise valid result.
+
+Gate and grouped-close requests pass only the worker's key/runId. The deterministic
+gate resolves the native original and verifies its digest and terminal producer
+before using knowledge or running commands; replay revalidates the original.
+The workflow chooses unit only for complete plus passing focused
 gates, no mutation and admission by any required task review; otherwise pause
 for a same-task continuation or gaps as described below. A failed
 gate alone never ends the loop except after the single review repair.
@@ -604,13 +544,11 @@ contains the task, delta reference, observed gate results and deterministic
 The models are frozen at admission from `pitako.execute.taskReviewer` and
 `pitako.execute.taskSynthesis`; see [configuration](../../docs/configuration.md).
 
-Both children receive a digest-bound `pitako-slot-diff v1` artifact at
-`.pi/subagents/execute/<invocation>/task-deltas/diff-<sha256>.patch`.
-Here `a/` is the slot baseline before attempt 1 and `b/` is the current candidate,
-including all attempts in the slot. Verify the supplied `sha256` with
-`file_sha256` first; a missing or mismatched diff is a blocking finding of
-uncertain provenance. Read the supplied absolute path with `read` offset paging,
-using the index's section start lines; grep skips the gitignored `.pi/`.
+Both children receive a digest-bound `pitako-slot-diff v1` record reference
+(`storeId`, `scope`, `seq`, and row digest). Page that record with `pitako_store`
+and match its digest before relying on `body.patch`. A missing or mismatched
+row is a blocking provenance finding. The index gives section start lines;
+`a/` is the slot baseline before attempt 1 and `b/` is the current candidate.
 This readable artifact is not a patch for `git apply`.
 
 The complete index includes digests and declared-limit statuses for paths without
@@ -663,8 +601,7 @@ stalled parent and creates new child IDs with `stalls = 0`, which may be selecte
 
 The second stall of the same task ID halts the run as `needs-decision` for the
 human, naming the task ID, metric series and both stall diagnoses. The human can
-edit the backlog or deliver an amendment, then relaunch or unblock through the
-existing routes. This does not change the three-attempt stall threshold.
+post the ruling as Board HUMAN and start a new invocation on the same worktree and backlog. This does not change the three-attempt stall threshold.
 Todo rows show e.g. `metric 18→8/0 · gates 3/5 · stall 1/3 · stalls 1/2`:
 `stall N/3` counts non-improving attempts; `stalls N/2` counts stalled loops.
 
@@ -722,9 +659,14 @@ one maxCycles slot) runs backlog acceptance commands: the project's complete
 procedure, then full shared adversarial review, then frozen-spec/amendment
 compliance, all on the same candidate. Per-task review does not replace this
 final-phase review; compliance runs only in the final phase.
-Review and compliance receive current HUMAN rulings, excepted acceptance results
-and acceptanceHistory (at most eight entries), as well as done/obsolete reasons
-and current DECISIONs. Review/compliance gaps become new tasks with origin
+Review and compliance receive the same blocking final-acceptance evidence even
+with no task results: a committed store record reference and digest, per-gate
+`id`, `status`, `exit`, `ms`, `logRef`, plus `after`, `mutated`, and
+`currentAcceptance`. No log tails are included; without a receipt the block is
+`null`. Relaunch reconstructs identical prompts from verified committed data;
+a digest mismatch fails integrity. Excepted results, current HUMAN rulings,
+acceptanceHistory (at most eight entries), done/obsolete reasons and current
+DECISIONs remain separate. Review/compliance gaps become new tasks with origin
 final-phase and a finding reference; the next director selects among them.
 For unmutated final acceptance where every blocking failure is a timeout, halt
 `timeout` with status `partial` and log references; the coordinator may relaunch
@@ -773,18 +715,10 @@ fresh. The retained record survives relaunch of the same invocation.
 
 Recompute the verdict using current exceptions: a reused pass proceeds to review;
 a reused failure halts `blocked` with code `repeat-acceptance` and original log
-references. Relaunch without a resolution re-finishes that halt unchanged, not
+references. Relaunch re-finishes that halt unchanged, not
 another cached gate or suite run.
 
-For an actual current human resolution, use the existing `--unblock` route with
-`unblock: true, resolution: {loop: <halted loop>, text: "<actual human input>"}`
-on the same invocation. A mismatching resolution is rejected. A matching one
-closes that loop as gaps, clears the halt/cached view, retains the record and
-sets a durable one-shot fresh-run authorization. The next final loop consumes
-another slot within the frozen maxCycles and re-evaluates the reused results
-first: a newly posted HUMAN can permit completion without rerunning. Only if the
-verdict still fails does it run acceptance fresh once. No slot renewal, seal or
-replay weakening, native barrier bypass or generic restart authority is implied.
+A relaunch only reconstructs the verified halt. A new invocation starts acceptance afresh.
 
 After final mandatory checks the root runs the REAL shared adversarial review:
 `evidence-contract` plus one director-selected risk angle, each independently
@@ -847,7 +781,7 @@ No capacity overrides or private budget replace native limits.
 ### Deterministic request observation
 
 The projection derives idempotent cancel/delete requests from main todo state in
-`requests.jsonl` beside the invocation ledger. Before every worker dispatch, retry
+`todo:<invocation>` using keyed requests that do not change the execute head. Before every worker dispatch, retry
 or continuation, grouped `pitako.loop-io` operations run the model-free request
 observer in-process. The standalone `pitako.request-observer` profile retains
 `observe.mjs --requests` for recovery and other workflows. The workflow persists observed
@@ -971,8 +905,7 @@ expected/observed hashes and a reconciliation step, never automatic recapture.
 The references freeze in `invocation.amendments`, separately from the base
 association/snapshot/sourceRefs, before planning and without renewing maxCycles.
 Reentry must pass the same entries/order/provenance; it rechecks their bytes and
-cannot add, merge or replace them. The existing `--unblock` resolution route is
-unchanged. The root itself delivers the exact frozen references to director,
+cannot add, merge or replace them. The root itself delivers the exact frozen references to director,
 worker, review and compliance; the director does not copy them into
 sharedContext. Every phase must read/hash the full sources.
 
@@ -992,26 +925,21 @@ Native replay is not stack restoration, exactly-once or a read-only reattachment
 API. Preserve exact producer/run, outputReference, outputArtifactPath,
 outputPathMapping, artifactPaths and optional results[].structuredOutputPath.
 Distinguish binding JSON, optional native value and debug artifacts. Consume the
-original full structuredOutput, not previews. Cache at most the identical active
-plan when it fits the ENTIRE 256 KiB native state file. Essential snapshot/frozen
-descriptor/progress persistence failure blocks unsafe dispatch.
-Closed-loop history goes to a verified ledger; superseded recovery data is
-archived then discarded. Execute state uses one contract version (v9). Older
-retained state fails before any resume or dispatch: "created by an incompatible
-Pitako contract vN; start a new mission". Version-8 state, including a paused
-invocation, cannot resume. Nothing is migrated.
-Keep current task/control progress and usage totals, not a closed-loop array.
-Sealed results retain report-equivalent fields and evidence references; unsealed
-results stay whole. Checkpoint intents are stored once by key in taskFrame,
-with reviewIntents/sources as key lists. After ledger admission, admitDrain
-compacts the archived loop to allow-listed control/report fields and the minimal
-gate/delta/settlement/checkpoint markers needed for identical reader output;
-the final-close archive is not compacted there. Full bodies remain in published
-ledger loop records and digest-verified receipts. Closing and gaps
-record bytes are rebuilt from immutable source fields, freezing mutable usage and
-resolution inputs (and cancelled scope for gaps). Archive each seal before discarding, and every consumed loop
-including gaps. Seals run inside grouped close with no extra dispatch; fused
-closing adds none and retries unpublished output with `.checkout.r<n>`.
+original full structuredOutput, not previews. Execute v10 saves only the
+validated `pitako-execute` cursor (16384 UTF-8 bytes including its key and
+pretty-printing). It holds no plan cache, result bodies or closed-loop history.
+The cwd-local `.pi/pitako/pitako.db` holds the admission, checkpoint intents,
+receipts and hash-chained ledger. The execute contract version (v10) has no
+migration of legacy state.
+The deterministic child commits before the cursor save and returns the
+in-memory projection; receipt lines are limited to 61440 bytes. On relaunch,
+verify the chain, resume the recorded action and observe existing producers
+by run ID. A lost save reuses the original operation and committed result by
+key; bounded `.rN` recovery does not rerun settled effects or change dispatched
+params. Recovery that starts a new store epoch preserves the loop budget.
+Inspectors and the checkpoint capture tool read the store at `cursor.head`, not the tip.
+Checkpoint images remain files. For history use `pitako_store` or the
+[read-only SQLite examples](../../docs/engineering.md#cwd-local-workflow-store).
 
 Retain three-loop rings of rejection diagnostics, native closing references and
 bounded summaries. Reports, review/compliance and the director receive summaries
@@ -1019,8 +947,7 @@ plus `{ledgerPath, head}`. The publisher verifies through `ledger.mjs` and retur
 the last three loop summaries, instead of requiring a shell-less director to
 read the ledger itself. Further reads verify the chain against head; missing or
 altered records block. Inspectors remain limited to exact supplied references.
-`--unblock` looks in invocation resolutions, last closed disposition, then the
-open loop; older closed entries cannot resume or conflict. Repeated defects
+Repeated defects
 beyond three loops are not automatically detected. Reject duplicate completion
 at admission, not dependent dispatch. Loop-owned keys contain `.l<n>.`;
 pre-admission `inspect-initial` is the sole configured-host exemption.
@@ -1156,7 +1083,7 @@ Retain concurrent barriers. Native Stop, rejection, uncertain activity and
 essential-save failure need their supported native inspection/reconciliation
 route; correcting a source cannot override them. For terminal roots, inspect
 retained evidence and report only operations valid for that state, never resume
-advice or a generic `--unblock`. No `--force`, silent hash replacement, extra
+advice. No `--force`, silent hash replacement, extra
 arbitrary approvals or restart that erases consumed work is supported.
 
 The 256 KiB mission-state limit is global. Essential intention/evidence saves

@@ -1,7 +1,8 @@
-import { afterAll, describe, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { afterAll, afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { parseFrontmatter } from "@earendil-works/pi-coding-agent";
 const originalsRoot = mkdtempSync(join(tmpdir(), "pitako-review-originals-"));
 let originalNumber = 0;
 afterAll(() => rmSync(originalsRoot, { recursive: true, force: true }));
@@ -12,8 +13,20 @@ import { readReviewOriginal, reviewOriginals } from "../skills/execute/loop.ts";
 import { createHash } from "node:crypto";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { analysisResource } from "../extensions/plan-execute.ts";
+import { reviewSynthesisScript } from "../skills/review/synthesis.mjs";
+import { reviewCursorScript } from "../skills/review/cursor.mjs";
+import { observeReview, saveReview } from "../skills/review/store-io.mjs";
+import { PitakoStore, StoreError } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
-const source = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" + readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
+let git: ReturnType<typeof gitFakeFixture>;
+beforeEach(() => { git = gitFakeFixture(); });
+afterEach(() => git.dispose());
+
+const source = readFileSync(new URL("../skills/workflow-canonical.js", import.meta.url), "utf8") + "\n" +
+  reviewSynthesisScript + reviewCursorScript + readFileSync(new URL("../skills/review/workflow.js", import.meta.url), "utf8");
 interface Request {
   agent?: string; resume?: string; context?: string; skill?: string[];
   model?: string; async?: boolean; task: string; label: string; phase: string; output: string; outputMode: string; outputSchema: unknown;
@@ -82,17 +95,6 @@ function nativeOriginal(key: string, request: Request, result: Result): Result {
   return { ...result, structuredOutput: value,
     results: result.results ?? [{ savedOutputPath, outputReference: { path: savedOutputPath } } as any] };
 }
-// Named-resource binding for native-sandbox runs, and the real verifier at the launch boundary.
-function nativeAccess() {
-  const missionPath = join(originalsRoot, `native-mission-${++originalNumber}.json`);
-  writeFileSync(missionPath, "{}");
-  return { prefix: `const pitakoAccess = ${JSON.stringify({ missionPath, namespace: "review" })};\n` };
-}
-function verifierLaunch(key: string, request: any) {
-  if (request.agent !== "pitako.access-verifier") return undefined;
-  return { key, ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(verifyGate(JSON.parse(request.task))),
-    artifactPaths: [], results: [{ exitCode: 0 }] } as any;
-}
 function deferred<T>() {
   let resolve!: (value: T) => void;
   const promise = new Promise<T>(accept => { resolve = accept; });
@@ -101,22 +103,55 @@ function deferred<T>() {
 function fixture(
   respond: (key: string, request: Request) => Result | Promise<Result> = key => child(key),
   synchronousFailureKey?: string,
-  storage?: { other?: string; failAt?: number },
+  storage?: { other?: string; failAt?: number; runtimeCutAt?: number; cut?: "before" | "after"; reuseStore?: boolean; framedSave?: boolean },
 ) {
   const calls: { key: string; request: Request }[] = [];
   const persisted = new Map<string, any>();
   const recovered = new Map<string, Result>();
   const fingerprints = new Map<string, string>();
   let replaying = false;
+  let storeCut = storage?.cut;
   let saveCount = 0;
-  const missionFile = join(originalsRoot, `mission-${++originalNumber}.json`);
-  writeFileSync(missionFile, "{}");
+  const root = mkdtempSync(join(originalsRoot, "review-cwd-"));
+  git.set(root, ["rev-parse", "--git-path", "info/exclude"], {stdout: ".git/info/exclude\n", stderr: "", status: 0});
+  const missionFile = join(root, "mission.json");
+  let workflowRunId = "workflow";
+  let asyncDir = join(root, workflowRunId);
+  mkdirSync(asyncDir);
+  const mission = {id: "mission", cwd: root, runs: [{runId: workflowRunId, mode: "workflow", asyncDir}], workflowChildren: [] as any[]};
+  writeFileSync(missionFile, JSON.stringify(mission));
+  let emissions: unknown[] = [];
+  let reusedFrom: string | undefined;
+  const status = (stopCause?: string, state = stopCause ? "stopped" : "running") => writeFileSync(join(asyncDir, "status.json"), JSON.stringify({runId: workflowRunId,
+    state, mode: "workflow", cwd: root,
+    workflow: {resource: {name: "pitako.review", invocation: "named"}, emits: emissions, stopCause, reusedFrom,
+      // Named resources inline the args in the resolved script; the native status has no argsDigest.
+      scriptDigest: createHash("sha256").update(source).digest("hex")}}));
+  const emit = (value: unknown) => { emissions.push(value); status(); };
+  status();
+  const journal = () => join(asyncDir, "workflow-children.jsonl");
+  function witnessed(key: string, request: Request, result: Result): Result {
+    result = {key, ...result} as Result;
+    if (result.runId) {
+      const fingerprint = createHash("sha256").update(workflowRunParamsFingerprint({...request})).digest("hex");
+      mission.workflowChildren.push({workflowRunId, key, runId: result.runId,
+        status: result.ok ? "completed" : result.stopped ? "stopped" : "failed", agent: request.agent ?? "pitako.reviewer"});
+      writeFileSync(missionFile, JSON.stringify(mission));
+      appendFileSync(journal(), JSON.stringify({type: "start", key, fingerprint, runId: result.runId}) + "\n" +
+        JSON.stringify({type: "settle", key, fingerprint, result}) + "\n");
+    }
+    return result;
+  }
   const stateFile = join(missionFile.slice(0, -5), "state.json");
   mkdirSync(missionFile.slice(0, -5));
   writeFileSync(stateFile, JSON.stringify({ other: storage?.other ?? "" }));
-  const state = { get: async (key: string) => persisted.get(key), set: (key: string, value: any) => {
+  const state = { get: async (key: string) => persisted.has(key) ? persisted.get(key) : JSON.parse(readFileSync(stateFile, "utf8"))[key], set: (key: string, value: any) => {
     saveCount++;
     if (saveCount === storage?.failAt) throw new Error("Essential mission save denied after User Stop");
+    if (saveCount === storage?.runtimeCutAt) {
+      status("runtime-replaced");
+      throw new Error("Runtime replaced before the cursor save");
+    }
     const mission = JSON.parse(readFileSync(stateFile, "utf8"));
     mission[key] = value;
     const bytes = JSON.stringify(mission);
@@ -125,26 +160,81 @@ function fixture(
     persisted.set(key, JSON.parse(JSON.stringify(value)));
   } };
   const access = { missionPath: missionFile, namespace: "review" };
-  let beforeVerify: (() => void | Result) | undefined;
+  let beforeVerify: ((key: string, request: Request) => void | Result) | undefined;
   const verifications: { key: string; request: any; output: any }[] = [];
+  const writes: {key: string; task: string; outcome?: string}[] = [];
+  const observations: string[] = [];
+  const reusedChildren: string[] = [];
+  const storeReceipts = new Map<string, { task: string; result: Result }>();
+  let beforeStore: (() => void) | undefined;
   function dispatch(key: string, request: Request): Promise<Result> {
+    if (request.agent === "pitako.store-io") return Promise.resolve().then(async () => {
+      const input = JSON.parse(request.task);
+      if (input.op === "observe-review") {
+        observations.push(key);
+        const observer = {workflowRunId, key, agent: request.agent, status: "running"};
+        mission.workflowChildren.push(observer);
+        writeFileSync(missionFile, JSON.stringify(mission));
+        let output;
+        try { output = observeReview(input, root); }
+        catch (error) { output = {code: (error as {code?: string}).code ?? "review-integrity", error: String((error as Error).message)}; }
+        observer.status = "completed";
+        writeFileSync(missionFile, JSON.stringify(mission));
+        return {ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(output)};
+      }
+      const retained = storeReceipts.get(key);
+      if (storage?.reuseStore && replaying && retained?.task === request.task)
+        return {...retained.result, reused: true};
+      const call = {key, task: request.task, outcome: undefined as string | undefined};
+      writes.push(call);
+      if (storeCut === "before") { storeCut = undefined; throw new Error("Cut before SQLite"); }
+      beforeStore?.();
+      let output;
+      if (storage?.framedSave) {
+        const child = Bun.spawn([process.execPath, "--preload", gitFakeBootstrap,
+          new URL("../skills/review/store-io.mjs", import.meta.url).pathname], {
+          cwd: root, stdin: Buffer.from(`<System instructions>\nFixed standalone review I/O.\n\n<Task>\n${request.task}`),
+          stdout: "pipe", stderr: "pipe",
+        });
+        const [stdout, stderr] = await Promise.all([
+          new Response(child.stdout).text(), new Response(child.stderr).text(),
+        ]).finally(() => child.exited);
+        if (child.exitCode !== 0) throw new Error(`store-io CLI exited with code ${child.exitCode}:\n${stderr}`);
+        try { output = JSON.parse(stdout); }
+        catch (error) { throw new Error(`store-io CLI emitted invalid JSON: ${error}\n${stderr}`); }
+      } else {
+        try { output = await saveReview(input, root); }
+        catch (error) { output = {code: error instanceof StoreError ? error.code : "review-integrity", error: String((error as Error).message)}; }
+      }
+      call.outcome = output.outcome;
+      const result = {ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(output)};
+      storeReceipts.set(key, {task: request.task, result});
+      if (storeCut === "after") { storeCut = undefined; throw new Error("Cut after SQLite"); }
+      return result;
+    });
     // The real model-free verifier runs over the actual published temp files.
     if (request.agent === "pitako.access-verifier") return Promise.resolve().then(() => {
-      const failure = beforeVerify?.();
-      if (failure) return failure;
-      const output = verifyGate(JSON.parse(request.task));
+      if (replaying && recovered.has(key)) return {...recovered.get(key)!, reused: true};
+      const failure = beforeVerify?.(key, request);
+      if (failure) return witnessed(key, request, {...failure, runId: failure.runId ?? `native-${key}`});
+      const output = verifyGate(JSON.parse(request.task), root);
       verifications.push({ key, request: JSON.parse(request.task), output });
-      return { ok: true, agent: request.agent, runId: `native-${key}`, output: JSON.stringify(output), results: [{ exitCode: 0 } as any] };
+      const result = witnessed(key, request, {ok: true, agent: request.agent, runId: `native-${key}-${canonicalDigest(request.task).slice(0, 10)}`,
+        output: JSON.stringify(output), results: [{exitCode: 0} as any]});
+      if (JSON.parse(request.task).namespace.startsWith("review-")) recovered.set(key, result);
+      return result;
     });
     const fingerprint = workflowRunParamsFingerprint({ ...request });
-    if (replaying && recovered.has(key) && fingerprints.get(key) === fingerprint)
+    if (replaying && recovered.get(key)?.ok && fingerprints.get(key) === fingerprint) {
+      reusedChildren.push(key);
       return Promise.resolve({ ...recovered.get(key)!, reused: true });
+    }
     expect(calls.some(call => call.key === key)).toBe(false);
     calls.push({ key, request });
     fingerprints.set(key, fingerprint);
     if (key === synchronousFailureKey) throw new Error("Synchronous dispatch rejection");
     return Promise.resolve().then(() => respond(key, request)).then(result => {
-      const published = nativeOriginal(key, request, result);
+      const published = witnessed(key, request, nativeOriginal(key, request, result));
       recovered.set(key, published);
       return published;
     });
@@ -164,141 +254,99 @@ function fixture(
   };
   const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor as new (
     ...parameters: string[]
-  ) => (input: unknown, runner: typeof runs, state: unknown) => Promise<Outcome>;
+  ) => (input: unknown, runner: typeof runs, state: unknown, emit: (value: unknown) => void) => Promise<Outcome>;
   // Named-resource resolution inlines pitakoAccess; the raw source alone refuses to run.
   const bound = `const pitakoAccess = ${JSON.stringify(access)};\n`;
   return {
+    root, get journal() { return journal(); }, writes, observations, reusedChildren, state, dispatch, bound, emit,
+    set beforeStore(value: (() => void) | undefined) { beforeStore = value; },
     get beforeVerify() { return beforeVerify; },
-    set beforeVerify(value: (() => void | Result) | undefined) { beforeVerify = value; },
+    set beforeVerify(value: typeof beforeVerify) { beforeVerify = value; },
     calls, persisted, missionFile, stateFile, verifications, recovered, saves: () => saveCount,
-    reconcile: () => { replaying = true; },
-    execute: (input: unknown = args) => new AsyncFunction("args", "runs", "state", bound + source)(input, runs, state),
-    resolved: (script: string) => new AsyncFunction("unused", "runs", "state", script)(undefined, runs, state),
-    raw: (input: unknown = args) => new AsyncFunction("args", "runs", "state", source)(input, runs, state),
+    archived(scope = persisted.get("pitako-review")?.scopeId): any {
+      return new PitakoStore(root).readRecords(`review:${scope}`).records[0]?.body;
+    },
+    reconcile: (newRoot = false) => {
+      replaying = newRoot ? saveCount === storage?.runtimeCutAt : saveCount !== storage?.failAt;
+      if (!newRoot) return;
+      if (!replaying) status(undefined, "complete"); // A caught save denial is not an interrupted native root.
+      reusedFrom = replaying ? workflowRunId : undefined;
+      workflowRunId = "resumed-workflow";
+      asyncDir = join(root, workflowRunId);
+      mkdirSync(asyncDir);
+      emissions = [];
+      mission.runs.push({runId: workflowRunId, mode: "workflow", asyncDir});
+      writeFileSync(missionFile, JSON.stringify(mission));
+      status();
+    },
+    nextRoot: () => { replaying = false; calls.length = 0; storeReceipts.clear(); },
+    execute: (input: unknown = args) => new AsyncFunction("args", "runs", "state", "emit", bound + source)(input, runs, state, emit),
+    resolved: (script: string) => new AsyncFunction("unused", "runs", "state", "emit", script)(undefined, runs, state, emit),
+    raw: (input: unknown = args) => new AsyncFunction("args", "runs", "state", "emit", source)(input, runs, state, emit),
     library: <T = Outcome>(input: unknown = args, options: object = {}, tail?: string) =>
-      new AsyncFunction("args", "runs", "state", `${bound}const pitakoReviewLibraryMode = true;\n${source}\n${
-        tail ?? `return reviewPhase(args, runs, ${JSON.stringify(options)});`
-      }`)(input, runs, state) as Promise<T>,
+      new AsyncFunction("args", "runs", "state", "emit", `${bound}const pitakoReviewLibraryMode = true;\n${source}\n${
+        tail ?? `const options = ${JSON.stringify(options)};
+          if (options.mode === "execute") {
+            options.decisionReference ??= { stateKey: "root", loop: 1 };
+            const root = await state.get(options.decisionReference.stateKey) ?? { loop: { number: options.decisionReference.loop } };
+            options.enclosingLoop = root.loop;
+            options.persist = () => state.set(options.decisionReference.stateKey, root);
+          }
+          return reviewPhase(args, runs, options);`
+      }`)(input, runs, state, emit) as Promise<T>,
   };
 }
 
 describe("review scripted workflow", () => {
-  test("same-args standalone relaunch starts a new pass after host abort leaves no terminalOutcome", async () => {
-    const stateFile = join(originalsRoot, `host-abort-state-${++originalNumber}.json`);
-    writeFileSync(stateFile, "{}");
-    const state = {
-      get: (key: string) => JSON.parse(readFileSync(stateFile, "utf8"))[key],
-      set: (key: string, value: unknown) => {
-        const retained = JSON.parse(readFileSync(stateFile, "utf8"));
-        retained[key] = value;
-        writeFileSync(stateFile, JSON.stringify(retained));
-      },
-    };
-    const script = nativeAccess().prefix + source;
+  test("a native host cut before the first settlement leaves a bounded cursor and resumes to a framed CLI save", async () => {
+    const host = fixture(undefined, undefined, {framedSave: true});
+    const script = host.bound + source;
     const controller = new AbortController();
     const interruptedCalls: string[] = [];
     await expect(runWorkflowScript({
-      script, args, state, signal: controller.signal,
+      script, args, state: host.state, signal: controller.signal, onEmit: values => host.emit(values.at(-1)),
       launch: async key => {
         interruptedCalls.push(key);
         controller.abort(new Error("Host user Stop"));
-        return { key, ok: false, error: "Host user Stop", artifactPaths: [] } as any;
+        return {key, ok: false, error: "Host user Stop", artifactPaths: []} as any;
       },
       status: async () => { throw new Error("Unexpected status query"); },
     })).rejects.toThrow("Host user Stop");
     expect(interruptedCalls).toEqual(["director-prepare"]);
-    const retained = state.get("review-standalone");
-    expect(retained).toBeDefined();
-    expect(retained.terminalOutcome).toBeUndefined();
-    expect(retained.originals).toEqual([]);
-
-    const calls: string[] = [];
+    expect(await host.state.get("pitako-review")).toMatchObject({terminal: null, slots: []});
+    expect(host.writes).toEqual([]);
     const relaunched = await runWorkflowScript({
-      script, args, state,
-      launch: async (key, request) => {
-        const verified = verifierLaunch(key, request);
-        if (verified) return verified;
-        calls.push(key);
-        return { key, ...nativeOriginal(key, request as unknown as Request, child(key)),
-          output: "", artifactPaths: [] } as any;
-      },
+      script, args, state: host.state, onEmit: values => host.emit(values.at(-1)),
+      launch: async (key, request) => ({key, output: "",
+        ...await host.dispatch(key, request as unknown as Request)}) as any,
       status: async () => { throw new Error("Unexpected status query"); },
     });
-    expect(relaunched.value).toMatchObject({ status: "completed", phase: "synthesis" });
-    expect(calls).toEqual(reviewKeys);
-    expect((relaunched.value as Outcome).references.every(ref => !ref.reused)).toBe(true);
-    expect(state.get("review-standalone").terminalOutcome).toBe("completed");
-  });
-
-  test("same-args standalone relaunch blocks after host abort leaves a saved prepare original", async () => {
-    const stateFile = join(originalsRoot, `host-abort-state-${++originalNumber}.json`);
-    writeFileSync(stateFile, "{}");
-    const state = {
-      get: (key: string) => JSON.parse(readFileSync(stateFile, "utf8"))[key],
-      set: (key: string, value: unknown) => {
-        const retained = JSON.parse(readFileSync(stateFile, "utf8"));
-        retained[key] = value;
-        writeFileSync(stateFile, JSON.stringify(retained));
-      },
-    };
-    const script = nativeAccess().prefix + source;
-    const controller = new AbortController();
-    const interruptedCalls: string[] = [];
-    await expect(runWorkflowScript({
-      script, args, state, signal: controller.signal,
-      launch: async (key, request) => {
-        interruptedCalls.push(key);
-        if (key.startsWith("independent-")) {
-          controller.abort(new Error("Host user Stop"));
-          return { key, ok: false, error: "Host user Stop", artifactPaths: [] } as any;
-        }
-        return { key, ...nativeOriginal(key, request as unknown as Request, child(key)),
-          output: "", artifactPaths: [] } as any;
-      },
-      status: async () => { throw new Error("Unexpected status query"); },
-    })).rejects.toThrow("Host user Stop");
-    expect(interruptedCalls[0]).toBe("director-prepare");
-    expect(interruptedCalls[1]).toBe("independent-evidence-contract-r1");
-    const retained = state.get("review-standalone");
-    expect(retained.terminalOutcome).toBeUndefined();
-    expect(retained.originals).toHaveLength(1);
-    expect(retained.originals[0]).toMatchObject({ key: "director-prepare", runId: "native-director-prepare" });
-
-    const calls: string[] = [];
-    const relaunched = await runWorkflowScript({
-      script, args, state,
-      launch: async (key, request) => {
-        calls.push(key);
-        return { key, ...nativeOriginal(key, request as unknown as Request,
-          { ...child(key), runId: `relaunched-${key}` }), output: "", artifactPaths: [] } as any;
-      },
-      status: async () => { throw new Error("Unexpected status query"); },
-    });
-    expect(calls).toEqual(["director-prepare"]);
-    expect(relaunched.value).toMatchObject({
-      status: "blocked",
-      error: "Review original integrity conflict: producer or canonical digest changed during execute reconciliation.",
-    });
-    expect(state.get("review-standalone").terminalOutcome).toBe("blocked");
+    expect(relaunched.value, (relaunched.value as Outcome).error).toMatchObject({status: "completed", phase: "synthesis"});
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    expect(host.writes.map(call => call.outcome)).toEqual(["appended"]);
+    expect(relaunched.value).toEqual(host.archived().result);
+    expect((await host.state.get("pitako-review")).terminal.outcome).toBe("completed");
   });
 
   test("standalone native replay freezes models and synthesis params after save interruption", async () => {
-    const root = mkdtempSync(join(originalsRoot, "settings-"));
+    const host = fixture(undefined, undefined, {cut: "before"});
+    const root = host.root;
     const agentDir = join(root, "agent");
     mkdirSync(agentDir);
     mkdirSync(join(root, ".pi"));
     const file = join(root, ".pi/settings.json");
     const configured = { r1: "custom/first:high", r2: "other/second:xhigh", synthesis: "custom/director:low" };
     writeFileSync(file, JSON.stringify({ pitako: { review: configured } }));
-    const host = fixture(undefined, undefined, { failAt: 5 });
-    const resolve = () => analysisResource("pitako.review", root, agentDir).resolve({
-      ...args, missionId: host.missionFile.split("/").pop()!.slice(0, -5), missionPath: host.missionFile,
+    const resolve = (input = args) => analysisResource("pitako.review", root, agentDir).resolve({
+      ...input, missionId: "mission", missionPath: host.missionFile,
     }).script;
     const script = resolve();
+    expect(resolve({target: args.target, brief: args.brief, workDescription: args.workDescription})).toBe(script);
     const first = await host.resolved(script);
     expect(first.status).toBe("failed");
     expect(host.recovered.has("director-synthesis")).toBe(true);
     writeFileSync(file, JSON.stringify({ pitako: { review: { r1: "changed/model", r2: "changed/model", synthesis: "changed/model" } } }));
+    expect(resolve({...args, brief: "A different identity"})).toContain('"model":"changed/model"');
     for (const { key, request } of host.calls)
       expect(request.model).toBe(key.startsWith("independent-") ? configured[key.endsWith("-r1") ? "r1" : "r2"] : configured.synthesis);
     host.reconcile();
@@ -307,12 +355,179 @@ describe("review scripted workflow", () => {
     expect(createHash("sha256").update(replayScript).digest("hex"))
       .toBe(createHash("sha256").update(script).digest("hex"));
     const replay = await host.resolved(replayScript);
+    expect(replay).toEqual(host.archived().result);
     expect(replay.status).toBe("completed");
-    expect(replay.references.every(ref => ref.reused)).toBe(true);
     for (const ref of replay.references)
       expect(ref.model).toBe(ref.key.startsWith("independent-") ? configured[ref.key.endsWith("-r1") ? "r1" : "r2"] : configured.synthesis);
     expect(host.calls).toHaveLength(6);
-    expect(host.persisted.get("review-standalone").models.r1.model).toBe(configured.r1);
+    expect(host.persisted.get("pitako-review").models.r1.model).toBe(configured.r1);
+    expect(host.writes.map(call => call.key)).toEqual(["store-review", "store-review"]);
+    expect(host.writes[1]!.task).toBe(host.writes[0]!.task);
+    expect(host.writes[1]!.outcome).toBe("appended");
+    expect(resolve()).toContain('"model":"changed/model"'); // A terminal cursor does not freeze settings.
+  });
+
+  test.each(["before-intent", "before-write", "after-commit", "tampered"] as const)(
+    "a failed unpublished original is never redispatched across %s", async seam => {
+      const host = fixture(key => key === "independent-a-r1" ? {
+        ...child(key, {coverage: "Complete unpublished analysis with a native save failure."}),
+        ok: false, results: [], error: "Mandatory publication failed",
+      } : child(key), undefined, {
+        ...(seam === "before-intent" ? {failAt: 4} : {cut: seam === "after-commit" ? "after" : "before"}),
+      });
+      expect((await host.execute()).status).toBe("failed");
+      const pending = host.persisted.get("pitako-review");
+      expect(pending.phase).toBe(seam === "before-intent" ? "independent" : "save");
+      expect(pending.terminal).toBeNull();
+      expect(pending.slots[3]).toMatchObject({failed: true, runId: "native-independent-a-r1"});
+      if (seam === "tampered") {
+        const entries = readFileSync(host.journal, "utf8");
+        writeFileSync(host.journal, entries.replace("Complete unpublished analysis", "Modified unpublished analysis"));
+      }
+      host.reconcile();
+      const resumed = await host.execute();
+      expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
+      expect(host.verifications).toHaveLength(0);
+      expect(host.writes.map(call => call.key)).toEqual(Array(seam === "before-intent" ? 1 : 2).fill("store-review"));
+      if (host.writes.length === 2) expect(host.writes[1]!.task).toBe(host.writes[0]!.task);
+      if (seam === "tampered") {
+        expect(resumed.error).toContain("Standalone review integrity failure");
+        expect(host.writes.at(-1)!.outcome).toBeUndefined();
+        expect(host.persisted.get("pitako-review")).toEqual(pending);
+      } else {
+        expect(resumed.status).toBe("blocked");
+        expect(host.writes.at(-1)!.outcome).toBe(seam === "after-commit" ? "replay" : "appended");
+        expect(host.archived().originals[3].failedOriginal.coverage).toBe("Complete unpublished analysis with a native save failure.");
+        expect(new PitakoStore(host.root).readRecords(`review:${pending.scopeId}`).records).toHaveLength(1);
+      }
+    },
+  );
+
+  test("a superseded save writes nothing; a foreign terminal cursor is refused read-only on resolve", async () => {
+    let second = false;
+    const host = fixture(key => ({...child(key), runId: `native-${key}${second ? "-second" : ""}`}));
+    expect(await host.execute()).toEqual(host.archived().result);
+    const old = host.persisted.get("pitako-review");
+    const oldRequest = JSON.parse(host.writes[0]!.task);
+    second = true;
+    host.calls.length = 0; // Simulate a distinct native root with its own key space.
+    const newInput = {...args, brief: "A new admitted standalone review"};
+    expect((await host.execute(newInput)).status).toBe("completed");
+    const active = new PitakoStore(host.root).readActiveReview()!;
+    expect(active.scope).not.toBe(`review:${old.scopeId}`);
+    await expect(saveReview(oldRequest, host.root)).rejects.toMatchObject({code: "superseded"});
+    host.state.set("pitako-review", old);
+    const clobbered = readFileSync(host.stateFile, "utf8");
+    const resolve = () => analysisResource("pitako.review", originalsRoot, host.root).resolve({
+      ...newInput, missionId: "mission", missionPath: host.missionFile,
+    });
+    expect(resolve).toThrow(/Standalone review integrity failure: .* differs from the active fence/);
+    expect(host.calls).toHaveLength(6); // No additional model dispatch on refusal.
+    expect(host.writes).toHaveLength(2);
+    expect(new PitakoStore(host.root).readActiveReview()).toEqual(active);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(clobbered);
+  });
+
+  test("a stale uncommitted cursor cannot reclaim the SQLite fence from its successor", async () => {
+    let second = false;
+    const host = fixture(key => ({...child(key), runId: `native-${key}${second ? "-second" : ""}`}), undefined, {cut: "before"});
+    expect((await host.execute()).status).toBe("failed");
+    const pending = host.persisted.get("pitako-review");
+    const oldRequest = JSON.parse(host.writes[0]!.task);
+    second = true;
+    host.calls.length = 0;
+    expect((await host.execute({...args, brief: "A different input takes ownership"})).status).toBe("completed");
+    const active = new PitakoStore(host.root).readActiveReview()!;
+    host.state.set("pitako-review", pending); // Stale root's cached cursor reaches disk.
+    await expect(saveReview(oldRequest, host.root)).rejects.toMatchObject({code: "superseded"});
+    const store = new PitakoStore(host.root);
+    expect(store.readActiveReview()).toEqual(active);
+    expect(store.readRecords(`review:${pending.scopeId}`).records).toHaveLength(0);
+    expect(host.persisted.get("pitako-review")).toEqual(pending);
+  });
+
+  test.each(["replaced", "tampered original after loss", "missing from same store", "corrupt in same store"])(
+    "pending save verifies receipt evidence when %s", async mode => {
+    let second = false;
+    const host = fixture(key => ({...child(key), runId: `native-${key}${second ? "-second" : ""}`}),
+      undefined, {cut: "after", reuseStore: true, failAt: 7});
+    let beforeVerifier: string;
+    host.beforeVerify = () => { beforeVerifier = readFileSync(host.stateFile, "utf8"); };
+    expect((await host.execute()).status).toBe("failed");
+    const stored = new PitakoStore(host.root).readActiveReview()!;
+    host.reconcile();
+    expect(await host.execute()).toMatchObject({status: "failed", error: "Essential mission save denied after User Stop"});
+    expect(host.writes.map(call => [call.key, call.outcome])).toEqual([
+      ["store-review", "appended"], ["store-review.r1", "replay"],
+    ]);
+    const receipt = host.verifications[0]!.output.receipt!.store!;
+    const quarantines = () => readdirSync(join(host.root, ".pi", "pitako")).filter(name => /^pitako\.db\.v[^-]+$/.test(name));
+    const damaged = mode === "missing from same store" || mode === "corrupt in same store";
+    if (damaged) {
+      const db = openSqliteSync(new PitakoStore(host.root).file);
+      try {
+        db.prepare(mode === "missing from same store" ? "DELETE FROM records WHERE scope=? AND seq=?"
+          : "UPDATE records SET body='null' WHERE scope=? AND seq=?").run(receipt.scope, receipt.seq);
+      }
+      finally { db.close(); }
+    } else {
+      rmSync(join(host.root, ".pi", "pitako"), {recursive: true});
+      new PitakoStore(host.root).activate("arch:replacement");
+      if (mode === "tampered original after loss")
+        writeFileSync(host.verifications[0]!.request.items[0].path, "{}");
+    }
+    if (mode === "tampered original after loss") {
+      await expect(saveReview(JSON.parse(host.writes[0]!.task), host.root)).rejects.toThrow(/access receipt differs/i);
+      expect(host.verifications).toHaveLength(1);
+      expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+      expect(new PitakoStore(host.root).readRecords(receipt.scope).records).toHaveLength(0);
+      return;
+    }
+    const pendingSave = readFileSync(host.stateFile, "utf8");
+    const store = new PitakoStore(host.root), beforeObservation = store.readIdentity();
+    try {
+      // Observe the same native verifier settlement from just before its cursor save.
+      writeFileSync(host.stateFile, beforeVerifier!);
+      const observed = observeReview({op: "observe-review", missionPath: host.missionFile,
+        cursor: JSON.parse(beforeVerifier!)["pitako-review"]}, host.root);
+      expect(observed.settlements).toContainEqual(expect.objectContaining({key: "verify-synthesis",
+        result: expect.objectContaining({output: JSON.stringify(host.verifications[0]!.output)})}));
+      expect(quarantines()).toEqual([]);
+      expect(store.readIdentity()).toEqual(beforeObservation);
+    } finally {
+      writeFileSync(host.stateFile, pendingSave);
+    }
+    expect((await host.execute()).status).toBe("completed");
+    const replaced = new PitakoStore(host.root).readActiveReview()!;
+    expect(replaced.scope).toBe(stored.scope);
+    expect(replaced.identity.storeId).not.toBe(stored.identity.storeId);
+    expect(replaced.head).toEqual(stored.head);
+    expect(quarantines()).toHaveLength(damaged ? 1 : 0);
+    expect(new PitakoStore(host.root).readRecords(receipt.scope).records).toHaveLength(0);
+    expect(host.writes[2]).toEqual({key: "store-review.r2", task: host.writes[0]!.task, outcome: "appended"});
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    expect(host.verifications).toHaveLength(1);
+    if (damaged) return;
+    await expect(saveReview(JSON.parse(host.writes[0]!.task), originalsRoot)).rejects.toMatchObject({code: "wrong-cwd"});
+    const database = join(host.root, ".pi", "pitako");
+    rmSync(database, {recursive: true});
+    const newInput = {...args, brief: "A new review after store loss"};
+    const resolve = () => analysisResource("pitako.review", originalsRoot, host.root).resolve({
+      ...newInput, missionId: "mission", missionPath: host.missionFile,
+    }).script;
+    const oldCursor = readFileSync(host.stateFile, "utf8");
+    const script = resolve();
+    expect(() => new PitakoStore(host.root).readActiveReview()).toThrow("Store does not exist");
+    new PitakoStore(host.root).activate("arch:independent");
+    expect(resolve()).toBe(script);
+    expect(readFileSync(host.stateFile, "utf8")).toBe(oldCursor);
+    second = true;
+    host.nextRoot();
+    expect((await host.resolved(script)).status).toBe("completed");
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    expect(host.observations).toEqual([]);
+    expect(host.writes.at(-1)).toMatchObject({key: "store-review", outcome: "appended"});
+    expect(new PitakoStore(host.root).readActiveReview()?.scope).not.toBe(stored.scope);
   });
 
   test("the unchanged library source is inert until called and validates standalone input inside the function", async () => {
@@ -383,7 +598,9 @@ describe("review scripted workflow", () => {
       expect(result.screening).toEqual(screening);
       // Synthesis resumes preparation; all independent reviewers are fresh.
       expect(host.calls.some(call => call.request.resume)).toBe(true);
+      const declared = parseFrontmatter(readFileSync(new URL("../agents/reviewer.md", import.meta.url), "utf8")).frontmatter.skills;
       for (const { request } of host.calls) {
+        expect(request.skill).toEqual(expect.arrayContaining(declared as string[]));
         expect(request.skill).toContain("scope-discipline");
         expect(request.task).toContain("Read and apply scope-discipline");
         expect(request.task).toContain("Trace inherited demands");
@@ -480,15 +697,14 @@ describe("review scripted workflow", () => {
   test.each(["diff", "solution", "codebase", "issue", "plan"])("native sandbox mirrors fixed and risk angles for %s", async kind => {
     for (const library of [false, true]) {
       const calls: string[] = [], fixed = kind === "plan" ? "decision-fidelity" : "evidence-contract";
+      const host = fixture();
       const result = await runWorkflowScript({
-        script: library ? `${nativeAccess().prefix}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : nativeAccess().prefix + source,
+        script: library ? `${host.bound}const pitakoReviewLibraryMode = true;\n${source}\nreturn reviewPhase(args, runs);` : host.bound + source,
         args: { ...args, target: { ...args.target, kind } },
-        state: { get: () => undefined, set: () => {} },
+        state: host.state,
         launch: async (key, request) => {
-          const verified = verifierLaunch(key, request);
-          if (verified) return verified;
-          calls.push(key);
-          return { key, ...nativeOriginal(key, request as unknown as Request, child(key)), output: "", artifactPaths: [] } as any;
+          if (request.agent === "pitako.reviewer" || request.resume) calls.push(key);
+          return { key, output: "", ...await host.dispatch(key, request as unknown as Request) } as any;
         },
         status: async () => { throw new Error("Unexpected status query"); },
       });
@@ -563,9 +779,20 @@ describe("review scripted workflow", () => {
     expect(host.calls[0]!.request.skill).toEqual(["verify-behavior", "ponytail-review"]);
   });
 
-  test("synthesizes four independent originals directly using stable slot keys", async () => {
-    const host = fixture();
+  test("recovers a busy verifier across a cursor cut and synthesizes four independent originals using stable slot keys", async () => {
+    const host = fixture(undefined, undefined, {runtimeCutAt: 4});
+    const attempts: { key: string; task: string }[] = [];
+    host.beforeVerify = (key, request) => {
+      attempts.push({key, task: request.task});
+      if (attempts.length < 3) return {ok: true, output: JSON.stringify({v: 1, code: "store-busy"})};
+    };
+    expect((await host.execute()).error).toContain("Runtime replaced before the cursor save");
+    host.reconcile(true);
     const result = await host.execute();
+    expect(result.status, result.error).toBe("completed");
+    expect(host.observations).toEqual(["store-review.observe.r1"]);
+    expect(attempts.map(attempt => attempt.key)).toEqual(["verify-synthesis", "verify-synthesis.r1", "verify-synthesis.r2"]);
+    expect(new Set(attempts.map(attempt => attempt.task)).size).toBe(1);
     expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
     const synthesis = host.calls.at(-1)!.request;
     expect(synthesis.resume).toBe("native-director-prepare");
@@ -574,7 +801,7 @@ describe("review scripted workflow", () => {
     expect(result.dispositions).toEqual([disposition]);
     expect(JSON.stringify(result)).not.toContain("PRIVATE_FINDING");
     expect(result.references).toHaveLength(6);
-    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-synthesis"]);
+    expect(host.verifications.map(entry => entry.key)).toEqual(["verify-synthesis.r2"]);
     for (const ref of result.references)
       expect(ref.model).toBe(keyModel(ref.key.startsWith("independent-") ? "review-independent" : "", `${ref.key}.json`));
   });
@@ -727,7 +954,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       const retainedBytes = readFileSync(host.stateFile, "utf8");
       const relaunch = await host.execute();
       expect(relaunch.status).toBe("blocked");
-      expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+      expect(relaunch.error).toContain("already terminal");
       expect(host.calls).toHaveLength(calls);
       expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     },
@@ -779,7 +1006,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const retainedBytes = readFileSync(host.stateFile, "utf8");
     const relaunch = await host.execute();
     expect(relaunch.status).toBe("blocked");
-    expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(relaunch.error).toContain("already terminal");
     expect(host.calls).toHaveLength(calls);
     expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
   });
@@ -798,7 +1025,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const retainedBytes = readFileSync(host.stateFile, "utf8");
     const relaunch = await host.execute();
     expect(relaunch.status).toBe("blocked");
-    expect(relaunch.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(relaunch.error).toContain("already terminal");
     expect(host.calls).toHaveLength(1);
     expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
   });
@@ -952,7 +1179,8 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
           expect(exact.coverage).toContain("CONTRARY_NON_FINDING");
       }
     }
-    const manifest = host.persisted.get("review-standalone");
+    const manifest = host.archived();
+    const cursor = host.persisted.get("pitako-review");
     expect(manifest.originals.map((item: any) => item.runId)).toEqual(host.calls.map(call => `native-${call.key}`));
     expect(manifest.originals.find((item: any) => item.key === "independent-a-r2").runId).toBe("native-independent-a-r2");
     expect(manifest.originals.every((item: any) => item.publication === "published" && !item.failedOriginal)).toBe(true);
@@ -960,15 +1188,9 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const retainedBytes = readFileSync(host.stateFile, "utf8");
     const sameArgs = await host.execute();
     expect(sameArgs.status).toBe("blocked");
-    expect(sameArgs.error).toContain("retained standalone pass is not implicitly restarted or migrated");
+    expect(sameArgs.error).toContain("already terminal");
     expect(host.calls).toHaveLength(6);
-    expect(host.persisted.get("review-standalone")).toEqual(manifest);
-    expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
-    const replay = await host.execute({ ...args, brief: "A different review contract" });
-    expect(replay.status).toBe("blocked");
-    expect(replay.error).toContain("reconciliation");
-    expect(host.calls).toHaveLength(6);
-    expect(host.persisted.get("review-standalone")).toEqual(manifest);
+    expect(host.persisted.get("pitako-review")).toEqual(cursor);
     expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     const synthesis = host.calls.find(call => call.key === "director-synthesis")!.request;
     expect(synthesis.task).not.toContain("When rejecting a claim");
@@ -982,7 +1204,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     } : child(key));
     const result = await host.execute();
     expect(result.status).toBe(kind === "mandatory" ? "failed" : "completed");
-    const original = host.persisted.get("review-standalone").originals[0];
+    const original = host.archived().originals[0];
     expect(original.publication).toBe(kind === "mandatory" ? "unpublished" : "published");
     expect(original.sufficient).toBe(kind === "optional");
     if (kind === "mandatory") {
@@ -1000,7 +1222,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     });
     const result = await host.execute();
     expect(result.status).toBe("blocked");
-    const manifest = host.persisted.get("review-standalone");
+    const manifest = host.archived();
     const original = manifest.originals.find((item: any) => item.key === "independent-a-r1");
     expect(original).toMatchObject({ delivery: "complete", publication: "unpublished", sufficient: false, terminal: "failed" });
     expect(original.failedOriginal.status).toBe(status);
@@ -1017,12 +1239,12 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       if (delivery === "rejection") throw new Error("Rejected without object");
       if (delivery === "missing") return { ok: false, runId: "missing", error: "No original delivered" };
       if (delivery === "text") return { ok: false, runId: "text", output: JSON.stringify(child(key).structuredOutput), error: "Unproved text route" };
-      return { ...child(key, delivery === "unknown" ? { delivery: undefined }
+      return { ...child(key, delivery === "unknown" ? { delivery: "unknown" }
         : { association: { query: "wrong" } }), ok: false, results: [], error: "Save failed" };
     });
     const result = await host.execute();
     expect(result.status).toBe("blocked");
-    const originals = host.persisted.get("review-standalone").originals;
+    const originals = host.archived().originals;
     expect(originals.every((item: any) => !item.failedOriginal)).toBe(true);
     const original = originals.find((item: any) => item.key === "independent-a-r1");
     if (delivery !== "rejection") expect(original.delivery).toBe(["missing", "text"].includes(delivery) ? "not-delivered" : "unproved");
@@ -1046,7 +1268,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     }
     expect(packet(host.calls[0]!.request)).toEqual([]);
     expect(packet(host.calls[1]!.request)).toEqual([]);
-    expect(host.persisted.get("review-standalone").version).toBe(3);
+    expect(host.persisted.get("pitako-review").version).toBe(10);
   });
 
   test.each(["context", "inline"])("%s cannot replace native publication", async source => {
@@ -1054,24 +1276,26 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       ? { ...child(key, { coverage: `Complete ${source} analysis available` }), results: [] } : child(key));
     expect((await host.execute()).status).toBe("failed");
     expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
-    expect(host.persisted.get("review-standalone").originals[3]).toMatchObject({
+    expect(host.archived().originals[3]).toMatchObject({
       publication: "unpublished", sufficient: false, failedOriginal: { coverage: `Complete ${source} analysis available` },
     });
   });
 
-  test.each([undefined, 1, 2])("incompatible review state v%s blocks before dispatch", async version => {
+  test("an invalid review cursor blocks before dispatch", async () => {
     const host = fixture();
-    host.persisted.set("review-standalone", { version, originals: [] });
+    host.persisted.set("pitako-review", {version: 1, originals: []});
     const result = await host.execute();
     expect(result.status).toBe("failed");
-    expect(result.error).toContain(`created by an incompatible Pitako contract v${version ?? 1}; start a new consultation/mission`);
+    expect(result.error).toContain("Invalid standalone review cursor");
     expect(host.calls).toEqual([]);
     expect(host.saves()).toBe(0);
   });
 
   test("old integrated review state cannot be superseded or reconciled", async () => {
     const host = fixture();
-    host.persisted.set("review-root", { version: 1, decision: { reference: { stateKey: "root", loop: 1 } } });
+    host.persisted.set("root", { loop: { number: 2, integratedReview: {
+      version: 1, decision: { reference: { stateKey: "root", loop: 1 } },
+    } } });
     const result = await host.library(args, { prefix: "loop2.", mode: "execute",
       decisionReference: { stateKey: "root", loop: 2 } });
     expect(result.status).toBe("failed");
@@ -1091,6 +1315,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const result = await host.execute();
     expect(result.status).toBe("blocked");
     expect(result.error).toContain(fault === "missing" ? "missing-file" : "content-differs");
+    expect(result.error).not.toMatch(/new mission|new consultation|decide which version/i);
     expect(host.calls.some(call => call.key === "director-synthesis")).toBe(false);
   });
 
@@ -1105,26 +1330,24 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect((await host.execute()).status).toBe("completed");
     expect(host.verifications.map(entry => entry.key)).toEqual(["verify-synthesis"]);
     expect(host.verifications.every(entry => entry.output.items.every((item: any) => item.state === "accessible"))).toBe(true);
-    const receipts = host.persisted.get("review-standalone").receipts;
+    const receipts = host.archived().receipts;
     expect(receipts.map((entry: any) => Object.keys(entry).sort())).toEqual(Array(1).fill(["accessible", "digest", "gate"]));
     expect(receipts.every((entry: any) => entry.accessible)).toBe(true);
-    expect(host.verifications[0].output.receipt.path).toContain(join("receipts", "review", "synthesis.json"));
+    expect(host.verifications[0].output.receipt.store).toMatchObject({ scope: `access:review-${host.persisted.get("pitako-review").scopeId}`, seq: 1 });
     expect(receipts[0].digest).toBe(host.verifications[0].output.receipt.digest);
   });
 
-  test("whole-mission UTF-8 capacity includes unrelated keys and failed originals, without retrying save", async () => {
+  test("the UTF-8 failed original is archived without consuming mission state capacity", async () => {
     const host = fixture(key => key === "independent-a-r1" ? { ...child(key, {
       status: "blocked", reason: "Partial but complete original", coverage: "é".repeat(8000),
     }), ok: false, results: [], error: "Output save failed" } : child(key), undefined, { other: "é".repeat(122000) });
     const result = await host.execute() as Outcome & { persistence?: string; lastConfirmed?: any };
-    expect(result.status).toBe("failed");
-    expect(result.error).toContain("Whole mission exceeds 256 KiB");
-    expect(result.persistence).toBe("failed");
+    expect(result.status).toBe("blocked");
     expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
-    expect(host.saves()).toBe(3); // admission, preparation, failed batch save; no catch retry
     const persisted = JSON.parse(readFileSync(host.stateFile, "utf8"));
-    expect(persisted["review-standalone"].originals).toHaveLength(1);
-    expect(result.lastConfirmed.originals).toHaveLength(1);
+    expect(Object.keys(persisted).sort()).toEqual(["other", "pitako-review"]);
+    expect(persisted["pitako-review"].slots).toHaveLength(5);
+    expect(host.archived().originals[3].failedOriginal.coverage).toBe("é".repeat(8000));
   });
 
   test("essential save failure stops new dispatch and retains original Stop diagnostic and confirmed state", async () => {
@@ -1134,7 +1357,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(result.error).toContain("Essential mission save denied after User Stop");
     expect(host.calls).toHaveLength(1);
     expect(host.saves()).toBe(2);
-    expect(result.lastConfirmed.originals).toEqual([]);
+    expect(result.lastConfirmed.slots).toEqual([]);
   });
 
 
@@ -1147,7 +1370,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     });
     const work = host.execute();
     try { await bEntered.promise; } finally { a.resolve(child("independent-a-r1")); await work; }
-    expect(host.persisted.get("review-standalone").originals.slice(0, 5).map((item: any) => item.key))
+    expect(host.archived().originals.slice(0, 5).map((item: any) => item.key))
       .toEqual(reviewKeys.slice(0, 5));
   });
 
@@ -1155,7 +1378,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const host = fixture(key => child(key, key === "director-synthesis" ? { dispositions: [] } : {}));
     const result = await host.execute();
     expect(result.status).toBe("failed");
-    const original = host.persisted.get("review-standalone").originals.at(-1);
+    const original = host.archived().originals.at(-1);
     expect(original).toMatchObject({ publication: "published", delivery: "complete", sufficient: false });
     expect(original.diagnostic).toContain("finding dispositions");
     expect(original.failedOriginal).toBeUndefined();
@@ -1168,7 +1391,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     } : child(key));
     const result = await host.execute();
     expect(result.status).toBe("failed");
-    const original = host.persisted.get("review-standalone").originals[0];
+    const original = host.archived().originals[0];
     expect(original.sufficient).toBe(false);
     if (fault === "save-error") expect(original.publication).toBe("unpublished");
     if (fault === "nonterminal") expect(original.terminal).toBe("unconfirmed");
@@ -1186,7 +1409,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(result.status).toBe("failed");
       expect(result.error).toContain("identity conflicts");
       expect(host.calls).toHaveLength(1);
-      const original = host.persisted.get("review-standalone").originals[0];
+      const original = host.archived().originals[0];
       expect(original).toMatchObject({ delivery: "unproved", sufficient: false });
       expect(original.failedOriginal).toBeUndefined();
       expect(original.results[0][field]).toBe("different-producer");
@@ -1198,7 +1421,7 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     const result = await host.execute();
     expect(result.status).toBe("failed");
     expect(result.error).toContain("identity conflicts");
-    const original = host.persisted.get("review-standalone").originals[0];
+    const original = host.archived().originals[0];
     expect(original).toMatchObject({ delivery: "unproved", sufficient: false });
     expect(original.failedOriginal).toBeUndefined();
     expect(host.calls).toHaveLength(1);
@@ -1218,16 +1441,16 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       const result = await host.execute();
       expect(result.status).toBe("failed");
       expect(result.error).toContain("Native child control/terminal failure");
-      const original = host.persisted.get("review-standalone").originals[0];
+      const original = host.archived().originals[0];
       expect(original.sufficient).toBe(false);
       expect(original.terminal).not.toBe("succeeded");
       expect(original.failedOriginal).toBeUndefined();
       expect(host.calls).toHaveLength(1);
-      expect(host.persisted.get("review-standalone").terminalOutcome).toBe("failed");
+      expect(host.persisted.get("pitako-review").terminal.outcome).toBe("failed");
       const retainedBytes = readFileSync(host.stateFile, "utf8");
       const relaunched = await host.execute();
       expect(relaunched.status).toBe("blocked");
-      expect(relaunched.error).toContain("not implicitly restarted or migrated");
+      expect(relaunched.error).toContain("already terminal");
       expect(host.calls).toHaveLength(1);
       expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     }
@@ -1245,16 +1468,59 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       expect(result.status).toBe("blocked");
       expect(result).toMatchObject({ nativeBarrier: flag ?? "access verifier failed" });
       expect(result.error).toContain("Verifier process failed");
-      expect(host.persisted.get("review-standalone").terminalOutcome).toBe("blocked");
+      expect(host.persisted.get("pitako-review").terminal.outcome).toBe(result.status);
       const retainedBytes = readFileSync(host.stateFile, "utf8");
       const relaunched = await host.execute();
       expect(relaunched.status).toBe("blocked");
-      expect(relaunched.error).toContain("not implicitly restarted or migrated");
+      expect(relaunched.error).toContain("already terminal");
       expect(host.calls).toHaveLength(5);
       expect(verifierCalls).toBe(1);
       expect(readFileSync(host.stateFile, "utf8")).toBe(retainedBytes);
     },
   );
+
+  test.each(["store-busy", "store-corrupt"])("a standalone review resumes with a fresh verifier after %s", async code => {
+    const host = fixture();
+    const store = new PitakoStore(host.root);
+    if (code === "store-corrupt") {
+      store.activate("arch:existing");
+      const db = openSqliteSync(store.file);
+      try { db.exec("PRAGMA user_version=2"); }
+      finally { db.close(); }
+    }
+    const attempts: string[] = [];
+    const initial = code === "store-busy" ? ["verify-synthesis", "verify-synthesis.r1", "verify-synthesis.r2"] : ["verify-synthesis"];
+    host.beforeVerify = (key, request) => {
+      attempts.push(key);
+      if (code === "store-busy" && attempts.length <= initial.length) return {ok: true, output: JSON.stringify({v: 1, code})};
+      if (code === "store-corrupt" && attempts.length === 1) {
+        try { verifyGate(JSON.parse(request.task), host.root); }
+        catch (error) {
+          if (!(error instanceof StoreError)) throw error;
+          return {ok: true, output: JSON.stringify({v: 1, code: error.code, recovery: error.recovery})};
+        }
+        throw new Error("Expected the verifier to quarantine the version-mismatched store.");
+      }
+    };
+    const result = await host.execute();
+    expect(result).toMatchObject({status: "failed", code, error: code === "store-busy"
+      ? "Access verifier store-busy after three attempts at synthesis." : "Access verifier store-corrupt at synthesis."});
+    if (code === "store-corrupt")
+      expect(result).toMatchObject({recovery: {quarantine: expect.any(String)}});
+    expect(result).not.toHaveProperty("nativeBarrier");
+    expect(attempts).toEqual(initial);
+    expect(host.writes).toEqual([]);
+    expect(host.persisted.get("pitako-review").terminal).toBeNull();
+
+    host.reconcile(true);
+    const resumed = await host.execute();
+    expect(resumed.status, resumed.error).toBe("completed");
+    expect(attempts.slice(initial.length)).toEqual([`verify-synthesis.r${initial.length}`]);
+    expect(host.observations).toEqual(["store-review.observe.r1"]);
+    expect(host.calls.map(call => call.key)).toEqual(reviewKeys);
+    expect(host.writes.map(write => write.outcome)).toEqual(["appended"]);
+    expect(host.persisted.get("pitako-review").terminal.outcome).toBe("completed");
+  });
 
   test("every reviewer reserves blocked for missing context and reports severe findings as ready", async () => {
     const severe = { ...finding, title: "Defect prevents a clear whole-spec result", classification: "scoped-defect" };
@@ -1283,8 +1549,8 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
       terminalOutcome: { state: "partial", reason: "timeout" }, results: [],
     } : child(key));
     expect((await host.execute()).status).toBe("failed");
-    expect(host.persisted.get("review-standalone").originals[0]).toMatchObject({ terminal: "unconfirmed", delivery: "unproved", sufficient: false });
-    expect(host.persisted.get("review-standalone").originals[0].failedOriginal).toBeUndefined();
+    expect(host.archived().originals[0]).toMatchObject({ terminal: "unconfirmed", delivery: "unproved", sufficient: false });
+    expect(host.archived().originals[0].failedOriginal).toBeUndefined();
     expect(host.calls).toHaveLength(1);
   });
 
@@ -1301,15 +1567,15 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
   test.each(["running", "queued", "paused"])("unpublished nonterminal nested %s is not a failed original", async state => {
     const host = fixture(key => key === "director-prepare" ? { ...child(key), results: [{ state } as any] } : child(key));
     expect((await host.execute()).status).toBe("failed");
-    expect(host.persisted.get("review-standalone").originals[0]).toMatchObject({ terminal: "unconfirmed", delivery: "unproved", sufficient: false });
-    expect(host.persisted.get("review-standalone").originals[0].failedOriginal).toBeUndefined();
+    expect(host.archived().originals[0]).toMatchObject({ terminal: "unconfirmed", delivery: "unproved", sufficient: false });
+    expect(host.archived().originals[0].failedOriginal).toBeUndefined();
     expect(host.calls).toHaveLength(1);
   });
 
   test("missing native mission state blocks before any producer dispatch", async () => {
     const calls: string[] = [];
     const result = await runWorkflowScript({
-      script: nativeAccess().prefix + source, args,
+      script: fixture().bound + source, args,
       launch: async key => { calls.push(key); throw new Error("Must not launch"); },
       status: async () => { throw new Error("Must not query status"); },
     });
@@ -1318,15 +1584,92 @@ Prior report and correction delta: /owned/evidence/closure.txt. Retain unaffecte
     expect(calls).toEqual([]);
   });
 
-  test("a failed save reports both its original persistence cause and observed child Stop", async () => {
-    const host = fixture(key => key === "independent-a-r1"
-      ? { ok: false, runId: "stopped", stopped: true, error: "User Stop during reasoning" }
-      : child(key), undefined, { failAt: 3 });
+  test.each(["success", "large with reuse", "large without reuse", "failure", "stop", "tampered journal", "tampered reuse"] as const)(
+    "the journal-to-cursor cut recovers %s without redispatching settled keys", async seam => {
+    const nativeReuse = seam === "large with reuse" || seam === "tampered reuse";
+    const large = nativeReuse || seam === "large without reuse";
+    const completes = seam === "success" || seam === "large with reuse";
+    const host = fixture(key => large && key.startsWith("independent-")
+      ? child(key, {coverage: "x".repeat(20000)}) : key !== "independent-a-r1" ? child(key) : seam === "failure"
+      ? {...child(key, {coverage: "Exact unpublished failed report"}), ok: false, results: [], error: "Output save failed"}
+      : seam === "stop" ? {ok: false, runId: "stopped", stopped: true, error: "User Stop during reasoning"} : child(key),
+    undefined, nativeReuse ? {runtimeCutAt: 3} : {failAt: 3});
     const result = await host.execute();
-    expect(result.error).toContain("Essential mission save denied");
-    expect(result.references).toContainEqual(expect.objectContaining({ error: "User Stop during reasoning", stopped: true }));
+    expect(result.error).toContain(nativeReuse ? "Runtime replaced" : "Essential mission save denied");
+    if (seam === "stop")
+      expect(result.references).toContainEqual(expect.objectContaining({error: "User Stop during reasoning", stopped: true}));
     expect(host.calls).toHaveLength(5);
-    expect(host.saves()).toBe(3);
+    const savesAtCut = host.saves();
+    expect(savesAtCut).toBe(3);
+    expect(host.observations).toEqual([]);
+    expect(host.persisted.get("pitako-review").slots.map((ref: any) => ref.key)).toEqual(["director-prepare"]);
+    if (seam === "tampered journal") {
+      const witness = readFileSync(host.journal, "utf8");
+      writeFileSync(host.journal, witness.replace("Inspected changed API and callers", "Modified native result"));
+    }
+    if (seam === "tampered reuse") {
+      for (const [key, prior] of host.recovered)
+        if (key.startsWith("independent-"))
+          host.recovered.set(key, {...prior, structuredOutput: child(key, {coverage: "Changed reuse result"}).structuredOutput});
+    }
+    const savedAtCut = readFileSync(host.stateFile, "utf8");
+    host.reconcile(true);
+    const resumed = await host.execute();
+    expect(host.observations).toEqual(["store-review.observe.r1"]);
+    if (nativeReuse) {
+      expect(host.reusedChildren).toHaveLength(2);
+      expect(host.reusedChildren.every(key => key.startsWith("independent-"))).toBe(true);
+    } else expect(host.reusedChildren).toEqual([]);
+    if (completes || seam === "failure")
+      expect(resumed.status, resumed.error).toBe(completes ? "completed" : "blocked");
+    expect(host.calls.map(call => call.key)).toEqual(completes ? reviewKeys : reviewKeys.slice(0, 5));
+    if (completes || seam === "failure") {
+      expect(host.writes.map(call => [call.key, call.outcome])).toEqual([["store-review", "appended"]]);
+      if (seam === "failure") expect(host.archived().originals[3].failedOriginal.coverage).toBe("Exact unpublished failed report");
+    } else {
+      expect(host.writes).toEqual([]);
+      expect(host.verifications).toEqual([]);
+      if (seam !== "stop") expect(resumed.error).toContain("Standalone review integrity failure");
+      if (seam === "large without reuse") {
+        // The diagnostic counts the full native settlements, not shortened bodies or a page.
+        const { scopeId } = host.persisted.get("pitako-review");
+        const settlements = [...host.recovered].map(([key, result]) => ({ key, result, digest: canonicalDigest(result) }));
+        const fullBytes = Buffer.byteLength(JSON.stringify({ scopeId, settlements, pending: [] })) + 1;
+        expect(fullBytes).toBeGreaterThan(61440);
+        expect(resumed).toEqual({
+          status: "failed", phase: expect.any(String), references: [],
+          error: `Standalone review integrity failure: review-recovery-overflow: ${fullBytes} bytes for 5 settled slots (limit 61440).`,
+        });
+        const savesAtOverflow = host.saves();
+        expect(savesAtOverflow - savesAtCut).toBe(1);
+        const saved = readFileSync(host.stateFile, "utf8");
+        const expected = JSON.parse(savedAtCut);
+        expected["pitako-review"].terminal = resumed.error;
+        expect(JSON.parse(saved)).toEqual(expected);
+        expect(() => new PitakoStore(host.root).readActiveReview()).toThrow("Store does not exist");
+
+        host.persisted.clear(); // The named relaunch starts from the durable cursor.
+        const {script} = analysisResource("pitako.review", host.root, host.root).resolve({
+          ...args, missionId: "mission", missionPath: host.missionFile,
+        });
+        expect(await host.resolved(script)).toEqual(resumed);
+        expect(host.observations).toEqual(["store-review.observe.r1"]);
+        expect(host.calls.map(call => call.key)).toEqual(reviewKeys.slice(0, 5));
+        expect(host.reusedChildren).toEqual([]);
+        expect(host.verifications).toEqual([]);
+        expect(host.writes).toEqual([]);
+        expect(host.saves()).toBe(savesAtOverflow);
+        expect(readFileSync(host.stateFile, "utf8")).toBe(saved);
+      } else if (seam === "stop") {
+        expect(resumed).toMatchObject({nativeBarrier: "stopped", references: [{key: "independent-a-r1", runId: "stopped"}]});
+        expect(host.persisted.get("pitako-review").slots.at(-1)).toMatchObject({barrier: "stop"});
+        const saved = readFileSync(host.stateFile, "utf8");
+        expect(await host.execute()).toEqual(resumed);
+        expect(readFileSync(host.stateFile, "utf8")).toBe(saved);
+        expect(host.observations).toEqual(["store-review.observe.r1"]);
+        expect(host.calls).toHaveLength(5);
+      }
+    }
   });
 
 });
@@ -1344,7 +1687,7 @@ test.each(["intact", "missing", "changed"])("consumed review original is read by
   else expect(() => readReviewOriginal(ref)).toThrow(sha256);
 });
 
-test.each(["standalone", "execute"])("v3 %s state size is independent of report bodies", async mode => {
+test.each(["standalone", "execute"])("%s state size is independent of report bodies", async mode => {
   const sizes: number[] = [];
   for (const length of [40, 40000]) {
     const host = fixture(key => {
@@ -1362,8 +1705,9 @@ test.each(["standalone", "execute"])("v3 %s state size is independent of report 
     const options = mode === "execute" ? { mode, prefix: "loop1.", decisionReference: { stateKey: "root", loop: 1 } } : {};
     expect((await host.library(args, options)).status).toBe("completed");
     expect(host.calls).toHaveLength(6);
-    const retained = host.persisted.get(mode === "execute" ? "review-root" : "review-standalone");
-    expect(retained.version).toBe(3);
+    const retained = mode === "execute" ? host.persisted.get("root").loop.integratedReview : host.archived();
+    expect([...host.persisted.keys()]).toEqual([mode === "execute" ? "root" : "pitako-review"]);
+    expect(host.writes).toHaveLength(mode === "execute" ? 0 : 1);
     expect(retained.originals).toHaveLength(6);
     for (const original of retained.originals) {
       expect(original).not.toHaveProperty("value");
@@ -1391,7 +1735,7 @@ test.each(["digest", "producer", "missing", "intact"])("execute replay verifies 
     } : {}));
     const options = { mode: "execute", prefix: "loop1.", decisionReference: { stateKey: "root", loop: 1 } };
     expect((await host.library(args, options)).status).toBe("completed");
-    host.persisted.set("root", { loop: { number: 1, review: { references:
+    host.persisted.set("root", { loop: { ...host.persisted.get("root").loop, review: { references:
       [...host.recovered].map(([key, result]) => ({ key, runId: result.runId, results: result.results })),
     } } });
     const key = "loop1.independent-a-r1", original = host.recovered.get(key)!;
@@ -1401,7 +1745,7 @@ test.each(["digest", "producer", "missing", "intact"])("execute replay verifies 
     host.reconcile();
     const result = await host.library(args, options);
     expect(host.calls).toHaveLength(6); // Reconciliation never launches another reviewer.
-    if (mode === "intact") expect(result.status).toBe("completed");
+    if (mode === "intact") expect(result.status, result.error).toBe("completed");
     else {
       expect(result.status).toBe("blocked");
       expect(result.error).toContain(mode === "missing" ? "missing-file" : "integrity conflict");
@@ -1424,7 +1768,7 @@ test.each([40000, 80000])("unpublished failures retain at most one bounded inlin
   } : child(key));
   expect((await host.execute()).status).toBe("blocked");
   expect(host.calls).toHaveLength(5);
-  const retained = host.persisted.get("review-standalone").originals;
+  const retained = host.archived().originals;
   expect(retained.filter((item: any) => item.failedOriginal)).toHaveLength(length === 40000 ? 1 : 0);
   expect(Buffer.byteLength(JSON.stringify(retained))).toBeLessThan(64 * 1024);
   if (length === 80000) expect(retained[1].diagnostic).toContain("inline retention limit");

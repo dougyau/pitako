@@ -10,6 +10,7 @@ tools:
   - git_show
   - resource_snapshot
   - file_sha256
+  - pitako_store
   - codemode
   - read
   - grep
@@ -32,6 +33,7 @@ extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/pitako-store-tool.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/@nicknisi/pi-ast-grep/index.ts

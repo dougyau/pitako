@@ -3,6 +3,7 @@ import { existsSync } from "node:fs";
 import path from "node:path";
 import { executeControllerFixture, copy, type ControllerHost, type Result } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
+import { canonicalDigest } from "../extensions/canonical.mjs";
 
 const { fixture } = executeControllerFixture();
 const receipt = (key: string) => {
@@ -23,7 +24,7 @@ const checkpointIntent = (host: ControllerHost, key: string) => {
 // with results: [] and no structuredOutput (run-status.js, workflowChildResult).
 function relaunchStatus(host: ControllerHost) {
   host.setStatus(ref => {
-    if (host.current().budgetRejectedKeys?.includes(ref)) throw new Error("Rejected admission has no native child to observe.");
+    if (host.current().budget.rejectedKeys.includes(canonicalDigest(ref))) throw new Error("Rejected admission has no native child to observe.");
     const child = host.native.get(ref);
     return child ? { ok: child.ok, runId: child.runId, output: `Run: ${ref}\nState: complete`, results: [] } as Result
       : { ok: true, output: "", results: [] };
@@ -46,7 +47,9 @@ test("a complete worker result received before gate budget exhaustion is reviewe
   const first = await host.execute();
   expect(first.status, first.reason).toBe("budget-exhausted");
   expect(denied()).toBe(`${worker}.gate`);
-  expect(host.current().loop.attempt).toMatchObject({ key: worker, stage: "launched" });
+  expect(host.current().loop.attempt).toMatchObject({ number: 1, stage: "launched" });
+  expect(host.current().action).toMatchObject({ kind: "pending", op: "gate", opKey: `${worker}.gate` });
+  expect(host.current().inFlight).toContainEqual({ key: worker, role: "worker", runId: host.native.get(worker)?.runId });
   expect(checkpoint(host, worker, "manifest.json")).toBe(true);
   expect(checkpoint(host, worker, "unit.json")).toBe(false);
 
@@ -62,8 +65,7 @@ test("a complete worker result received before gate budget exhaustion is reviewe
   expect(checkpoint(host, worker, "restore.json")).toBe(false);
   expect(host.calls.filter(call => call.key === `${worker}.gate`)).toHaveLength(1);
   expect(host.records().find((record: any) => record.kind === "unit").body.result).toMatchObject({ attempt: 1, status: "complete" });
-  // The retained copy is admission input only; admission consumes it.
-  expect(JSON.stringify(host.current())).not.toContain('"received"');
+  expect(host.current().inFlight.some((ref: any) => ref.key === worker)).toBe(false);
 });
 
 test("a pause result received before budget exhaustion continues from its seal on relaunch, not a rollback", async () => {
@@ -84,25 +86,8 @@ test("a pause result received before budget exhaustion continues from its seal o
   expect(checkpoint(host, worker, "restore.json")).toBe(false);
   const next = checkpointIntent(host, "invoke-human-1.l1.t1.a2");
   expect(next).not.toHaveProperty("restore");
-  expect(host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!.task).toContain(`/native/output/${worker}.json`);
+  const previous = host.records().filter((record: any) => record.kind === "unit")[0].body.result;
+  expect(previous.ref).toMatchObject({ key: worker, runId: host.native.get(worker)?.runId });
+  expect(host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!.task).toContain(previous.ref.path);
   expect(host.records().filter((record: any) => record.kind === "unit").map((record: any) => record.body.result.status)).toEqual(["continue", "complete"]);
-});
-
-test("without a retained worker result, relaunch keeps the checkpoint-first fallback", async () => {
-  const host = fixture(undefined, { realCheckout: true, taskCount: 1 });
-  exhaustAfterWorker(host);
-  expect((await host.execute()).status).toBe("budget-exhausted");
-  // State written before retention existed has only the launch reference.
-  const retained = host.current();
-  delete retained.loop.attempt.received;
-  host.storage.set("invoke-human-1", retained);
-
-  // The controlled worker does not perform restoration; observe the dispatch only.
-  host.setRespond((request, normal) => request.agent === "pitako.worker" ? receipt(request.key) : normal());
-  relaunchStatus(host);
-  await host.execute();
-  const request = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a2")!;
-  const fallback = JSON.parse(request.task.split("CHECKPOINT FALLBACK (same pending task, not a metadata repair):\n")[1]!.split("\n")[0]!);
-  expect(fallback).toMatchObject({ producer: { key: worker } });
-  expect(checkpoint(host, worker, "unit.json")).toBe(false);
 });

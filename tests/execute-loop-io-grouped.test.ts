@@ -4,21 +4,46 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, 
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
-import { apply, prepare, readBacklog, topicOwner, type Task } from "../skills/execute/loop.ts";
+import { apply, prepare, readBacklog, readTaskGateWire, topicOwner, type Task } from "../skills/execute/loop.ts";
 import { openBoard } from "../extensions/board/store.ts";
 import { repositoryIdentity } from "../extensions/board/workspace.ts";
 import { canonicalDigest, canonicalJSON, sha256 } from "../extensions/canonical.mjs";
+import { appendExecuteTodoRecords } from "../extensions/execute-todo-projection.ts";
+import { PitakoStore } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { executionStatePath } from "../extensions/execute-state.ts";
+import { validateExecuteCursor } from "../extensions/execute-cursor.ts";
 import { applyCheckpoint, beginHookEffect, captureCheckpoint, checkpointDirectory, recordContextPeak, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
-import { realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
+import { childResponse, realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
 
 const entry = path.resolve("skills/execute/loop-io.mjs");
-const { verifyLedger } = await import(path.resolve("skills/execute/ledger.mjs"));
+const { verifyLedger, executeProjection } = await import(path.resolve("skills/execute/ledger.mjs"));
 const composition = realCheckoutCompositionFixture();
 const { roots } = composition;
 const runtime = nativeCheckpointFixture(composition);
 beforeAll(() => runtime.startNativeCheckpoint({ extension: false }));
 const invocation = "drain-fixture";
 const authority = { specDigest: "a".repeat(64), amendmentDigests: [] };
+const scope = `exec:${invocation}.e0`;
+function stored(root: string) {
+  const records = new PitakoStore(root).read(scope).records;
+  expect(JSON.stringify(records)).not.toContain('"P":');
+  return records;
+}
+function storedOperation(root: string, operation: string, key: string) {
+  const prefix = new PitakoStore(root).read(scope);
+  const row = prefix.records.find(row => row.opKey === `operation:${key}`)!;
+  return { operation, invocation, key: `${key}.r1`, storeId: prefix.identity.storeId, scope,
+    expectedHead: { seq: row.seq, hash: row.digest }, refs: { input: { seq: row.seq, digest: row.digest } } };
+}
+function corruptRecord(root: string, opKey: string) {
+  const db = openSqliteSync(path.join(root, ".pi/pitako/pitako.db"));
+  try {
+    expect(db.prepare("SELECT seq FROM records WHERE scope=? AND opKey=?").get(scope, opKey)).toBeDefined();
+    db.prepare("UPDATE records SET body='{}' WHERE scope=? AND opKey=?").run(scope, opKey);
+  } finally { db.close(); }
+}
+const markerKey = (key: string) => `loop-io:loop-io/steps/${sha256(key)}/000000.json`;
 
 async function fixture() {
   const root = mkdtempSync(path.join(tmpdir(), "pitako-drain-")); roots.push(root);
@@ -89,7 +114,10 @@ async function launchCase(f: Awaited<ReturnType<typeof fixture>>, request: any, 
 function receipt(output: string) {
   const reference = JSON.parse(output.trim());
   expect(Object.keys(reference).sort()).toEqual(expect.arrayContaining(["digest", "path"]));
-  const bytes = readFileSync(reference.path, "utf8");
+  const [root, relative] = reference.path.split("/.pi/subagents/execute/" + invocation + "/");
+  const row = stored(root).find(row => row.opKey === "loop-io:" + relative)!;
+  const bytes = canonicalJSON(row.body);
+  expect(existsSync(reference.path)).toBe(false);
   expect(sha256(bytes)).toBe(reference.digest);
   const value = JSON.parse(bytes);
   expect(canonicalDigest(value.result)).toBe(value.resultDigest);
@@ -103,7 +131,8 @@ async function finalState(f: Awaited<ReturnType<typeof fixture>>, output: string
     count: value.steps[2].result.count, head: value.steps[2].result.head,
   });
   expect(records.map((record: any) => record.kind)).toEqual(["spec", "unit", "loop"]);
-  expect(readdirSync(path.join(f.root, ".pi/subagents/execute", invocation)).filter(name => name.endsWith(".json"))).toHaveLength(3);
+  expect(stored(f.root).filter(row => row.kind === "ledger").flatMap(row => (row.body as any).entries)).toHaveLength(3);
+  expect(existsSync(path.join(f.root, ".pi/subagents/execute", invocation, "000000.json"))).toBe(false);
   const backlog = readBacklog(f.root, "example").backlog!;
   expect(backlog.tasks[0]!.status).toBe("obsolete");
   expect(backlog.tasks[0]!.history.filter(event => event.event === "cancel")).toHaveLength(1);
@@ -132,6 +161,14 @@ test("drains in persisted order and returns an immutable receipt by reference, i
     const empty = await launch(f, { ...f.request, key: "empty-finish", intentions: [] });
     expect(empty.exit, empty.stderr).toBe(0);
     expect(receipt(empty.stdout)).toEqual({ invocation, steps: [] });
+    const original = JSON.parse(stdout), later = JSON.parse(empty.stdout);
+    expect(later.head.seq).toBeGreaterThan(original.head.seq);
+    expect((await launch(f)).stdout).toBe(stdout);
+    const { head, P } = original;
+    const { executeProjection } = await import("../skills/execute/ledger.mjs");
+    expect(P).toEqual(new PitakoStore(f.root, executeProjection).read(scope, head).P);
+    expect(P.preview.loopSummaries).toHaveLength(1);
+    expect(P.preview.manifest.length).toBe(1);
   }).result;
   })();
   // Own the caller too: a runner timeout abandons its await of the lifecycle.
@@ -139,33 +176,62 @@ test("drains in persisted order and returns an immutable receipt by reference, i
   return work;
 });
 
-async function groupedFixture(operation: "advance" | "close") {
+async function groupedFixture(operation: "advance" | "close", workerStatus = "complete", initialRequest = true) {
   const f = await fixture();
   const intent: CheckpointIntent = { version: 2, association: { root: f.root,
     commonDir: path.join(f.root, ".git"), missionId: "mission", missionPath: path.join(f.root, "mission.json"),
     invocation, source: path.join(f.root, "spec.md"), digest: authority.specDigest, maxCycles: 15, sourceRefs: [] },
     key: "worker.a1", taskId: "one", attempt: 1, loop: 1, cursor: 0, phase: "implementation", planRef: {},
     progress: { consumedLoops: 1, admitted: {}, previous: null } };
+  const store = new PitakoStore(f.root), identity = store.activate(scope);
+  const saved = store.commit(scope, store.read(scope).head, "fixture:intent", canonicalDigest(intent),
+    () => ({ kind: "intent", body: intent }));
+  if (saved.outcome !== "appended" || !saved.head) throw new Error("Expected fixture intent append.");
+  const input = { seq: saved.head.seq, digest: saved.head.hash };
+  const cursor = {
+    version: 10, storeId: identity.storeId, root: f.root, invocation, epoch: 0,
+    associationDigest: canonicalDigest(intent.association), admissionBinding: "b".repeat(64), head: saved.head,
+    action: { kind: "launched", key: intent.key, runId: null, role: "worker", input, gateTimeoutMs: 1000 },
+    loop: { number: 1, phase: "implementation", cursor: 0, taskId: "one", outcome: null,
+      attempt: { number: 1, stage: "launched", intent: input, revival: null } },
+    inFlight: [], halt: null, hostHalt: null,
+    timeouts: { reviewerMs: 1000, workerMs: 1000, gateFloorMs: 0 },
+    models: { taskReviewer: "fixture/reviewer", taskSynthesis: "fixture/synthesis",
+      r1: "fixture/r1", r2: "fixture/r2", synthesis: "fixture/synthesis" },
+    budget: { consumedLoops: 1, maxCycles: 15, rejectedKeys: [], lastProgress: null },
+    backlogDigest: null, boardTopicId: 1, review: null,
+  };
+  validateExecuteCursor("pitako-execute", cursor);
+  const statePath = executionStatePath(intent.association);
+  mkdirSync(path.dirname(statePath), { recursive: true });
+  writeFileSync(statePath, JSON.stringify({ "pitako-execute": cursor }));
   captureCheckpoint(intent, ["product"]);
   recordContextPeak(intent, 12000);
   applyCheckpoint(intent, [{ path: "product", image: { bytes: Buffer.from("completed").toString("base64"), mode: 0o644 } }]);
+  const worker = childResponse(intent.key, { agent: "pitako.worker",
+    extensionBindings: { "pitako.checkpoint/1": intent } }, { root: f.root }, undefined, 1,
+    { work: "Settled attempt", status: workerStatus, remaining: [],
+      continuation: { mode: workerStatus === "continue" ? "resume" : "fresh", reason: "Same task" },
+      knowledge: { findings: ["Grouped finding"], handoff: "Grouped handoff" } });
   const request: any = { ...f.request, operation, key: operation, requests: { cursor: 0 } };
   request.prepare = { specId: "example", dbPath: f.dbPath, previousConfirmedUnit: null, loop: 1 };
   request.gate = { specId: "example", dbPath: f.dbPath, key: "worker.a1.gate", loop: 1, attempt: 1,
     task: { id: "one", gates: [{ id: "focused", command: "printf run >> .pi/gate-count", cwd: ".", timeoutMs: 1000 }],
       metric: null, progress: { nonImproving: 0, last5: [] } },
-    workerStatus: "complete", writerSettled: true, checkpoint: intent,
-    knowledge: { findings: ["Grouped finding"], handoff: "Grouped handoff" } };
+    workerStatus, writerSettled: true, checkpoint: intent, revival: { decision: "resume" },
+    worker: { key: intent.key, runId: worker.runId } };
   request.seal = { unit: { v: 1, intent }, pause: { v: 1, intent } };
   const directory = path.join(f.root, ".pi/subagents/execute", invocation);
   mkdirSync(directory, { recursive: true });
-  writeFileSync(path.join(directory, "requests.jsonl"), JSON.stringify({ v: 1, invocation,
-    requestId: "request-1", taskId: "one", kind: "cancel", origin: "main", at: 1 }) + "\n");
+  if (initialRequest) appendExecuteTodoRecords(f.root, invocation, "request", [{ v: 1, invocation,
+    requestId: "request-1", taskId: "one", kind: "cancel", origin: "main", at: 1 } as any]);
   return { ...f, request, intent };
 }
 
 async function groupedState(f: Awaited<ReturnType<typeof groupedFixture>>, output: string) {
   const result = receipt(output);
+  const { head, P } = JSON.parse(output);
+  expect(P).toEqual(new PitakoStore(f.root, executeProjection).read(scope, head).P);
   const projection = JSON.parse(output).projection;
   const nestedApply = projection.steps[0].result.projection.steps.find((step: any) => step.operation === "apply").result;
   for (const field of ["acceptance", "acceptanceHistory", "view"])
@@ -195,10 +261,23 @@ async function groupedState(f: Awaited<ReturnType<typeof groupedFixture>>, outpu
   expect(gate.receipt).toHaveProperty("view");
   expect(projection.view).toEqual(gate.receipt.view);
   expect(projection.steps[2].result.receipt).not.toHaveProperty("view");
+  const projectedGate = { ...projection.steps[2].result.receipt, view: projection.view };
+  expect(Buffer.byteLength(JSON.stringify(projectedGate) + "\n")).toBeLessThanOrEqual(8192);
+  const decoded = readTaskGateWire(projectedGate, f.request.gate.task.gates, projection.steps[2].result.workerOriginal);
+  expect(decoded.gates).toEqual(gate.receipt.gates.map((entry: Record<string, unknown>) => ({ ...entry, tail: "" })));
+  expect(decoded.progress).toEqual(gate.receipt.progress);
+  expect(decoded.workerOriginal).toEqual(gate.receipt.workerOriginal);
   expect(gate.receipt).not.toHaveProperty("contextPeak");
   expect(result.contextPeak).toBe(12000);
+  expect(JSON.parse(output).P.control.lastAttempt).toMatchObject({
+    taskId: "one", number: 1, checkpoint: { loop: 1 }, launch: f.request.gate.worker,
+    revival: { decision: "resume" }, result: { status: "complete" },
+    gate: { receipt: { contextPeak: 12000, after: gate.receipt.after,
+      progress: { nonImproving: gate.receipt.progress.nonImproving }, stalled: gate.receipt.stalled } },
+  });
   expect(seal).toMatchObject({ kind: "unit", workerStatus: "complete", mutated: false, receipt: { outcome: "sealed", kind: "unit" } });
-  expect(sha256(readFileSync(seal.gate.path))).toBe(seal.gate.digest);
+  expect(existsSync(seal.gate.path)).toBe(false);
+  expect(sha256(canonicalJSON(stored(f.root).find(row => row.opKey === markerKey("close.gate"))!.body))).toBe(seal.gate.digest);
   expect(readFileSync(path.join(f.root, ".pi/gate-count"), "utf8")).toBe("run");
   expect(readdirSync(checkpointDirectory(f.intent)).filter(name => ["unit.json", "pause.json"].includes(name))).toEqual(["unit.json"]);
   return { state, seal: { kind: seal.kind, outcome: seal.receipt.outcome }, content: readFileSync(path.join(f.root, "product"), "utf8") };
@@ -209,17 +288,22 @@ for (const operation of ["advance", "close"] as const) {
   for (const phase of ["afterEffect", "afterStep"]) for (const name of names) {
     test(`${operation} resumes ${phase} ${name} without duplicate effects`, async () => {
       const f = await groupedFixture(operation);
+      // IDs are bound by the ordered gate request, not repeated on a large wire receipt.
+      const longId = operation === "close" && phase === "afterStep" && name === "gate";
+      if (longId) f.request.gate.task.gates[0].id = "focused".repeat(1200);
       const interrupted = await launch(f, f.request, { phase, key: `${operation}.${name}` });
       expect(interrupted.exit, interrupted.stderr).toBe(1);
       expect(interrupted.stderr).toContain("injected interruption");
-      const resumed = await launch(f, { ...f.request, key: `${operation}.r1` });
+      const resumed = await launch(f, storedOperation(f.root, operation, operation));
       expect(resumed.exit, resumed.stdout + resumed.stderr).toBe(0);
       const state = await groupedState(f, resumed.stdout);
       const replay = await launch(f, f.request, { phase: "afterEffect", key: `${operation}.${name}` });
       expect(replay.exit, replay.stderr).toBe(0);
       expect(replay.stdout).toBe(resumed.stdout);
       expect(await groupedState(f, replay.stdout)).toEqual(state);
-      const clean = await groupedFixture(operation), completed = await launch(clean);
+      const clean = await groupedFixture(operation);
+      if (longId) clean.request.gate.task.gates[0].id = f.request.gate.task.gates[0].id;
+      const completed = await launch(clean);
       expect(completed.exit, completed.stdout + completed.stderr).toBe(0);
       expect(await groupedState(clean, completed.stdout)).toEqual(state);
     });
@@ -238,8 +322,7 @@ test("close refuses an active writer before draining", async () => {
 for (const operation of ["selection", "close"] as const) for (const phase of ["afterEffect", "afterStep"])
   for (const name of operation === "selection" ? ["baseline"] : ["nextRequests", "nextBaseline"]) {
   test(`${operation} resumes ${phase} folded baseline step ${name} without changing attribution`, async () => {
-    const f = await groupedFixture("close");
-    writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation, "requests.jsonl"), "");
+    const f = await groupedFixture("close", "continue", false);
     const intent = { ...f.intent, key: "worker.a2", attempt: 2 };
     const request = operation === "selection" ? {
       operation, key: operation, invocation, intentions: [], requests: { cursor: 0 }, baseline: intent,
@@ -260,18 +343,18 @@ for (const operation of ["selection", "close"] as const) for (const phase of ["a
     const baseline = JSON.parse(JSON.parse(bytes).data);
     expect(baseline.intent.key).toBe(intent.key);
     expect(baseline.intent.baseline).toEqual(result.steps.at(-1).result.candidate);
+    const intentRef = result.steps.at(-1).result.intent;
+    const committed = stored(f.root).find(row => row.seq === intentRef.seq)!;
+    expect(committed.kind).toBe("intent");
+    expect(committed.digest).toBe(intentRef.digest);
+    expect(committed.seq).toBeLessThanOrEqual(JSON.parse(resumed.stdout).head.seq);
+    expect(committed.body).toEqual(baseline.intent);
   });
 }
 
 test.each(["sealed", "observed", "unit", "mismatch", "open", "blocked", "cancelled"])(
   "next baseline selects only the workflow-prepared progress for %s evidence", async outcome => {
-    const f = await groupedFixture("close");
-    writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation, "requests.jsonl"), "");
-    if (outcome === "cancelled") {
-      const late = { v: 1, invocation, requestId: "late", taskId: "one", kind: "cancel", origin: "main", at: 2 };
-      f.request.gate.task.gates[0].command = `printf '%s\\n' '${JSON.stringify(late)}' >> .pi/subagents/execute/${invocation}/requests.jsonl`;
-    }
-    f.request.gate.workerStatus = outcome === "unit" ? "complete" : outcome === "blocked" ? "blocked" : "continue";
+    const f = await groupedFixture("close", outcome === "unit" ? "complete" : outcome === "blocked" ? "blocked" : "continue", false);
     const next = { ...f.intent, key: "worker.a2", attempt: 2,
       progress: { consumedLoops: 1, admitted: { one: ["continue"] }, previous: null } };
     const previous = { taskId: "previous", attempt: 1, resultRef: { key: "previous" },
@@ -280,10 +363,49 @@ test.each(["sealed", "observed", "unit", "mismatch", "open", "blocked", "cancell
     if (outcome === "observed") rmSync(path.join(checkpointDirectory(f.intent), "manifest.json"));
     if (outcome === "mismatch") writeFileSync(path.join(f.root, "product"), "unjournaled");
     if (outcome === "open") beginHookEffect(f.intent, "edit", ["product"]);
-    const output = await launch(f);
+    const identity = new PitakoStore(f.root).readIdentity();
+    let output: Awaited<ReturnType<typeof launch>>;
+    if (outcome === "cancelled") {
+      const late = { v: 1, invocation, requestId: "late", taskId: "one", kind: "cancel", origin: "main", at: 2 };
+      const foreground = new URL("../extensions/execute-todo-projection.ts", import.meta.url).href;
+      // Load the foreground module before the timed gate; publish only after the gate's signal.
+      execFileSync("mkfifo", [".pi/todo-start", ".pi/todo-committed"], { cwd: f.root });
+      const script = `import {readFileSync,writeFileSync} from "node:fs";
+        import {appendExecuteTodoRecords} from ${JSON.stringify(foreground)};
+        console.log("ready");
+        if (readFileSync(".pi/todo-start", "utf8") !== "start\\n") throw new Error("Missing gate signal");
+        appendExecuteTodoRecords(process.cwd(), ${JSON.stringify(invocation)}, "request", [${JSON.stringify(late)}]);
+        writeFileSync(".pi/todo-committed", "committed\\n");`;
+      const child = Bun.spawn([process.execPath, "-e", script], { cwd: f.root, stdout: "pipe", stderr: "inherit" });
+      const settled = (async () => {
+        const ready = await child.stdout.getReader().read();
+        expect(new TextDecoder().decode(ready.value)).toBe("ready\n");
+        f.request.gate.task.gates[0].command = "printf 'start\\n' > .pi/todo-start && read receipt < .pi/todo-committed && test \"$receipt\" = committed";
+        const result = await launch(f);
+        expect(result.exit, result.stdout + result.stderr).toBe(0);
+        expect(receipt(result.stdout).steps.find((step: any) => step.operation === "gate").result.receipt.gates)
+          .toMatchObject([{ id: "focused", status: "pass" }]);
+        expect(await child.exited).toBe(0);
+        return result;
+      })();
+      // If the gate failed before the handshake, cancel the blocked foreground process.
+      const run = settled.finally(async () => {
+        if (child.exitCode === null) child.kill("SIGKILL");
+        await child.exited;
+      });
+      composition.workflowSettlements.push(run.then(() => {}, () => {}));
+      output = await run;
+    } else {
+      output = await launch(f);
+    }
     expect(output.exit, output.stdout + output.stderr).toBe(0);
     const result = receipt(output.stdout), baseline = result.steps.at(-1).result;
     if (outcome === "cancelled") {
+      const store = new PitakoStore(f.root);
+      expect(store.readIdentity()).toEqual(identity);
+      const {head} = JSON.parse(output.stdout);
+      expect(store.readRecords(scope, head).head).toEqual(head);
+      expect(store.readRecords(`todo:${invocation}`).records.map(row => row.body)).toMatchObject([{requestId: "late"}]);
       expect(result.steps.find((step: any) => step.operation === "requests").result.requests).toEqual([]);
       expect(result.steps.find((step: any) => step.operation === "nextRequests").result.requests).toMatchObject([{ requestId: "late" }]);
     }
@@ -302,22 +424,23 @@ test.each(["sealed", "observed", "unit", "mismatch", "open", "blocked", "cancell
   });
 
 test.each(["truncate", "replace"])("nextRequests rejects %s of an earlier sticky request snapshot", async damage => {
-  const f = await groupedFixture("close");
-  const file = `.pi/subagents/execute/${invocation}/requests.jsonl`;
-  f.request.gate.workerStatus = "continue";
-  f.request.gate.task.gates[0].command = damage === "truncate" ? `: > ${file}`
-    : `printf '%s\\n' '${JSON.stringify({ v: 1, invocation, requestId: "replacement", taskId: "one", kind: "cancel", origin: "main", at: 2 })}' > ${file}`;
+  const f = await groupedFixture("close", "continue");
+  const file = new PitakoStore(f.root).file;
+  const sql = damage === "truncate" ? `DELETE FROM records WHERE scope='todo:${invocation}'` :
+    `UPDATE records SET body='null' WHERE scope='todo:${invocation}'`;
+  f.request.gate.task.gates[0].command = `node -e '${`const {DatabaseSync}=require("node:sqlite");
+    const db=new DatabaseSync(${JSON.stringify(file)}); try {db.exec(${JSON.stringify(sql)});} finally {db.close();}`.replaceAll("'", "'\\''")}'`;
   const next = { ...f.intent, key: "worker.a2", attempt: 2 };
   f.request.nextBaseline = { sealed: next, observed: next };
   const output = await launch(f);
   expect(output.exit).toBe(1);
-  expect(JSON.parse(output.stdout).reason).toContain("request snapshot integrity conflict");
+  expect(JSON.parse(output.stdout).reason).toContain(damage === "truncate" ? "request snapshot integrity conflict" : "Record body mismatch");
   expect(existsSync(path.join(checkpointDirectory(next), "baseline.json"))).toBe(false);
 });
 
 test.each(["worker", "failed", "missing", "mutated"])("close selects pause for %s evidence", async difference => {
-  const f = await groupedFixture("close");
-  if (difference === "worker") f.request.gate.workerStatus = "continue";
+  const f = await groupedFixture("close", difference === "worker" ? "continue" : "complete");
+  if (difference === "worker") delete f.request.gate.revival;
   if (difference === "failed") f.request.gate.task.gates[0].command = "false";
   if (difference === "mutated") f.request.gate.task.gates[0].command = "printf drift > product";
   if (difference === "missing") {
@@ -330,6 +453,7 @@ test.each(["worker", "failed", "missing", "mutated"])("close selects pause for %
   const result = await launch(f);
   expect(result.exit, result.stdout + result.stderr).toBe(0);
   expect(receipt(result.stdout).steps.at(-1).result.kind).toBe("pause");
+  if (difference === "worker") expect(JSON.parse(result.stdout).P.control.lastAttempt.revival).toBeNull();
 });
 
 test("close transports a near-60 KiB sealer receipt by verified disk reference", async () => {
@@ -351,12 +475,202 @@ test("close transports a near-60 KiB sealer receipt by verified disk reference",
   expect(JSON.parse(result.stdout).projection.steps.at(-1).result.receipt.restored).not.toHaveProperty("preserve");
 });
 
+test.each(["selection", "close"] as const)("%s transports a near-48 KiB request page with one bounded P", async operation => {
+  const f = await groupedFixture("close", "continue", false);
+  // A full planning packet must not consume the request page's transport budget.
+  const body = f.request.intentions.at(-1).input.record.body;
+  body.results[0].remaining = ["g".repeat(4096)];
+  body.review = { verdict: "gaps", reason: "r".repeat(4096) };
+  body.compliance = { status: "gaps", reason: "c".repeat(4096), unresolved: ["u".repeat(4096)] };
+  body.plan = { rejection: { diagnostic: "d".repeat(4096) } };
+  f.request.gate.task.gates[0].verifies = [1, 2, 3, 4, 5, 6, 7, 8];
+  // Accumulated loops and full context pages must fit together, not just alone.
+  const anchor = f.request.intentions.at(-1).input.expected;
+  let seq = anchor.count;
+  let head = sha256(canonicalJSON({ ...f.request.intentions.at(-1).input.record,
+    seq, prev: anchor.head }));
+  for (const loop of [2, 3]) {
+    const record = { kind: "loop", loop, body };
+    f.request.intentions.push({ key: `gaps-${loop}`, operation: "ledger",
+      input: { expected: { count: ++seq, head }, record } });
+    head = sha256(canonicalJSON({ ...record, seq, prev: head }));
+  }
+  const current = readBacklog(f.root, "example");
+  const addTasks: Parameters<typeof apply>[0] & { dbPath: string } = {
+    root: f.root, specId: "example", dbPath: f.dbPath, invocation,
+    key: "more-tasks", loop: 1, authority, expectedDigest: current.digest,
+    director: { select: "one", reason: "Full admitted task page", changes: [{
+      kind: "update" as const, id: "one", patch: { goal: "Complete selected task ".repeat(30) },
+      reason: "Full current prompt, not a display preview",
+    }, ...[2, 3, 4].map(index => ({
+      kind: "add" as const, reason: "Full page",
+      task: { ...current.backlog!.tasks[0]!, id: `task${index}`,
+        title: "t".repeat(80), goal: "g".repeat(128), remaining: "r".repeat(128) },
+    }))] } };
+  const added = apply(addTasks);
+  f.request.intentions[1].input.expectedDigest = added.digest;
+  const board = await openBoard(f.dbPath);
+  try {
+    const workspace = repositoryIdentity(f.root);
+    const topicId = board.findTopicOwnedByPlan(workspace, topicOwner(f.root, "example"))!;
+    for (let index = 0; index < 4; index++)
+      board.postOnce(workspace, `full-page-${index}`, { topicId, type: "FINDING", content: "b".repeat(220) });
+  } finally { board.close(); }
+  const history = await launch(f, { operation: "drain", key: "prior-loops", invocation,
+    intentions: f.request.intentions.filter((intention: any) => intention.operation === "ledger") });
+  expect(history.exit, history.stdout + history.stderr).toBe(0);
+  f.request.intentions = f.request.intentions.filter((intention: any) => intention.operation !== "ledger");
+  const requests = Array.from({ length: 1000 }, (_, index) => ({ v: 1, invocation,
+    requestId: "r".repeat(250) + index, taskId: `task${index}`, kind: "cancel", origin: "main", at: 1 }));
+  // A valid identifier can exceed the text-preview budget when JSON-escaped.
+  requests[0]!.requestId = "\\".repeat(256);
+  const sourceStore = new PitakoStore(f.root, () => null);
+  await sourceStore.withSession(() => {
+    for (const body of requests) {
+      const digest = canonicalDigest(body);
+      sourceStore.commit(`todo:${invocation}`, undefined, digest, digest, () => ({kind: "request", body}));
+    }
+  });
+  const request = operation === "close" ? f.request : {
+    operation, key: operation, invocation, intentions: [], requests: { cursor: 0 },
+    apply: { specId: "example", dbPath: f.dbPath, key: "select", invocation, loop: 1, authority,
+      expectedDigest: readBacklog(f.root, "example").digest,
+      director: { select: "one", changes: [], reason: "Select task" } },
+  };
+  request.admission = { association: { root: f.root, invocation, maxCycles: 30 },
+    admissionBinding: "a".repeat(64), amendments: [], models: { taskReviewer: "test/reviewer" } };
+  if (operation === "selection") request.plan = { ref: { key: "director", runId: "native-director" },
+    stage: "published" };
+  else {
+    request.taskFrame = { taskId: "one", identities: ["attempt-one"],
+      workerKnowledge: { "attempt-one": { work: "Exact retained knowledge ".repeat(500) } } };
+    const next = { ...f.intent, key: "worker.a2", attempt: 2 };
+    request.nextBaseline = { sealed: next, observed: next };
+  }
+  const output = await launch(f, request);
+  expect(output.exit, output.stdout + output.stderr).toBe(0);
+  expect(Buffer.byteLength(output.stdout)).toBeLessThanOrEqual(61440);
+  const transport = JSON.parse(output.stdout), P = transport.P.preview;
+  expect(Buffer.byteLength(JSON.stringify(P))).toBeLessThanOrEqual(8192);
+  expect(transport.storeId).toBe(new PitakoStore(f.root).read(scope).identity.storeId);
+  expect(transport.P.prompt.selectedTask).toEqual(readBacklog(f.root, "example").backlog!.tasks.find(task => task.id === "one"));
+  expect(transport.P.control.selectedTask).toMatchObject({ id: "one", gates: transport.P.prompt.selectedTask.gates });
+  expect(transport.projection.steps[0].result).not.toHaveProperty("P");
+  expect(receipt(output.stdout).steps[0].result).not.toHaveProperty("P");
+  const requestStep = operation === "close" ? "nextRequests" : "requests";
+  const page = transport.projection.steps.find((step: any) => step.operation === requestStep).result;
+  const retainedPage = receipt(output.stdout).steps.find((step: any) => step.operation === requestStep).result;
+  expect(Buffer.byteLength(JSON.stringify(retainedPage.requests))).toBeGreaterThan(47 * 1024);
+  expect(page.requests.length).toBeGreaterThan(0);
+  if (operation === "close") {
+    expect(page.requests.length).toBeLessThan(retainedPage.requests.length);
+    expect(page.observed).toEqual({ count: retainedPage.requests.length, next: retainedPage.next,
+      taskId: "one", requested: false });
+    expect(transport.projection.steps.find((step: any) => step.operation === "requests").result.count)
+      .toBe(page.observed.count);
+    expect(transport.projection.steps.find((step: any) => step.operation === "nextBaseline").result.captured).toBe(false);
+  }
+  expect(page.requests).toEqual(requests.slice(0, page.next));
+  const observation = await runtime.nativeCheckpointCase({ ...runtime.nativeCheckpointInput(),
+    sdk: false, root: f.root, page, invocation }, `async ({page,invocation}) => {
+      const {observeRequests}=await import(${JSON.stringify(pathToFileURL(path.resolve("skills/execute/observe.mjs")).href)});
+      const requests=[...page.requests];
+      while(page.next!==null) {
+        page=observeRequests({invocation,cursor:page.next});
+        requests.push(...page.requests);
+      }
+      return requests;
+    }`);
+  expect(observation?.[0], observation?.[2]).toBe(0);
+  expect(JSON.parse(observation![1])).toEqual(requests);
+  const replay = await launch(f, request);
+  expect(replay.exit, replay.stdout + replay.stderr).toBe(0);
+  expect(replay.stdout).toBe(output.stdout);
+  const rows = stored(f.root);
+  expect(transport.P).toEqual(new PitakoStore(f.root, executeProjection).read(scope, transport.head).P);
+  const control = transport.P.control;
+  const admissionRow = rows.find(row => row.seq === control.admission.seq)!;
+  expect(admissionRow.digest).toBe(control.admission.digest);
+  expect(admissionRow.body).toEqual(request.admission);
+  const inputRow = rows.find(row => row.seq === control.operation.input.seq)!;
+  expect(inputRow.digest).toBe(control.operation.input.digest);
+  expect(inputRow.body).toMatchObject({ operation, request: {
+    ...(operation === "selection" ? { plan: request.plan } : { taskFrame: request.taskFrame }),
+  } });
+  expect(control.operation).toMatchObject({ operation, key: request.key });
+  expect(operation === "selection" ? control.plan : control.taskFrame).toEqual(control.operation.input);
+  // Bodies stay in the store, not duplicated alongside the 48 KiB request page.
+  expect(JSON.stringify(control)).not.toContain("Exact retained knowledge");
+  const beforeEffect = new PitakoStore<ReturnType<typeof executeProjection>>(f.root, executeProjection).read(scope,
+    { seq: inputRow.seq, hash: inputRow.digest });
+  expect(beforeEffect.P.control.operation).toEqual(control.operation);
+  expect(P.admittedTasks.items[0]).toMatchObject({ id: "one" });
+  expect(P.admittedTasks.items[0].goal.length).toBeLessThan(transport.P.prompt.selectedTask.goal.length);
+  expect(P.admittedTasks.items[1]).toMatchObject({ id: "task2", status: "pending" });
+  expect(P.view.items).toEqual(expect.arrayContaining([
+    expect.objectContaining(operation === "close"
+      ? { type: "HANDOFF", content: "Grouped handoff" }
+      : { type: "FINDING", content: expect.stringMatching(/^b+/) }),
+  ]));
+  expect(P.pendingDemand.requests.items.length).toBeGreaterThan(0);
+  expect(P.pendingDemand.requests.items).toEqual(page.requests.slice(0, P.pendingDemand.requests.items.length));
+  expect(P.pendingDemand.requests.total).toBe(retainedPage.requests.length);
+  expect(P.pendingDemand.requests.omitted).toBeGreaterThan(0);
+  for (const ref of [P.pendingDemand.requests.ref, P.admittedTasks.ref, P.view.ref]) {
+    expect(ref.scope).toBe(scope);
+    expect(ref.seq).toBeLessThanOrEqual(transport.head.seq);
+    expect(rows.find(row => row.seq === ref.seq)?.digest).toBe(ref.digest);
+  }
+  const demand = rows.find(row => row.seq === P.pendingDemand.requests.ref.seq)!;
+  expect((demand.body as any).result.requests).toEqual(retainedPage.requests);
+  if (operation === "close") {
+    expect(P.loopSummaries.map((summary: any) => summary.loop)).toEqual([1, 2, 3]);
+    expect(P.loopSummaries[0]).toMatchObject({ loop: 1, status: "gaps" });
+    expect(P.loopSummaries[0].gaps).toContain("work");
+    expect(P.planRejections[0].diagnostic).toContain("ddd");
+    expect(P.pendingDemand.sources[0].review).toContain("verdict");
+    expect(P.criterionStatuses.items).toEqual(expect.arrayContaining([
+      expect.objectContaining({ criterion: 1, status: "passed" }),
+    ]));
+    const source = readFileSync(path.resolve("skills/execute/workflow.js"), "utf8");
+    const decideRevival = new Function("const text = value => typeof value === 'string' && value.trim().length > 0;\n" +
+      source.slice(source.indexOf("function same("), source.indexOf("function continuationIdentity(")) + "\nreturn decideRevival;")();
+    const previous = transport.P.control.lastAttempt;
+    const cfg = { taskId: "one", loop: 1, candidate: previous.gate.receipt.after };
+    expect(previous.gate.receipt.contextPeak).toBe(12000);
+    expect(decideRevival(previous, cfg, previous.gate.receipt.contextPeak)).toEqual({ decision: "resume", code: "eligible" });
+    expect(decideRevival({ ...previous, gate: { receipt: { ...previous.gate.receipt,
+      progress: { nonImproving: 1 } } } }, cfg, previous.gate.receipt.contextPeak)).toEqual({
+      decision: "fresh", code: "revived-no-improvement",
+    });
+  }
+  const replayRequest = storedOperation(f.root, operation, request.key);
+  expect(Buffer.byteLength(JSON.stringify(replayRequest))).toBeLessThan(1024);
+  expect((await launch(f, replayRequest)).stdout).toBe(output.stdout);
+  const { key: _key, ...referencedReplay } = replayRequest;
+  expect((await launch(f, referencedReplay)).stdout).toBe(output.stdout);
+  const rowsBefore = stored(f.root);
+  for (const invalid of [
+    { ...replayRequest, storeId: "replaced-store" },
+    { ...replayRequest, scope: `exec:another.e0` },
+    { ...replayRequest, key: "another.r1" },
+    { ...replayRequest, expectedHead: { seq: admissionRow.seq, hash: admissionRow.digest } },
+    { ...replayRequest, refs: { input: { ...replayRequest.refs.input, digest: "0".repeat(64) } } },
+    { ...replayRequest, intentions: [] },
+  ]) {
+    const rejected = await launch(f, invalid);
+    expect(rejected.exit, rejected.stdout + rejected.stderr).toBe(1);
+    expect(JSON.parse(rejected.stdout).reason).toContain("loop-io stored operation");
+    expect(stored(f.root)).toEqual(rowsBefore);
+  }
+});
+
 test("a later launch verifies referenced receipt bytes before any effects", async () => {
   const f = await groupedFixture("advance"), first = await launch(f);
   expect(first.exit, first.stdout + first.stderr).toBe(0);
   const { path: file, digest } = JSON.parse(first.stdout);
-  writeFileSync(file, readFileSync(file, "utf8") + "\n");
-  const next = await launch(f, { ...f.request, key: "next-advance", intentions: [], receipts: [{ path: file, digest }] });
+  const next = await launch(f, { ...f.request, key: "next-advance", intentions: [],
+    receipts: [{ path: file, digest: digest.replace(/^./, (point: string) => point === "0" ? "1" : "0") }] });
   expect(next.exit).toBe(1);
   expect(JSON.parse(next.stdout).reason).toContain("receipt digest mismatch");
 });
@@ -426,18 +740,39 @@ test("a finished long backlog crosses the final-phase selection as a bounded pro
   expect(kept.history).toHaveLength(8);
 });
 
-test.each(["request", "gate-marker", "candidate", "seal"])("close rejects changed %s on replay without rerunning gates", async damage => {
+test.each(["request", "gate-marker", "candidate", "seal", "worker-original", "worker-native"])("close rejects changed %s on replay without rerunning gates", async damage => {
   const f = await groupedFixture("close"), first = await launch(f);
   expect(first.exit, first.stdout + first.stderr).toBe(0);
   if (damage === "request") f.request.gate.workerStatus = "continue";
-  if (damage === "gate-marker") writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation,
-    "loop-io/steps", sha256("close.gate"), "000000.json"), "{}");
+  if (damage === "gate-marker") corruptRecord(f.root, markerKey("close.gate"));
   if (damage === "candidate") writeFileSync(path.join(f.root, "product"), "foreign");
   if (damage === "seal") writeFileSync(path.join(checkpointDirectory(f.intent), "unit.json"), "{}");
+  const nativeDirectory = path.join(f.root, ".pi/native-originals", f.request.gate.worker.runId);
+  if (damage === "worker-original") writeFileSync(path.join(nativeDirectory, `${f.intent.key}.json`), "{}");
+  if (damage === "worker-native") {
+    const file = path.join(nativeDirectory, "status.json"), status = JSON.parse(readFileSync(file, "utf8"));
+    status.steps[0].interrupted = true;
+    writeFileSync(file, JSON.stringify(status));
+  }
   const replay = await launch(f, { ...f.request, key: "close.r1" });
   expect(replay.exit).toBe(1);
   expect(JSON.parse(replay.stdout).error).toBe("loop-io");
   expect(readFileSync(path.join(f.root, ".pi/gate-count"), "utf8")).toBe("run");
+});
+
+test("close verifies the native worker digest before gate or Board effects", async () => {
+  const f = await groupedFixture("close");
+  const original = path.join(f.root, ".pi/native-originals", f.request.gate.worker.runId, `${f.intent.key}.json`);
+  writeFileSync(original, JSON.stringify({ status: "complete", knowledge: { findings: ["Unverified finding"] } }));
+  const output = await launch(f);
+  expect(output.exit).toBe(1);
+  expect(JSON.parse(output.stdout).reason).toBe("Worker native original digest mismatch");
+  expect(existsSync(path.join(f.root, ".pi/gate-count"))).toBe(false);
+  const board = await openBoard(f.dbPath);
+  try {
+    const workspace = repositoryIdentity(f.root), topic = board.findTopicOwnedByPlan(workspace, topicOwner(f.root, "example"))!;
+    expect(board.readTopic(workspace, topic).posts.map(post => post.content)).toEqual(["Existing gate finding"]);
+  } finally { board.close(); }
 });
 
 for (const phase of ["afterEffect", "afterStep"]) {
@@ -449,8 +784,8 @@ for (const phase of ["afterEffect", "afterStep"]) {
       expect(failed.stderr).toContain("injected interruption");
       const interruptedBacklog = readBacklog(f.root, "example").backlog!;
       expect(interruptedBacklog.tasks[0]!.status).toBe(key === "unit-one" ? "pending" : "obsolete");
-      const interruptedDirectory = path.join(f.root, ".pi/subagents/execute", invocation);
-      expect(readdirSync(interruptedDirectory).filter(name => name.endsWith(".json"))).toHaveLength(key === "gaps-one" ? 3 : 2);
+      expect(stored(f.root).filter(row => row.kind === "ledger").flatMap(row => (row.body as any).entries))
+        .toHaveLength(key === "gaps-one" ? 3 : 2);
       const resumed = await launch(f, { ...f.request, key: "finish.r1" });
       expect(resumed.exit, resumed.stderr).toBe(0);
       const state = await finalState(f, resumed.stdout);
@@ -510,18 +845,23 @@ test("verifies superseded apply markers when the following apply published befor
   expect(receipt(resumed.stdout).steps.map((step: any) => step.key)).toEqual(["unit-one", "settle-one", "cancel-one", "gaps-one"]);
 });
 
-test("a damaged ledger chain reaches the CLI boundary as a human-only ledger integrity failure", async () => {
+test("a damaged ledger chain reaches the CLI boundary with a quarantined recovery identity", async () => {
   const f = await fixture(), first = await launch(f);
   expect(first.exit, first.stderr).toBe(0);
-  writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation, "000001.json"), "{}");
+  corruptRecord(f.root, "ledger:0");
   const child = Bun.spawn(["node", entry], { cwd: f.root, env: { ...process.env }, stdin: "pipe", stdout: "pipe", stderr: "pipe" });
   child.stdin.write(JSON.stringify(f.request)); child.stdin.end();
   const replay = (await composition.checkpointLifecycle(child,
     ([exit, stdout, stderr]) => ({ exit, stdout, stderr })).result)!;
   expect(replay.exit).toBe(1);
   const failure = JSON.parse(replay.stdout.trim().split("\n").at(-1)!);
-  expect(failure).toMatchObject({ error: "loop-io", ledgerIntegrity: true });
-  expect(failure.reason).toMatch(/ledger/i);
+  expect(failure).toMatchObject({ error: "loop-io", code: "store-corrupt", ledgerIntegrity: true });
+  expect(failure.recovery.root).toBe(f.root);
+  expect(existsSync(failure.recovery.quarantine)).toBe(true);
+  const recovered = new PitakoStore(f.root).read(scope);
+  expect(recovered.identity).toEqual({ root: f.root, storeId: failure.recovery.storeId });
+  expect(recovered.records).toEqual([]);
+  expect(failure.reason).toMatch(/ledger|record/i);
 });
 
 test.each(["request", "marker", "ledger", "backlog"])("rejects changed %s instead of redispatching", async damage => {
@@ -529,9 +869,8 @@ test.each(["request", "marker", "ledger", "backlog"])("rejects changed %s instea
     expect(first.exit, first.stderr).toBe(0);
     const request = structuredClone(f.request);
     if (damage === "request") request.intentions[0]!.input.record!.body = { taskId: "other", attempt: 1 } as any;
-    if (damage === "marker") writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation,
-      "loop-io/steps", sha256("unit-one"), "000000.json"), "{}");
-    if (damage === "ledger") writeFileSync(path.join(f.root, ".pi/subagents/execute", invocation, "000001.json"), "{}");
+    if (damage === "marker") corruptRecord(f.root, markerKey("unit-one"));
+    if (damage === "ledger") corruptRecord(f.root, "ledger:0");
     if (damage === "backlog") {
       const current = readBacklog(f.root, "example");
       current.backlog!.tasks[0]!.remaining = "outside change";

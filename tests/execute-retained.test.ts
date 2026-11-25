@@ -3,217 +3,170 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSyn
 import os from "node:os";
 import path from "node:path";
 import { boundRetainedAnalyses, retainedAnalyses } from "../extensions/execute-retained.ts";
-import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
+import { type ExecuteCursor } from "../extensions/execute-cursor.ts";
+import { PitakoStore } from "../extensions/pitako-store.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
+import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
-function fixture(run: (value: {
-	root: string; file: string; native: string; mission: string; statePath: string;
-	ref: Record<string, unknown>; original: Record<string, unknown>; load: () => unknown;
-}) => void) {
-	const root = mkdtempSync(path.join(os.tmpdir(), "pitako-retained-"));
+function fixture(run: (f: ReturnType<typeof setup>) => void) {
+	const root = mkdtempSync(path.join(os.tmpdir(), "pitako-retained-")), fake = gitFakeFixture();
 	try {
-		const native = path.join(root, "native", "producer-1");
-		const file = path.join(native, "structured-output", "original.json");
-		mkdirSync(path.dirname(file), { recursive: true });
-		const original = { status: "ready", memo: "COMPLETE ORIGINAL\n" + "source evidence ".repeat(1000), findings: [] };
-		const ref = { key: "invoke-human-1.l1.review.director-synthesis", runId: "producer-1", asyncDir: native,
-			results: [{ structuredOutputPath: file }] };
-		const mission = path.join(root, "mission.json");
-		const statePath = path.join(root, "mission-1", "state.json");
-		mkdirSync(path.dirname(statePath));
-		writeFileSync(mission, JSON.stringify({ schemaVersion: 1, id: "mission-1", title: "Fixture mission" }));
-		const context = { missionId: "mission-1", missionPath: mission, invocation: "human-1" };
-		writeFileSync(file, JSON.stringify(original));
-		writeFileSync(path.join(native, "status.json"), JSON.stringify({
-			runId: ref.runId, workflowKey: ref.key, cwd: root, state: "complete",
-			steps: [{ exitCode: 0, structuredOutput: original }],
-		}));
-		const association = { ...context, root, source: "/spec.md", digest: "e".repeat(64) };
-		writeFileSync(statePath, JSON.stringify({ "invoke-human-1": {
-			version: EXECUTE_STATE_VERSION, association, loop: { number: 1, kind: "final", phase: "review", review: { references: [ref] } },
-		} }));
-		run({ root, file, native, mission, statePath, ref, original,
-			load: () => retainedAnalyses(root, "/spec.md", "e".repeat(64), context) });
-	} finally { rmSync(root, { recursive: true, force: true }); }
+		fake.fakeRepo(root);
+		fake.set(root, ["rev-parse", "--git-path", "info/exclude"], { stdout: ".git/info/exclude\n", stderr: "", status: 0 });
+		run(setup(root));
+	} finally { fake.dispose(); rmSync(root, { recursive: true, force: true }); }
 }
-
-test("reads complete original JSON without a result in the management response or truncating it", () => fixture(f => {
-	expect(f.load()).toEqual([{ key: f.ref.key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+function setup(root: string) {
+	const runId = "11111111-1111-4111-8111-111111111111";
+	const native = path.join(root, "native", runId);
+	let key = "invoke-human-1.l1.review.director-synthesis";
+	const file = path.join(root, "originals", key + ".json");
+	mkdirSync(native, { recursive: true }); mkdirSync(path.dirname(file), { recursive: true });
+	const original = { status: "ready", memo: "COMPLETE ORIGINAL\n" + "source evidence ".repeat(1000), findings: [] };
+	const mission = path.join(root, "mission.json"), statePath = path.join(root, "mission-1", "state.json");
+	const context = { missionId: "mission-1", missionPath: mission, invocation: "human-1", sourceRefs: [] };
+	const association = { ...context, root, source: "/spec.md", digest: "e".repeat(64), commonDir: path.join(root, ".git"), maxCycles: 3 };
+	const store = new PitakoStore(root), scope = "exec:human-1.e0";
+	const identity = store.activate(scope);
+	const commit = (kind: string, body: unknown) => {
+		const head = store.read(scope).head;
+		const saved = store.commit(scope, head, kind + ":" + (head?.seq ?? 0), canonicalDigest(body), () => ({ kind, body }));
+		if (saved.outcome !== "appended" || !saved.head) throw Error("Expected fixture append");
+		return saved.head;
+	};
+	const head = commit("root-admission", { association, admissionBinding: "b".repeat(64), amendments: [] });
+	const input = { seq: head.seq, digest: head.hash };
+	const cursor: ExecuteCursor = {
+		version: 10, storeId: identity.storeId, root, invocation: "human-1", epoch: 0,
+		associationDigest: canonicalDigest(association), admissionBinding: "b".repeat(64), head,
+		action: { kind: "launched", key, runId, role: "reviewer", input },
+		loop: { number: 1, phase: "review", cursor: 0, taskId: null, outcome: null, attempt: null },
+		inFlight: [], halt: null, hostHalt: null,
+		timeouts: { reviewerMs: 1000, workerMs: 1000, gateFloorMs: 0 },
+		models: { taskReviewer: "fixture/reviewer", taskSynthesis: "fixture/synthesis", r1: "fixture/r1", r2: "fixture/r2", synthesis: "fixture/synthesis" },
+		budget: { consumedLoops: 1, maxCycles: 3, rejectedKeys: [], lastProgress: null },
+		backlogDigest: null, boardTopicId: 1,
+		review: { generation: 1, phase: "review", slots: [{ key, runId, phase: "reviewer", digest: null }], verifier: null },
+	};
+	const child = { key, runId, workflowRunId: "parent", agent: "pitako.reviewer", status: "completed", artifactPaths: [native, file] };
+	const status = { runId, workflowKey: key, cwd: root, state: "complete", steps: [{ exitCode: 0, structuredOutput: original }] };
+	const persist = () => {
+		mkdirSync(path.dirname(statePath), { recursive: true });
+		writeFileSync(statePath, JSON.stringify({ "pitako-execute": cursor }));
+		writeFileSync(mission, JSON.stringify({ id: "mission-1", workflowChildren: [child] }));
+	};
+	writeFileSync(file, JSON.stringify(original));
+	writeFileSync(path.join(native, "status.json"), JSON.stringify(status));
+	persist();
+	const select = (nextKey: string, phase = "review") => {
+		key = nextKey; child.key = key; child.artifactPaths = [native, path.join(path.dirname(file), key + ".json")];
+		writeFileSync(child.artifactPaths[1]!, JSON.stringify(original));
+		status.workflowKey = key; writeFileSync(path.join(native, "status.json"), JSON.stringify(status));
+		cursor.loop!.phase = phase;
+		cursor.action = { kind: "launched", key, runId, role: "reviewer", input };
+		cursor.review!.slots = [{ key, runId, phase: "reviewer", digest: null }]; persist();
+	};
+	const load = () => retainedAnalyses(root, "/spec.md", "e".repeat(64), context);
+	const bound = () => boundRetainedAnalyses(root, association.commonDir, "/spec.md", "e".repeat(64), "b".repeat(64), context);
+	return { root, native, file, mission, statePath, original, cursor, child, status, association, store, scope, commit, persist, select, load, bound, runId };
+}
+test("reads full originals from a saved v10 cursor without reader writes", () => fixture(f => {
+	const state = readFileSync(f.statePath), database = readFileSync(f.store.file);
+	expect(f.load()).toEqual([{ key: f.child.key, runId: f.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+	expect(readFileSync(f.statePath)).toEqual(state); expect(readFileSync(f.store.file)).toEqual(database);
+	expect(f.bound()!.originals).toHaveLength(1);
 }));
-
-test.each(["file", "native-status"])("retains the full original when optional %s is absent", absent => fixture(f => {
+test.each(["file", "native-status"])("an absent optional %s does not discard a surviving full original", absent => fixture(f => {
 	rmSync(absent === "file" ? f.file : path.join(f.native, "status.json"));
-	expect(f.load()).toEqual([{ key: f.ref.key, runId: f.ref.runId, ok: true,
-		...(absent === "file" ? { state: "complete" } : {}), structuredOutput: f.original }]);
+	expect(f.load()).toMatchObject([{ ok: true, structuredOutput: f.original }]);
 }));
-
-test.each(["reviewer", "synthesis"])("retains execute-owned task-%s originals", stage => fixture(f => {
-	const key = `invoke-human-1.l1.t1.a1.task-${stage}`;
-	const ref = { ...f.ref, key };
-	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-	state["invoke-human-1"].loop = { number: 1, phase: "implementation", analysisCalls: [{ key, ref }] };
-	writeFileSync(f.statePath, JSON.stringify(state));
-	const status = JSON.parse(readFileSync(path.join(f.native, "status.json"), "utf8"));
-	status.workflowKey = key;
-	writeFileSync(path.join(f.native, "status.json"), JSON.stringify(status));
-	expect(f.load()).toEqual([{ key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
-}));
-
 test.each(["task-reviewer", "task-synthesis", "demand-observation", "compliance", "review.director-synthesis"])(
-	"retained access follows generation keys for %s and ignores retired producers", role => fixture(f => {
-		const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-		const key = `invoke-human-1.l1.${role.startsWith("task-") ? "t1.a1." : ""}g2.${role}`;
-		const ref = { ...f.ref, key };
-		state["invoke-human-1"].loop = { number: 1,
-			phase: role === "demand-observation" ? "director" : role.startsWith("task-") ? "implementation" : "review",
-			analysisGenerations: { "final-review": 2, "demand-observation": 2 },
-			analysisCalls: [{ key, ref }], retired: [{ ...f.ref, runId: "missing-retired-producer" }] };
-		writeFileSync(f.statePath, JSON.stringify(state));
-		const native = JSON.parse(readFileSync(path.join(f.native, "status.json"), "utf8"));
-		native.workflowKey = key;
-		writeFileSync(path.join(f.native, "status.json"), JSON.stringify(native));
-		expect(f.load()).toEqual([{ key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+	"only current generation references are read for %s", role => fixture(f => {
+		f.select(`invoke-human-1.l1.${role.startsWith("task-") ? "t1.a1." : ""}g2.${role}`,
+			role === "demand-observation" ? "director" : role.startsWith("task-") ? "implementation" : "review");
+		expect(f.load()).toMatchObject([{ key: f.child.key, ok: true }]);
+		f.cursor.review!.slots = []; f.cursor.action = { kind: "pending", op: "advance", opKey: "next", input: { seq: f.cursor.head.seq, digest: f.cursor.head.hash } }; f.persist();
+		expect(f.load()).toEqual([]);
 	}));
-
-test.each(["settled", "foreign", "changed", "missing", "stopped", "conflicting-native"])(
-	"bound replay verifies settled task review growth without admitting %s originals", mode => fixture(f => {
-		const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
-		const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
-		invocation.admissionBinding = binding;
-		Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
-		const key = "invoke-human-1.l1.t1.a1.g2.task-reviewer", ref = { ...f.ref, key };
-		invocation.loop = { number: 1, phase: "implementation", analysisCalls: [{ key, ref }],
-			attempt: { taskReview: { reviewer: { key, runId: mode === "foreign" ? "foreign" : f.ref.runId,
-				path: f.file, digest: canonicalDigest(f.original) } } } };
-		writeFileSync(f.statePath, JSON.stringify(state));
-		const native = JSON.parse(readFileSync(path.join(f.native, "status.json"), "utf8"));
-		native.workflowKey = key;
-		if (mode === "stopped") native.state = "stopped";
-		if (mode === "conflicting-native") native.steps[0].structuredOutput = { ...f.original, memo: "changed" };
-		writeFileSync(path.join(f.native, "status.json"), JSON.stringify(native));
-		if (mode === "changed") writeFileSync(f.file, JSON.stringify({ ...f.original, memo: "changed" }));
-		if (mode === "missing") rmSync(f.file);
-		const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,
-			{ missionId: "mission-1", missionPath: f.mission, invocation: "human-1", sourceRefs: [] });
-		if (mode === "settled") expect(load()).toBeUndefined();
-		else if (mode === "foreign") expect(load()!.originals).toHaveLength(1);
-		else expect(load).toThrow(mode === "changed" ? "integrity conflict" : mode === "missing" ? "missing at" : "native producer conflicts");
-	}));
-
-test("compares full JSON semantics, not property order", () => fixture(f => {
-	writeFileSync(f.file, JSON.stringify(Object.fromEntries(Object.entries(f.original).reverse())));
-	expect(f.load()).toEqual([{ key: f.ref.key, runId: f.ref.runId, ok: true, state: "complete", structuredOutput: f.original }]);
+test.each(["complete", "changed", "stopped", "missing"])("bound task-review replay verifies the committed original (%s)", mode => fixture(f => {
+	f.select("invoke-human-1.l1.t1.a1.task-reviewer", "implementation");
+	f.cursor.head = f.commit("review-originals", { originals: [{ key: f.child.key, runId: f.runId, path: f.child.artifactPaths[1], body: f.original }] }); f.persist();
+	if (mode === "changed") writeFileSync(f.child.artifactPaths[1]!, JSON.stringify({ status: "different" }));
+	if (mode === "stopped") { f.status.state = "stopped"; writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status)); }
+	if (mode === "missing") { rmSync(f.child.artifactPaths[1]!); rmSync(path.join(f.native, "status.json")); }
+	if (mode === "complete" || mode === "missing") expect(f.bound()).toBeUndefined();
+	else expect(f.bound()!.originals).toMatchObject([{ ok: false }]);
 }));
-
-test("reports conflicting originals instead of choosing the convenient value", () => fixture(f => {
-	writeFileSync(f.file, JSON.stringify({ ...f.original, memo: "different" }));
+test("a committed original beyond cursor.head cannot suppress a pending review", () => fixture(f => {
+	f.select("invoke-human-1.l1.t1.a1.task-reviewer", "implementation");
+	f.commit("review-originals", { originals: [{ key: f.child.key, runId: f.runId, body: f.original }] });
+	expect(f.bound()!.originals).toHaveLength(1);
+	f.cursor.action = { kind: "pending", op: "gate", opKey: "invoke-human-1.l1.t1.a1.gate",
+		input: { seq: f.cursor.head.seq, digest: f.cursor.head.hash }, gateTimeoutMs: 1000,
+		gateTimeouts: [1000], gateMetricMs: 0 };
+	f.persist();
+	expect(f.bound()).toBeUndefined();
+	expect(f.load()).toEqual([]);
+}));
+test("admitted task-review references suppress replay only at the saved head and with matching originals", () => fixture(f => {
+	f.select("invoke-human-1.l1.t1.a1.task-reviewer", "implementation");
+	const head = f.commit("ledger", { entries: [{ kind: "unit", body: { result: { taskReview: {
+		reviewer: { key: f.child.key, runId: f.runId, path: f.child.artifactPaths[1], digest: canonicalDigest(f.original) },
+	} } } }] });
+	expect(f.bound()!.originals).toHaveLength(1);
+	f.cursor.head = head; f.persist();
+	expect(f.bound()).toBeUndefined();
+	f.status.state = "stopped";
+	writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
+	expect(f.bound()!.originals).toMatchObject([{ ok: false, state: "stopped" }]);
+	f.status.state = "complete";
+	f.status.steps[0]!.structuredOutput = { ...f.original, memo: "changed" };
+	writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
+	writeFileSync(f.child.artifactPaths[1]!, JSON.stringify(f.status.steps[0]!.structuredOutput));
+	expect(f.bound()!.originals).toMatchObject([{ ok: false }]);
+}));
+test("semantic comparison accepts property order but rejects conflicting complete originals", () => fixture(f => {
+	writeFileSync(f.file, JSON.stringify(Object.fromEntries(Object.entries(f.original).reverse())));
+	expect(f.load()).toMatchObject([{ ok: true }]);
+	writeFileSync(f.file, JSON.stringify({ ...f.original, memo: "changed" }));
 	expect(f.load()).toMatchObject([{ ok: false, error: "Conflicting complete retained analysis originals." }]);
 }));
-
-test("does not load an unrelated invocation's references", () => fixture(f => {
-	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-	state["invoke-human-1"].association.missionId = "other";
-	writeFileSync(f.statePath, JSON.stringify(state));
-	expect(f.load).toThrow("Retained analysis association differs");
+test.each(["association", "binding", "sources", "corrupt-state", "missing-store", "ahead"])(
+	"unavailable or conflicting authority is not a fresh admission (%s)", mode => fixture(f => {
+		if (mode === "association") f.association.missionId = "other";
+		if (mode === "binding") f.cursor.admissionBinding = "c".repeat(64);
+		if (mode === "sources") f.association.sourceRefs.push({} as never);
+		if (["association", "sources"].includes(mode)) {
+			f.cursor.head = f.commit("root-admission", { association: f.association, admissionBinding: f.cursor.admissionBinding });
+			f.cursor.associationDigest = canonicalDigest(f.association);
+		}
+		if (mode === "ahead") f.cursor.head.seq++;
+		f.persist();
+		if (mode === "corrupt-state") writeFileSync(f.statePath, "{invalid");
+		if (mode === "missing-store") rmSync(f.store.file);
+		expect(f.bound).toThrow();
+	}));
+test.each(["failed", "stopped", "running"])("preserves current native %s state, even after status retention", state => fixture(f => {
+	f.status.state = state; writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
+	expect(f.load()).toMatchObject([{ ok: false, state }]);
+	f.child.status = state; f.persist(); rmSync(path.join(f.native, "status.json"));
+	expect(f.load()).toMatchObject([{ ok: false, state }]);
 }));
-
-test("does not substitute a mismatching native producer", () => fixture(f => {
-	const file = path.join(f.native, "status.json");
-	const status = JSON.parse(readFileSync(file, "utf8"));
-	status.workflowKey = "invoke-human-1.l2.review.director-synthesis";
-	writeFileSync(file, JSON.stringify(status));
+test("native producer conflicts and symlink escapes never supply authority", () => fixture(f => {
+	f.status.workflowKey = "foreign"; writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
 	expect(f.load()).toMatchObject([{ ok: false, error: "Retained native producer conflicts with its reference." }]);
+	f.status.workflowKey = f.child.key; writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
+	const outside = path.join(f.root, "outside.json"); writeFileSync(outside, JSON.stringify(f.original));
+	rmSync(f.file); symlinkSync(outside, f.file);
+	expect(f.load()).toMatchObject([{ ok: false }]);
 }));
-
-test("does not follow an original symlink outside its exact native producer", () => fixture(f => {
-	const outside = path.join(f.root, "unrelated.json");
-	writeFileSync(outside, JSON.stringify(f.original));
-	rmSync(f.file);
-	symlinkSync(outside, f.file);
-	expect(f.load()).toMatchObject([{ ok: false, error: "Structured original escapes its retained native producer." }]);
-}));
-
-test.each(["failed", "stopped", "running"])("keeps a current native %s state", state => fixture(f => {
-	writeFileSync(path.join(f.native, "status.json"), JSON.stringify({
-		runId: f.ref.runId, workflowKey: f.ref.key, state,
-	}));
-	expect(f.load()).toEqual([{ key: f.ref.key, runId: f.ref.runId, ok: false, state }]);
-}));
-
-test("does not promote a stopped attempt that already emitted JSON", () => fixture(f => {
-	writeFileSync(path.join(f.native, "status.json"), JSON.stringify({
-		runId: f.ref.runId, state: "complete", steps: [{ exitCode: 0, stopped: true, structuredOutput: f.original }],
-	}));
-	expect(f.load()).toMatchObject([{ ok: false, stopped: true }]);
-}));
-
-test("a new invocation has no historical reference scan", () => fixture(f => {
-	writeFileSync(f.mission, readFileSync(f.statePath));
-	writeFileSync(f.statePath, "{}");
-	expect(f.load()).toEqual([]);
-}));
-
-test.each(["stopped", "interrupted", "detached"])("missing status does not erase a retained %s observation", field => fixture(f => {
-	rmSync(path.join(f.native, "status.json"));
-	const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-	state["invoke-human-1"].loop.review.references[0].results[0][field] = true;
-	writeFileSync(f.statePath, JSON.stringify(state));
+test.each(["stopped", "interrupted", "detached"])("emitting JSON does not erase a native %s barrier", field => fixture(f => {
+	Object.assign(f.status.steps[0]!, { [field]: true });
+	writeFileSync(path.join(f.native, "status.json"), JSON.stringify(f.status));
 	expect(f.load()).toMatchObject([{ ok: false, [field]: true }]);
 }));
-
-test("missing native state never substitutes metadata containing invocation-shaped data", () => fixture(f => {
-	writeFileSync(f.mission, readFileSync(f.statePath));
-	rmSync(f.statePath);
+test("legacy keys and missing state do not authorize a historical scan", () => fixture(f => {
+	writeFileSync(f.statePath, JSON.stringify({ "invoke-human-1": { version: 9, association: f.association, loop: {} } }));
 	expect(f.load()).toEqual([]);
-}));
-
-test("corrupt native state is not treated as a fresh invocation", () => fixture(f => {
-	writeFileSync(f.statePath, "{invalid");
-	expect(f.load).toThrow();
-}));
-
-
-test.each(["eligible", "legacy", "v8", "binding", "sources"])("bound admission recovery captures only eligible new-root originals: %s", mode => fixture(f => {
-	const state = JSON.parse(readFileSync(f.statePath, "utf8")), invocation = state["invoke-human-1"];
-	const binding = "b".repeat(64), commonDir = path.join(f.root, ".git");
-	Object.assign(invocation, { version: mode === "legacy" ? 5 : mode === "v8" ? 8 : EXECUTE_STATE_VERSION, admissionBinding: mode === "binding" ? "c".repeat(64) : binding });
-	Object.assign(invocation.association, { commonDir, maxCycles: 3, sourceRefs: [] });
-	writeFileSync(f.statePath, JSON.stringify(state));
-	const load = () => boundRetainedAnalyses(f.root, commonDir, "/spec.md", "e".repeat(64), binding,
-		{ missionId: "mission-1", missionPath: f.mission, invocation: "human-1", sourceRefs: mode === "sources" ? [{ path: "/changed", digest: "f".repeat(64) }] : [] });
-	if (mode === "legacy") expect(load).toThrow("Retained execution created by an incompatible Pitako contract v5; start a new mission.");
-	else if (mode === "v8") expect(load).toThrow("Retained execution created by an incompatible Pitako contract v8; start a new mission.");
-	else if (mode !== "eligible") {
-		expect(load).toThrow("Retained recovery binding differs or predates bound admission");
-		expect(load).toThrow("without redispatch or automatic recapture");
-	} else {
-		const captured = load()!;
-		expect(captured.association).toEqual(invocation.association);
-		expect(captured.references).toEqual([f.ref]);
-		expect(captured.originals[0]).toMatchObject({ structuredOutput: f.original });
-		expect(captured.digest).toMatch(/^[a-f0-9]{64}$/);
-	}
-	expect(readFileSync(f.statePath, "utf8")).toBe(JSON.stringify(state));
-}));
-
-test("pending demand observation retains exact original only until director dispatch", () => fixture(f => {
-  const state = JSON.parse(readFileSync(f.statePath, "utf8"));
-  const loop = state["invoke-human-1"].loop;
-  const ref = { ...f.ref, key: "invoke-human-1.l1.demand-observation" };
-  loop.phase = "director"; delete loop.review;
-  loop.analysisCalls = [{ key: ref.key, stage: "receipt", ref }];
-  const statusFile = path.join(f.native, "status.json");
-  const status = JSON.parse(readFileSync(statusFile, "utf8")); status.workflowKey = ref.key;
-  writeFileSync(statusFile, JSON.stringify(status));
-  writeFileSync(f.statePath, JSON.stringify(state));
-  expect(f.load()).toMatchObject([{ key: ref.key, ok: true, structuredOutput: f.original }]);
-  // No local body is needed; the retained native witness is the source.
-  rmSync(statusFile);
-  expect(f.load()).toMatchObject([{ key: ref.key, ok: true, structuredOutput: f.original }]);
-  loop.plan = { stage: "intention", ref: { key: "invoke-human-1.l1.director" } };
-  writeFileSync(f.statePath, JSON.stringify(state));
-  expect(f.load()).toEqual([]);
-  loop.phase = "compliance";
-  writeFileSync(f.statePath, JSON.stringify(state));
-  expect(f.load()).toEqual([]);
+	rmSync(f.statePath); expect(f.load()).toEqual([]);
 }));

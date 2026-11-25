@@ -54,8 +54,9 @@ test.each([undefined, { taskReviewer: "custom/reviewer:low", taskSynthesis: "cus
       return { ...value, admission: { ...unset, ...override } };
     });
     expect((await host.execute()).status).toBe("complete");
-    expect(host.current()).toMatchObject(override ?? models);
-    const frozen = { taskReviewer: host.current().taskReviewer, taskSynthesis: host.current().taskSynthesis };
+    expect(host.current().models).toMatchObject(override ?? models);
+    const { taskReviewer, taskSynthesis } = host.current().models;
+    const frozen = { taskReviewer, taskSynthesis };
     host.setHostResponse((key, value) => {
       // The admission producer omits settings after association exists.
       if (key === "inspect-initial") expect(value).not.toHaveProperty("admission");
@@ -64,7 +65,7 @@ test.each([undefined, { taskReviewer: "custom/reviewer:low", taskSynthesis: "cus
     });
     const calls = host.calls.length;
     expect((await host.execute()).status).toBe("complete");
-    expect(host.current()).toMatchObject(frozen);
+    expect(host.current().models).toMatchObject(frozen);
     expect(host.calls).toHaveLength(calls);
     expect(host.hostCalls).not.toContain("execute-settings");
   });
@@ -99,13 +100,17 @@ test.each([false, true])("final review uses admission-frozen full-review models 
     return normal();
   });
   expect((await host.execute()).status).toBe("budget-exhausted");
-  expect(host.current().reviewModels).toEqual(frozen);
+  expect(host.current().models).toMatchObject(Object.fromEntries(
+    Object.entries(frozen).map(([slot, setting]) => [slot, setting.model])));
   // Invalid current settings must not be read after admission, even mid-review.
   writeFileSync(file, JSON.stringify({ pitako: { review: { r1: false, r2: false, synthesis: false } } }));
   host.setLaunchRespond();
-  expect((await host.execute()).status).toBe("complete");
+  const replay = await host.execute();
+  expect(replay.status, replay.reason).toBe("complete");
   const prefix = "invoke-human-1.l1.review.";
   const children = host.calls.filter(call => call.key.startsWith(prefix) && call.phase?.startsWith("review-"));
+  expect(host.launches.filter(call => call.key.endsWith(".r1")).map(call => call.key))
+    .toEqual(["invoke-human-1.l1.acceptance.gate.r1"]);
   expect(children.map(call => call.key.slice(prefix.length))).toEqual([
     "director-prepare", "independent-evidence-contract-r2", "independent-angle1-r1",
     "independent-angle1-r2", "independent-evidence-contract-r1", "director-synthesis",

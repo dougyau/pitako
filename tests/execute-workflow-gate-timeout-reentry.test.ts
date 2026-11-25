@@ -1,7 +1,9 @@
 import { expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { copy, cutAt, executeControllerFixture, type Result } from "./fixtures/execute-workflow.ts";
+import { canonicalDigest } from "../extensions/canonical.mjs";
+import { executeStore } from "../skills/execute/ledger.mjs";
+import { copy, cutAt, executeControllerFixture, nativeRunId, type Result } from "./fixtures/execute-workflow.ts";
 
 const { fixture } = executeControllerFixture();
 const phases = [
@@ -47,22 +49,29 @@ test.each(phases)("$step: strict raise retires only the timed-out gate, not sett
   const host = setup(phase);
   const first = await host.executeNative();
   expect(first.status, first.reason).toBe("partial");
-  expect(host.current().loop.halt).toMatchObject({ code: "timeout", class: phase.step,
+  expect(first.loopReport.halt).toMatchObject({ code: "timeout", class: phase.step,
     key: phase.target, launchedMs: phase.launchedMs });
+  expect(host.current().halt).toEqual({ stage: "timeout", digest: canonicalDigest(first.loopReport.halt) });
   expect(first.action).toMatchObject({ actor: "foreground", started: false });
   expect(first.action.operation).toContain(`args.timeouts.gateFloorMs strictly greater than ${phase.launchedMs}`);
   const count = host.launches.length;
+  const writes = host.snapshots.length;
+  const saved = JSON.stringify(host.current(), null, 2);
   const backlog = JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8"));
   for (const gateFloorMs of [phase.launchedMs, 1]) {
-    expect((await host.executeNative({ timeouts: { gateFloorMs } })).status).toBe("partial");
+    const unchanged = await host.executeNative({ timeouts: { gateFloorMs } });
+    expect(unchanged.status, unchanged.reason).toBe("partial");
+    expect(unchanged.loopReport.halt).toEqual(first.loopReport.halt);
+    expect(JSON.stringify(host.current(), null, 2)).toBe(saved);
+    expect(host.snapshots).toHaveLength(writes);
     expect(host.launches).toHaveLength(count);
   }
-  host.current().lastBudgetProgress = { retained: "budget progress" };
   const resumed = await host.executeNative({ timeouts: { gateFloorMs: 20000000 } });
   expect(resumed.status, resumed.reason).toBe("complete");
   const fresh = host.launches.filter(call => call.key === generation(phase.target, 2));
   expect(fresh).toHaveLength(1);
-  expect(JSON.parse(fresh[0]!.task).task.gates[0].timeoutMs).toBe(20000000);
+  const input = JSON.parse(fresh[0]!.task);
+  expect(input.refs?.gateFloorMs ?? input.task.gates[0].timeoutMs).toBe(20000000);
   expect(JSON.parse(fresh[0]!.task)).not.toHaveProperty("reuse");
   expect(host.launches.filter(call => call.key === phase.target)).toHaveLength(1);
   expect(host.launches.slice(count).some(call => call.agent === "pitako.worker" ||
@@ -71,8 +80,17 @@ test.each(phases)("$step: strict raise retires only the timed-out gate, not sett
   expect(after.acceptance).toEqual(backlog.acceptance);
   expect(after.acceptanceHistory).toEqual(backlog.acceptanceHistory);
   expect(after.tasks.map((task: any) => task.gates)).toEqual(backlog.tasks.map((task: any) => task.gates));
-  expect(host.records().some((record: any) => record.body.retired?.some((ref: any) =>
-    ref.key === phase.target && ref.runId === `native-${phase.target}`))).toBe(true);
+  if (phase.step === "final-acceptance") {
+    const cursor = host.current();
+    const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
+    const committed = store.readRecords(scope, cursor.head).records.filter(record => record.kind === "final-gate");
+    expect(committed.map((record: any) => [record.body.producer, record.body.receipt.gates[0].status]))
+      .toEqual([[phase.target, "timeout"], [generation(phase.target, 2), "pass"]]);
+    expect(host.native.get(phase.target)?.runId).toBe(nativeRunId(phase.target));
+  } else {
+    expect(host.records().some((record: any) => record.body.retired?.some((ref: any) =>
+      ref.key === phase.target && ref.runId === nativeRunId(phase.target)))).toBe(true);
+  }
 });
 
 test.each(phases.flatMap(phase => ["before", "after"].map(cut => ({ ...phase, cut }))))(
@@ -80,7 +98,9 @@ test.each(phases.flatMap(phase => ["before", "after"].map(cut => ({ ...phase, cu
   const host = setup(phase, "reason");
   expect((await host.executeNative()).status).toBe("partial");
   const count = host.launches.length;
-  const retiring = (value: any) => value.loop?.retired?.some((ref: any) => ref.key === phase.target);
+  const original = copy(host.current());
+  const retiring = (value: any) => value.halt?.digest === original.halt.digest &&
+    value.action?.opKey === phase.target && value.timeouts.gateFloorMs === 20000000;
   if (phase.cut === "before") cutAt(host, retiring);
   else host.setSaveObserver(value => {
     if (!retiring(value)) return;
@@ -89,9 +109,10 @@ test.each(phases.flatMap(phase => ["before", "after"].map(cut => ({ ...phase, cu
   });
   expect((await host.executeNative({ timeouts: { gateFloorMs: 20000000 } })).reason).toContain("Essential persistence failed");
   expect(host.launches).toHaveLength(count);
+  expect(host.current().timeouts.gateFloorMs).toBe(phase.cut === "before" ? original.timeouts.gateFloorMs : 20000000);
   host.setFailSave();
   host.setSaveObserver(undefined);
-  const output = await host.executeNative();
+  const output = await host.executeNative(phase.cut === "before" ? { timeouts: { gateFloorMs: 20000000 } } : {});
   expect(output.status, output.reason).toBe("complete");
   expect(host.launches.filter(call => call.key === generation(phase.target, 2))).toHaveLength(1);
 });
@@ -111,10 +132,9 @@ test.each(phases)("$step: no fourth generation", async phase => {
   for (const gateFloorMs of [1800000, 20000000, 30000000, 40000000]) {
     const output = await host.executeNative({ timeouts: { gateFloorMs } });
     expect(output.status, output.reason).toBe("partial");
-    expect(output.action.actor).toBe("foreground");
-    if (gateFloorMs === 40000000) expect(output.action.operation).toContain("new invocation");
+    if (gateFloorMs === 40000000) expect(output.reason).toContain("new invocation");
   }
-  expect(host.current().loop.halt.reason).toContain("new invocation");
+  expect(host.current().halt.stage).toBe("timeout");
   expect(host.launches.filter(call => [original, generation(original, 2), generation(original, 3)].includes(call.key))).toHaveLength(3);
   expect(host.launches.some(call => call.key === generation(original, 4))).toBe(false);
 });
@@ -142,8 +162,8 @@ test.each(["error", "fail", "mixed-error", "mixed-fail"])("final acceptance %s i
   }
   const first = await host.executeNative();
   expect(first.status, first.reason).not.toBe("complete");
-  expect(host.current().loop.halt?.code).not.toBe("timeout");
-  if (mode !== "fail") expect(host.current().loop.halt?.code).toBe("environment");
+  expect(host.current().halt?.stage).not.toBe("timeout");
+  if (mode !== "fail") expect(host.current().halt?.stage).toBe("environment");
   const count = host.launches.length;
   const output = await host.executeNative({ timeouts: { gateFloorMs: 86400000 } });
   expect(output.status, output.reason).not.toBe("complete");
@@ -175,12 +195,17 @@ test.each(phases.flatMap(phase => ["stop", "denial"].map(mode => ({ ...phase, mo
     });
     const blocked = await host.executeNative({ timeouts: { gateFloorMs: 20000000 } });
     expect(blocked.status).toBe(phase.mode === "stop" ? "cancelled" : "blocked");
-    expect(host.current().loop.halt).toMatchObject({ code: "native-barrier",
+    expect(blocked.loopReport.halt).toMatchObject({ code: "native-barrier",
       cause: phase.mode === "stop" ? "stopped" : "native permission denial" });
+    const cursor = copy(host.current());
+    expect(cursor.halt).toEqual({ stage: `gate-renewal-${phase.mode === "stop" ? "stop" : "permission"}`,
+      digest: canonicalDigest(blocked.loopReport.halt) });
     host.setStatus(ref => ({ ok: true, runId: ref, results: [], state: "complete" }));
-    expect((await host.executeNative({ timeouts: { gateFloorMs: 30000000 } })).status).not.toBe("complete");
+    const resumed = await host.executeNative({ timeouts: { gateFloorMs: 30000000 } });
+    expect(resumed.status, resumed.reason).toBe(blocked.status);
+    expect(resumed.loopReport.halt).toEqual(blocked.loopReport.halt);
     expect(host.launches).toHaveLength(count);
-    expect(host.current().loop.halt.code).toBe("native-barrier");
+    expect(host.current()).toEqual(cursor);
   });
 
 test("a failed renewed task gate stays settled through grouped close", async () => {
@@ -189,15 +214,12 @@ test("a failed renewed task gate stays settled through grouped close", async () 
   expect((await host.executeNative()).status).toBe("partial");
   const freshKey = generation(phase.target, 2);
   let executions = 0;
-  host.setRespond((request, normal) => {
-    const result = normal();
-    if (request.key !== freshKey && request.key !== phase.target) return result;
+  host.setRespond();
+  host.setTaskGatePass(key => {
+    if (key !== freshKey && key !== phase.target) return true;
     executions++;
-    const receipt = JSON.parse(result.output!);
     // A duplicate execution would pass and incorrectly promote this attempt.
-    receipt.gates[0] = { ...receipt.gates[0], status: executions === 1 ? "fail" : "pass",
-      exit: executions === 1 ? 1 : 0 };
-    return { ...result, output: JSON.stringify(receipt) };
+    return executions > 1;
   });
   const output = await host.executeNative({ timeouts: { gateFloorMs: 20000000 } });
   expect(executions, output.reason).toBe(1);
@@ -206,9 +228,13 @@ test("a failed renewed task gate stays settled through grouped close", async () 
   const seal = host.calls.find(call => call.key === "invoke-human-1.l1.t1.a1.seal")!;
   expect(JSON.parse(seal.task).kind).toBe("pause");
   expect(host.launches.some(call => call.key.startsWith("invoke-human-1.l1.t1.a1.task-"))).toBe(false);
-  expect(host.snapshots.some(value => value.loop?.attempt?.gate?.stage === "receipt" &&
-    value.loop.attempt.gate.key === freshKey && value.loop.attempt.close?.stage === "receipt" &&
-    value.loop.attempt.gate.receipt.gates[0].status === "fail")).toBe(true);
+  const saved = host.current();
+  const { store, scope } = executeStore(host.root, saved.invocation, false, saved.epoch);
+  const rows = store.readRecords(scope, saved.head).records;
+  const gate = rows.find(row => row.opKey === `worker-gate:${freshKey}`);
+  const closed = rows.find(row => row.opKey === `operation:${close.key}`);
+  expect(gate?.body).toMatchObject({ result: { gates: [{ status: "fail" }] } });
+  expect(closed?.body).toMatchObject({ request: { gate: { key: freshKey } } });
 });
 
 test("gate transport reentry advances a spent retry instead of redispatching r2", async () => {
@@ -235,12 +261,17 @@ test.each([1, 2])("gate reentry after a retry-%i intention save cut advances the
     return request.key === base || retry === 2 && request.key === `${base}.r1`
       ? { ...result, output: "Invalid receipt" } : result;
   });
-  cutAt(host, value => value.loop?.attempt?.gate?.retry === retry &&
-    !value.loop.attempt.gate.dispatched);
+  cutAt(host, value => value.action?.opKey === base &&
+    host.launches.filter(call => call.key.startsWith(base)).length === retry);
   expect((await host.executeNative()).reason).toContain("Essential persistence failed");
   host.setFailSave();
-  host.setStatus(ref => ref.includes(".gate") ? { ok: true, runId: ref, results: [], state: "failed" }
-    : { state: "complete", ...copy(host.native.get(ref)!), ok: true });
+  host.setStatus(ref => {
+    const admitted = host.native.get(ref);
+    if (!admitted) throw new Error("Run not found. Provide id or runId.");
+    return ref.includes(".gate") ? { ok: true, key: ref, runId: admitted.runId, agent: "pitako.loop-io",
+      results: [], state: retry === 2 && ref === base ? "complete" : "failed" }
+      : { state: "complete", ...copy(admitted), ok: true };
+  });
   const output = await host.executeNative();
   expect(output.status, output.reason).toBe("complete");
   const keys = host.launches.filter(call => call.key.startsWith(base)).map(call => call.key);
@@ -262,7 +293,8 @@ test("grouped close retries retain their frozen task and derived total despite a
     const result = await normal();
     return request.key === closeKey ? { ...result, output: "Invalid transport" } : result;
   });
-  cutAt(host, value => value.loop?.attempt?.close?.retry === 1);
+  cutAt(host, value => value.action?.opKey === closeKey &&
+    host.launches.some(call => call.key === closeKey));
   expect((await host.executeNative({ timeouts: { gateFloorMs: 20000000 } })).reason).toContain("Essential persistence failed");
   const original = host.launches.find(call => call.key === closeKey)!;
   expect(original.timeoutMs).toBe(23600000);
@@ -271,7 +303,13 @@ test("grouped close retries retain their frozen task and derived total despite a
   const replay = host.launches.find(call => call.key === `${closeKey}.r1`)!;
   expect(replay, output.reason).toBeDefined();
   expect(replay.timeoutMs).toBe(original.timeoutMs);
-  expect(replay.task).toBe(original.task);
+  const cursor = host.current();
+  const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
+  const closes = store.readRecords(scope, cursor.head).records.filter(row => row.opKey === `operation:${closeKey}`);
+  expect(closes).toHaveLength(1);
+  const committed = closes[0]!.body as { request: { gate: { task: unknown } } };
+  expect(committed.request.gate.task).toEqual(JSON.parse(original.task).gate.task);
+  expect(host.launches.filter(call => call.key === closeKey)).toHaveLength(1);
   for (const call of host.launches.filter(call => call.agent === "pitako.loop-io" &&
     !["gate", "close"].includes(JSON.parse(call.task).operation))) expect(call).not.toHaveProperty("timeoutMs");
 });

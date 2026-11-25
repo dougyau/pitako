@@ -9,7 +9,9 @@ test.each([false, true])("transient save retries identical bytes without duplica
   const attempts: any[] = [];
   let injected = false;
   host.state.set = async (key, value) => {
-    if (key === "invoke-human-1" && (value as any).loop?.attempt?.stage === "intention" && !injected) {
+    const cursor = value as any;
+    if (key === "pitako-execute" && cursor.action.kind === "launched" &&
+        cursor.action.role === "worker" && !cursor.action.runId && !injected) {
       injected = true;
       attempts.push(copy(value));
       if (committed) await set(key, value);
@@ -22,7 +24,7 @@ test.each([false, true])("transient save retries identical bytes without duplica
   expect(output.status, output.reason).toBe("complete");
   expect(attempts).toHaveLength(2);
   expect(attempts[1]).toEqual(attempts[0]);
-  expect(host.current().consumedLoops).toBe(2);
+  expect(host.current().budget.consumedLoops).toBe(2);
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call =>
     JSON.parse(call.task!.split("COMPLETE SELECTED TASK:\n")[1]!.split("\nTASK CONTINUATION")[0]!).id)).toEqual(["change1"]);
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
@@ -31,7 +33,7 @@ test.each([false, true])("transient save retries identical bytes without duplica
 test.each([
   "Mission state exceeds the 256 KiB limit (273647 bytes; maximum 262144 bytes).",
   "Invalid mission state file '/state.json': Unexpected end of JSON input",
-  "state.set('invoke-human-1') value must contain only JSON data",
+  "state.set('pitako-execute') value must contain only JSON data",
 ])("deterministic save failure halts immediately: %s", async message => {
   const host = fixture();
   let attempts = 0;
@@ -41,13 +43,14 @@ test.each([
   expect(output.reason).toContain(message);
   expect(output.reason).toContain("Essential persistence failed");
   expect(attempts).toBe(1);
-  expect(host.calls).toHaveLength(0);
+  expect(host.launches.map(call => call.key)).toEqual(["invoke-human-1.l1.advance"]);
+  expect(host.current()).toBeUndefined();
 });
 
 test.each(["seal", "drain", "gaps", "observation", "closing"].flatMap(phase => [
   "Mission state exceeds the 256 KiB limit (273647 bytes; maximum 262144 bytes).",
   "Invalid mission state file '/state.json': Unexpected end of JSON input",
-  "state.set('invoke-human-1') value must contain only JSON data",
+  "state.set('pitako-execute') value must contain only JSON data",
 ].map(message => ({ phase, message }))))("deterministic $phase save failure cannot trigger outer retries: $message", async ({ phase, message }) => {
   const host = fixture(undefined, { readOnly: phase !== "seal" }); host.setLimit(["observation", "closing"].includes(phase) ? 2 : 1);
   if (phase === "gaps") host.setRespond((request, normal) => {
@@ -57,10 +60,10 @@ test.each(["seal", "drain", "gaps", "observation", "closing"].flatMap(phase => [
   });
   let attempts = 0, calls = 0;
   host.setFailSave(value => {
-    const selected = phase === "seal" ? value.intentions?.some((entry: any) => entry.operation === "ledger" && entry.input.record.kind === "unit") && !value.sealPending
-      : phase === "drain" ? value.ledger?.count >= 2 && value.finishDrain?.admitted
-      : phase === "gaps" ? value.loop?.archived
-      : phase === "observation" ? !!value.loop?.closing
+    const selected = phase === "seal" ? host.native.has("invoke-human-1.l1.t1.a1.seal")
+      : phase === "drain" ? host.native.has("invoke-human-1.l1.finishDrain")
+      : phase === "gaps" ? value.loop?.outcome === "gaps"
+      : phase === "observation" ? value.loop?.phase === "closing"
       : value.loop?.phase === "finished";
     if (selected) { if (++attempts === 1) calls = host.calls.length; throw Error(message); }
     return false;
@@ -85,7 +88,8 @@ test.each([
   expect(output.reason).toContain("Three state-save attempts failed");
   expect(output.reason).toContain(message);
   expect(attempts).toBe(3);
-  expect(host.calls).toHaveLength(0);
+  expect(host.launches.map(call => call.key)).toEqual(["invoke-human-1.l1.advance"]);
+  expect(host.current()).toBeUndefined();
 });
 
 test.each(["transport", "envelope"])("fixed host inspection recovers automatically on its third attempt: %s", async kind => {
@@ -100,7 +104,7 @@ test.each(["transport", "envelope"])("fixed host inspection recovers automatical
   const output = await host.executeNative();
   expect(output.status, output.reason).toBe("complete");
   expect(host.hostCalls).toEqual(["inspect-initial", "inspect-initial.r1", "inspect-initial.r2"]);
-  expect(host.current().hostHalt).toBeUndefined();
+  expect(host.current().hostHalt).toBeNull();
   expect(new Set(host.calls.map(call => call.key)).size).toBe(host.calls.length);
 });
 
@@ -108,42 +112,24 @@ test.each([false, true])("bounded host reconstruction retries and preserves its 
   const host = fixture();
   host.setHostResponse(() => { throw Error("EIO: transport loss"); });
   expect((await host.execute()).status).toBe("blocked");
-  const original = copy(host.current().hostHalt), before = host.hostCalls.length;
+  expect(host.current()).toBeUndefined();
+  const before = host.hostCalls.length;
   host.setHostResponse((_key, value) => {
     if (!recovers || host.hostCalls.length < before + 2) throw Error("EIO: repeated transport loss");
     return value;
   });
   const output = await host.execute();
   expect(output.status, output.reason).toBe(recovers ? "complete" : "blocked");
-  expect(host.current().hostReconstruction.stage).toBe(recovers ? "admitted" : "failed");
-  expect(host.current().hostReconstruction.source).toEqual(original);
+  if (recovers) expect(host.current().hostHalt).toBeNull();
   if (!recovers) {
     expect(host.hostCalls).toHaveLength(before + 3);
     expect(output.reason).toContain("Three inspection attempts failed: EIO: repeated transport loss");
     const calls = host.hostCalls.length;
     host.setHostResponse();
     const replay = await host.execute();
-    expect(replay.status).toBe("blocked");
-    expect(replay.reason).toContain("EIO: repeated transport loss");
-    expect(host.hostCalls).toHaveLength(calls);
-    expect(host.calls).toHaveLength(0);
+    expect(replay.status, replay.reason).toBe("complete");
+    expect(host.hostCalls).toHaveLength(calls + 1);
   }
-});
-
-test.each(["stopped", "permission"])("host retry never clears a %s barrier", async cause => {
-  const host = fixture();
-  host.setHostResponse(() => { throw Error("Transport loss"); });
-  await host.execute();
-  const before = copy(host.current());
-  if (cause === "stopped") before.hostHalt.observedState = "stopped";
-  else before.hostHalt.observedBarrier = "native permission denial";
-  host.storage.set("invoke-human-1", copy(before));
-  host.setHostResponse();
-  const calls = host.hostCalls.length;
-  expect((await host.execute()).status).toBe("blocked");
-  expect(host.hostCalls).toHaveLength(calls);
-  expect(host.current()).toEqual(before);
-  expect(host.calls).toHaveLength(0);
 });
 
 test.each([
@@ -155,7 +141,8 @@ test.each([
   const output = await host.executeNative();
   expect(output.status).toBe("blocked");
   expect(host.hostCalls).toEqual(["inspect-initial"]);
-  expect(host.current().hostHalt.observedError).toContain(message);
+  expect(output.reason).toContain(message);
+  expect(host.current()).toBeUndefined();
   expect(host.calls).toHaveLength(0);
 });
 
@@ -165,12 +152,12 @@ test("a transient barrier save retries without relaunching a stopped writer", as
     ? { ...normal(), ok: false, stopped: true } : normal());
   let attempts = 0;
   host.setFailSave(value => {
-    if (!value.activePlan && value.loop?.halt?.cause === "stopped" && attempts++ === 0) throw Error("EBUSY: resource busy, rename");
+    if (value.halt?.stage === "native-barrier" && attempts++ === 0) throw Error("EBUSY: resource busy, rename");
     return false;
   });
   const output = await host.execute();
   expect(output.status).toBe("cancelled");
   expect(attempts).toBe(2);
-  expect(host.current().loop.halt.cause).toBe("stopped");
+  expect(host.current().halt).toMatchObject({ stage: "native-barrier", digest: expect.stringMatching(/^[a-f0-9]{64}$/) });
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
 });

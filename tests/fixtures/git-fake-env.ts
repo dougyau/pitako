@@ -10,6 +10,9 @@ export function guardEnv(env: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
     const preload = `--import=${gitFakeBootstrap}`;
     const options = guarded.NODE_OPTIONS ?? process.env.NODE_OPTIONS ?? "";
     guarded.NODE_OPTIONS = options.includes(preload) ? options : `${options} ${preload}`.trim();
+    const bunPreload = `--preload=${gitFakeBootstrap}`;
+    const bunOptions = guarded.BUN_OPTIONS ?? process.env.BUN_OPTIONS ?? "";
+    guarded.BUN_OPTIONS = bunOptions.includes(bunPreload) ? bunOptions : `${bunOptions} ${bunPreload}`.trim();
   }
   const sentinel = guarded.PITAKO_TEST_GIT_SENTINEL;
   if (sentinel) {

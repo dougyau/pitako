@@ -2,11 +2,12 @@
 name: researcher
 package: pitako
 description: Read-only planning evidence provider for external dependency/documentation facts.
-tools: read, grep, find, ls, web_search, fetch_content, get_search_content, source_check, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
+tools: read, grep, find, ls, web_search, fetch_content, get_search_content, source_check, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, pitako_store, codemode
 extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/pitako-store-tool.ts
   - ../node_modules/pi-web-access/dist/index.js
 acceptanceRole: read-only
 defaultContext: fresh

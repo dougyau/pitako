@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
 import path from "node:path";
+import { executeStore } from "../skills/execute/ledger.mjs";
 import { executeControllerFixture, gaps } from "./fixtures/execute-workflow.ts";
 import { RunFanoutLimitError } from "../node_modules/pi-subagents/src/runs/shared/run-fanout-budget.js";
 
@@ -35,18 +36,21 @@ test("overrides reach workers, all analyses and task/final gates without rewriti
   const gates = host.launches.filter(request => request.agent === "pitako.loop-io" && JSON.parse(request.task).operation === "gate");
   expect(gates).toHaveLength(2);
   for (const request of gates) {
-    expect(JSON.parse(request.task).task.gates.map((gate: any) => gate.timeoutMs)).toEqual([4000000, 5000000]);
+    const cursor = host.snapshots.find(value => value.action?.opKey === request.key);
+    expect(cursor.timeouts.gateFloorMs).toBe(4000000);
+    const input = JSON.parse(request.task);
+    expect(cursor.action.gateTimeouts).toEqual(input.refs ? [1000, 5000000] : [4000000, 5000000]);
+    if (input.refs) expect(input.refs.gateFloorMs).toBe(4000000);
+    else expect(input.task.gates.map((gate: any) => gate.timeoutMs)).toEqual([4000000, 5000000]);
     expect(request.timeoutMs).toBe(14400000);
   }
   const backlog = JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8"));
   expect(backlog.tasks[0].gates.map((gate: any) => gate.timeoutMs)).toEqual([1000, 5000000]);
   expect(backlog.acceptance.map((gate: any) => gate.timeoutMs)).toEqual([1000, 5000000]);
-  const selected = host.snapshots.find(value => value.loop?.task)?.loop.task;
-  expect(selected.gates.map((gate: any) => gate.timeoutMs)).toEqual([1000, 5000000]);
   expect(output.timeouts.values).toEqual({ reviewerMs: 20000000, workerMs: 21000000, gateFloorMs: 4000000 });
-  const calls = host.snapshots.flatMap(value => value.loop?.analysisCalls ?? []);
+  const calls = host.history().flatMap((value: { analysisCalls?: { key: string }[] }) => value.analysisCalls ?? []);
   expect(calls.length).toBeGreaterThan(0);
-  for (const call of calls) expect(call.timeoutMs).toBe(20000000);
+  for (const call of calls) expect(analysis.find(request => request.key === call.key)?.timeoutMs).toBe(20000000);
 });
 
 test.each([
@@ -90,7 +94,7 @@ test.each(["worker", "gate", "close", "analysis", "final"])("raising values afte
   if (phase === "close") host.setRespond((request, normal) => {
     const result = normal();
     if (request.agent === "pitako.worker") {
-      result.structuredOutput.status = "gaps";
+      result.structuredOutput.status = "continue";
       result.structuredOutput.remaining = ["Concrete remaining task work"];
     }
     return result;
@@ -114,25 +118,20 @@ test.each(["worker", "gate", "close", "analysis", "final"])("raising values afte
   host.setAdmission();
   const output = await host.executeNative({ timeouts: { reviewerMs: 25000000, workerMs: 26000000, gateFloorMs: 27000000 } });
   const launched = host.launches.slice(launchCount);
-  if (phase === "worker") {
-    const request = launched.find(request => request.key === before.loop.attempt.key)!;
+  if (phase === "worker" || phase === "analysis") {
+    const request = launched.find(request => request.key === before.action.key)!;
     expect(request, output.reason).toBeDefined();
-    expect(request.timeoutMs).toBe(16000000);
-  } else if (phase === "analysis") {
-    const pending = before.loop.analysisCalls[0];
-    const request = launched.find(request => request.key === pending.key)!;
-    expect(request, output.reason).toBeDefined();
-    expect(request.timeoutMs).toBe(15000000);
+    expect(request.timeoutMs).toBe(phase === "worker" ? 16000000 : 15000000);
   } else {
-    const pending = phase === "final" ? before.loop.finalAttempt.gate : before.loop.attempt[phase];
-    const request = launched.find(request => request.key === pending.key)!;
+    expect(before.action.op).toBe(phase === "final" ? "gate" : phase);
+    const request = launched.find(request => [before.action.opKey, `${before.action.opKey}.r1`].includes(request.key))!;
     expect(request, output.reason).toBeDefined();
     const input = JSON.parse(request.task);
-    const task = phase === "close" ? input.gate.task : input.task;
-    expect(task.gates[0].timeoutMs).toBe(17000000);
+    const task = phase === "close" ? input.gate?.task : input.task;
+    expect(input.refs?.gateFloorMs ?? task.gates[0].timeoutMs).toBe(17000000);
     expect(request.timeoutMs).toBe(20600000);
   }
-  expect(output.timeouts.values.workerMs).toBe(26000000);
+  expect(output.timeouts.values.workerMs, output.reason).toBe(26000000);
   if (phase !== "final" && phase !== "close") {
     const later = launched.filter(request => request.agent === "pitako.loop-io" &&
       JSON.parse(request.task).operation === "gate" && request.key.endsWith(".acceptance.gate"));
@@ -145,10 +144,12 @@ test("completed children are observed, not relaunched, when overrides change", a
   const host = fixture();
   expect((await host.executeNative()).status).toBe("complete");
   const count = host.launches.length;
+  const terminal = structuredClone(host.current());
   const output = await host.executeNative({ timeouts: { reviewerMs: 24000000, workerMs: 25000000, gateFloorMs: 26000000 } });
   expect(output.status, output.reason).toBe("complete");
   expect(host.launches).toHaveLength(count);
-  expect(output.timeouts.values).toEqual({ reviewerMs: 24000000, workerMs: 25000000, gateFloorMs: 26000000 });
+  expect(output.timeouts.values).toEqual(terminal.timeouts);
+  expect(host.current()).toEqual(terminal);
 });
 
 test("raising the floor between final loops disables acceptance reuse", async () => {
@@ -157,7 +158,12 @@ test("raising the floor between final loops disables acceptance reuse", async ()
   host.setFailSave(value => value.loop?.number === 2);
   const interrupted = await host.execute();
   expect(interrupted.reason).toContain("Essential persistence failed");
-  expect(host.current().lastFinalAcceptance.exec[0].timeoutMs).toBe(1800000);
+  const saved = host.current();
+  const { store, scope } = executeStore(host.root, saved.invocation, false, saved.epoch);
+  const gate = store.readRecords(scope, saved.head).records.find(row => row.opKey === "final-gate:invoke-human-1.l1.acceptance.gate");
+  expect(gate).toBeDefined();
+  expect(JSON.parse(host.launches.find(call => call.key === "invoke-human-1.l1.acceptance.gate")!.task).task.gates[0].timeoutMs)
+    .toBe(1800000);
   const acceptance = JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8")).acceptance;
   host.setFailSave();
   const output = await host.execute({ timeouts: { gateFloorMs: 20000000 } });
@@ -168,49 +174,5 @@ test("raising the floor between final loops disables acceptance reuse", async ()
   expect(input).not.toHaveProperty("reuse");
   expect(input.task.gates[0].timeoutMs).toBe(20000000);
   expect(request.timeoutMs).toBe(23600000);
-  expect(JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8")).acceptance).toEqual(acceptance);
-});
-
-test("a fresh acceptance intention uses reset timeouts after a reused-receipt persistence cut", async () => {
-  const host = fixture(undefined, { taskCount: 0 });
-  host.setLimit(5);
-  host.setRespond((request, normal) => {
-    const result = normal();
-    if (request.key === "invoke-human-1.l1.acceptance.gate") {
-      const receipt = JSON.parse(result.output!);
-      const logRef = path.join(host.root, ".pi/acceptance-failure.log");
-      writeFileSync(logRef, "Controlled acceptance failure");
-      receipt.gates[0] = { ...receipt.gates[0], status: "fail", exit: 1, logRef };
-      result.output = JSON.stringify(receipt);
-    }
-    return result;
-  });
-  const initial = await host.execute({ timeouts: { gateFloorMs: 20000000 } });
-  expect(initial.status, initial.reason).toBe("blocked");
-  expect(host.current().loop.halt.code, initial.reason).toBe("repeat-acceptance");
-  const previous = structuredClone(host.current().lastFinalAcceptance);
-  host.setFailSave(value => value.loop?.finalAttempt?.freshAuthorized &&
-    value.loop.finalAttempt.gate.stage === "intention");
-  const interrupted = await host.execute({
-    unblock: true, resolution: { loop: 3, text: "Run acceptance fresh once" },
-  });
-  expect(interrupted.reason).toContain("Essential persistence failed");
-  const saved = structuredClone(host.current());
-  expect(saved.freshAcceptanceAuthorized).toBe(true);
-  expect(saved.loop.finalAttempt.gate.receipt.reused).toEqual({ loop: previous.loop, gateKey: previous.gateKey });
-  expect(saved.loop.finalAttempt.gate.task.gates[0].timeoutMs).toBe(20000000);
-  const acceptance = JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8")).acceptance;
-
-  host.setFailSave();
-  const output = await host.execute({ timeouts: {} });
-  expect(output.status, output.reason).toBe("complete");
-  const fresh = host.launches.filter(request => request.key === `${saved.loop.finalAttempt.key}.fresh.gate`);
-  expect(fresh).toHaveLength(1);
-  const input = JSON.parse(fresh[0]!.task);
-  expect(input).not.toHaveProperty("reuse");
-  expect(input.task.gates[0].timeoutMs).toBe(1800000);
-  expect(fresh[0]!.timeoutMs).toBe(14400000);
-  expect(host.current().lastFinalAcceptance.exec[0].timeoutMs).toBe(1800000);
-  expect(saved.loop.finalAttempt.gate.task.gates[0].timeoutMs).toBe(20000000);
   expect(JSON.parse(readFileSync(path.join(host.root, ".pitako/backlog/spec.json"), "utf8")).acceptance).toEqual(acceptance);
 });

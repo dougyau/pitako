@@ -50,6 +50,7 @@ export function createGitFake(files: GitFakeFiles) {
       writeFileSync(path.join(admin, "HEAD"), branch === "HEAD" ? head + "\n" : `ref: refs/heads/${branch}\n`);
     }
     const put = (args: string[], stdout: string) => set(root, args, response(stdout));
+    put(["rev-parse", "--git-path", "info/exclude"], path.join(commonDir, "info/exclude") + "\n");
     put(["rev-parse", "--is-inside-work-tree", "--is-bare-repository", "--path-format=absolute", "--git-common-dir"], `true\nfalse\n${commonDir}\n`);
     put(["rev-parse", "--path-format=absolute", "--show-toplevel"], root + "\n");
     put(["--no-pager", "--literal-pathspecs", "rev-parse", "--path-format=absolute", "--git-common-dir"], commonDir + "\n");

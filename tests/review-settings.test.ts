@@ -13,7 +13,9 @@ function fixture() {
   const agentDir = path.join(root, "agent");
   mkdirSync(agentDir);
   mkdirSync(path.join(root, ".pi"));
-  return { root, agentDir, global: path.join(agentDir, "settings.json"), project: path.join(root, ".pi/settings.json") };
+  const missionPath = path.join(root, "m.json");
+  writeFileSync(missionPath, JSON.stringify({id: "m", cwd: root}));
+  return { root, agentDir, missionPath, global: path.join(agentDir, "settings.json"), project: path.join(root, ".pi/settings.json") };
 }
 
 test("review model defaults and per-key project precedence preserve exact strings", () => {
@@ -34,8 +36,8 @@ test.each([null, 42, "", "provider", " provider/model", "p/m ", "p/*", "p/a,p/b"
     const f = fixture();
     for (const slot of ["r1", "r2", "synthesis"]) {
       writeFileSync(f.project, JSON.stringify({ pitako: { review: { [slot]: value } } }));
-      const resolve = () => analysisResource("pitako.review", f.root, f.agentDir).resolve({
-        missionId: "m", missionPath: path.join(f.root, "m.json"),
+      const resolve = () => analysisResource("pitako.review", f.agentDir, f.agentDir).resolve({
+        missionId: "m", missionPath: f.missionPath,
       });
       expect(resolve).toThrow(f.project);
       expect(resolve).toThrow(`pitako.review.${slot}`);

@@ -28,7 +28,8 @@ test("execute todo transitions expose only validated tasks and retain awaited wo
     const result = normal();
     return result;
   });
-  expect((await host.executeNative()).status).toBe("complete");
+  const executed = await host.executeNative();
+  expect(executed.status, JSON.stringify(executed)).toBe("complete");
   const values = snapshots(host);
   const admitted = values.find(value => value.tasks.length);
   expect(admitted.phases[0].status).toBe("completed");

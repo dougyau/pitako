@@ -5,7 +5,9 @@ mission and launches the named resource `pitako.architecture` (raw script paths
 fail). `skills/architecture/workflow.js` owns dispatch and uses the packaged
 `pitako.architect` profile for the director and perspective members. Each
 consuming gate first runs the model-free `pitako.access-verifier`; consumers then
-receive verified references `{ id, path, digest }` and read them, and a
+receive verified references `{ id, path, digest }` for native originals or
+`{ id, store, digest }` for caller context. They read store records using
+`pitako_store`. A
 contradictory or unavailable original blocks the gate with an explanation.
 Agents reason about the same complete decision rather than specialist subtasks.
 
@@ -31,7 +33,7 @@ The skill is the authoritative usage procedure.
 
 All consultations require an explicit mission, stable consultation identity and
 complete versioned `currentDecision`. Reentry requires the exact version-4
-continuation. v3 state is not migrated: start a new consultation/mission.
+continuation. Older incompatible formats are not migrated.
 A changed decision requires a full associated `replacement` with
 the expected revision. It accounts for preserved and replaced obligations and
 retains active human content and provenance. Resuming an unchanged decision or
@@ -50,42 +52,72 @@ with status and verified original references in dependent questions' prerequisit
 director's evaluation. Native failures still abort. No factualRetry is accepted
 while paused; a later round may narrow the fact or raise an experiment.
 
-Contract v4 stores all model-authored prose only in published native originals.
-The verified hash-chain ledger at
-`<missionDirectory>/ledger/architecture-<consultation>/`, outside the checkout,
+Contract v4 retains model-authored prose in native originals and closed-round
+store records, never mission state. Archived model access items use SQLite row
+refs and the item ID within `body.originals`; live path receipts keep their
+existing format. Access receipts are no-clobber records in
+`access:architecture-<consultation>`, except the completed memo receipt. HUMAN
+#4224 keeps that original file, byte for byte, outside the database so it can
+witness a restored chain; it is neither indexed nor copied into SQLite.
+The verified hash-chain ledger in the cwd-local `.pi/pitako/pitako.db` scope
+`arch:<consultation>`
 retains admissions, replacements, caller answers/evidence with provenance and
-closed rounds. State holds only control skeletons and digest-pinned references,
-plus the args-bounded current decision and transient digest-only replacement intention.
+closed rounds. The single `pitako-architecture` mission key holds a closed
+16384-byte cursor (including the pretty-printed wrapper): identity, revision
+and decision digest, head, round counts, phase, current slots, frontier/context
+refs, steering stages and any pending replacement digest. A committed
+consultation uses this same key and fences the old writer. Decision bodies,
+rosters, native paths and diagnostics are not in the cursor.
 Fresh perspectives read their focus and packet in the director original; factual
 providers read their doubt by id in the doubts original. Latest caller-context
 ledger references remain active in subsequent rounds; each context record chains
 earlier active answers/evidence through `priorActive` entries with exact
-`{path, digest}`, and those chained records are active too. Foreground reads the
+`{store, digest}`, and those chained records are active too. The ledger
+observer reconstructs the current context references at the saved store head.
+If the store is lost, the writer verifies native ledger requests and
+settlements against that head, restores the chain, and rebinds the context
+references. Missing or contradictory native originals cause a terminal
+integrity failure without renewing the original round count.
+For a completed consultation, the same memo gate can pass under the restored
+store. The verifier checks the full restored chain and uses native history to
+prove the old receipt's scope, sequences, digests and item identities. Failed
+correspondence is a terminal integrity failure. The receipt bytes stay intact,
+and `checkReceipt` still rejects the old store ID.
+If a store-backed access item is unavailable after the ledger observation, the
+current root halts without launching the consumer or publishing a gate receipt.
+The existing observer on same-consultation relaunch rechecks the store; the
+consumer uses its normal gate after successful rehydration.
+For an open rolling round, the same observer checks the challenge original and
+native child journal. Reentry before `sending` records a verified unavailable
+route as missed without registering the old sibling. A sibling that settles
+after the cursor save can be adopted from its matching native settlement and
+published original; an unsettled sibling is not redispatched. `sending` without
+a verified outcome is unconfirmed and is never resent. A verified outcome
+without its sending boundary, a contradiction, or a rejected live transport is
+an integrity failure. Steering is persisted in SQLite only at round close.
+Foreground reads the
 verified doubts/factual originals to ask the human, and the verified memo reference
 to read a conclusion (the returned excerpt is only a preview).
-D8 uses unrelated state = current stateBytes minus this consultation's retained
-entry (conservative measurement); unrelated + derived worst case 108306 <= 262144.
-Capacity failure returns blocked with numbers and the action to use a new mission.
-The bound includes maximal reference counts, args-bounded decision and digest-only ledgerPending,
-control skeletons and measured pretty overhead; it is independent of prose/round
-history. Prose has no D4 caps or projection compaction. Eight factual doubts, eight deliberation doubts and
+Prose has no D4 caps or projection compaction. Eight factual doubts, eight deliberation doubts and
 64 human/experiment IDs are checked before confirmation.
 
-Architecture's derived per-consultation bound is 108306 pretty-printed bytes
-(<=112 KiB), leaving over 150 KiB for other mission state, including /plan's
-initial-context. Artifact root (384 JSON bytes) is stored per original; original relative
-paths (160 JSON bytes) must reconstruct exactly the native savedOutputPath. Each
-root is derived from that original's native saved path; digest pins, path
-normalization and traversal checks protect retained references. Previous-round originals retain only
-id/root/path/digest. Run IDs are bounded to 96 JSON bytes, doubt IDs to 32 ASCII
-characters, and diagnostics (only for insufficient/failed originals) to 512 JSON
-bytes. Associations/native witnesses are stored once per dispatch; compact control
-tuples preserve validated logical controls. See the architecture skill for the
-bound and retained-state representation.
+Round close empties the dispatch slots; the pinned round record supplies the
+previous roster, original references, next director packet or memo, and
+steering outcomes. On reentry the existing ledger observer restores this
+projection at the saved head and checks each live slot against its matching
+native settlement and published digest. It reconstructs the verified path,
+phase controls and diagnostics rather than reading them from mission state.
+An identical append replay returns the original result; a stale writer adopts
+the committed head without applying or acknowledging the rejected operation.
+When the tip contains committed human answers after a lost cursor save, relaunch
+verifies the answer record's slot and phase basis, restores the open round and
+continues evaluation. If a native steering outcome exists but no saved sending
+stage proves it, the continuation halts without dispatch.
+The observer's receipt is limited to 61440 bytes.
 
 A pending replacement stores only kind, expectedRevision and canonical SHA-256.
 Reentry MUST resubmit the identical complete replacement: matching digest finishes
-the idempotent append, saves snapshot/anchor and clears the marker; missing or
+the idempotent append, saves the decision digest and anchor, and clears the marker; missing or
 different input blocks before any child. A confirmed failed comparison is archived
 as a failed ledger round before a caller-requested new prepare, without changing
 consumed/valid counts or making failed originals later essentials. Identical replay

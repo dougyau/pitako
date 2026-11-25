@@ -13,7 +13,7 @@ commandSchema.properties.verifies = list(integer);
 const backlogTaskSchema = object({
   id: string, title: { ...string, maxLength: 80 }, goal: string, expectedResult: string, status: { enum: ["pending"] },
   origin: object({ kind: { enum: ["spec", "director", "final-phase", "human"] }, ref: string }),
-  specRefs: list(string), dependsOn: list(string), gates: { ...list(commandSchema), minItems: 1 },
+  specRefs: list(string), dependsOn: list(string), gates: { ...list(commandSchema), minItems: 1, maxItems: EXECUTE_TASK_GATES_MAX },
   metric: nullable(object({ command: string, unit: string, target: { type: "number" } })),
   parent: nullable(string), remaining: { type: "string" },
   progress: object({ nonImproving: { type: "integer", minimum: 0 }, last5: list({ type: "object" }) }),
@@ -59,7 +59,8 @@ const recoverySchema = object({
   comparison: { enum: ["equal-full-json", "different-full-json", "only-original", "neither"] },
   provenance: list(string),
 });
-const key = `invoke-${config.invocation}`;
+let key = `invoke-${config.invocation}`;
+const stateKey = "pitako-execute";
 const references = [];
 const nativeCalls = [];
 function retainNativeCall(promise) {
@@ -137,52 +138,10 @@ function candidate(value) {
     throw new Error("Missing checkoutEvidence candidate identity.");
   return { head: value.head, fingerprint: value.fingerprint };
 }
-function nativeReference(childKey, result) {
-  const ref = { key: childKey };
-  // Review publication and control witnesses are projected only for review children;
-  // other children keep the stable reference used for recovery reconciliation.
-  const review = childKey.includes(".review.");
-  // Review retains a failed original once in its own state; keep only the diagnostic here.
-  if (review && text(result?.error)) ref.error = result.structuredOutput === undefined ? result.error
-    : result.error.split("\n\nOutput:\n")[0]
-      .replaceAll(JSON.stringify(result.structuredOutput, null, 2), "[retained failed original]")
-      .replaceAll(JSON.stringify(result.structuredOutput), "[retained failed original]");
-  for (const field of ["agent", "runId", "asyncDir", "outputReference", "outputArtifactPath", "outputPathMapping", "artifactPaths", "externalAdapter",
-    ...(review ? ["model", "nativeKey", "workflowKey", "outputSaveError", "metadataSaveError", "exitCode", "timedOut", "terminalOutcome", "stopped", "interrupted", "detached", "recovery", "toolBudgetBlocked", "state"] : [])])
-    if (result?.[field] !== undefined) ref[field] = result[field];
-  // Native acceptance metadata is large and constant for read-only reviewers; only
-  // its recovery barrier is control evidence. Per-result debug paths stay in the
-  // native run, reachable through asyncDir/artifactPaths, not in mission state.
-  const recovery = item => item?.acceptance?.recovery !== undefined ? { acceptance: { recovery: item.acceptance.recovery } } : {};
-  if (review) Object.assign(ref, recovery(result));
-  if (!review) {
-    const witnesses = result?.results?.filter(entry => text(entry.structuredOutputPath) || text(entry.savedOutputPath))
-      .map(entry => Object.fromEntries(["structuredOutputPath", "savedOutputPath"].filter(field => text(entry[field])).map(field => [field, entry[field]])));
-    if (witnesses?.length) ref.results = witnesses;
-    if (childKey === loop?.attempt?.key && loop.attempt.referenceCapacity)
-      assertWorkerReferenceCapacity(ref, result);
-    return ref;
-  }
-  if (result?.key !== undefined && result.key !== childKey && result.key !== result.runId) ref.nativeKey = result.key;
-  const witnesses = result?.results?.map(entry => Object.fromEntries(
-    ["index", "key", "agent", "runId", "workflowKey", "savedOutputPath", "outputReference", "structuredOutputPath",
-      "outputSaveError", "metadataSaveError", "exitCode", "terminalOutcome", "state", "stopped", "interrupted", "timedOut", "detached", "recovery", "toolBudgetBlocked"]
-      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]]).concat(Object.entries(recovery(entry)))));
-  if (witnesses?.length) ref.results = witnesses;
-  return ref;
-}
 function barrier(result, ref) {
   if (!result) return null;
-  for (const field of ["stopped", "interrupted"])
-    if (result[field]) return field;
-  for (const field of ["stopped", "interrupted"])
-    if (result.results?.some(child => child[field])) return field;
-  for (const field of ["detached", "recovery"])
-    if (result[field]) return field;
-  if (["running", "queued", "pending", "paused", "stopped", "interrupted", "detached", "recovery", "rejected"].includes(result.state)) return result.state;
-  if (result.results?.some(child => child.stopped || child.interrupted || child.detached ||
-      child.acceptance?.recovery || child.toolBudgetBlocked)) return "native child barrier";
-  if (/Blocked by pi-subagents permission rule:/.test(result.error ?? "")) return "native permission denial";
+  const cause = settledBarrier(result);
+  if (cause) return cause;
   if (ref && Array.isArray(result.results) && !result.results.length && typeof result.output === "string") {
     let lines = result.output.split("\n");
     // 0.83.0 wraps management receipts; neither capacity nor remembered
@@ -206,11 +165,69 @@ function barrier(result, ref) {
   }
   return null;
 }
-function nativeBarrier(cause, ref) {
+function nativeBarrier(cause, ref, settled) {
   const error = new Error(`Positive native barrier: ${cause}`);
   error.nativeBarrier = cause;
   if (ref) error.nativeReference = clone(ref);
+  if (ref?.key && text(ref.runId) && ref.agent?.startsWith("pitako.") &&
+      settledBarrier(settled) === cause && !["running", "queued", "pending"].includes(cause))
+    error.settlementHalt = { ref: { key: ref.key, runId: ref.runId, agent: ref.agent },
+      cause, originalDigest: canonicalDigest(clone(settled)) };
   return error;
+}
+function settledNativeHalt(witness) {
+  const status = ["stopped", "interrupted"].includes(witness.cause) ||
+    /\.task-(reviewer|synthesis)$/.test(witness.ref.key) ? "cancelled" : "blocked";
+  const reason = `${status === "cancelled" ? "Execution cancelled: " : ""}${nativeBarrier(witness.cause).message}`;
+  return { status, code: "native-barrier", reason, ...witness };
+}
+function retainSettledNativeHalt(witness) {
+  const { key: producer, runId, agent } = witness.ref;
+  retainHaltProducer({ key: producer, runId }, agent.slice("pitako.".length));
+  loop.halt = settledNativeHalt(witness);
+}
+function retainHaltProducer({ key, runId }, role) {
+  inFlight.delete(key);
+  inFlight.set(key, { key, runId, role });
+}
+function loopIOViewOverflow(receipt, ref) {
+  const reason = viewOverflowReason(receipt);
+  if (!reason) return;
+  const producer = ref?.runId && ref.agent === "pitako.loop-io" ? { key: ref.key, runId: ref.runId } : null;
+  const diagnostic = excerpt(producer ? reason : `Board view overflow native original integrity failure: ${reason}`);
+  throw Object.assign(new Error(diagnostic), { viewOverflowHalt: {
+    status: "blocked", code: "view-overflow", reason: diagnostic,
+    ...(producer ? { ref: producer } : {}), originalDigest: canonicalDigest(clone(receipt)),
+  } });
+}
+function workerInterruptionHalt(action, cause) {
+  // Status may no longer expose the original artifact paths. Bind to the
+  // launched producer identity; the checkpoint is independently bound at head.
+  const cancelled = cause !== "native permission denial";
+  return { status: cancelled ? "cancelled" : "blocked", code: "native-barrier", cause,
+    reason: `${cancelled ? "Execution cancelled: " : ""}${nativeBarrier(cause).message}`,
+    ref: { key: action.key, runId: action.runId, agent: "pitako.worker" } };
+}
+function directorInterruptionHalt(action, cause) {
+  return { status: "cancelled", code: "native-barrier", cause,
+    reason: `Execution cancelled: ${nativeBarrier(cause).message}`,
+    ref: { key: action.key, runId: action.runId, agent: "pitako.execution-director" } };
+}
+function closingInterruptionHalt(action, cause) {
+  const cancelled = ["stopped", "interrupted"].includes(cause) || /\.task-(reviewer|synthesis)$/.test(action.key);
+  return { status: cancelled ? "cancelled" : "blocked", code: "native-barrier", cause,
+    reason: `${cancelled ? "Execution cancelled: " : ""}${nativeBarrier(cause).message}`,
+    ref: { key: action.key, runId: action.runId, agent: `pitako.${action.role ?? "reviewer"}` } };
+}
+function loopIOHalt(action, cause) {
+  return { status: ["stopped", "interrupted"].includes(cause) ? "cancelled" : "blocked",
+    code: "native-barrier", cause, reason: nativeBarrier(cause).message,
+    ref: { key: action.key, runId: action.runId, agent: "pitako.loop-io" } };
+}
+function restorationPendingFailure(ref, interrupted) {
+  return { code: "recovery",
+    reason: "Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.",
+    ref: interrupted ? { key: ref.key, runId: ref.runId, agent: "pitako.worker" } : clone(ref) };
 }
 function nativeFailure(childKey, error, result) {
   const message = String(error?.message ?? error);
@@ -220,16 +237,54 @@ function nativeFailure(childKey, error, result) {
     /^Active async run capacity exhausted: \d+\/\d+ used\.$/.test(message) ||
     /^Subagent spawn limit reached for this session \(\d+\/\d+ used, \d+ requested\)\. \d+ remaining; the declared run cannot fit, so no children were started\. Grant budget explicitly from the root interactive session or start a new session\.$/.test(message);
   return { code: capacity ? "capacity" : "native-dispatch", reason: excerpt(message),
-    ref: nativeReference(childKey, result) };
+    ref: result?.runId ? nativeReference(childKey, result) : { key: childKey } };
+}
+const noRunBarrier = { stop: "stopped", interrupt: "interrupted", permission: "native permission denial" };
+function noRunHalt(action, { stage, reason }) {
+  const cause = noRunBarrier[stage];
+  return { status: stage === "task-review-model" ? "blocked" : !cause ? "partial" :
+    cause === "native permission denial" && !/\.task-(reviewer|synthesis)$/.test(action.key) ? "blocked" : "cancelled",
+    code: cause ? "native-barrier" : stage, ...(cause ? { cause } : {}), reason, ref: { key: action.key } };
+}
+function taskReviewModelHalt(key, result, models) {
+  const role = key.endsWith(".task-reviewer") ? "taskReviewer" : "taskSynthesis";
+  return { status: "blocked", code: "task-review-model",
+    reason: excerpt(`pitako.execute.${role} model '${models[role]}' failed: ${result?.error ?? "missing original"}. Fix the setting and start a new invocation; no retry or fallback model.`),
+    ref: result?.runId ? nativeReference(key, result) : { key } };
 }
 function dispatch(requests) {
+  let calledNative = false;
   return Promise.resolve().then(() => {
     if (requests.some(request => budgetRejected(request.key))) {
-      invocation.budgetRejectedKeys = invocation.budgetRejectedKeys.filter(childKey => !requests.some(request => request.key === childKey));
+      invocation.budgetRejectedKeys = invocation.budgetRejectedKeys.filter(digest => !requests.some(request => canonicalDigest(request.key) === digest));
       // Consume the no-launch evidence before launch; an uncertain new call must reconcile normally.
       return save();
     }
-  }).then(() => retainNativeCall(runs.all(requests))).then(results => {
+  }).then(() => {
+    const models = requests.filter(request => !["pitako.loop-io", "pitako.access-verifier",
+      "pitako.request-observer", "pitako.checkpoint-sealer", "pitako.checkout-observer"].includes(request.agent));
+    if (!models.length || !invocation?.head) return;
+    const request = models[0];
+    dispatchedAction = { kind: "launched", key: request.key, runId: null,
+      role: (request.agent ?? (request.key.includes(".review.") ? "pitako.reviewer" : "pitako.worker")).replace(/^pitako\./, "") };
+    if (dispatchedAction.role === "worker" && loop?.task)
+      dispatchedAction.gateTimeoutMs = gateOperationTimeout(gateTaskFor(loop.task));
+    return save();
+  }).then(() => {
+    calledNative = true;
+    return retainNativeCall(runs.all(requests));
+  }).then(results => {
+    results.forEach((result, index) => {
+      const request = requests[index], role = (request.agent ??
+        (request.key.includes(".review.") ? "pitako.reviewer" : "pitako.worker")).replace(/^pitako\./, "");
+      if (dispatchedAction?.key === request.key && text(result.runId))
+        dispatchedAction.runId = result.runId;
+      // A settled worker is still an input until its consuming writer commits.
+      if (text(result.runId) && (role === "worker" || role === "loop-io" && barrier(result, request.key) ||
+          ["running", "queued", "pending"].includes(result.state)))
+        inFlight.set(request.key, { key: request.key, runId: result.runId, role });
+      else inFlight.delete(request.key);
+    });
     const rejected = results.filter((result, index) => {
       // 0.83.0 strips RunFanoutLimitError's type at the sandbox boundary.
       // Only its complete admission receipt, without a child identity, proves no launch.
@@ -240,13 +295,10 @@ function dispatch(requests) {
         /^Run fan-out limit reached at .+ \(\d+\/\d+ used; \d+ requested, \d+ remaining\)\. No children from this admission group were started\. Start a new top-level run or raise config\.maxSubagentSpawnsPerRun\.$/.test(message ?? "");
     });
     if (rejected.length) {
-      invocation.budgetRejectedKeys = [...new Set([...(invocation.budgetRejectedKeys ?? []), ...rejected.map(result => result.key)])];
+      invocation.budgetRejectedKeys = [...new Set([...(invocation.budgetRejectedKeys ?? []), ...rejected.map(result => canonicalDigest(result.key))])];
       throw Object.assign(new Error(rejected[0].error), { spawnBudgetExhausted: true });
     }
     results.forEach((result, index) => {
-      const cause = barrier(result);
-      if (resolution && ["stopped", "interrupted", "native permission denial"].includes(cause))
-        resolution.currentBarrier = { cause, ref: nativeReference(requests[index].key, result) };
       if (!result?.ok) {
         const cause = nativeFailure(requests[index].key, result?.error ?? "Native child failed.", result);
         if (cause.code === "capacity") result.nativeFailure = cause;
@@ -254,27 +306,34 @@ function dispatch(requests) {
     });
     return results;
   }).catch(error => {
-    if (error?.workerReferenceCapacity) throw error;
     if (error?.spawnBudgetExhausted) throw error;
-    if (error?.nativeBarrier) {
-      if (resolution && ["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier))
-        resolution.currentBarrier = { cause: error.nativeBarrier, ref: { key: requests[0].key } };
-      throw error;
-    }
-    if (/^Blocked by pi-subagents permission rule:/.test(String(error?.message ?? error))) {
-      if (resolution) resolution.currentBarrier = { cause: "native permission denial", ref: { key: requests[0].key }, observedError: String(error.message ?? error) };
-      throw nativeBarrier("native permission denial");
-    }
-    const cause = nativeFailure(requests[0].key, error);
+    if (error?.nativeBarrier || !calledNative) throw error;
+    const { key, agent } = requests[0];
+    const nativeDispatch = { key, role: (agent ?? "pitako.reviewer").replace(/^pitako\./, "") };
+    if (/^Blocked by pi-subagents permission rule:/.test(String(error?.message ?? error)))
+      throw Object.assign(nativeBarrier("native permission denial", { key }), { nativeDispatch });
+    const cause = nativeFailure(key, error);
     const failure = new Error(cause.reason);
     failure.nativeFailure = cause;
+    failure.nativeDispatch = nativeDispatch;
     throw failure;
   });
 }
-function budgetRejected(childKey) {
-  return invocation?.budgetRejectedKeys?.includes(childKey);
+function retainUnstartedDispatch(error, reason) {
+  if (!error?.nativeDispatch || error.nativeReference?.runId || error.nativeFailure?.ref?.runId) return false;
+  const stage = error.nativeFailure?.code ?? Object.keys(noRunBarrier).find(stage => noRunBarrier[stage] === error.nativeBarrier);
+  if (!stage) return false;
+  const { key, role } = error.nativeDispatch;
+  dispatchedAction = { kind: "launched", key, role, runId: null,
+    ...(dispatchedAction?.role === "worker" && role === "worker"
+      ? { gateTimeoutMs: dispatchedAction.gateTimeoutMs } : {}) };
+  loop.halt = noRunHalt(dispatchedAction, { stage, reason: excerpt(reason) });
+  return true;
 }
-function observeStatus(ref, retainUnknown = false) {
+function budgetRejected(childKey) {
+  return invocation?.budgetRejectedKeys?.includes(canonicalDigest(childKey));
+}
+function observeStatus(ref, retainUnknown = false, onUnavailable) {
   return runs.status(ref).catch(error => {
     const message = String(error?.message ?? error);
     const prefix = `Status '${ref}' failed: `;
@@ -287,8 +346,25 @@ function observeStatus(ref, retainUnknown = false) {
     if (failure.code === "capacity") {
       const blocked = new Error(failure.reason); blocked.nativeFailure = failure; throw blocked;
     }
+    if (onUnavailable) throw onUnavailable(message);
     // Best-effort observer unavailability is unknown, not activity or settlement.
     if (retainUnknown) return { ok: false, state: "unknown", output: message };
+  });
+}
+function observeReplayDirector(director) {
+  const target = director.runId ?? director.key;
+  return observeStatus(target, true).then(observed => {
+    const cause = analysisBarrier(observed, director.runId ?? observed?.runId ?? target) ?? analysisBarrier(observed, target);
+    if (cause) throw nativeBarrier(cause, director);
+    return observed;
+  }).catch(error => {
+    const cause = error.nativeBarrier;
+    if (["stopped", "interrupted", "native permission denial"].includes(cause)) {
+      // Status is not a settlement original; retain the bounded host observation instead.
+      error.hostHalt = { stage: cause === "native permission denial" ? "host" : "host-stop",
+        reason: excerpt(`Director status observation for ${director.key}: ${error.message}`) };
+    }
+    throw error;
   });
 }
 function host(grant, attempt = 1, original = grant) {
@@ -303,6 +379,13 @@ function host(grant, attempt = 1, original = grant) {
     // The fixed inspector transports even failed reads in a successful bounded JSON envelope.
     if (text(value.error) && transientSaveError(new Error(value.error)))
       throw new Error([value.error, value.next].filter(Boolean).join(" "));
+    const { version, binding, checkout, error, next } = value;
+    inspectedEpochAdmission = { version, binding, checkout, error, next };
+    if (value.checkpointObservation && typeof value.checkpointObservation === "object") {
+      const output = /\/outputs\/([a-f0-9-]{36})\/host\/(inspect-initial(?:\.r[12])?)\.log$/.exec(result.outputPath ?? "");
+      if (output?.[2] === grant.key)
+        checkpointWitnessRefs.set(value.checkpointObservation, { key: output[2], runId: output[1] });
+    }
     return value;
   }).catch(error => {
     // The native wrapper discards the receipt on failure. This exact message at
@@ -317,35 +400,63 @@ function host(grant, attempt = 1, original = grant) {
     if (transient && !error.nativeBarrier &&
         !["queued", "running", "pending", "stopped", "interrupted"].includes(receipt?.state) && attempt < 3 && next)
       return host(next, attempt + 1, original);
-    error.hostHalt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked", code: "host-observation",
-        reason: error?.message === `Host command '${grant.key}' failed: Command stopped because the workflow was aborted.`
-          ? "Native host abort/failure observation is ambiguous; retain the unknown cause for bounded reconstruction under current native authority."
-          : "Read-only host inspection failed; retain its observation for bounded reconstruction under current native authority.",
-        ref: { key: grant.key }, command: grant.command,
-        observedError: String(error?.message ?? error), request: hostRequest(),
-        ...(receipt?.state !== undefined ? { observedState: receipt.state } : {}),
-        ...(error.nativeBarrier ? { observedBarrier: error.nativeBarrier } : {}),
-        ...(receipt?.outputPath !== undefined ? { outputReference: receipt.outputPath } : {}) };
-    if (attempt === 3) error.hostHalt.reason += ` Three inspection attempts failed: ${String(error?.message ?? error)}`;
+    const status = ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked";
+    const diagnostic = message === `Host command '${grant.key}' failed: Command stopped because the workflow was aborted.`
+      ? "Native host abort/failure observation is ambiguous"
+      : "Read-only host inspection failed";
+    error.hostHalt = { stage: status === "cancelled" ? "host-stop" : "host",
+      reason: excerpt(`${diagnostic}: ${error.nativeBarrier ? `${error.nativeBarrier}: ` : ""}${attempt === 3
+        ? "Three inspection attempts failed: " : ""}${message}`) };
+    error.hostRef = { key: grant.key };
     throw error;
   });
 }
-function hostRequest() {
-  return { missionId: config.missionId, missionPath: config.missionPath,
-    invocation: config.invocation, root: config.root, id: config.id,
-    inspectionCommand: config.inspections[0].command, sourceRefs: config.sourceRefs ?? [] };
+function hostHaltReport(action, { stage, reason }) {
+  const ref = action?.kind === "pending" ? { key: action.opKey } :
+    action?.kind === "launched" ? { key: action.key, runId: action.runId } : undefined;
+  return { status: stage === "host-stop" ? "cancelled" : "blocked", code: "host-observation",
+    reason, ...(ref ? { ref } : {}) };
 }
-function capture(current) {
+function hostHaltCursor(cursor, diagnostic) {
+  return { ...diagnostic, digest: canonicalDigest({ action: clone(cursor.action),
+    command: config.inspections[0].command, halt: hostHaltReport(cursor.action, diagnostic) }) };
+}
+function hostHaltDisposition(cursor, halt) {
+  return { ...cursorDisposition(cursor, halt.status, halt.reason), loopReport: { halt },
+    action: { actor: "native run operator", operation: "continue only in a new invocation",
+      reason: halt.reason, references: halt.ref ? [halt.ref] : [], started: false } };
+}
+function matchesCursorRequest(cursor) {
+  const preliminary = config.preliminary;
+  const association = { missionId: config.missionId, missionPath: config.missionPath,
+    invocation: config.invocation, root: preliminary?.root, commonDir: preliminary?.commonDir,
+    source: preliminary?.source, digest: preliminary?.digest,
+    maxCycles: cursor.budget.maxCycles, sourceRefs: config.sourceRefs ?? [] };
+  return preliminary?.binding === cursor.admissionBinding &&
+    canonicalDigest(association) === cursor.associationDigest;
+}
+function checkAdmissionBinding(current) {
   const preliminary = config.preliminary;
   if (!preliminary || preliminary.version !== 1 || current.version !== 1 ||
       !/^[a-f0-9]{64}$/.test(current.binding ?? "") || current.binding !== preliminary.binding ||
       preliminary.id !== config.id || typeof preliminary.content !== "string" ||
       !preliminary.content || utf8Bytes(preliminary.content) > 39936 || !candidate(current.checkout))
     throw new Error(`Preliminary/native admission binding mismatch for ${preliminary?.source ?? "unavailable source"}; expected ${preliminary?.binding ?? "unavailable"}, observed ${current.binding ?? "unavailable"}. Reconcile the disputed selection, content and physical identity; explicitly prepare admission with the intended version, never auto-select newer content. After admission preserve the original snapshot and restore reliable exact bytes; deliver desired changes as a human addendum. Native barriers still require native reconciliation.`);
-  if (config.recovery?.digest !== current.recoveryDigest ||
-      (current.recoveryDigest !== undefined && !/^[a-f0-9]{64}$/.test(current.recoveryDigest)))
-    throw new Error(`Retained recovery originals changed between preliminary capture and native admission; expected ${config.recovery?.digest ?? "unavailable"}, observed ${current.recoveryDigest ?? "unavailable"}. Preserve exact producer references and the admitted snapshot; inspect those originals and reconcile the exact pending operation, never redispatch or silently recapture.`);
-  const witness = current.checkpointObservation;
+  return preliminary;
+}
+function capture(current, proof = refreshedTimeoutAdmission ?? config) {
+  const preliminary = checkAdmissionBinding(current);
+  const readFailure = current.storeFailure ?? proof.preliminaryStoreFailure;
+  if (readFailure && !recoveredEpochCursor)
+    throw Object.assign(new Error(readFailure.reason), { code: readFailure.code });
+  if (!recoveredEpochCursor && (proof.recovery?.digest !== current.recoveryDigest ||
+      current.recoveryDigest !== undefined && !/^[a-f0-9]{64}$/.test(current.recoveryDigest)))
+    throw new Error(`Retained recovery originals changed between preliminary capture and native admission; expected ${proof.recovery?.digest ?? "unavailable"}, observed ${current.recoveryDigest ?? "unavailable"}. Preserve exact producer references and the admitted snapshot; inspect those originals and reconcile the exact pending operation, never redispatch or silently recapture.`);
+  if (!recoveredEpochCursor && (proof.timeoutRecovery?.digest !== current.timeoutDigest ||
+      proof.timeoutRecovery && (canonicalDigest(proof.timeoutRecovery.packet) !== current.timeoutDigest ||
+        utf8Bytes(JSON.stringify(proof.timeoutRecovery.packet)) > 61440)))
+    throw new Error("Timeout projection preliminary/native digest integrity mismatch.");
+  const witness = recoveredEpochCursor ? undefined : current.checkpointObservation;
   if (witness !== undefined && (!witness || typeof witness !== "object" || Array.isArray(witness) ||
       !text(witness.key) || !text(witness.taskId) || !Number.isSafeInteger(witness.attempt) || witness.attempt < 1 ||
       !Number.isSafeInteger(witness.loop) || witness.loop < 1 || !Number.isSafeInteger(witness.cursor) || witness.cursor < 0 ||
@@ -354,10 +465,22 @@ function capture(current) {
     throw new Error("Invalid native checkpoint observation; retain the pending unit and inspect the exact native admission receipt before recovery.");
   return { metadata: { root: preliminary.root, commonDir: preliminary.commonDir,
     selected: { source: preliminary.source, digest: preliminary.digest }, checkout: current.checkout,
-    retainedAnalyses: config.recovery?.originals ?? [], ...(witness ? { checkpointObservation: witness } : {}) }, content: preliminary.content };
+    retainedAnalyses: recoveredEpochCursor ? [] : proof.recovery?.originals ?? [],
+    ...(!recoveredEpochCursor && proof.timeoutRecovery ? { timeoutProjection: proof.timeoutRecovery.packet } : {}),
+    ...(witness ? { checkpointObservation: witness } : {}) }, content: preliminary.content };
 }
+const checkpointWitnessRefs = new WeakMap();
 let invocation, loop, activePlan, currentCandidate, checkpointObservation, replay = false;
-let hostHalt, resolution, hostReconstruction;
+let storeProjection;
+let replayAdmissionObservation;
+let inspectedEpochAdmission;
+let retainedAnalysisDeadline;
+let refreshedTimeoutAdmission;
+let recoveredEpochCursor;
+let dispatchedAction;
+const inFlight = new Map();
+let hostHalt;
+let retiringAnalysis;
 let inspectedAnalyses = [];
 let admissionValidated = false;
 let persistenceFailed = false;
@@ -373,167 +496,164 @@ function transientSaveError(error) {
   return /^Timed out acquiring mission state lock '[^']+'\.$/.test(message) ||
     /(?:^|[\s:])(EAGAIN|EBUSY|EIO|EINTR|ETIMEDOUT|ENOSPC|EDQUOT|EMFILE|ENFILE|EACCES|EPERM)(?=[:\s,]|$)/.test(message);
 }
-function persistState(stateKey, value, optionalPlan = null) {
+function persistState(stateKey, value) {
+  validateExecuteCursor(stateKey, value);
   // Freeze once and serialize saves: a retried older projection must not overwrite a newer receipt.
-  const frozen = compactWorkerReferences(clone(value));
-  const projections = [frozen, ...(optionalPlan ? [{ ...frozen, activePlan: clone(optionalPlan) }] : [])];
-  function writeProjection(index, attempt = 1) {
-    return Promise.resolve().then(() => state.set(stateKey, projections[index])).catch(error => {
-      if (index === 1 && /^Mission state exceeds the 256 KiB limit/.test(String(error?.message ?? error))) return;
+  const frozen = clone(value);
+  function writeProjection(attempt = 1) {
+    return Promise.resolve().then(() => state.set(stateKey, frozen)).catch(error => {
       if (!transientSaveError(error)) throw Object.assign(error, {
         terminalPersistence: deterministicSaveError(error),
       });
       if (attempt === 3) throw new Error(`Three state-save attempts failed: ${String(error?.message ?? error)}`);
       // set re-reads disk under its lock; get is cached and cannot confirm a failed write.
-      return writeProjection(index, attempt + 1);
+      return writeProjection(attempt + 1);
     });
   }
-  const pending = saveTail.then(() => writeProjection(0)).then(() =>
-    projections.length === 2 ? writeProjection(1).catch(error => {
-      throw Object.assign(new Error(`Optional active-plan persistence failed; dispatch halted: ${String(error?.message ?? error)}`),
-        { optionalPersistence: true, terminalPersistence: error.terminalPersistence === true });
-    }) : undefined);
+  const pending = saveTail.then(() => writeProjection());
   saveTail = pending.catch(() => {});
   return pending;
 }
 function maxCycles() { return invocation?.association?.maxCycles ?? null; }
-// The native setter measures the whole file as indented JSON (pi-subagents
-// workflow-state.js, 256 KiB). The quarter left covers other keys and later saves.
-const DRAIN_BEFORE_ARCHIVE_BYTES = 192 * 1024;
 const prettyBytes = value => utf8Bytes(JSON.stringify(value, null, 2));
-function stateBytes() { return prettyBytes({ [key]: compactWorkerReferences({ ...invocation, activePlan: null }) }); }
-// Historical capped-window measurement: 118250 B, rounded to 116 KiB; known
-// close/gate bodies and native growth are counted separately. Behavioral capacity
-// tests cover pre-worker blocking and ordinary continuation, not this calibration.
-const WORKER_STATE_RESIDUAL_BYTES = 116 * 1024;
-function workerStateCapacity() {
-  const descriptor = loop.attempt, task = selectedTasks()[0];
-  const previous = invocation.tasks[task.id].last;
-  // Future bounded worker knowledge/gate output belongs to R, not known K.
-  const close = clone(closeAttemptInput(descriptor, task,
-    { status: "complete", knowledge: { findings: [], handoff: "" } }));
-  const closeBytes = prettyBytes(close);
-  for (const kind of ["unit", "pause"]) if (close.seal[kind].restoreSources) {
-    delete close.seal[kind].restoreSources;
+function executeCursor() {
+  const operation = storeProjection?.P.control.operation;
+  if (!operation) throw new Error("Execute cursor requires a committed operation reference.");
+  const input = committedIntentReference(operation.input, invocation.head);
+  const attempt = loop?.attempt;
+  const integrated = loop?.integratedReview;
+  const closingSlots = integrated ? new Map(integrated.originals.map(original => [original.key, {
+    key: original.key, runId: original.runId ?? null, phase: original.phase ?? integrated.phase,
+    digest: original.digest ?? loop.closingSeed?.digests[original.key] ??
+      (original.failedOriginal === undefined ? null : canonicalDigest(original.failedOriginal)),
+  }])) : null;
+  if (closingSlots && loop?.halt?.class === "final-review")
+    for (const call of loop.analysisCalls ?? [])
+      if (call.key.startsWith(reviewPrefix()) && !closingSlots.has(call.key))
+        closingSlots.set(call.key, { key: call.key, runId: call.ref.runId ?? null, phase: integrated.phase, digest: null });
+  const taskReview = attempt?.taskReview ? { generation: 1, phase: "task",
+    slots: [attempt.launch && { ...attempt.launch, phase: "worker" },
+      ...(loop.analysisCalls ?? []).filter(call => call.key.startsWith(`${attempt.key}.`) &&
+        /\.task-(reviewer|synthesis)$/.test(call.key)).map(call => ({ ...call.ref, phase: "reviewer" }))]
+      .filter(Boolean).map(ref => ({ key: ref.key, runId: ref.runId ?? null, phase: ref.phase, digest: null })),
+    verifier: null } : loop?.taskReviewCursor;
+  const stageDigest = value => value ? {
+    stage: value.stage ?? value.code ?? "halted", digest: canonicalDigest(value),
+  } : null;
+  const replay = { op: operation.operation, opKey: operation.key, input };
+  const timedOutReviewer = loop?.halt?.code === "timeout" && loop.halt.ref?.agent === "pitako.reviewer" &&
+    text(loop.halt.ref.runId) ? loop.halt.ref : null;
+  const action = timedOutReviewer
+    ? { kind: "launched", role: "reviewer", key: timedOutReviewer.key, runId: timedOutReviewer.runId, input }
+    : dispatchedAction?.kind === "pending"
+    ? { ...dispatchedAction, input: dispatchedAction.input ? committedIntentReference(dispatchedAction.input, invocation.head) : input }
+    : !loop?.halt && (loop?.outcome === "gaps" && invocation.consumedLoops >= maxCycles() || loop?.outcome === "complete")
+    ? { kind: "terminal" }
+    : dispatchedAction ? { ...dispatchedAction, input }
+      : { kind: "pending", ...replay };
+  if (action.kind === "launched" && action.role === "worker" &&
+      action.gateTimeoutMs === undefined && loop?.task)
+    action.gateTimeoutMs = gateOperationTimeout(gateTaskFor(loop.task));
+  if (action.kind === "launched" && action.role === "worker")
+    action.op = operation.operation;
+  if (action.kind === "pending" && ["gate", "close"].includes(action.op) &&
+      action.gateTimeoutMs === undefined && loop?.task)
+    action.gateTimeoutMs = gateOperationTimeout(gateTaskFor(loop.task));
+  if (action.kind === "pending" && action.op === "gate" && loop?.task) {
+    action.gateTimeouts = loop.task.gates.map(gate => gate.timeoutMs ?? 1800000);
+    action.gateMetricMs = loop.task.metric ? 1800000 : 0;
   }
-  const K = {
-    sealBodyTwice: previous ? 2 * prettyBytes(sealRecord(previous).body) : 0,
-    close: prettyBytes(close),
-    conditional: closeBytes - prettyBytes(close),
-    gate: descriptor.gate?.receipt ? prettyBytes(descriptor.gate.receipt) : 0,
-    native: descriptor.referenceCapacity.windowBytes,
+  const noRunStage = action.kind === "launched" && action.runId === null &&
+      same(loop?.halt?.ref, { key: action.key })
+    ? loop.halt.code === "native-barrier"
+      ? Object.keys(noRunBarrier).find(stage => noRunBarrier[stage] === loop.halt.cause)
+      : ["capacity", "native-dispatch", "task-review-model"].includes(loop.halt.code) ? loop.halt.code : null
+    : null;
+  return {
+    version: 10, storeId: invocation.storeId, root: invocation.association.root,
+    invocation: config.invocation, epoch: invocation.epoch ?? 0,
+    associationDigest: canonicalDigest(invocation.association), admissionBinding: invocation.admissionBinding,
+    head: clone(invocation.head), action,
+    loop: loop ? { number: loop.number, phase: loop.phase, cursor: loop.cursor,
+      taskId: loop.task?.id ?? attempt?.taskId ?? null, outcome: loop.outcome ?? null,
+      attempt: attempt ? { number: attempt.number, stage: attempt.stage,
+        intent: attempt.intent ?? null, revival: attempt.revival?.code ?? null } : null } : null,
+      inFlight: [...inFlight.values()], halt: noRunStage
+      ? { stage: noRunStage, digest: canonicalDigest(loop.halt), reason: loop.halt.reason }
+      : loop?.halt?.code === "native-barrier" && loop.halt.originalDigest
+      ? { stage: "native-settlement", digest: canonicalDigest(loop.halt) }
+      : loop?.halt?.cause === "native permission denial" &&
+      (action.kind === "pending" && ["close", "drain"].includes(action.op) ||
+        action.kind === "launched" && action.role === "reviewer" && action.runId &&
+        ["review", "compliance"].includes(loop.phase) && loop.halt.ref?.runId === action.runId &&
+        loop.halt.ref.key === action.key)
+      ? { stage: "native-permission", digest: canonicalDigest(loop.halt) }
+      : action.kind === "launched" && action.role === "worker" && action.runId &&
+        loop?.halt?.code === "native-barrier" && ["running", "queued", "pending"].includes(loop.halt.cause)
+      ? { stage: "worker-activity", digest: canonicalDigest(loop.halt) }
+      : loop?.halt?.code === "native-barrier" && ["running", "queued", "pending"].includes(loop.halt.cause) &&
+        inFlight.get(loop.halt.ref?.key)?.role === "checkpoint-sealer"
+      ? { stage: "sealer-activity", digest: canonicalDigest(loop.halt) } : stageDigest(loop?.halt),
+    hostHalt: hostHalt ? hostHaltCursor({ action }, hostHalt) : null,
+    timeouts: { ...effectiveTimeouts(),
+      ...(action.kind === "launched" && action.runId === null && action.key === retainedAnalysisDeadline?.key
+        ? { reviewerMs: retainedAnalysisDeadline.ms } : {}) },
+    models: { taskReviewer: invocation.taskReviewer, taskSynthesis: invocation.taskSynthesis,
+      ...Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [slot, invocation.reviewModels[slot].model])) },
+    budget: { consumedLoops: invocation.consumedLoops, maxCycles: maxCycles(),
+      rejectedKeys: invocation.budgetRejectedKeys ?? [], lastProgress: invocation.lastBudgetProgress ?? null },
+    backlogDigest: invocation.backlogDigest, boardTopicId: invocation.boardTopicId,
+    review: integrated ? {
+      generation: loop.analysisGenerations?.["final-review"] ?? 1,
+      phase: integrated.phase,
+      slots: [...closingSlots.values()],
+      verifier: null,
+    } : taskReview ?? null,
   };
-  const U = descriptor.capacityIO.receipt.unrelated, S = stateBytes(), R = WORKER_STATE_RESIDUAL_BYTES;
-  return { U, S, K, R, total: U + S + Object.values(K).reduce((sum, bytes) => sum + bytes, 0) + R };
 }
-function workerReferenceFrame(ref) {
-  return { [key]: { loop: { attempt: { launch: ref } } } };
-}
-function workerReferenceCapacity(childKey) {
-  // Only settled current-run producers establish the native artifact roots.
-  // A fresh capacity observer also supplies routing after a director-less relaunch.
-  const observer = loop.attempt?.capacityIO;
-  const currentObserver = observer?.stage === "receipt" &&
-    references.find(ref => ref.key === observer.ref?.key && ref.runId === observer.ref?.runId);
-  const producer = currentObserver || loop.plan?.stage === "admitted" &&
-    references.find(ref => ref.key === loop.plan.ref?.key && ref.runId === loop.plan.ref?.runId);
-  const paths = producer && [
-    producer.asyncDir, producer.outputReference, producer.outputArtifactPath,
-    producer.outputPathMapping?.savedPath, ...(producer.artifactPaths ?? []),
-    ...(producer.results ?? []).flatMap(entry => [entry.savedOutputPath, entry.structuredOutputPath]),
-  ].filter(value => typeof value === "string" && value.startsWith("/"));
-  // pi-subagents 0.87: shared/artifacts.js:186-195 (fixed artifact kinds);
-  // runs/foreground/subagent-executor.js:3334-3353 (120-byte run segment,
-  // <=128-byte workflow key), :4185 (UUID), :4226-4238 (<=5 artifact paths);
-  // :7456-7492 (one UUID/run-0/session.jsonl below the shared session root);
-  // runs/shared/structured-output.js:375-389 (six random chars + fixed names).
-  // 512 covers those suffixes in serialized UTF-8, including child session paths.
-  // Missing current-run evidence uses PATH_MAX serialized bytes per path.
-  const pathBytes = paths?.length ? Math.max(...paths.map(value =>
-    utf8Bytes(JSON.stringify(value.slice(0, value.lastIndexOf("/") + 1))) - 2)) + 512 : 4096;
-  const pathname = "/" + "x".repeat(pathBytes - 1);
-  const ref = { key: childKey, agent: "pitako.worker", runId: "x".repeat(128),
-    asyncDir: pathname, outputReference: pathname, outputArtifactPath: pathname,
-    outputPathMapping: { requestedPath: pathname, savedPath: pathname },
-    artifactPaths: Array(5).fill(pathname), launchedMs: 86400000,
-    terminalOutcome: { state: "x".repeat(64), reason: "x".repeat(64) },
-    results: [{ agent: "pitako.worker", structuredOutputPath: pathname, savedOutputPath: pathname,
-      state: "x".repeat(64), timedOut: true, exitCode: -9007199254740991,
-      terminalOutcome: { state: "x".repeat(64), reason: "x".repeat(64) } }] };
-  // Replay may admit a complete status response with different paths while the
-  // launch remains retained. All five result consumers share that second route.
-  // Only launch carries timeout controls; nativeReference keeps result paths.
-  const resultRef = clone(ref);
-  delete resultRef.launchedMs;
-  delete resultRef.terminalOutcome;
-  resultRef.results = [{ structuredOutputPath: pathname, savedOutputPath: pathname }];
-  resultRef.asyncDir = "/" + "y".repeat(pathBytes - 1);
-  const window = compactWorkerReferences({ copies: [ref, ...Array.from({ length: 5 }, () => clone(resultRef))] });
-  return { bytes: prettyBytes(workerReferenceFrame(ref)),
-    windowBytes: prettyBytes({ [key]: window }), pathBytes,
-    source: paths?.length ? producer.key : "PATH_MAX" };
-}
-function observeWorkerStateCapacity() {
-  const descriptor = loop.attempt;
-  const observation = (descriptor.capacityIO?.observation ?? 0) + 1;
-  descriptor.capacityIO = { key: `${descriptor.key}.capacity-${observation}`,
-    observation, retry: 0, stage: "intention" };
-  return loopIO("capacityIO", { operation: "stateCapacity", root: config.root,
-    missionPath: invocation.association.missionPath, missionId: invocation.association.missionId,
-    invocation: config.invocation }, descriptor).then(receipt => {
-    if (!["total", "execute", "unrelated"].every(field =>
-        Number.isSafeInteger(receipt[field]) && receipt[field] >= 0) ||
-        receipt.execute < prettyBytes({ [key]: {} }) ||
-        receipt.total !== receipt.execute + receipt.unrelated)
-      throw new Error("Invalid whole-file state capacity observation; no worker dispatched.");
-    descriptor.referenceCapacity = workerReferenceCapacity(descriptor.key);
-    return receipt;
-  });
-}
-function assertWorkerReferenceCapacity(ref, original) {
-  const prediction = loop.attempt.referenceCapacity;
-  const path = value => typeof value === "string" && value.startsWith("/") &&
-    utf8Bytes(JSON.stringify(value)) - 2 <= prediction.pathBytes;
-  const outcome = value => value === undefined || value && !Array.isArray(value) &&
-    Object.keys(value).every(field => ["state", "reason"].includes(field)) &&
-    Object.values(value).every(value => typeof value === "string" && utf8Bytes(JSON.stringify(value)) - 2 <= 64);
-  const supported = ref.externalAdapter === undefined &&
-    (ref.agent === undefined || ref.agent === "pitako.worker") &&
-    (ref.runId === undefined || typeof ref.runId === "string" && utf8Bytes(JSON.stringify(ref.runId)) - 2 <= 128) &&
-    ["asyncDir", "outputReference", "outputArtifactPath"].every(field => ref[field] === undefined || path(ref[field])) &&
-    (ref.outputPathMapping === undefined || ref.outputPathMapping && !Array.isArray(ref.outputPathMapping) &&
-      Object.keys(ref.outputPathMapping).every(field => ["requestedPath", "savedPath"].includes(field)) &&
-      Object.values(ref.outputPathMapping).every(value => typeof value === "string" &&
-        utf8Bytes(JSON.stringify(value)) - 2 <= prediction.pathBytes)) &&
-    (ref.artifactPaths === undefined || Array.isArray(ref.artifactPaths) && ref.artifactPaths.length <= 5 && ref.artifactPaths.every(path)) &&
-    outcome(ref.terminalOutcome) &&
-    (ref.results === undefined || Array.isArray(ref.results) && ref.results.length <= 1 && ref.results.every(entry =>
-      entry && !Array.isArray(entry) && Object.keys(entry).every(field =>
-        ["agent", "structuredOutputPath", "savedOutputPath", "state", "timedOut", "exitCode", "terminalOutcome"].includes(field)) &&
-      (entry.agent === undefined || entry.agent === "pitako.worker") &&
-      ["structuredOutputPath", "savedOutputPath"].every(field => entry[field] === undefined || path(entry[field])) &&
-      (entry.state === undefined || typeof entry.state === "string" && utf8Bytes(JSON.stringify(entry.state)) - 2 <= 64) &&
-      (entry.timedOut === undefined || typeof entry.timedOut === "boolean") &&
-      (entry.exitCode === undefined || entry.exitCode === null || Number.isSafeInteger(entry.exitCode)) &&
-      outcome(entry.terminalOutcome)));
-  const actual = prettyBytes(workerReferenceFrame(ref));
-  if (!supported || actual > prediction.bytes) {
-    const cause = barrier(original ?? ref);
-    if (cause) throw nativeBarrier(cause, { key: loop.attempt.key });
-    throw Object.assign(new Error(`Worker native reference exceeds its prelaunch capacity prediction (${actual} bytes; reserved ${prediction.bytes}; supported shape: ${!!supported}); use a new mission. Native originals remain unchanged; inspect the exact worker key before recovery.`),
-      { workerReferenceCapacity: { actual, reserved: prediction.bytes, supported: !!supported, key: loop.attempt.key } });
+function save(budgetOnly = false) {
+  // Before the first advance COMMIT, relaunch repeats its native key; no cursor exists yet.
+  if (!invocation?.head) return Promise.resolve();
+  // Until the replacement launch-intention save, the verified timeout is the
+  // replay point. A cursor naming neither generation cannot rebuild the prompt.
+  if (retiringAnalysis) {
+    if (dispatchedAction?.kind !== "launched" ||
+        !dispatchedAction.key.startsWith(retiringAnalysis) || dispatchedAction.runId)
+      return Promise.resolve();
+    retiringAnalysis = undefined;
   }
-}
-function save() {
+  // Before the replacement baseline commits, only the interrupted source is
+  // durable. A cursor must not combine that launch with the successor slot.
+  if (loop?.attempt?.restore && !loop.attempt.intent &&
+      dispatchedAction?.kind === "launched" && dispatchedAction.role === "worker" &&
+      dispatchedAction.key === loop.attempt.restore.producer.key)
+    return Promise.resolve();
+  // Keep the launched cursor authoritative until the existing grouped drain commits admission.
+  // A committed close or baseline reconstructs the pending unit on replay.
+  // A Stop on the drain itself must survive; its native producer pins the request.
+  const stoppedDrain = dispatchedAction?.kind === "pending" && dispatchedAction.op === "drain" &&
+    loop?.halt?.code === "native-barrier" && inFlight.has(loop.halt.ref?.key);
+  if (!stoppedDrain && !loop?.attempt?.foldedBaseline && !(
+      loop?.attempt?.intent && loop.attempt.baselineIO?.stage === "receipt") &&
+      (invocation.sealPending?.record.kind === "unit" ||
+      invocation.intentions?.some(entry => entry.operation === "ledger" && entry.input.record.kind === "unit"))) {
+    if (budgetOnly === true) return state.get(stateKey).then(cursor => {
+      if (!cursor || cursor.invocation !== config.invocation || cursor.storeId !== invocation.storeId)
+        throw new Error("Missing retained action for spawn-budget save.");
+      return persistState(stateKey, { ...cursor, halt: loop?.halt
+        ? { stage: loop.halt.code, digest: canonicalDigest(loop.halt) } : cursor.halt,
+        budget: { ...cursor.budget, rejectedKeys: clone(invocation.budgetRejectedKeys),
+          lastProgress: invocation.lastBudgetProgress } });
+    });
+    return Promise.resolve();
+  }
+  if (loop?.attempt?.stage === "launched")
+    committedIntentReference(loop.attempt.intent, invocation.head);
   if ((loop?.phase === "closing" && !loop.closing || loop?.outcome === "gaps") && !loop.archivePending && !loop.archived)
     loop.archivePending = frozenLoopArchive(loop.phase !== "closing");
   if (loop?.phase === "closing" && loop.archivePending && !loop.archived) closingRecord();
-  // The native setter measures the ENTIRE merged file, including unrelated keys.
-  // Essential state is committed first. One optional identical active plan cannot
-  // displace snapshot, frozen descriptor, progress, or historical records.
-  const essential = { ...invocation, activePlan: null };
-  return persistState(key, essential).then(() => { emitTodoSnapshot(); }).catch(error => {
-    if (error.optionalPersistence) throw error;
+  // The native setter measures the entire merged file, including unrelated keys.
+  return persistState(stateKey, executeCursor()).then(() => { emitTodoSnapshot(); }).catch(error => {
     persistenceFailed = true;
     persistenceReason = `Essential persistence failed; dispatch halted: ${String(error?.message ?? error)}`;
     throw Object.assign(new Error(persistenceReason), { terminalPersistence: error.terminalPersistence === true });
@@ -597,20 +717,30 @@ function observeMainRequests(cursor = 0, records = [], settling = false, supplie
   if (supplied) return admitRequests(supplied, cursor, records, settling);
   invocation.requestObservation = (invocation.requestObservation ?? 0) + 1;
   const observerKey = `${key}.l${loop.number}.requests-${invocation.requestObservation}`;
-  return save().then(() => dispatch([{ key: observerKey, agent: "pitako.request-observer",
-    context: "fresh", cwd: config.root, task: JSON.stringify({ invocation: config.invocation, cursor }),
+  const task = JSON.stringify({ invocation: config.invocation, cursor,
+      storeId: invocation.storeId, expectedHead: clone(invocation.head),
+      ...(invocation.epoch > 0 ? { epoch: invocation.epoch } : {}),
+      ...(loop.attempt?.taskReview?.synthesis ? { observation: { key: observerKey,
+        number: invocation.requestObservation, input: storeProjection.P.control.operation.input } } : {}) });
+  const observe = (retry = 0) => dispatch([{ key: retry ? `${observerKey}.r${retry}` : observerKey, agent: "pitako.request-observer",
+    context: "fresh", cwd: config.root, task,
     output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false,
-  }])).then(([result]) => {
-    references.push(nativeReference(observerKey, result));
+  }]).then(([result]) => {
+    const ref = nativeReference(observerKey, result);
+    references.push(ref);
     const cause = barrier(result);
-    if (cause) throw nativeBarrier(cause);
+    if (cause) throw nativeBarrier(cause, ref, result);
     if (!result?.ok || result.agent !== "pitako.request-observer" || !text(result.runId) ||
         !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 ||
         typeof result.output !== "string" || utf8Bytes(result.output) > 65536 ||
         [result, ...result.results].some(item => item.error || item.outputPartial || item.truncation || item.timedOut || item.processSignal))
       throw new Error("Execute request observation lacks a complete successful result; no worker dispatched.");
-    return admitRequests(JSON.parse(result.output), cursor, records, settling);
+    const page = JSON.parse(result.output);
+    if (page?.code === "store-busy" && retry < 2) return observe(retry + 1);
+    if (page?.code) throw Object.assign(new Error(page.reason), { code: page.code, recovery: page.recovery });
+    return admitRequests(page, cursor, records, settling);
   });
+  return save().then(() => observe());
 }
 function admitRequests(page, cursor = 0, records = [], settling = false) {
     if (page.version !== 1 || page.ok !== true || page.invocation !== config.invocation ||
@@ -619,15 +749,21 @@ function admitRequests(page, cursor = 0, records = [], settling = false) {
           !["cancel", "delete"].includes(request.kind) || !/^[a-z][a-z0-9_-]{0,31}$/.test(request.origin ?? "")) ||
         !(page.next === null || Number.isSafeInteger(page.next) && page.next === cursor + page.requests.length && page.next > cursor))
       throw new Error(`Invalid execute request observation: ${page.reason ?? "invalid page"}; no worker dispatched.`);
+    if (page.observed && (Object.keys(page.observed).sort().join(",") !== "count,next,requested,taskId" ||
+        !Number.isSafeInteger(page.observed.count) || page.observed.count <= page.requests.length ||
+        !text(page.observed.taskId) || typeof page.observed.requested !== "boolean" ||
+        !(page.observed.next === null || page.observed.next === cursor + page.observed.count)))
+      throw new Error("Invalid execute request wire window; no worker dispatched.");
     records.push(...page.requests);
     if (page.next !== null) return observeMainRequests(page.next, records, settling);
+    invocation.lastRequestPage = { ...page, requests: clone(records) };
     for (const request of records) {
-      const task = selectedTasks().find(task => task.id === request.taskId);
-      const retained = task && invocation.tasks[task.id];
+      const taskId = loop.task?.id ?? invocation.transitionReplay?.taskId;
+      const retained = request.taskId === taskId && invocation.tasks[taskId];
       if (!retained || retained.cancel || retained.completed) continue;
       retained.cancel = { requestId: request.requestId, origin: request.origin, kind: request.kind,
         reason: `cancelled by main-session request (origin: ${request.origin}; ${request.kind})` };
-      (invocation.pendingCancellations ??= []).push({ taskId: task.id, requestId: request.requestId,
+      (invocation.pendingCancellations ??= []).push({ taskId, requestId: request.requestId,
         origin: request.origin, kind: request.kind });
     }
     // A settled worker's effective result is admitted before deciding late cancellation.
@@ -770,10 +906,9 @@ function generationKey(base, step) {
   const generation = loop.analysisGenerations?.[step.startsWith("task-") ? `${base}.${step}` : step] ?? 1;
   return generation === 1 ? base : `${base}.g${generation}`;
 }
-function reviewPrefix() {
-  const generation = loop.analysisGenerations?.["final-review"] ?? 1;
-  if (generation === 1) return `${key}.l${loop.number}.review.`;
-  const suffix = `.l${loop.number}.g${generation}.review.`;
+function reviewPrefix(generation = loop.analysisGenerations?.["final-review"] ?? 1, number = loop.number) {
+  if (generation === 1) return `${key}.l${number}.review.`;
+  const suffix = `.l${number}.g${generation}.review.`;
   const base = key.length + suffix.length <= 83 ? key
     : `${key.slice(0, 83 - suffix.length - 13)}-${canonicalDigest(key).slice(0, 12)}`;
   return `${base}${suffix}`;
@@ -781,9 +916,41 @@ function reviewPrefix() {
 function demandKey() {
   return `${generationKey(`${key}.l${loop.number}`, "demand-observation")}.demand-observation`;
 }
-function reviewStateKey() {
-  const generation = loop.analysisGenerations?.["final-review"] ?? 1;
-  return `review-${key}${generation === 1 ? "" : `.g${generation}`}`;
+function finalReviewRequest(cursor) {
+  const { invocation, epoch, root, storeId, action, review, timeouts } = cursor;
+  const base = `${key}.l${cursor.loop.number}`;
+  const originals = review.slots.filter(slot => slot.key !== action.key)
+    .map(({ key, runId, digest }) => ({ key, runId, digest }));
+  // The last native result may have settled before reviewPhase remembered it.
+  // The writer binds that original through the journal on both paths.
+  originals.push({ key: action.key, runId: action.runId });
+  return { operation: "reviewOriginals", root, invocation, key: `${base}.reviewOriginals`,
+    storeId, scope: `exec:${invocation}.e${epoch}`, expectedHead: { seq: action.input.seq, hash: action.input.digest },
+    refs: { input: { seq: action.input.seq, digest: action.input.digest }, originals, reviewerMs: timeouts.reviewerMs } };
+}
+function admitFinalReview(receipt, request, target) {
+  const seed = receipt.P?.prompt.closingSeed;
+  if (receipt.storeId !== request.storeId || !same(seed?.input, request.refs.input) ||
+      !same(seed.body.integratedReview.originals.map(({ key, runId }) => ({ key, runId })),
+        request.refs.originals.map(({ key, runId }) => ({ key, runId }))) ||
+      request.refs.originals.some(ref => ref.digest && seed.digests[ref.key] !== ref.digest))
+    throw new Error("Final review publication receipt integrity mismatch.");
+  const synthesis = seed.body.integratedReview.originals.at(-1);
+  Object.assign(target, {
+    candidate: candidate(seed.body.candidate),
+    closingSeed: seed, review: seed.body.review, integratedReview: seed.body.integratedReview,
+    reviewSynthesis: { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 },
+    closingPublication: { invocation: request.invocation, storeId: request.storeId,
+      input: { seq: seed.input.seq, digest: seed.input.digest }, compliance: null },
+    usage: clone(seed.body.usage), analysisCalls: clone(seed.body.analysisCalls),
+  });
+  delete receipt.P.prompt.closingSeed;
+}
+function compactIntegratedReview() {
+  const retained = loop.integratedReview;
+  if (retained?.decision?.reference?.loop !== loop.number || loop.closingSeed || loop.archived) return Promise.resolve();
+  const request = finalReviewRequest(executeCursor());
+  return loopIO("reviewOriginals", request).then(receipt => admitFinalReview(receipt, request, loop));
 }
 function analysisBarrier(result, ref) {
   return barrier(result, ref) ?? [result, ...(result?.results ?? [])].filter(Boolean)
@@ -805,28 +972,25 @@ function terminalAnalysis(result, ref) {
     analysisSettled(result, ref) || managementAnalysisState(result, ref) === "failed" ||
     closedProducerProcesses(result);
 }
+function analysisTimeoutHalt(call, result, generation) {
+  const step = analysisStep(call.key);
+  return { code: "timeout", status: "partial", class: step, key: call.key,
+    launchedMs: call.timeoutMs, ref: clone(nativeReference(call.key, result, true)),
+    reason: `${step} ${call.key} timed out at ${call.timeoutMs} ms. ${generation >= 3
+      ? "The three-generation limit is reached; use a new invocation."
+      : `Relaunch with args.timeouts.reviewerMs strictly greater than ${call.timeoutMs}.`}` };
+}
 function haltAnalysisTimeout(call, result) {
   if (!nativeTimeout(result)) return Promise.resolve();
   const step = analysisStep(call.key);
-  call.timeout = true;
-  // Keep the exact native timeout witnesses even for non-review analysis roles.
-  call.ref = { ...call.ref, ...nativeReference(call.key, result),
-    ...(result.terminalOutcome ? { terminalOutcome: result.terminalOutcome } : {}) };
-  if (result.results?.length) call.ref.results = result.results.map((entry, index) => ({
-    ...call.ref.results?.[index],
-    ...Object.fromEntries(["timedOut", "terminalOutcome", "exitCode", "state"]
-      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])),
-  }));
   const slot = step.startsWith("task-") ? `${loop.attempt.key}.${step}` : step;
-  const capped = (loop.analysisGenerations?.[slot] ?? 1) >= 3;
-  loop.halt ??= { code: "timeout", status: "partial", class: step, key: call.key,
-    launchedMs: call.timeoutMs, ref: clone(call.ref),
-    reason: `${step} ${call.key} timed out at ${call.timeoutMs} ms. ${capped
-      ? "The three-generation limit is reached; use a new invocation."
-      : `Relaunch with args.timeouts.reviewerMs strictly greater than ${call.timeoutMs}.`}` };
+  const halt = analysisTimeoutHalt(call, result, loop.analysisGenerations?.[slot] ?? 1);
+  call.timeout = true;
+  call.ref = clone(halt.ref);
+  loop.halt ??= halt;
   return save().then(() => { throw new Error(loop.halt.reason); });
 }
-function renewAnalysisTimeout() {
+function renewAnalysisTimeout(cursor) {
   const halt = loop?.halt;
   if (halt?.code !== "timeout" || !["task-reviewer", "task-synthesis", "demand-observation", "compliance", "final-review"].includes(halt.class))
     return;
@@ -840,6 +1004,8 @@ function renewAnalysisTimeout() {
   }
   const call = loop.analysisCalls?.find(call => call.key === halt.key);
   if (!call?.timeout || !nativeTimeout(halt.ref)) return;
+  const replayedReviewer = cursor?.halt?.stage === "timeout" && reviewerTimeoutAction(cursor.action) &&
+    cursor.action.key === halt.key && cursor.halt.digest === canonicalDigest(halt);
   // Re-observe exact producers, including settled siblings of a whole review phase.
   const retiring = step === "final-review"
     ? loop.analysisCalls.filter(call => call.key.includes(".review.")) : [call];
@@ -847,7 +1013,7 @@ function renewAnalysisTimeout() {
   let settled = true;
   return retiring.reduce((previous, entry) => previous.then(() => {
     let ref = loop.review?.references?.find(ref => ref.key === entry.key) ?? entry.ref;
-    if (!text(ref.runId) && entry.stage === "intention")
+    if (!text(ref.runId) && entry.stage === "intention" && step !== "final-review")
       ref = config.recovery?.references?.find(ref => ref.key === entry.key) ?? ref;
     // Only the exact native admission rejection proves a sibling never started.
     if (!text(ref.runId) && budgetRejected(entry.key)) {
@@ -855,10 +1021,12 @@ function renewAnalysisTimeout() {
       return;
     }
     if (!text(ref.runId)) { settled = false; return; }
-    return observeStatus(ref.runId, true).then(observed => {
+    const status = replayedReviewer ? observeReviewerTimeoutStatus(ref.runId) : observeStatus(ref.runId, true);
+    return status.then(observed => {
+      if (replayedReviewer) checkReviewerTimeoutIdentity(observed, ref);
       const cause = analysisBarrier(observed, ref.runId ?? ref.key);
       if (cause) throw nativeBarrier(cause, ref);
-      if (!text(ref.runId) || observed?.runId && observed.runId !== ref.runId ||
+      if (!text(ref.runId) || observed?.runId !== ref.runId && !managementAnalysisState(observed, ref) ||
           observed?.agent && ref.agent && observed.agent !== ref.agent ||
           observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
           !terminalAnalysis(observed, ref)) settled = false;
@@ -867,30 +1035,29 @@ function renewAnalysisTimeout() {
   }), Promise.resolve()).then(() => {
     if (!settled) {
       halt.reason = `${step} timeout renewal requires exact terminal, barrier-free producer evidence for every retiring step; reconcile the retained producers. No replacement dispatched.`;
-      return save();
+      return;
     }
-    const before = clone(loop), rejectedKeys = invocation.budgetRejectedKeys;
+    const rejectedKeys = invocation.budgetRejectedKeys;
     (loop.retired ??= []).push(...retiring.map(entry =>
       clone(entry.key === halt.key ? halt.ref : retiredRefs.get(entry.key))));
     loop.analysisCalls = loop.analysisCalls.filter(entry => !retiring.includes(entry));
     if (rejectedKeys)
-      invocation.budgetRejectedKeys = rejectedKeys.filter(childKey => !retiring.some(entry => entry.key === childKey));
+      invocation.budgetRejectedKeys = rejectedKeys.filter(digest => !retiring.some(entry => canonicalDigest(entry.key) === digest));
     (loop.analysisGenerations ??= {})[slot] = generation + 1;
     if (step === "final-review") {
-      delete loop.review; delete loop.reviewSynthesis; delete loop.reviewOriginals;
+      delete loop.review; delete loop.reviewSynthesis; delete loop.reviewOriginals; delete loop.integratedReview;
     }
     if (step === "compliance") delete loop.compliance;
     delete loop.halt;
     delete loop.outcome;
-    return save().catch(error => {
-      Object.keys(loop).forEach(field => delete loop[field]); Object.assign(loop, before);
-      if (rejectedKeys) invocation.budgetRejectedKeys = rejectedKeys;
-      throw error;
-    });
+    retiringAnalysis = step === "final-review" ? reviewPrefix() :
+      `${halt.key.replace(new RegExp(`(?:\\.g[23])?\\.${step}$`), "")}.g${generation + 1}.${step}`;
   }).catch(error => {
     // This pre-budget observation precedes admissionValidated; retain current
     // Stop/denial evidence here rather than relying on the general catch below.
     if (!error?.nativeBarrier || persistenceFailed) throw error;
+    if (replayedReviewer && reviewerRenewalCauses.includes(error.nativeBarrier))
+      return holdReviewerRenewal(cursor, halt, error.nativeBarrier);
     loop.halt = { code: "native-barrier",
       status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
       cause: error.nativeBarrier, reason: String(error.message),
@@ -911,10 +1078,10 @@ function analysisSettled(observed, ref) {
   // Failed management status proves retirement, never successful original admission.
   return observed?.ok && (observed.state === "complete" || managementAnalysisState(observed, ref) === "complete");
 }
-function retainedReadOnlyOriginal(observed, ref) {
+function retainedReadOnlyOriginal(observed, ref, originals = inspectedAnalyses) {
   // Management status is not the original. Prefer its complete native body;
   // only fall back to the exact associated original read by the inspector.
-  const original = inspectedAnalyses.find(value => value.key === ref.key && value.runId === ref.runId);
+  const original = originals.find(value => value.key === ref.key && value.runId === ref.runId);
   const retainedBarrier = barrier(original, ref.runId ?? ref.key);
   if (retainedBarrier) throw nativeBarrier(retainedBarrier);
   if (original?.error && original.error !== "Complete retained analysis original unavailable.")
@@ -994,188 +1161,10 @@ function reconcileAnalysis() {
       if (loop.analysisCalls?.length && loop.halt?.code === "native-barrier") delete loop.halt;
     });
 }
-function interruptedReceipt(observed, ref) {
-  if ([observed, ...(observed?.results ?? [])].some(item => /Blocked by pi-subagents permission rule:/.test(item?.error ?? "")))
-    throw nativeBarrier("native permission denial", ref);
-  if (!observed || !text(observed.runId) || (ref.runId && ref.runId !== observed.runId))
-    throw new Error("Interrupted producer identity/settlement uncertain; no fresh work dispatched.");
-  if ((ref.agent && observed.agent !== ref.agent) ||
-      (observed.key && observed.key !== ref.key && observed.key !== ref.runId))
-    throw new Error("Interrupted producer/key identity conflicts with retained reference.");
-  if ([observed, ...(observed.results ?? [])].some(item =>
-    ["running", "queued", "pending", "paused", "detached", "recovery"].includes(item.state) ||
-    item.detached || item.recovery || item.acceptance?.recovery || item.toolBudgetBlocked))
-    throw nativeBarrier("interrupted producer remains active or unsettled");
-  const cause = barrier(observed, ref.runId ?? ref.key);
-  const historical = ["stopped", "interrupted"].includes(cause);
-  // Native ok is completed work, not a launch receipt. Missing inventory and
-  // terminal-looking labels cannot settle a stopped/denied producer.
-  if ((cause && !historical) || ((historical || !observed.ok) && !closedProducerProcesses(observed)) || (!cause && !observed.ok))
-    throw nativeBarrier(cause ?? "interrupted producer settlement/result uncertain");
-  return historical;
-}
 // A pending v6 task must retain its selected identity and checkpoint intention.
 function pendingCheckpointUnit() {
   return loop?.phase === "implementation" && loop.attempt?.checkpoint && !loop.attempt.result &&
     selectedTasks()[loop.cursor]?.id === loop.attempt.taskId;
-}
-const reconciledRecoveries = new Map();
-function reconcileRetainedRecoveries() {
-  const needsPlan = loop.phase === "implementation" && loop.attempt?.checkpoint && !loop.attempt.result && !loop.task;
-  return (needsPlan ? recoverPlan().then(found => {
-    if (!found) throw new Error("Complete admitted task definition unavailable before continuation.");
-  }) : Promise.resolve()).then(() => {
-    const operations = resolution.operations ?? [];
-    if (pendingCheckpointUnit())
-      return; // A1: old read-only queries need not be salvaged before rollback.
-    // Only this continuation's loop and relevant unfinished observations. A
-    // completed historical recovery is not a universal inventory prerequisite.
-    const retained = (loop.recoveries ?? []).filter(item => item.stage !== "observed" ||
-      !["recovered", "lost"].includes(item.disposition) ||
-      operations.some(ref => ref.key === item.source?.key));
-    return retained.reduce((previous, recovery) => previous.then(() =>
-      inspectRecovery(recovery.phase, recovery.source, recovery).then(value => {
-        if (value.status === "unresolved")
-          throw new Error(`Retained recovery unresolved: ${value.reason}`);
-        if (recovery.phase === "loop-plan") {
-          if (value.status === "recovered") {
-            if (!value.originalAvailable || !value.original)
-              throw new Error("Retained plan recovery lacks the complete original.");
-            planAuthority(value.original);
-            if (activePlan && !same(activePlan, value.original)) planConflict("Conflicting complete backlog selection values.");
-            validatePlan(value.original, loop.number, loop.manifest);
-          } else if (loop.plan.stage === "admitted")
-            throw new Error("Retained admitted plan recovery lacks the complete original.");
-        } else if (recovery.phase === "checkpoint") {
-          checkpointOriginal(value, loop.attempt);
-        } else {
-          if (value.status !== "recovered" || !value.originalAvailable || !value.original)
-            throw new Error(`Interrupted operation lacks an exact settled original receipt: ${value.reason}`);
-          interruptedReceipt(value.original, recovery.source);
-        }
-        reconciledRecoveries.set(recovery.subject, value);
-        // Complete-value validation precedes resolution application, not just the
-        // inspector's observed disposition. Essential persistence gates effects.
-        return save();
-      })), Promise.resolve());
-  });
-}
-function reconcileInterruptedOperations() {
-  // Human input is associated with one retained interruption. It never grants
-  // native permissions, even when a later management view omits that denial.
-  if (!same(resolution.halt, loop.halt)) throw nativeBarrier(loop.halt.cause);
-  if (loop.halt.cause === "native permission denial") throw nativeBarrier(loop.halt.cause);
-  if (loop.halt.ref?.agent === "pitako.loop-io") {
-    const ref = loop.halt.ref;
-    const pending = [...Object.values(invocation), ...Object.values(loop), ...Object.values(loop.attempt ?? {})]
-      .find(value => value?.dispatched && value.ref?.key === ref.key &&
-        ["advance", "selection", "close", "drain"].includes(value.input?.operation));
-    if (!pending || pending.ref.runId !== ref.runId)
-      throw new Error("Grouped operation reference conflicts with its retained intention.");
-    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
-      const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? ref.key);
-      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
-      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
-          (observed?.agent && observed.agent !== ref.agent))
-        throw new Error("Grouped operation producer/run identity conflicts with its intention.");
-      resolution.observations = [projection(ref.key, observed ?? { ok: false, state: "unknown" })];
-      resolution.stage = confirmedPausePending() ? "accepted" : "applied";
-      // A fresh native key resumes the same on-disk sub-step markers.
-      if (pending.stage !== "receipt") {
-        pending.retry++; pending.dispatched = false; delete pending.ref;
-      }
-      if (pending.input?.operation === "drain") pending.reconciled = ref.key;
-      if (loop.attempt?.seal && loop.attempt.close === pending)
-        loop.attempt.seal.reconciled = ref.key;
-      delete loop.halt;
-      delete loop.outcome;
-      return save();
-    });
-  }
-  if (invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger") {
-    const ref = loop.halt.ref;
-    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
-      const cause = barrier(observed, ref.runId ?? ref.key);
-      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
-      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
-          (observed?.agent && observed.agent !== "pitako.execution-ledger"))
-        throw new Error("Archiver producer/run identity conflicts with pending seal.");
-      resolution.observations = [projection(ref.key, observed)];
-      resolution.stage = confirmedPausePending() ? "accepted" : "applied";
-      delete loop.halt;
-      delete loop.outcome;
-      return save();
-    });
-  }
-  if (loop.halt.ref?.agent === "pitako.checkpoint-sealer" && loop.attempt?.seal && loop.attempt.stage !== "result") {
-    // Observe the settled sealer before input applies; normal replay then
-    // re-observes the worker and dispatches a fresh seal under the next key.
-    const ref = loop.halt.ref;
-    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
-      const cause = observed?.state === "unknown" ? null : barrier(observed, ref.runId ?? ref.key);
-      if (cause && !["stopped", "interrupted"].includes(cause)) throw nativeBarrier(cause, ref);
-      if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
-          (observed?.agent && observed.agent !== "pitako.checkpoint-sealer"))
-        throw new Error("Sealer producer/run identity conflicts with the pending seal.");
-      resolution.observations = [projection(ref.key, observed ?? { ok: false, state: "unknown" })];
-      resolution.stage = "applied";
-      loop.attempt.seal.reconciled = ref.key;
-      delete loop.halt;
-      delete loop.outcome;
-      return save();
-    });
-  }
-  if (pendingCheckpointUnit()) {
-    const ref = loop.attempt.launch ?? { key: loop.attempt.key };
-    if (!resolution.operations?.some(item => same(item, ref)))
-      throw new Error("Continuation input does not identify the pending checkpoint writer.");
-    // Observe before applying input. Admission and removal of only its old Stop
-    // share one durable save, so a cut cannot erase an unobserved denial.
-    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
-      assertFallbackProducer(observed, ref);
-      resolution.observations = [projection(ref.key, observed)];
-      resolution.stage = "applied";
-      loop.attempt.interruption ??= clone(loop.halt);
-      delete loop.outcome;
-      delete loop.halt;
-      return save();
-    });
-  }
-  const observations = [];
-  let historicalBarrier = false;
-  return (resolution.operations ?? []).reduce((previous, ref) => previous.then(() =>
-    observeStatus(ref.runId ?? ref.key).then(observed => {
-      if ([observed, ...(observed?.results ?? [])].some(item => /Blocked by pi-subagents permission rule:/.test(item?.error ?? "")))
-        throw nativeBarrier("native permission denial", ref);
-      const cause = barrier(observed, ref.runId ?? ref.key);
-      if (cause && !["stopped", "interrupted"].includes(cause))
-        throw nativeBarrier(cause);
-      if (observed?.runId && closedProducerProcesses(observed)) return observed;
-      if (observed?.ok && text(observed.runId) && observed.structuredOutput && !cause) return observed;
-      const retained = loop.recoveries.find(item => item.source?.key === ref.key);
-      // A different subject must not replace an already launched observation.
-      // Payload recovery is not an original operation settlement receipt.
-      if (retained && retained.phase !== "interrupted-operation")
-        throw new Error("Retained payload recovery does not settle the interrupted producer; no replacement query authorized.");
-      return (retained ? Promise.resolve(reconciledRecoveries.get(retained.subject))
-        : inspectRecovery("interrupted-operation", ref)).then(value => {
-        if (value.status !== "recovered" || !value.original)
-          throw new Error(`Interrupted operation lacks an exact settled original receipt: ${value.reason}`);
-        return value.original;
-      });
-    }).then(observed => {
-      const historical = interruptedReceipt(observed, ref);
-      historicalBarrier ||= historical;
-      observations.push(projection(ref.key, observed));
-    })), Promise.resolve()).then(() => {
-      if (!observations.length || !historicalBarrier)
-        throw new Error("No authoritative settled historical interruption to discharge; retain the pending obligation.");
-      resolution.observations = observations;
-      resolution.stage = "applied";
-      loop.outcome = "gaps";
-      delete loop.halt;
-      return save();
-    });
 }
 const REVIEWER_TIMEOUT_MS = 14400000;
 function effectiveTimeouts() {
@@ -1209,22 +1198,32 @@ function gateOperationTimeout(task) {
     task.gates.reduce((sum, gate) => sum + (gate.timeoutMs ?? 1800000), 0) +
       (task.metric ? 1800000 : 0) + 3600000));
 }
-function haltGateTimeout(descriptor, step, launchedMs, result) {
+function gateTimeoutHalt(descriptor, step, launchedMs, result, closingLoop = loop) {
   const pending = descriptor.gate;
-  const ref = clone(pending.ref);
+  // The sandbox can omit result paths and normalize the artifact inventory.
+  // Bind the halt to the producer identity and timeout controls present in both views.
+  const { key, runId, agent } = pending.ref;
+  const ref = { key, runId, agent };
   if (result) {
     if (result.terminalOutcome) ref.terminalOutcome = clone(result.terminalOutcome);
     ref.results = (result.results ?? []).map(entry => Object.fromEntries(
       ["timedOut", "terminalOutcome", "exitCode", "state"]
         .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
   }
-  pending.timeout = true;
-  loop.halt = { code: "timeout", status: "partial", class: step,
+  return { code: "timeout", status: "partial", class: step,
     key: ref.key, launchedMs, ref,
     reason: `${step} ${ref.key} timed out at ${launchedMs} ms.${step === "final-acceptance"
-      ? ` ${acceptanceResults().blocking.filter(gate => gate.status === "timeout").map(gate => `${gate.id}: ${gate.logRef}`).join("; ")}.` : ""} ${(descriptor.gateGeneration ?? 1) >= 3
+      ? ` ${acceptanceResults(closingLoop).blocking.filter(gate => gate.status === "timeout").map(gate => `${gate.id}: ${gate.logRef}`).join("; ")}.` : ""} ${(descriptor.gateGeneration ?? 1) >= 3
       ? "The three-generation limit is reached; use a new invocation."
       : `Relaunch with args.timeouts.gateFloorMs strictly greater than ${launchedMs}.`}` };
+}
+function haltGateTimeout(descriptor, step, launchedMs, result) {
+  descriptor.gate.timeout = true;
+  loop.halt = gateTimeoutHalt(descriptor, step, launchedMs, result);
+  // Bind the actual deadline independently of higher options saved on relaunch.
+  dispatchedAction.gateTimeoutMs = launchedMs;
+  const ref = loop.halt.ref;
+  if (text(ref.runId)) inFlight.set(ref.key, { key: ref.key, runId: ref.runId, role: "loop-io" });
   return save();
 }
 function renewGateTimeout() {
@@ -1246,41 +1245,13 @@ function renewGateTimeout() {
     halt.reason = `${halt.class} reached the three-generation limit; use a new invocation.`;
     return save();
   }
-  if ((halt.class === "gate-transport" && !nativeTimeout(halt.ref)) || !text(halt.ref.runId)) return;
-  return observeStatus(halt.ref.runId, true).then(observed => {
-    const cause = analysisBarrier(observed, halt.ref.runId);
-    if (cause) {
-      loop.halt = { code: "native-barrier", status: ["stopped", "interrupted"].includes(cause) ? "cancelled" : "blocked",
-        cause, ref: clone(halt.ref), reason: `Gate timeout renewal encountered ${cause}; no replacement dispatched.` };
-      return save();
-    }
-    if (observed?.runId && observed.runId !== halt.ref.runId ||
-        observed?.key && ![halt.key, halt.ref.runId].includes(observed.key) ||
-        observed?.agent && observed.agent !== halt.ref.agent || !terminalAnalysis(observed, halt.ref)) {
-      halt.reason = `${halt.class} timeout renewal requires exact terminal, barrier-free producer evidence; reconcile ${halt.ref.runId}. No replacement dispatched.`;
-      return save();
-    }
-    const before = clone(loop);
-    (loop.retired ??= []).push(clone(halt.ref));
-    descriptor.gateGeneration = generation + 1;
-    descriptor.gate = { key: `${descriptor.key}.g${generation + 1}.gate`, stage: "intention",
-      retry: 0, task: freshTask };
-    if (descriptor === loop.finalAttempt) descriptor.freshAuthorized = true;
-    delete loop.halt;
-    delete loop.outcome;
-    return save().catch(error => {
-      Object.keys(loop).forEach(field => delete loop[field]); Object.assign(loop, before);
-      throw error;
-    });
-  }).catch(error => {
-    // Renewal observes native barriers before admissionValidated.
-    if (!error?.nativeBarrier || persistenceFailed) throw error;
-    loop.halt = { code: "native-barrier",
-      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
-      cause: error.nativeBarrier, reason: String(error.message),
-      ref: clone(error.nativeReference ?? halt.ref) };
-    return save().then(() => { throw error; });
-  });
+  (loop.retired ??= []).push(clone(halt.ref));
+  descriptor.gateGeneration = generation + 1;
+  inFlight.delete(halt.ref.key);
+  descriptor.gate = { key: `${descriptor.key}.g${generation + 1}.gate`, stage: "intention",
+    retry: 0, task: freshTask };
+  delete loop.halt;
+  delete loop.outcome;
 }
 function analysisDispatch(requests) {
   return Promise.allSettled(requests.map(request => Promise.resolve().then(() => {
@@ -1289,10 +1260,19 @@ function analysisDispatch(requests) {
     if (call && !budgetRejected(call.key)) return analysisResults.get(call.key) ?? observeAnalysis(call);
     if (!call) {
       call = { key: request.key, stage: "intention", ref: { key: request.key },
-        timeoutMs: effectiveTimeouts().reviewerMs };
+        timeoutMs: request.key === retainedAnalysisDeadline?.key
+          ? retainedAnalysisDeadline.ms : effectiveTimeouts().reviewerMs };
       loop.analysisCalls.push(call);
     }
-    return save().then(() => {
+    const checkMissing = loop.replayedEarlyReview && request.key.includes(".review.")
+      && !budgetRejected(request.key) ? observeStatus(request.key, true).then(observed => {
+        const cause = analysisBarrier(observed, request.key);
+        if (cause) throw nativeBarrier(cause, { key: request.key, runId: observed.runId });
+        if (observed?.runId || observed?.state && observed.state !== "unknown" ||
+            observed?.state === "unknown" && !String(observed.output).endsWith("Run not found. Provide id or runId."))
+          throw new Error(`Review re-entry lacks an exact original for ${request.key}; no replacement dispatched.`);
+      }) : Promise.resolve();
+    return checkMissing.then(() => save()).then(() => {
       if (persistenceFailed) throw new Error(persistenceReason);
       return dispatch([{ ...request, timeoutMs: call.timeoutMs }]);
     }).then(([result]) => {
@@ -1303,11 +1283,19 @@ function analysisDispatch(requests) {
       call.barrier = analysisBarrier(result);
       // The first receipt must retain timeout evidence even if management status cannot replay it.
       if (!call.barrier && nativeTimeout(result)) return haltAnalysisTimeout(call, result);
+      const failure = () => {
+        const error = nativeBarrier(call.barrier, { ...call.ref, agent: result.agent }, result);
+        if (call.barrier === "native permission denial" && !call.ref.runId)
+          error.nativeDispatch = { key: call.key, role: "reviewer" };
+        return error;
+      };
       return save().then(() => {
-        if (call.barrier) throw nativeBarrier(call.barrier,
-          request.key.endsWith(".demand-observation") || /\.task-(reviewer|synthesis)$/.test(request.key) ? call.ref : undefined);
+        if (call.barrier) throw failure();
         analysisResults.set(call.key, result);
         return result;
+      }, error => {
+        if (call.barrier) throw failure();
+        throw error;
       });
     }, error => {
       if (persistenceFailed) throw error;
@@ -1333,7 +1321,12 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
   return dispatcher([{
     key: childKey, ...(resume ? { resume } : { agent, context: "fresh" }), label, phase: display.phase, cwd: config.root,
     output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
-    skill: ["verify-behavior", ...(scopeDiscipline ? ["scope-discipline"] : [])],
+    skill: [...new Set([
+      "verify-behavior", "ponytail",
+      ...(agent === "pitako.worker" ? ["rust-best-practices", "rust-review", "rust-port"] : []),
+      ...(agent === "pitako.reviewer" ? ["ponytail-review", "rust-best-practices", "rust-review"] : []),
+      ...(scopeDiscipline ? ["scope-discipline"] : []),
+    ])],
     task: `${label}\n\n${scopeDiscipline ? "Read and apply scope-discipline before expanding work or verification; preserve admitted tasks and gates.\n" : ""}${task}`, outputSchema,
     // Keep awaited final-result admission; live steps reach the main session from the child session file.
     ...(implementation ? { timeoutMs: loop.attempt.timeoutMs,
@@ -1355,20 +1348,17 @@ function collect(childKey, agent, display, task, outputSchema, implementation = 
 function association(number) {
   return { ...invocation.association, loop: number };
 }
-function planConflict(reason) {
-  loop.halt = { status: "blocked", code: "semantic-block", reason, ref: clone(loop.plan.ref) };
+function planConflict(reason, result) {
+  const { key, runId } = loop.plan.ref;
+  loop.halt = result && runId && result.agent === "pitako.execution-director"
+    ? { status: "blocked", code: "plan-conflict", reason, ref: { key, runId },
+        originalDigest: canonicalDigest(clone({ value: result.structuredOutput, output: result.output })) }
+    : { status: "blocked", code: "semantic-block", reason, ref: clone(loop.plan.ref) };
   throw new Error(reason);
 }
 function planAuthority(value, result) {
-  if (!value || !(value.select === null || text(value.select)) || !Array.isArray(value.changes) || !text(value.reason)) planConflict("Invalid backlog selection.");
-  if (result && ((result.agent && result.agent !== "pitako.execution-director") ||
-      !text(result.runId) || (loop.plan.ref.runId && result.runId !== loop.plan.ref.runId)))
-    planConflict("backlog selection producer/run identity conflict.");
-  if (result && text(result.output) && /^[\s]*\{/.test(result.output)) {
-    let binding;
-    try { binding = JSON.parse(result.output); } catch (_) { planConflict("Invalid complete backlog selection binding JSON."); }
-    if (!same(binding, value)) planConflict("Changed/conflicting backlog selection binding; no edits authorized.");
-  }
+  const reason = planConflictReason(value, result, loop.plan.ref.runId, same);
+  if (reason) planConflict(reason, result);
 }
 function validatePlan(value) {
   if (!value || !(value.select === null || text(value.select)) || !Array.isArray(value.changes) || !text(value.reason))
@@ -1393,11 +1383,23 @@ function backlogAuthority() {
   return { specDigest: invocation.association.digest, amendmentDigests: (invocation.amendments ?? []).map(item => item.sha256) };
 }
 const LOOP_IO_CONTROL = { needsAttentionAfterMs: 1_800_000 };
-function loopIORequest(childKey, input) {
+function loopIORequest(childKey, input, timeoutMs) {
   return { key: childKey, agent: "pitako.loop-io", cwd: config.root, context: "fresh", output: false,
     outputMode: "inline", outputSchema: false, reads: false, progress: false,
-    control: LOOP_IO_CONTROL, ...(input.operation === "close" ? { timeoutMs: gateOperationTimeout(input.gate.task) } : {}),
-    task: JSON.stringify(input) };
+    control: LOOP_IO_CONTROL, ...(["close", "gate"].includes(input.operation) &&
+      (input.gate || timeoutMs !== undefined) ? { timeoutMs: timeoutMs ?? gateOperationTimeout(input.gate.task) } : {}),
+    task: ["close", "baseline", "taskDelta", "drain"].includes(input.operation) && !input.refs
+      ? canonicalJSON(input) : JSON.stringify(input) };
+}
+function terminalLoopIOResult(result, childKey, operation) {
+  return result.ok && result.agent === "pitako.loop-io" && text(result.runId) &&
+    (result.key === undefined || result.key === childKey) && result.state === undefined && !result.terminalOutcome &&
+    (!["advance", "selection", "close", "drain"].includes(operation) ||
+      text(result.asyncDir) && text(result.externalAdapter?.outputArtifacts?.stdoutPath) &&
+      text(result.externalAdapter?.outputArtifacts?.stderrPath)) &&
+    ![result, ...(result.results ?? [])].some(item => item.error || item.outputSaveError || item.metadataSaveError ||
+      item.transcriptError || item.outputPartial || item.truncation || item.timedOut || item.processSignal) &&
+    Array.isArray(result.results) && result.results.length === 1 && result.results[0].exitCode === 0;
 }
 function queueIntention(intention) {
   const pending = invocation.intentions ??= [];
@@ -1423,7 +1425,7 @@ function queueApply(slot, input) {
   if (invocation.intentions?.some(entry => entry.key === input.key)) return;
   const previous = invocation.intentions?.findLast(entry => entry.operation === "apply");
   if (previous) { input.expectedDigestFrom = previous.key; delete input.expectedDigest; }
-  queueIntention({ key: input.key, operation: "apply", slot, taskId: loop.task?.id,
+  queueIntention({ key: input.key, operation: "apply", slot, taskId: loop.task?.id ?? invocation.transitionReplay?.taskId,
     complete: slot === "settlement" && loopResults().at(-1)?.status === "complete", input });
 }
 function receiptReference(value) {
@@ -1438,7 +1440,6 @@ function admitDrain(transport, intentions) {
   const receipt = transport.projection;
   if (receipt?.invocation !== config.invocation || !Array.isArray(receipt.steps) ||
       receipt.steps.length !== intentions.length) throw new Error("Invalid loop-io drain projection.");
-  let archived = false;
   for (let index = 0; index < intentions.length; index++) {
     const intention = intentions[index], step = receipt.steps[index], value = step.result;
     if (step.key !== intention.key || step.operation !== intention.operation)
@@ -1455,7 +1456,6 @@ function admitDrain(transport, intentions) {
         // A resumed drain closes the loop even if its interruption cleared the outcome.
         loop.outcome = value.summaries.at(-1).status;
         foldLoop(value.summaries);
-        archived = true;
       }
     } else {
       if (!/^[a-f0-9]{64}$/.test(value?.digest ?? "") || !Array.isArray(value.cancelledScope))
@@ -1467,7 +1467,6 @@ function admitDrain(transport, intentions) {
       invocation.excludedScope = Object.fromEntries(value.cancelledScope.map(task => [task.id, task]));
     }
   }
-  if (archived) compactArchivedLoop();
 }
 function groupedIO(slot, input, owner = loop) {
   if (slot === "finishDrain" && owner[slot]?.admitted && invocation.intentions?.length) {
@@ -1476,19 +1475,27 @@ function groupedIO(slot, input, owner = loop) {
   }
   const pending = owner[slot] ??= { key: owner === loop || owner === invocation ? `${key}.l${loop.number}.${slot}` : `${owner.key}.${slot}`, retry: 0, stage: "intention" };
   pending.intentionCount ??= invocation.intentions?.length ?? 0;
-  pending.input ??= { ...clone(input), root: config.root, invocation: config.invocation, key: pending.key,
+  pending.input ??= input.refs ? clone(input) : { ...clone(input), root: config.root, invocation: config.invocation, key: pending.key,
+    ...(slot === "finishDrain" ? { storeId: invocation.storeId,
+      expectedHead: clone(loop.replayedDrainAnchor &&
+        same(storeProjection.P.control.operation.input, loop.replayedDrainAnchor.input)
+        ? loop.replayedDrainAnchor.head : invocation.head),
+      ...(loop.outcome === "complete" || loop.outcome === "gaps" && invocation.consumedLoops >= maxCycles()
+        ? { finalDrain: true } : {}) } : {}),
+    ...(input.operation !== "drain" ? { requestObservation: invocation.requestObservation ?? 0 } : {}),
     receipts: invocation.receiptReference ? [clone(invocation.receiptReference)] : [],
     ...(input.operation !== "drain" ? { requests: { cursor: 0 } } : {}) };
+  const names = pending.steps ?? (input.operation === "advance" ? ["drain", "prepare", "requests"]
+    : input.operation === "selection" ? ["drain", "apply", "requests", ...(pending.input.baseline ? ["baseline"] : [])]
+    : input.operation === "close" ? ["drain", "requests", "gate", "seal", ...(pending.input.nextBaseline || pending.input.refs?.worker ? ["nextRequests", "nextBaseline"] : [])]
+    : []);
   const intentions = pending.admitted ? [] : (invocation.intentions ?? []).slice(0, pending.intentionCount).map(transportIntention);
-  return loopIO(slot, { ...pending.input, intentions }, owner).then(transport => {
+  return loopIO(slot, pending.input.refs ? pending.input : { ...pending.input, intentions }, owner).then(transport => {
     const reference = receiptReference(transport), projection = transport.projection;
     if (!projection || projection.invocation !== config.invocation || !Array.isArray(projection.steps) ||
         input.operation !== "drain" && projection.operation !== input.operation)
       throw new Error("Invalid grouped loop-io projection.");
     if (input.operation !== "drain") {
-      const names = input.operation === "advance" ? ["drain", "prepare", "requests"]
-        : input.operation === "selection" ? ["drain", "apply", "requests", ...(pending.input.baseline ? ["baseline"] : [])]
-        : ["drain", "requests", "gate", "seal", ...(pending.input.nextBaseline ? ["nextRequests", "nextBaseline"] : [])];
       if (!same(projection.steps.map(step => step.operation), names) ||
           projection.steps.some(step => step.key !== `${pending.key}.${step.operation}`))
         throw new Error("Grouped loop-io step order differs from its intention.");
@@ -1550,10 +1557,22 @@ function checkpointIntent(taskId, number, attemptKey) {
       previous: invocation.lastConfirmed?.kind === "unit" ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
         clone({ taskId, attempt, resultRef, checkpointRef, digest }))(invocation.lastConfirmed) : null } };
 }
-function admitBaseline(intent, receipt) {
+function committedIntentReference(reference, head) {
+  if (!reference || Object.keys(reference).sort().join(",") !== "digest,seq" ||
+      !Number.isSafeInteger(reference.seq) || reference.seq < 1 ||
+      !/^[a-f0-9]{64}$/.test(reference.digest ?? "") ||
+      !Number.isSafeInteger(head?.seq) || head.seq < reference.seq ||
+      !/^[a-f0-9]{64}$/.test(head.hash ?? ""))
+    throw Object.assign(new Error("Worker launch requires a committed intent at or before the store head."),
+      { checkpointIntegrity: true });
+  return clone(reference);
+}
+function admitBaseline(intent, receipt, head) {
   if (typeof receipt?.captured !== "boolean") throw new Error("Invalid grouped baseline receipt.");
   if (!receipt.captured) return null;
-  return { ...clone(intent), baseline: candidate(receipt.candidate) };
+  const reference = committedIntentReference(receipt.intent, head);
+  invocation.head = clone(head);
+  return { checkpoint: { ...clone(intent), baseline: candidate(receipt.candidate) }, intent: reference };
 }
 function advanceLoop(slot = "advance", number = loop.number) {
   if (loop[slot]?.stage === "receipt" && !loop[slot].receipt?.projection) {
@@ -1564,7 +1583,24 @@ function advanceLoop(slot = "advance", number = loop.number) {
     loop[slot] = { key: `${key}.l${loop.number}.${slot}.v${generation}`, generation, retry: 0, stage: "intention" };
   }
   const complete = invocation.intentions?.findLast(entry => entry.slot === "settlement" && entry.complete);
-  return groupedIO(slot, { operation: "advance", prepare: { specId: config.id,
+  return groupedIO(slot, { operation: "advance",
+    loopStartedAt: committedLoopOpen(number) ?? (number === loop.number ? loop.startedAt : Date.now()),
+    candidate: candidate(currentCandidate),
+    transition: { taskId: loop.task?.id ?? null, tasks: loop.task ? {
+      [loop.task.id]: { completed: !!invocation.tasks[loop.task.id]?.completed,
+        cancel: clone(invocation.tasks[loop.task.id]?.cancel ?? null) },
+    } : {},
+      requestObservation: invocation.requestObservation ?? 0 },
+    demand: { sources: [
+      ...(invocation.demandSources ?? []).filter(item => item.loop !== loop.number),
+      { loop: loop.number, sources: loopDemandSources() },
+    ], observations: invocation.demandObservations ?? [] },
+    admission: { association: clone(invocation.association), admissionBinding: invocation.admissionBinding,
+      amendments: clone(invocation.amendments ?? []), revivalContextPeak: invocation.revivalContextPeak,
+      startedAt: invocation.startedAt, timeouts: clone(invocation.timeouts ?? null),
+      models: { taskReviewer: invocation.taskReviewer, taskSynthesis: invocation.taskSynthesis,
+        ...clone(invocation.reviewModels) } },
+    prepare: { specId: config.id,
     previousConfirmedUnit: complete?.taskId ?? invocation.lastBacklogUnit ?? null, loop: number } }).then(transport => {
     const prepared = groupedStep(transport, "prepare");
     // The full grouped evidence is already published and admitted. Release it
@@ -1575,6 +1611,9 @@ function advanceLoop(slot = "advance", number = loop.number) {
     invocation.backlogPath = prepared.path; invocation.backlogDigest = prepared.digest;
     invocation.excludedScope = Object.fromEntries((prepared.cancelledScope ?? []).map(task => [task.id, task]));
     invocation.currentView = view; invocation.boardTopicId = view.topicId;
+    invocation.loopSummaries = storeProjection.P.prompt.loopSummaries;
+    invocation.demandSources = storeProjection.P.prompt.demand?.sources ?? [];
+    invocation.demandObservations = storeProjection.P.prompt.demand?.observations ?? [];
     if (number === loop.number) loop.prepare = { stage: "receipt", receipt: clone(prepareReceipt) };
     else invocation.preparedNext = { stage: "receipt", receipt: clone(prepareReceipt) };
     return observeGroupedRequests(transport).then(() => save());
@@ -1582,7 +1621,15 @@ function advanceLoop(slot = "advance", number = loop.number) {
 }
 // Runtime operations have durable intentions and fresh retry keys, like gate.
 function loopIO(slot, input, owner = loop) {
+  if (input.operation === "baseline" && !input.refs)
+    input = { ...input, requestObservation: invocation.requestObservation ?? 0 };
   const pending = owner[slot] ??= { key: slot === "baselineIO" ? `${input.intent.key}.baseline` : `${key}.l${loop.number}.${slot}${slot === "selection" && loop.directorRetry ? ".d1" : ""}`, retry: 0, stage: "intention" };
+  if (["close", "drain"].includes(input.operation) && pending.stage !== "receipt")
+    dispatchedAction = { kind: "pending", op: input.operation, opKey: pending.key,
+      ...(input.operation === "drain" && input.refs ? { input: clone(input.refs.input) } : {}),
+      ...(input.operation === "drain" ? { drainDigest: canonicalDigest(input) } : {}) };
+  if (input.operation === "reviewOriginals")
+    input = { ...input, root: config.root, invocation: config.invocation, key: pending.key };
   if (pending.stage === "receipt" && slot === "prepare" && !invocation.currentView && !Array.isArray(pending.receipt.view?.posts)) {
     pending.retry++; delete pending.ref; pending.dispatched = false; pending.stage = "intention";
     return save().then(() => loopIO(slot, input, owner));
@@ -1604,43 +1651,121 @@ function loopIO(slot, input, owner = loop) {
     }).then(observed => {
       if (observed) return [observed];
       pending.dispatched = true;
-      return save().then(() => dispatch([loopIORequest(childKey, input)]));
+      return save().then(() => dispatch([loopIORequest(childKey, input,
+        input.operation === "close" && input.refs?.worker ? gateOperationTimeout(gateTaskFor(loop.task)) : undefined)]));
     }).then(([result]) => {
       pending.ref = nativeReference(childKey, result);
       const cause = barrier(result, childKey);
-      if (cause) throw nativeBarrier(cause, pending.ref);
+      if (cause) throw nativeBarrier(cause, pending.ref, result);
       if (result?.nativeFailure) throw Object.assign(new Error(result.nativeFailure.reason),
         { nativeFailure: result.nativeFailure });
       let receipt;
       const last = result.output?.trim().split("\n").at(-1);
       try { if (utf8Bytes(last ?? "") <= 61440) receipt = JSON.parse(last); } catch (_) { /* Missing transport output is retried. */ }
+      // With no committed head, the first advance can retry its original input
+      // against the replacement store without charging another loop.
+      const firstAdvanceQuarantined = slot === "advance" && !invocation.head &&
+        receipt?.code === "store-corrupt" && receipt.recovery?.root === config.root &&
+        text(receipt.recovery.storeId) && text(receipt.recovery.quarantine);
+      if (receipt?.error === "loop-io" && (receipt.code === "store-busy" || firstAdvanceQuarantined) && pending.retry < 2) {
+        pending.retry++; delete pending.ref; pending.dispatched = false;
+        return save().then(run);
+      }
+      if (receipt?.error === "loop-io" && receipt.code)
+        throw Object.assign(new Error(receipt.reason), { code: receipt.code, recovery: receipt.recovery });
       if (receipt?.error === "loop-io" && receipt.ledgerIntegrity === true && text(receipt.reason))
-        throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${receipt.reason}`), { ledgerIntegrity: true });
+        throw Object.assign(new Error(`Execute ledger integrity failure: ${receipt.reason}`), { ledgerIntegrity: true });
       if (receipt?.error === "loop-io") {
-        const semantic = receipt.selectionRejected || receipt.replayRejected || receipt.viewOverflow ||
+        if (!invocation.head && viewOverflowReason(receipt) && receipt.overflowAdmission) {
+          const { head, storeId, associationDigest, topicId, key } = receipt.overflowAdmission;
+          if (input.operation !== "advance" || key !== pending.key ||
+              associationDigest !== canonicalDigest(invocation.association) ||
+              !Number.isSafeInteger(topicId) || topicId < 1 ||
+              !/^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(storeId ?? ""))
+            throw new Error("Board overflow committed admission integrity mismatch.");
+          const inputRef = committedIntentReference({ seq: head?.seq, digest: head?.hash }, head);
+          storeProjection = { head, P: { control: { operation: { operation: "advance", key, input: inputRef } } } };
+          Object.assign(invocation, { head, storeId, boardTopicId: topicId, backlogDigest: null });
+        }
+        loopIOViewOverflow(receipt, pending.ref);
+        const semantic = receipt.selectionRejected || receipt.replayRejected ||
           /backlog-conflict:|integrity|digest mismatch|replay differs|completed .* changed|exceeds 61440/.test(receipt.reason ?? "");
         if (!semantic && pending.retry < 2) {
           pending.retry++; delete pending.ref; return save().then(run);
         }
-        throw Object.assign(new Error(receipt.viewOverflow && input.operation === "close"
-          ? "HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions"
-          : receipt.reason), { selectionRejected: receipt.selectionRejected === true,
-          replayRejected: receipt.replayRejected === true, viewOverflow: receipt.viewOverflow === true,
-          backlogConflict: receipt.reason?.startsWith("backlog-conflict:") });
+        const backlogConflict = receipt.reason?.startsWith("backlog-conflict:");
+        if (backlogConflict && text(pending.ref.runId))
+          inFlight.set(childKey, { key: childKey, runId: pending.ref.runId, role: "loop-io" });
+        throw Object.assign(new Error(receipt.reason), { selectionRejected: receipt.selectionRejected === true,
+          replayRejected: receipt.replayRejected === true,
+          rejectedDrain: receipt.rejectedDrain,
+          backlogConflict,
+          ...(backlogConflict && text(pending.ref.runId) ? {
+            conflictRef: { key: childKey, runId: pending.ref.runId }, originalDigest: canonicalDigest(clone(receipt)),
+          } : {}) });
       }
-      if (!result.ok || result.agent !== "pitako.loop-io" || !text(result.runId) ||
-          result.key !== undefined && result.key !== childKey || result.state !== undefined || result.terminalOutcome ||
-          ["advance", "selection", "close", "drain"].includes(input.operation) &&
-            (!text(result.asyncDir) || !text(result.externalAdapter?.outputArtifacts?.stdoutPath) ||
-              !text(result.externalAdapter?.outputArtifacts?.stderrPath)) ||
-          [result, ...(result.results ?? [])].some(item => item.error || item.outputSaveError || item.metadataSaveError ||
-            item.transcriptError || item.outputPartial || item.truncation || item.timedOut || item.processSignal) ||
-          !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 || !receipt) {
+      if (!terminalLoopIOResult(result, childKey, input.operation) || !receipt) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
         pending.retry++; delete pending.ref; return save().then(run);
       }
-      if (input.operation === "stateCapacity" && input.root === config.root)
-        references.push(nativeReference(childKey, result));
+      if (receipt.P !== undefined) {
+        // P is a head-bound decision input, never part of a retained operation receipt.
+        const firstAdmission = !invocation.storeId;
+        // Replayed drains return their original prefix, not the current tip.
+        // Consuming that receipt must not move a newer admitted intent backwards.
+        if (!invocation.head || receipt.head.seq >= invocation.head.seq) {
+          storeProjection = { head: clone(receipt.head), P: receipt.P };
+          invocation.head = clone(receipt.head);
+        }
+        const compliance = slot === "closingDrain" ? loop.closingPublication?.compliance : null;
+        if (slot !== "reviewOriginals" || !input.refs)
+          dispatchedAction = compliance ? { kind: "launched", role: "reviewer", ...compliance } : undefined;
+        invocation.storeId = receipt.storeId;
+        if (input.operation === "close") {
+          const worker = input.refs?.worker ?? input.gate?.worker;
+          if (worker && inFlight.get(worker.key)?.runId === worker.runId)
+            inFlight.delete(worker.key);
+        }
+        const prepared = receipt.projection?.steps.find(step => step.operation === "prepare")?.result;
+        if (prepared) {
+          invocation.backlogDigest = prepared.digest;
+          invocation.boardTopicId = prepared.view.topicId;
+        }
+        if (input.operation === "advance" && firstAdmission) {
+          const admission = receipt.P.prompt?.admission;
+          if (!admission || admission.admissionBinding !== invocation.admissionBinding ||
+              admission.association?.digest !== invocation.association.digest ||
+              admission.association?.root !== config.root || admission.association.invocation !== config.invocation)
+            throw new Error("Committed execute admission differs from its immutable request.");
+          invocation.association = clone(admission.association);
+          invocation.startedAt = admission.startedAt;
+          invocation.revivalContextPeak = admission.revivalContextPeak;
+          invocation.timeouts = clone(admission.timeouts);
+          invocation.taskReviewer = admission.models.taskReviewer;
+          invocation.taskSynthesis = admission.models.taskSynthesis;
+          invocation.reviewModels = Object.fromEntries(["r1", "r2", "synthesis"]
+            .map(slot => [slot, clone(admission.models[slot])]));
+        }
+        if (["advance", "selection"].includes(input.operation)) {
+          const operation = receipt.P.control?.operation;
+          if (operation?.key !== pending.key || operation.operation !== input.operation)
+            throw new Error("Grouped loop-io store operation differs from its pending request.");
+          const reference = committedIntentReference(operation.input, receipt.head);
+          pending.steps ??= input.operation === "advance" ? ["drain", "prepare", "requests"]
+            : ["drain", "apply", "requests", ...(input.baseline ? ["baseline"] : [])];
+          // After COMMIT the exact request belongs to the store, not the root.
+          pending.input = { operation: input.operation, root: config.root, invocation: config.invocation,
+            key: pending.key, storeId: receipt.storeId, scope: `exec:${config.invocation}.e${invocation.epoch ?? 0}`,
+            expectedHead: clone(receipt.head), refs: { input: reference } };
+        }
+        if (input.operation !== "reviewOriginals" || !input.refs) delete receipt.P;
+      }
+      if (input.operation === "taskDelta") {
+        delete receipt.head;
+        delete receipt.storeId;
+      }
+      if (input.operation === "reviewOriginals" && input.refs) return receipt;
+      if (input.operation === "drain" && input.refs) return receipt;
       if (["advance", "selection", "close", "drain"].includes(input.operation)) {
         receiptReference(receipt);
         pending.receipt = receipt; pending.stage = "receipt";
@@ -1656,10 +1781,19 @@ function loopIO(slot, input, owner = loop) {
       }
       if (["settlement", "cancellation", "finalGaps"].includes(slot)) delete projection.view;
       pending.receipt = projection; pending.stage = "receipt";
+      if (input.operation === "baseline") {
+        const admitted = admitBaseline(input.intent, { ...projection, captured: true }, projection.head);
+        owner.checkpoint = clone(admitted.checkpoint);
+        owner.intent = clone(admitted.intent);
+      }
       return save().then(() => slot === "selection" ? { ...projection, selected: loop.task } : projection);
     }).catch(error => {
       if (persistenceFailed || error.nativeFailure?.code !== "native-dispatch" || pending.retry >= 2) throw error;
       return observeStatus(pending.ref?.runId ?? childKey, true).then(observed => {
+        if (text(observed?.runId)) {
+          pending.ref = nativeReference(childKey, observed);
+          inFlight.set(childKey, { key: childKey, runId: observed.runId, role: "loop-io" });
+        }
         const cause = barrier(observed, pending.ref?.runId ?? childKey);
         if (cause) throw nativeBarrier(cause, pending.ref ?? { key: childKey, agent: "pitako.loop-io" });
         pending.retry++; delete pending.ref; pending.dispatched = false;
@@ -1681,10 +1815,7 @@ function loopIO(slot, input, owner = loop) {
 }
 function assertSelection() {
   const receipt = loop.selection?.receipt;
-  // Retained pre-compaction missions are read in place, never migrated.
-  const legacy = receipt && typeof receipt.selected === "object" && loop.taskBacklogDigest === undefined;
-  if (!receipt || (legacy ? !same(receipt.selected, loop.task)
-    : receipt.selected !== (loop.task?.id ?? null) || receipt.digest !== loop.taskBacklogDigest))
+  if (!receipt || receipt.selected !== (loop.task?.id ?? null) || receipt.digest !== loop.taskBacklogDigest)
     planConflict("Selected task ID or backlog digest conflicts with the selection receipt.");
 }
 function settleTask() {
@@ -1707,14 +1838,15 @@ function settleTask() {
       return groupedIO("finishDrain", { operation: "drain" }, invocation);
   });
 }
+function needsDecisionHalt(value) {
+  return { status: "needs-decision", code: "needs-decision", ...clone(value),
+    reason: `Task ${value.taskId} reached two stalls. Metric series: ${JSON.stringify(value.metricSeries)}. Stall diagnoses: ${JSON.stringify(value.diagnoses)}. Human decision required: post the ruling as Board HUMAN and start a new invocation on the same worktree and backlog.` };
+}
 function admitSettlement(value, intention) {
     invocation.backlogDigest = value.digest; invocation.currentView = null;
     if (intention.complete) invocation.lastBacklogUnit = intention.taskId;
     if (loop.settlement) loop.settlement.applied = true;
-    if (value.needsDecision) {
-      loop.halt = { status: "needs-decision", code: "needs-decision", ...clone(value.needsDecision),
-        reason: `Task ${value.needsDecision.taskId} reached two stalls. Metric series: ${JSON.stringify(value.needsDecision.metricSeries)}. Stall diagnoses: ${JSON.stringify(value.needsDecision.diagnoses)}. Human decision required: edit the backlog or deliver an amendment, then relaunch or unblock through the existing routes.` };
-    }
+    if (value.needsDecision) loop.halt = needsDecisionHalt(value.needsDecision);
 }
 function recordFinalGaps(kind, findings, outputs) {
   const changes = findings.map((finding, index) => ({ kind: "add", reason: finding.reason,
@@ -1740,8 +1872,7 @@ function findingOutput(ref) {
   return { key: ref.key, path };
 }
 function fullContext() {
-  return `CURRENT HUMAN RESOLUTIONS (accepted input, not new permissions): ${JSON.stringify([
-    ...retainedResolutions(),
+  return `CURRENT HUMAN RESOLUTIONS (accepted input, not new permissions): ${canonicalJSON([
   ])}
 ASSOCIATION (data): ${JSON.stringify(association(loop.number))}
 COMPLETE IMMUTABLE SPEC SNAPSHOT:\n${config.preliminary.content}
@@ -1770,9 +1901,14 @@ The director uses these last-three summaries (no shell); the inspector reads onl
 function closedSources(number) {
   return invocation.demandSources?.find(item => item.loop === number)?.sources ?? [];
 }
-function retainDemandSources(latest) {
-  invocation.demandSources = (invocation.demandSources ?? []).filter(item => item.loop === latest ||
-    (invocation.demandObservations ?? []).some(observation => observation.loop - 1 === item.loop));
+function retainDemandSources(latest, state = invocation) {
+  state.demandSources = (state.demandSources ?? []).filter(item => item.loop === latest ||
+    (state.demandObservations ?? []).some(observation => observation.loop - 1 === item.loop));
+}
+function retainDemandObservation(state, number, ref) {
+  state.demandObservations = [...(state.demandObservations ?? []).filter(item => item.loop !== number),
+    { loop: number, ref }].slice(-3);
+  retainDemandSources(number - 1, state);
 }
 function demandHistory() {
   return (invocation.demandObservations ?? []).map(item => ({ loop: item.loop, ref: item.ref, sources: closedSources(item.loop - 1) }));
@@ -1786,7 +1922,8 @@ function observeDemands() {
   const retained = sources.filter(source => source.kind === "review").map(source => ({
     id: source.ref.key, ...source.ref,
   }));
-  const verified = retained.length ? loopIO("demandOriginals", { operation: "reviewOriginals", originals: retained }) : Promise.resolve();
+  const verified = retained.length && !loop.demandOriginalsVerified
+    ? loopIO("demandOriginals", { operation: "reviewOriginals", originals: retained }) : Promise.resolve();
   const childKey = demandKey();
   return verified.then(() => collect(childKey, "pitako.reviewer", { label: "Observe inherited demands", phase: "director" }, `${fullContext()}
 INDIVIDUAL READ-ONLY DEMAND OBSERVATION, not product review or a future plan.
@@ -1809,9 +1946,7 @@ work in mixed tasks, explicit requirements, admitted gates and whole-spec suffic
         throw new Error("Demand observation lacks a usable structured original.");
       const ref = { ...loop.analysisCalls.find(call => call.key === childKey).ref, ...nativeReference(childKey, result) };
       // Constant-size ring of refs; the closed loop itself is archived without it.
-      invocation.demandObservations = [...(invocation.demandObservations ?? []).filter(item => item.loop !== loop.number),
-        { loop: loop.number, ref }].slice(-3);
-      retainDemandSources(loop.number - 1);
+      retainDemandObservation(invocation, loop.number, ref);
       // The native receipt is already durable; the director intention saves this projection.
       return { ref, body: value };
     });
@@ -1821,13 +1956,13 @@ function inspectRecovery(kind, ref, retained) {
   // or query key. There is one finite observation route for this subject/stage.
   // The authorized replacement director has its own finite recovery route.
   const planSubject = ref.key === `${key}.l${loop.number}.director.d1` ? "loop-plan:d1" : "loop-plan";
-  const subject = kind === "checkpoint" ? `checkpoint:${loop.attempt.taskId}:${loop.attempt.number}` : kind === "interrupted-operation" ? `interrupted-operation:${ref.key}` : planSubject;
+  const subject = kind === "checkpoint" ? `checkpoint:${loop.attempt.taskId}:${loop.attempt.number}` : planSubject;
   if (loop.recoveries.some(item => !text(item.subject)))
     return Promise.reject(new Error("Retained recovery lacks immutable subject/stage; no replacement query or migration authorized."));
   let recovery = loop.recoveries.find(item => item.subject === subject);
   const existing = !!recovery;
   const producer = kind === "loop-plan" ? loop.plan?.ref : ref;
-  if ((retained && retained !== recovery) || !["loop-plan", "interrupted-operation", "checkpoint"].includes(kind) ||
+  if ((retained && retained !== recovery) || !["loop-plan", "checkpoint"].includes(kind) ||
       (recovery && (!same(recovery.association, association(loop.number)) ||
       recovery.phase !== kind || !same(recovery.source, ref) || !text(recovery.ref?.key) ||
       !["intention", "observed"].includes(recovery.stage))) ||
@@ -1843,6 +1978,14 @@ function inspectRecovery(kind, ref, retained) {
   }
   const recoveryKey = recovery.ref.key;
   const recoveryRunId = recovery.ref.runId;
+  const operation = storeProjection?.P.control.operation;
+  const selectionSource = kind === "loop-plan" && loop.phase === "director" &&
+    operation?.operation === "advance" && ref.runId
+    ? { advance: clone(operation.input), director: { key: ref.key, runId: ref.runId, digest: canonicalDigest(clone(ref)) } }
+    : null;
+  // The settlement journal binds the inspector's request to this exact director
+  // and advance. Keep the original identity until the selection consumes it.
+  if (selectionSource) inFlight.set(ref.key, { key: ref.key, runId: ref.runId, role: "execution-director" });
   // Persist intent before the external query. An uncertain launch is reconciled
   // by status only: repeating runs.all with the same key is not reattachment.
   return (existing && !budgetRejected(recoveryKey) ? observeStatus(recovery.ref.runId ?? recoveryKey).then(result => {
@@ -1851,14 +1994,13 @@ function inspectRecovery(kind, ref, retained) {
         (result?.key && result.key !== recoveryKey && result.key !== recoveryRunId))
       throw new Error("Recovery producer/run identity conflict.");
     const cause = barrier(result, recovery.ref.runId ?? recoveryKey);
-    if (cause) throw nativeBarrier(cause);
+    if (cause) throw nativeBarrier(cause, { ...recovery.ref, agent: "pitako.execution-inspector" }, result);
     return retainedReadOnlyOriginal(result, recovery.ref);
   }) : save().then(() =>
     collect(recoveryKey, "pitako.execution-inspector",
-    { label: kind === "checkpoint" ? "Recover writer checkpoint"
-      : kind === "interrupted-operation" ? "Recover interrupted operation" : "Recover complete execution plan", phase: "recovery" },
+    { label: kind === "checkpoint" ? "Recover writer checkpoint" : "Recover complete execution plan", phase: "recovery" },
     `EXCEPTIONAL READ-ONLY ${kind} recovery. No tests, writes or delegation.
-${fullContext()}
+${selectionSource ? `Selection source (data): ${canonicalJSON(selectionSource)}\n` : ""}${fullContext()}
 Use existing read tools and ONLY these exact native producer/run/output references, plus Git/WIP:
 ${JSON.stringify(recovery.source)}
 Frozen descriptor and manifest (data): ${JSON.stringify({ attempt: loop.attempt, manifest: loop.manifest })}
@@ -1873,11 +2015,6 @@ Return original as {manifest, digest, envelope}, where manifest is that exact pa
 digest is file_sha256 of its actual original bytes and envelope is its COMPLETE original JSON.
 Do not reconstruct a manifest or treat an intention as a backup. Missing/incomplete/changed
 manifest => lost/conflict/unresolved with concrete original evidence. No restore, tests or writes.
-For interrupted-operation recovery, original must be the ORIGINAL COMPLETE native operation receipt,
-not the agent's output value. Read only the exact already-retained producer references above.
-Require actual terminal/settlement evidence; a completed label alone is insufficient. Preserve every
-original field, including Stop/denial. If the receipt or settlement proof is unavailable, return unresolved,
-not a reconstructed receipt. Do not derive artifact paths from keys or search unrelated locations.
 Recovery is limited to observing this authorized subject and stage. Do not repair functional gaps,
 change artifacts, permissions, settings or budgets. If observation needs an out-of-scope action,
 do not perform it: report unresolved with actor, concrete impediment, exact evidence and the
@@ -1894,7 +2031,7 @@ Use structured_output.`, recoverySchema))).then(result => {
     // Save the query receipt before body validation or admission.
     return (result?.runId ? save() : Promise.resolve()).then(() => {
       const cause = barrier(result, recovery.ref.runId ?? recoveryKey);
-      if (cause) throw nativeBarrier(cause);
+      if (cause) throw nativeBarrier(cause, recovery.ref, result);
       if (existing && (!text(result?.runId) || !result?.structuredOutput || (recoveryRunId && result.runId !== recoveryRunId)))
         throw new Error("Recovery settlement/result uncertain; no replacement query authorized.");
       const value = result?.structuredOutput;
@@ -1902,10 +2039,14 @@ Use structured_output.`, recoverySchema))).then(result => {
           !value.provenance.length || !value.provenance.every(text) || !text(value.reason) ||
           !["recovered", "lost", "conflict", "unresolved"].includes(value.status))
         throw new Error("Recovery has no authoritative complete observation.");
-      if (text(result.output) && /^[\s]*\{/.test(result.output)) {
-        let binding;
-        try { binding = JSON.parse(result.output); } catch (_) { throw new Error("Invalid complete recovery binding JSON."); }
-        if (!same(binding, value)) throw new Error("Changed/conflicting recovery binding.");
+      const conflict = inspectorConflictReason(result, same);
+      if (conflict) {
+        const { key, runId } = recovery.ref;
+        if (runId) retainHaltProducer({ key, runId }, "execution-inspector");
+        loop.halt = { status: "blocked", code: "plan-conflict",
+          reason: excerpt(runId ? conflict : "Inspector conflict native original integrity failure."),
+          ...(runId ? { ref: { key, runId } } : {}), originalDigest: canonicalDigest(clone({ value, output: result.output })) };
+        throw new Error(loop.halt.reason);
       }
       const observedProjection = projection(recoveryKey, result);
       Object.assign(recovery, observedProjection, { stage: "observed",
@@ -1913,12 +2054,7 @@ Use structured_output.`, recoverySchema))).then(result => {
         disposition: value.status, reason: excerpt(value.reason), provenance: value.provenance });
       // The full native original remains at its exact ref. Save its disposition
       // before admission/cursor movement; never persist a reconstructed payload.
-      return save().then(() => {
-        if (value.status === "conflict" || value.binding === "changed" ||
-            value.comparison === "different-full-json")
-          throw new Error(`Changed/conflicting recovery evidence: ${value.reason}`);
-        return value;
-      });
+      return save().then(() => value);
     });
   });
 }
@@ -2020,10 +2156,7 @@ function assertFallbackProducer(observed, ref) {
     results: observed?.results?.map(item => ({ ...item, stopped: false, interrupted: false })) }, ref.runId ?? ref.key);
   if (independent && !["stopped", "interrupted"].includes(independent)) throw nativeBarrier(independent, ref);
   const cause = barrier(observed, ref.runId ?? ref.key);
-  const historicalStop = cause === "stopped" && resolution?.loop === loop.number && !loop.archived && ["accepted", "applied"].includes(resolution?.stage) &&
-    !resolution.currentBarrier && resolution.halt?.cause === "stopped" &&
-    resolution.operations?.some(item => item.key === ref.key && item.runId === ref.runId);
-  if (cause && cause !== "interrupted" && !historicalStop) throw nativeBarrier(cause, ref);
+  if (cause && cause !== "interrupted") throw nativeBarrier(cause, ref);
   if ((observed?.runId && ref.runId && observed.runId !== ref.runId) ||
       (observed?.agent && observed.agent !== "pitako.worker"))
     throw new Error("Worker producer/run identity conflicts with frozen attempt.");
@@ -2079,9 +2212,9 @@ function renewWorkerTimeout() {
       descriptor.launch.launchedMs !== descriptor.timeoutMs || !text(descriptor.launch.runId)) return withholdRenewal();
   const ref = descriptor.launch;
   return Promise.resolve().then(() => observeStatus(ref.runId, true)).then(observed => {
-    assertFallbackProducer(observed, ref);
     const cause = analysisBarrier(observed, ref.runId);
     if (cause) throw nativeBarrier(cause, ref);
+    assertFallbackProducer(observed, ref);
     if (!terminalAnalysis(observed, ref) ||
         observed?.key && ![ref.key, ref.runId].includes(observed.key)) return withholdRenewal();
     return checkpointFallback(observed, ref, selectedTasks()[0], true);
@@ -2093,19 +2226,32 @@ function renewWorkerTimeout() {
     return save().then(() => { throw error; });
   });
 }
+function workerTimeoutHalt(descriptor, result, launchedMs) {
+  const ref = { key: descriptor.key, runId: result.runId, agent: result.agent, launchedMs };
+  if (result.terminalOutcome) ref.terminalOutcome = clone(result.terminalOutcome);
+  if (result.results?.length) ref.results = result.results.map(entry => Object.fromEntries(
+    ["agent", "timedOut", "terminalOutcome", "exitCode", "state"]
+      .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
+  return { code: "timeout", status: "partial", class: "worker", key: descriptor.key, launchedMs, ref,
+    reason: `Restoring worker ${descriptor.key} timed out at ${launchedMs} ms. ${(descriptor.timeoutGeneration ?? 1) >= 3
+      ? "The three-generation limit is reached; use a new invocation."
+      : `Relaunch with args.timeouts.workerMs strictly greater than ${launchedMs}.`}` };
+}
 function checkpointFallback(observed, ref, task, timeoutRenewal = false) {
   const descriptor = loop.attempt;
   assertFallbackProducer(observed, ref);
   if (!descriptor.checkpoint || loopResults().some(result => result.taskId === task.id && result.status === "complete"))
     throw new Error("Checkpoint fallback cannot restore a completed task or missing checkpoint.");
   const witness = checkpointObservation;
-  if (witness && (witness.key !== descriptor.key || witness.taskId !== task.id || witness.attempt !== descriptor.number ||
-      witness.loop !== loop.number || witness.cursor !== loop.cursor))
-    throw new Error("Checkpoint observation conflicts with pending unit.");
-  if (witness?.error) {
-    const reason = `Checkpoint observation unavailable: ${witness.error}`;
-    loop.halt = { status: "blocked", code: "checkpoint-integrity", reason, ref: clone(ref) };
-    throw new Error(reason);
+  const witnessIssue = witness && checkpointWitnessIssue(witness, { key: descriptor.key, taskId: task.id,
+    attempt: descriptor.number, loop: loop.number, cursor: loop.cursor });
+  if (witnessIssue) {
+    const producer = checkpointWitnessRefs.get(witness);
+    if (producer) retainHaltProducer(producer, "host-observation");
+    loop.halt = { status: "blocked", code: "checkpoint-witness",
+      reason: excerpt(producer ? witnessIssue : `Checkpoint observation native original integrity failure: ${witnessIssue}`),
+      ...(producer ? { ref: producer } : {}), originalDigest: canonicalDigest(witness) };
+    throw new Error(loop.halt.reason);
   }
   const evidence = witness?.evidence ?? null;
   // A restoration intention consumes this material witness durably, before
@@ -2139,28 +2285,19 @@ function checkpointFallback(observed, ref, task, timeoutRenewal = false) {
   // Reconcile the exact operation/result without inventing its original evidence.
   // Non-pause recovery retains its existing material-progress routes.
   const lastRestore = descriptor.restore ?? frame.operations.at(-1);
-  // Unchanged restoration evidence needs current human input or the separately
-  // checked terminal-timeout exception; neither renews an unnamed future writer.
-  const renewal = timeoutRenewal || !!descriptor.restore && !!evidence && evidence === descriptor.restore.evidence &&
-    resolution?.loop === loop.number && !loop.archived && ["accepted", "applied"].includes(resolution.stage) &&
-    !resolution.currentBarrier && resolution.operations?.some(item => item.key === descriptor.key);
+  const renewal = timeoutRenewal;
   if (lastRestore && !renewal && (!evidence || frame.evidence.includes(evidence) || prior.some(item => item.evidence === evidence ||
       pauseRestoration && !item.evidence &&
         same(item.confirmedPause, descriptor.result?.checkpoint?.confirmation ?? lastRestore.authority?.confirmedPause ?? lastRestore.confirmedPause)))) {
     if (descriptor.restore && nativeTimeout(descriptor.launch)) {
       const launchedMs = descriptor.launch.launchedMs;
-      loop.halt ??= { code: "timeout", status: "partial", class: "worker", key: descriptor.key,
-        launchedMs, ref: clone(descriptor.launch),
-        reason: `Restoring worker ${descriptor.key} timed out at ${launchedMs} ms. ${(descriptor.timeoutGeneration ?? 1) >= 3
-          ? "The three-generation limit is reached; use a new invocation."
-          : `Relaunch with args.timeouts.workerMs strictly greater than ${launchedMs}.`}` };
+      loop.halt ??= workerTimeoutHalt(descriptor, descriptor.launch, launchedMs);
+      descriptor.launch = clone(loop.halt.ref);
       return save().then(() => { throw new Error(loop.halt.reason); });
     }
-    const error = new Error("Restoration remains pending with no new checkpoint evidence; reconcile the exact operation or supply material progress, no replacement writer authorized.");
-    error.nativeFailure = { code: "recovery", reason: error.message, ref: clone(ref) };
-    throw error;
+    const failure = restorationPendingFailure(ref, descriptor.restore && ref.runId && barrier(observed, ref.runId) === "interrupted");
+    throw Object.assign(new Error(failure.reason), { nativeFailure: failure });
   }
-  if (renewal && !timeoutRenewal) resolution.stage = "applied";
   checkpointObservation = undefined;
   const manifest = `${config.root}/.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`;
   // The modifying worker reads and validates these exact bytes through the owned
@@ -2256,7 +2393,9 @@ function workerValue(result, descriptor, task, statusRef, observed) {
     gates.every(gate => receipt.gates.some(observed => observed.id === gate.id && observed.status === "pass"));
   if (observed) {
     value.candidate = candidate(observed.candidate);
-    if (observed.restored) value.restoreReceipt = clone(observed.restored);
+    if (observed.restored) value.restoreReceipt = Object.fromEntries(
+      ["checkpointRef", "partialRef", "restoredRef", "digest", "position", "candidate", "confirmedPause", "confirmedUnit"]
+        .filter(key => observed.restored[key] !== undefined).map(key => [key, clone(observed.restored[key])]));
     if (observed.outcome === "sealed") value.checkpointReceipt = {
       kind: observed.kind, checkpointRef: observed.checkpointRef, digest: observed.digest,
       candidate: value.candidate, position: clone(observed.position), progress: clone(descriptor.checkpoint.progress),
@@ -2319,7 +2458,14 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   const taskState = invocation.tasks[task.id];
   if (value?.status === "complete" && taskState.completed)
     throw new Error("Duplicate task completion rejected at admission.");
+  const original = descriptor.gate?.receipt?.workerOriginal;
+  if (descriptor.gate && (!original || original.key !== descriptor.key ||
+      original.runId !== descriptor.launch.runId || !text(original.path) || !/^[a-f0-9]{64}$/.test(original.sha256 ?? "")))
+    throw new Error("Worker admission lacks its verified native original.");
   const base = { ...projection(descriptor.key, result), taskId: descriptor.taskId, attempt: descriptor.number,
+    ...(original ? { ref: {
+      key: original.key, runId: original.runId, path: original.path, digest: original.sha256,
+    } } : {}),
     ...(observed ? { candidate: candidate(observed.candidate) } : {}),
     ...(descriptor.checkpoint ? { checkpoint: {
       key: descriptor.checkpoint.key, manifest: `.pi/subagents/checkpoints/${descriptor.checkpoint.key}/manifest.json`,
@@ -2377,8 +2523,7 @@ function admitWorker(result, descriptor, task, recoveryRef, statusRef, observed,
   delete loop.attempt.received;
   if (value?.checkpointReceipt) prepareSeal(projected);
   // A recovered rejection does not settle the interrupted producer.
-  if (["recovery", "native-barrier"].includes(loop.halt?.code) &&
-      !(resolution?.stage === "accepted" && same(resolution.halt, loop.halt))) delete loop.halt;
+  if (["recovery", "native-barrier"].includes(loop.halt?.code)) delete loop.halt;
   if (projected.status === "blocked") retainWorkerBlock(projected);
   if (observed) currentCandidate = candidate(observed.candidate);
   if (parsed.rejection) return projected;
@@ -2440,6 +2585,7 @@ let settledTaskSealer;
 // A retained seal intention is observed before any fallback, recovery or re-seal.
 // Grouped closes resume verified markers; legacy seals keep the fresh-dispatch route.
 function observePendingSealer() {
+  if (loop?.attempt?.recoveredSeal) return Promise.resolve();
   const pending = loop?.attempt?.seal;
   const close = loop?.attempt?.close;
   if (loop?.attempt?.stage === "result") return Promise.resolve();
@@ -2457,7 +2603,7 @@ function observePendingSealer() {
         (observed?.agent && observed.agent !== ref.agent))
       throw new Error("Sealer producer/run identity conflicts with the pending seal.");
     if (loop.attempt.taskReview?.synthesis && ref.agent === "pitako.checkpoint-sealer" &&
-        observed?.ok && observed.output) {
+        observed?.ok && observed.output?.trimStart().startsWith("{")) {
       const receipt = JSON.parse(observed.output);
       if (receipt.outcome === "sealed" && !same(candidate(receipt.candidate), currentCandidate))
         throw new Error("Current candidate differs from the settled task sealer; recovery required.");
@@ -2465,12 +2611,25 @@ function observePendingSealer() {
     }
   });
 }
+function validFinalGateRecord(record, receipt, receiptDigest, opKey, invocation, epoch) {
+  const { seq, digest, prev, requestDigest, producer, execDigest } = record ?? {};
+  const hash = /^[a-f0-9]{64}$/;
+  return Number.isSafeInteger(seq) && seq > 0 && hash.test(digest ?? "") && hash.test(requestDigest ?? "") &&
+    hash.test(execDigest ?? "") && typeof producer === "string" && producer.replace(/\.r[123]$/, "") === opKey &&
+    (prev === null || hash.test(prev ?? "")) && canonicalDigest(receipt) === receiptDigest &&
+    canonicalDigest({ scope: `exec:${invocation}.e${epoch}`, seq, kind: "final-gate",
+      opKey: `final-gate:${opKey}`, requestDigest, prev,
+      bodyDigest: canonicalDigest({ producer, execDigest, receipt, receiptDigest }) }) === digest;
+}
+
 // Gate intentions and receipts survive relaunch; a saved seal never reruns gates.
 function verifyAttempt(descriptor, task, value, reuse) {
   const pending = descriptor.gate ??= { key: `${descriptor.key}.gate`, stage: "intention", retry: 0 };
   if (pending.stage === "receipt") return Promise.resolve(pending.receipt);
   if (descriptor.seal) return Promise.reject(new Error("Seal intention has no durable gate receipt; recovery required."));
   const gateTask = pending.task ??= gateTaskFor(task);
+  pending.gateFloorMs ??= effectiveTimeouts().gateFloorMs;
+  let finalRequestDigest;
   function runGate() {
     const gateKey = `${pending.key}${pending.retry ? `.r${pending.retry}` : ""}`;
     return Promise.resolve().then(() => {
@@ -2493,29 +2652,72 @@ function verifyAttempt(descriptor, task, value, reuse) {
       if (observed) return [observed];
       // Admission exhaustion proves no child launched and preserves this key.
       pending.stage = "intention"; pending.dispatched = true;
-      return save().then(() => dispatch([{ ...loopIORequest(gateKey, {
+      const gateInput = descriptor.checkpoint && descriptor.launch?.runId &&
+          !descriptor.restore && !reuse && !descriptor.gateGeneration &&
+          ["selection", "close", "baseline"].includes(storeProjection?.P.control.operation?.operation)
+        ? storedWorkerCloseInput({ root: config.root, invocation: config.invocation,
+          storeId: invocation.storeId, epoch: invocation.epoch ?? 0, head: invocation.head,
+          intent: descriptor.intent, gateFloorMs: pending.gateFloorMs,
+          associationDigest: canonicalDigest(invocation.association), admissionBinding: invocation.admissionBinding },
+          { key: descriptor.key, runId: descriptor.launch.runId }, storeProjection.P.control.operation.input, "gate")
+        : {
         operation: "gate", root: config.root, specId: config.id, invocation: config.invocation,
         loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
-        workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge, ...(reuse ? { reuse } : {}),
-      }), timeoutMs: gateOperationTimeout(gateTask) }]));
+        workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint,
+        requestObservation: invocation.requestObservation ?? 0,
+        ...(descriptor.checkpoint ? { worker: { key: descriptor.key, runId: descriptor.launch.runId } } : {}),
+        ...(reuse ? { reuse } : {}),
+      };
+      dispatchedAction = { kind: "pending", op: "gate", opKey: pending.key,
+        ...(reuse && descriptor === loop.finalAttempt ? { input: invocation.lastFinalGate } : {}),
+        gateTimeoutMs: gateOperationTimeout(gateTask),
+        gateTimeouts: task.gates.map(gate => gate.timeoutMs ?? 1800000),
+        gateMetricMs: task.metric ? 1800000 : 0 };
+      const replayFinal = descriptor === loop.finalAttempt && pending.retry && pending.key.endsWith(".acceptance.gate");
+      if (descriptor === loop.finalAttempt && !pending.retry) {
+        const { operation, ...request } = JSON.parse(JSON.stringify(gateInput));
+        finalRequestDigest = canonicalDigest(request);
+      }
+      return save().then(() => dispatch([loopIORequest(gateKey,
+        replayFinal ? finalGateReplayRequest(executeCursor(), gateKey) : gateInput, gateOperationTimeout(gateTask))]));
     }).then(([result]) => {
       if (result.gateReceipt) return result.gateReceipt;
       pending.ref = { ...pending.ref, ...nativeReference(gateKey, result) };
       const cause = analysisBarrier(result, gateKey);
-      if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref); });
+      if (cause) return save().then(() => { throw nativeBarrier(cause, pending.ref, result); });
       if (nativeTimeout(result)) return haltGateTimeout(descriptor, "gate-transport", gateOperationTimeout(gateTask), result)
         .then(() => { throw new Error(loop.halt.reason); });
       let receipt;
       if (typeof result?.output === "string") {
         const last = result.output.trim().split("\n").at(-1);
-        if (utf8Bytes(last ?? "") <= 8192) {
+        if (utf8Bytes(last ?? "") <= 61440) {
           try { receipt = JSON.parse(last); } catch (_) { /* Malformed output is not gate evidence. */ }
         }
       }
-      if (receipt?.viewOverflow === true) return save().then(() => {
-        throw Object.assign(new Error("HUMAN + DECISION overflow: ask the human to consolidate current Board HUMAN rulings and decisions"), { viewOverflow: true });
-      });
+      if (receipt?.error === "loop-io" && receipt.code === "store-busy" && pending.retry < 2) {
+        pending.retry++; pending.dispatched = false; delete pending.ref;
+        return save().then(runGate);
+      }
+      if (receipt?.error === "loop-io" && receipt.code)
+        throw Object.assign(new Error(receipt.reason), { code: receipt.code, recovery: receipt.recovery });
+      loopIOViewOverflow(receipt, pending.ref);
+      if (descriptor === loop.finalAttempt && receipt?.selectionHead) {
+        const { receipt: value, finalGate, receiptDigest, storeId, selectionHead, selectionInput } = receipt;
+        if (!same(selectionHead, invocation.head) || !same(selectionInput, storeProjection.P.control.operation.input) ||
+            finalGate?.requestDigest !== finalRequestDigest)
+          throw new Error("Final acceptance retry selection integrity mismatch.");
+        receipt = { ...value, finalGate, receiptDigest, storeId };
+      }
       const failures = [result, ...(result?.results ?? [])].filter(Boolean);
+      const committedGate = receipt?.P ? { head: receipt.head, P: receipt.P, storeId: receipt.storeId } : null;
+      if (receipt?.P) {
+        const { head, P, storeId, ...gateReceipt } = receipt;
+        receipt = gateReceipt;
+      }
+      const { finalGate, storeId: finalStoreId, receiptDigest: finalReceiptDigest, ...finalReceipt } = receipt ?? {};
+      if (finalGate) receipt = finalReceipt;
+      if (descriptor !== loop.finalAttempt)
+        receipt = readTaskGateWire(receipt, gateTask.gates, committedGate?.P.prompt.execution?.worker?.reference);
       const terminal = result?.ok && result.agent === "pitako.loop-io" && text(result.runId) &&
         (result.key === undefined || result.key === gateKey) && !result.state && !result.terminalOutcome &&
         Array.isArray(result.results) && result.results.length === 1 && result.results[0].exitCode === 0 &&
@@ -2532,7 +2734,28 @@ function verifyAttempt(descriptor, task, value, reuse) {
         pending.retry++; pending.stage = "intention"; pending.dispatched = false; delete pending.ref;
         return save().then(runGate);
       }
+      if (committedGate) {
+        committedIntentReference(descriptor.intent, committedGate.head);
+        if (committedGate.storeId !== invocation.storeId ||
+            committedGate.P.control.operation?.operation !== "gate" ||
+            committedGate.P.control.operation.key !== pending.key)
+          throw new Error("Committed gate differs from its pending worker.");
+        storeProjection = { head: clone(committedGate.head), P: committedGate.P };
+        invocation.head = clone(committedGate.head);
+      }
+      if (task.id === "final-acceptance") {
+        if (finalStoreId !== invocation.storeId ||
+            !validFinalGateRecord(finalGate, finalReceipt, finalReceiptDigest, pending.key, config.invocation, invocation.epoch ?? 0) ||
+            finalGate.seq <= invocation.head.seq)
+          throw new Error("Final acceptance gate record integrity mismatch.");
+        const { seq, digest, producer } = finalGate;
+        pending.record = { seq, digest };
+        pending.producer = producer;
+        invocation.head = { seq, hash: digest };
+      }
       pending.receipt = receipt; pending.stage = "receipt";
+      if (inFlight.get(descriptor.key)?.runId === descriptor.launch?.runId)
+        inFlight.delete(descriptor.key);
       // Only a fresh receipt observes the current candidate; cached receipts do not.
       currentCandidate = candidate(receipt.after);
       loop.metricSeries = clone(receipt.progress);
@@ -2544,20 +2767,41 @@ function verifyAttempt(descriptor, task, value, reuse) {
   return runGate();
 }
 
-function acceptanceResults() {
-  const receipt = loop?.finalAttempt?.gate?.receipt;
+function acceptanceResults(closingLoop = loop) {
+  const receipt = closingLoop?.finalAttempt?.gate?.receipt;
   const humanIds = new Set((receipt?.view?.posts ?? []).filter(post => post.type === "HUMAN").map(post => post.id));
   const blocking = [], excepted = [];
   for (const result of receipt?.gates ?? []) {
-    const exception = loop.acceptance?.find(command => command.id === result.id)?.exception;
+    const exception = closingLoop.acceptance?.find(command => command.id === result.id)?.exception;
     if (exception && humanIds.has(exception.humanRef)) excepted.push({ ...result, ...exception });
     else blocking.push(result);
   }
   return { blocking, excepted };
 }
+function finalAcceptanceHalt(code, reused, results) {
+  return { status: "blocked", code, reason: excerpt(code === "repeat-acceptance"
+    ? `Repeated final acceptance from loop ${reused.loop} (${reused.gateKey}) still fails: ${results}`
+    : `Final acceptance environment failure: ${results}`) };
+}
+function retainFinalAcceptanceHalt(code, receipt, failures) {
+  const { key, runId } = loop.finalAttempt.gate.ref;
+  inFlight.set(key, { key, runId, role: "loop-io" });
+  loop.halt = finalAcceptanceHalt(code, receipt.reused,
+    failures.map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; "));
+}
 function acceptanceBrief() {
-  return `Excepted acceptance results: ${JSON.stringify(acceptanceResults().excepted)}.
-Acceptance history: ${JSON.stringify(loop.acceptanceHistory ?? loop.selection?.receipt?.acceptanceHistory ?? [])}.
+  const gate = loop.finalAttempt?.gate, receipt = gate?.receipt;
+  const { blocking, excepted } = acceptanceResults();
+  if (receipt && !gate.record) throw new Error("Final acceptance gate record integrity mismatch.");
+  const evidence = receipt ? {
+    store: { storeId: invocation.storeId, scope: `exec:${config.invocation}.e${invocation.epoch ?? 0}`, seq: gate.record.seq },
+    digest: gate.record.digest,
+    gates: blocking.map(({ id, status, exit, ms, logRef }) => ({ id, status, exit, ms, logRef })),
+    after: receipt.after, mutated: receipt.mutated, currentAcceptance: currentAcceptance(),
+  } : null;
+  return `Blocking final acceptance (mandatory checks): ${JSON.stringify(evidence)}.
+Excepted acceptance results: ${JSON.stringify(excepted)}.
+Acceptance history: ${canonicalJSON(loop.acceptanceHistory ?? loop.selection?.receipt?.acceptanceHistory ?? [])}.
 Inspect acceptanceHistory and report as a gap any acceptance replacement that narrows, filters or relaxes a command and cites no HUMAN post ID that is current in this execute topic.
 An excepted failure covered by a current HUMAN is reported, not a gap or repair task.`;
 }
@@ -2592,8 +2836,6 @@ function validGateReceipt(receipt, task, status) {
         (receipt.metric.error === null || text(receipt.metric.error)) : receipt.metric === null);
   } catch (_) { return false; }
 }
-// Separate construction from dispatch so capacity can measure the exact frozen
-// transport without performing checkpoint or restoration effects.
 function closeAttemptInput(descriptor, task, value) {
   const gateKey = descriptor.gate?.key ?? `${descriptor.key}.gate`;
   const gateTask = descriptor.close?.input?.gate?.task ?? descriptor.gate?.task ?? gateTaskFor(task);
@@ -2610,20 +2852,85 @@ function closeAttemptInput(descriptor, task, value) {
       if (!source) throw new Error("Missing authenticated restoration source intent.");
       return source;
     }) } : {}) };
-  return { operation: "close",
+  return { operation: "close", taskFrame: clone(invocation.taskFrame),
     gate: { root: config.root, specId: config.id, invocation: config.invocation,
       loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
-      workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint, knowledge: value.knowledge },
-    seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines };
+      workerStatus: value.status, writerSettled: true, checkpoint: descriptor.checkpoint,
+      ...(descriptor.revival ? { revival: { decision: descriptor.revival.decision } } : {}),
+      worker: { key: descriptor.key, runId: descriptor.launch.runId } },
+    seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines,
+    continuation: { attempt: { ...Object.fromEntries(["taskId", "index", "number", "key", "timeoutMs",
+      "checkpoint", "intent", "baseline", "bindingKey", "revival", "resume", "resumeAfter", "boardPostIds",
+      "taskReview", "restore", "pauseSource"].filter(field => descriptor[field] !== undefined)
+      .map(field => [field, clone(descriptor[field])])), launch: { key: descriptor.key, runId: descriptor.launch.runId } },
+      taskState: clone(invocation.tasks[task.id]), taskFrame: clone(invocation.taskFrame),
+      results: clone(loop.results), recoveries: clone(loop.recoveries),
+      usage: clone(loop.usage),
+      metricSeries: clone(loop.metricSeries ?? task.progress), lastConfirmed: clone(invocation.lastConfirmed ?? null) } };
+}
+function storedWorkerCloseInput(position, worker, input, operation = "close") {
+  return { operation, root: position.root, invocation: position.invocation,
+    key: `${worker.key}.${operation}`, storeId: position.storeId,
+    scope: `exec:${position.invocation}.e${position.epoch}`, expectedHead: clone(position.head),
+    refs: { input, intent: position.intent, worker: { key: worker.key, runId: worker.runId },
+      gateFloorMs: position.gateFloorMs,
+      request: { associationDigest: position.associationDigest, admissionBinding: position.admissionBinding,
+        missionId: config.missionId, missionPath: config.missionPath, sourceRefs: config.sourceRefs ?? [],
+        amendments: config.amendments ?? [], specId: config.id } } };
+}
+function canReferenceWorkerClose(descriptor, value) {
+  return !descriptor.close && descriptor.number === 1 && !descriptor.restore &&
+    !descriptor.revival && ["blocked", "continue"].includes(value.status) &&
+    storeProjection?.P.control.operation?.operation === "selection" && !invocation.intentions?.length;
+}
+function recordWorkerClose(descriptor, result, task) {
+  let value;
+  try { value = workerValue(result, descriptor, task).value; }
+  catch (error) {
+    if (error.reportRejection) return;
+    throw error;
+  }
+  // Settled later attempts and repairs have the same consuming-writer boundary.
+  // Reference-only first-attempt transport is an optimization, not that boundary.
+  const op = value.status === "complete" ? "gate" : "close";
+  dispatchedAction = { kind: "pending", op, opKey: `${descriptor.key}.${op}`,
+    gateTimeoutMs: dispatchedAction?.gateTimeoutMs ?? gateOperationTimeout(gateTaskFor(loop.task)),
+    ...(op === "gate" ? { gateTimeouts: task.gates.map(gate => gate.timeoutMs ?? 1800000),
+      gateMetricMs: task.metric ? 1800000 : 0 } : {}) };
 }
 function closeAttempt(descriptor, task, value) {
+  if (descriptor.close?.input?.refs) {
+    // Reference conversion happens only after all close decisions and request effects settle.
+    if (descriptor.close.stage !== "receipt" || descriptor.gate?.stage !== "receipt")
+      throw new Error("Referenced close lacks its admitted gate receipt.");
+    if (!same(currentCandidate, candidate(descriptor.gate.receipt.after))) {
+      const reason = "Current candidate differs from the saved close gate receipt; recovery required, gates must not be rerun.";
+      loop.halt = { status: "blocked", code: "recovery", reason, ref: clone(descriptor.close.ref) };
+      return save().then(() => { throw new Error(reason); });
+    }
+    return Promise.resolve(groupedStep(descriptor.close.receipt, "seal"));
+  }
   const savedReceipt = descriptor.close?.stage === "receipt";
   const input = closeAttemptInput(descriptor, task, value);
   const gateTask = input.gate.task;
   const nextBaselines = input.nextBaseline;
   const gateKey = input.gate.key;
-  return groupedIO("close", input, descriptor).then(transport => {
+  const selection = storeProjection?.P.control.operation;
+  // Freeze the same reference-only request on first dispatch and on cursor replay.
+  const storedInput = canReferenceWorkerClose(descriptor, value)
+    ? storedWorkerCloseInput({ root: config.root, invocation: config.invocation,
+      storeId: invocation.storeId, epoch: invocation.epoch ?? 0, head: invocation.head,
+      intent: descriptor.intent, gateFloorMs: effectiveTimeouts().gateFloorMs,
+      associationDigest: canonicalDigest(invocation.association), admissionBinding: invocation.admissionBinding },
+      { key: descriptor.key, runId: descriptor.launch.runId }, selection.input)
+    : input;
+  return groupedIO("close", storedInput, descriptor).then(transport => {
+    const operation = storeProjection?.P && storeProjection.head.seq === transport.head?.seq
+      && storeProjection.P.control?.operation;
+    const committedInput = operation?.operation === "close" && operation.key === descriptor.close.key
+      ? committedIntentReference(operation.input, transport.head) : null;
     const gate = groupedStep(transport, "gate"), selected = groupedStep(transport, "seal");
+    gate.receipt = readTaskGateWire(gate.receipt, gateTask.gates, gate.workerOriginal);
     const view = transport.projection.view ?? (descriptor.gate?.stage === "receipt" ? invocation.currentView : null);
     if (!validGateReceipt({ ...gate.receipt, view }, gateTask, value.status) ||
         gate.contextPeak !== null && (!Number.isSafeInteger(gate.contextPeak) || gate.contextPeak < 0) ||
@@ -2640,14 +2947,24 @@ function closeAttempt(descriptor, task, value) {
       receipt: { ...gate.receipt, contextPeak: transport.projection.contextPeak } };
     const requests = groupedStep(transport, "nextRequests"), baseline = groupedStep(transport, "nextBaseline");
     const earlier = groupedStep(transport, "requests");
+    const observed = requests.observed;
+    if (observed && (observed.taskId !== task.id || !Number.isSafeInteger(observed.count) ||
+        observed.count <= requests.requests.length ||
+        !(observed.next === null || observed.next === observed.count) ||
+        typeof observed.requested !== "boolean"))
+      throw Object.assign(new Error("Invalid close request wire window."), { checkpointIntegrity: true });
     if (!Number.isSafeInteger(earlier.count) || earlier.count < 0 || !Array.isArray(requests.requests) ||
-        requests.requests.length < earlier.count)
+        (observed?.count ?? requests.requests.length) < earlier.count)
       throw Object.assign(new Error("Close request snapshot integrity conflict."), { checkpointIntegrity: true });
     const outcome = selected.receipt.outcome;
     const variant = kind === "pause" && value.status !== "blocked" && ["sealed", "observed"].includes(outcome) &&
-      requests.next === null && !requests.requests.some(request => request.taskId === task.id) ? outcome : null;
+      (observed ? observed.next === null && !observed.requested :
+        requests.next === null && !requests.requests.some(request => request.taskId === task.id)) ? outcome : null;
     if (baseline.variant !== variant || baseline.sealOutcome !== outcome || baseline.captured !== (variant !== null))
       throw Object.assign(new Error("Close next-baseline selection differs from workflow evidence."), { checkpointIntegrity: true });
+    if (variant && (storeProjection?.head.seq !== transport.head?.seq ||
+        storeProjection.P.prompt.execution?.checkpoint.key !== nextBaselines[variant].key))
+      throw Object.assign(new Error("Close continuation reference integrity mismatch."), { checkpointIntegrity: true });
     if (savedReceipt && !same(currentCandidate, candidate(gate.receipt.after))) {
       const reason = "Current candidate differs from the saved close gate receipt; recovery required, gates must not be rerun.";
       loop.halt = { status: "blocked", code: "recovery", reason, ref: clone(descriptor.close.ref) };
@@ -2659,7 +2976,14 @@ function closeAttempt(descriptor, task, value) {
     invocation.boardTopicId = invocation.currentView.topicId;
     delete transport.projection.view;
     return observeGroupedRequests(transport, true, requests).then(() => {
-      descriptor.foldedNextBaseline = variant ? admitBaseline(nextBaselines[variant], baseline) : null;
+      descriptor.foldedNextBaseline = variant ? admitBaseline(nextBaselines[variant], baseline, transport.head) : null;
+      if (committedInput) {
+        descriptor.close.steps = transport.projection.steps.map(step => step.operation);
+        descriptor.close.input = { operation: "close", root: config.root, invocation: config.invocation,
+          key: descriptor.close.key, storeId: invocation.storeId,
+          scope: `exec:${config.invocation}.e${invocation.epoch ?? 0}`,
+          expectedHead: clone(transport.head), refs: { input: committedInput } };
+      }
       return save();
     }).then(() => selected);
   });
@@ -2722,7 +3046,8 @@ function taskReviewRepair() {
 }
 function reviewTask(descriptor, task) {
   const review = descriptor.taskReview ??= {};
-  const originals = [review.reviewer, review.synthesis].filter(Boolean);
+  if (descriptor.reviewRecovered && review.synthesis) return Promise.resolve();
+  const originals = descriptor.reviewRecovered ? [] : [review.reviewer, review.synthesis].filter(Boolean);
   // Recheck published bytes on every re-entry; a cached decision is not an access receipt.
   const access = originals.length ? (() => {
     const prior = descriptor.taskReviewAccess;
@@ -2742,13 +3067,15 @@ function reviewTask(descriptor, task) {
     ...(invocation.taskFrame.sources ?? []).map(frameIntent), descriptor.checkpoint]
     .map(intent => [intent.key, intent])).values()].sort((a, b) => a.attempt - b.attempt);
   return access.then(() => loopIO("delta", { operation: "taskDelta", root: config.root, invocation: config.invocation,
-    intents }, descriptor)).then(delta => {
+    requestObservation: invocation.requestObservation ?? 0, intents }, descriptor)).then(delta => {
     if (delta.unsettled === true) { review.unsettled = true; return; }
     if (!Array.isArray(delta.touched) || !Array.isArray(delta.netChanged) || delta.netChanged.length > 200 ||
         ![...delta.touched, ...delta.netChanged].every(text)) throw new Error("Invalid task delta evidence.");
     const diff = delta.diff;
     if (delta.touched.length ? !diff || typeof diff.sha256 !== "string" || !/^[a-f0-9]{64}$/i.test(diff.sha256) ||
-        diff.path !== `${config.root}/.pi/subagents/execute/${config.invocation}/task-deltas/diff-${diff.sha256}.patch` ||
+        !/^[a-f0-9]{64}$/.test(diff.digest ?? "") || diff.store?.storeId !== invocation.storeId ||
+        diff.store?.scope !== `exec:${config.invocation}.e${invocation.epoch ?? 0}` ||
+        !Number.isSafeInteger(diff.store.seq) || diff.store.seq < 1 || diff.store.seq > invocation.head?.seq ||
         ![diff.bytes, diff.lines, diff.omitted].every(value => Number.isSafeInteger(value) && value >= 0) ||
         diff.lines < 1 : diff !== null) throw new Error("Invalid task delta evidence.");
     if (!delta.touched.length) return;
@@ -2757,18 +3084,18 @@ function reviewTask(descriptor, task) {
     const brief = `Read-only per-task review. Read the complete immutable spec and its Scope and Exclusions:
 ${invocation.association.source} (SHA-256 ${invocation.association.digest}).
 ${fullContext()}
-Frozen amendments: ${JSON.stringify(invocation.amendments ?? [])}.
-Task definition: ${JSON.stringify(task)}.
-Delta reference: ${JSON.stringify(diff)}.
+Frozen amendments: ${canonicalJSON(invocation.amendments ?? [])}.
+Task definition: ${canonicalJSON(task)}.
+Delta reference: ${canonicalJSON(diff)}.
 a/ = slot baseline before attempt 1, b/ = current candidate.
-Verify sha256 with file_sha256 first; a missing or mismatched diff is a blocking finding of uncertain provenance.
-Read the absolute path with read offset paging, using the index start lines (grep skips the gitignored .pi/).
+Read the record with pitako_store (op: record, storeId, scope, seq); page it fully and match its digest.
+Read body.patch using its index start lines. Missing or mismatched evidence is a blocking finding of uncertain provenance.
 Non-rendered statuses are declared limits: do not claim to have reviewed unavailable bytes, and do not deduct for that alone.
 git_diff and watchdog_diff compare with HEAD and include earlier loops' WIP.
 The diff covers only this loop; for carried tasks, earlier-loop work is visible only in current source.
-Changed-file evidence: ${JSON.stringify(delta)}.
+Changed-file evidence: ${canonicalJSON(delta)}.
 Observed gate results (command definitions and status, exit, bounded tail, log reference):
-${JSON.stringify({ definitions: task.gates, results: descriptor.gate.receipt.gates })}.
+${canonicalJSON({ definitions: task.gates, results: descriptor.gate.receipt.gates })}.
 Unavailable checks are unobserved; do not deduct for that alone. carried: ${carried}.
 Answer completeness against expectedResult (for corrections, every admitted finding path);
 correctness against achieving the result without introducing failures; scope against goal,
@@ -2785,7 +3112,7 @@ Inherited-only findings never block: prove they predate the task and do not affe
 Uncertain provenance blocks; carried task defects affecting its result block regardless of origin.
 For inherited findings set predatesTask true only with concrete evidence they predate the task;
 otherwise set it false. On rejection provide remaining, diagnosis and revival for the repair.
-Prior blocking findings and synthesis original: ${JSON.stringify(taskReviewRepair() ?? null)}.
+Prior blocking findings and synthesis original: ${canonicalJSON(taskReviewRepair() ?? null)}.
 When repairing, review the whole slot delta and verify every prior blocking finding is closed.
 Report conflict when expectedResult requires a spec exclusion. No unrelated improvements.
 Finish with structured_output.`;
@@ -2797,18 +3124,14 @@ Finish with structured_output.`;
         cwd: config.root, label: `Task ${stage}: ${task.id}`, phase: `task-${stage}`,
         model: invocation[stage === "reviewer" ? "taskReviewer" : "taskSynthesis"],
         output: `${childKey}.json`, outputMode: "file-only", reads: false, progress: false,
-        skill: ["verify-behavior", "scope-discipline"], outputSchema: taskReviewSchema,
+        skill: ["verify-behavior", "ponytail", "ponytail-review", "rust-best-practices", "rust-review", "scope-discipline"], outputSchema: taskReviewSchema,
         task: brief + (prior ? `\nStrict synthesis: read the reviewer original by path ${prior.path}
 (canonical digest ${prior.digest}); re-check every finding against source and rescore independently.
 Admit only if all three scores >=9 and no introduced or task-outcome finding blocks.` : ""),
       }]).then(([result]) => {
         if (!result?.ok || !result.structuredOutput) {
-          const setting = `pitako.execute.${stage === "reviewer" ? "taskReviewer" : "taskSynthesis"}`;
-          const model = invocation[stage === "reviewer" ? "taskReviewer" : "taskSynthesis"];
-          const reason = `${setting} model '${model}' failed: ${result?.error ?? "missing original"}. Fix the setting and start a new invocation; no retry or fallback model.`;
-          loop.halt = { status: "blocked", code: "task-review-model", reason,
-            ref: nativeReference(childKey, result) };
-          return save().then(() => { throw new Error(reason); });
+          loop.halt = taskReviewModelHalt(childKey, result, invocation);
+          return save().then(() => { throw new Error(loop.halt.reason); });
         }
         const path = result.results?.find(item => text(item.savedOutputPath) && !item.outputSaveError)?.savedOutputPath;
         if (!path || !text(result.runId)) throw new Error("Task review original was not published.");
@@ -2827,19 +3150,25 @@ Admit only if all three scores >=9 and no introduced or task-outcome finding blo
     }), Promise.resolve());
   });
 }
+function checkpointIntegrityHalt(observed, ref) {
+  return { status: "blocked", code: "checkpoint-integrity", reason: checkpointMismatchReason(observed.paths),
+    ref: { key: ref.key, runId: ref.runId, agent: ref.agent }, originalDigest: canonicalDigest(clone(observed)) };
+}
 // Only the active root can turn the settled result and its saved gates into a seal.
 function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   if (loop.attempt.stage === "result") throw new Error("Duplicate attempt admission rejected.");
   // Replay must check the observed native reference before any close or review.
-  if (descriptor.referenceCapacity) nativeReference(descriptor.key, result);
   let structural;
   try { structural = workerValue(result, descriptor, task, statusRef); } catch (error) {
     if (!error?.reportRejection) throw error;
     structural = { rejection: String(error.message) };
   }
-  let groupedSeal;
+  if (!structural.rejection && !descriptor.launch) descriptor.launch = nativeReference(descriptor.key, result);
+  let groupedSeal = descriptor.recoveredSeal;
   const complete = !structural.rejection && !recoveryRef && structural.value.status === "complete";
-  return (complete ? verifyAttempt(descriptor, task, structural.value).then(receipt => {
+  return (descriptor.close?.receipt?.projection
+    ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
+    : complete ? verifyAttempt(descriptor, task, structural.value).then(receipt => {
     const passed = !receipt.mutated && (task.gates ?? task.checks).every(gate =>
       receipt.gates.some(result => result.id === gate.id && result.status === "pass"));
     return passed ? reviewTask(descriptor, task) : undefined;
@@ -2847,14 +3176,14 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
     // Ineligible attempts retain the grouped close, including its request observation.
     if (!descriptor.taskReview?.synthesis && !descriptor.taskReview?.unsettled && !descriptor.seal)
       return closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; });
-    return observeMainRequests(0, [], true).then(() => {
+    return (descriptor.recoveredRequests
+      ? admitRequests(descriptor.recoveredRequests, 0, [], true)
+      : observeMainRequests(0, [], true)).then(() => {
       if (invocation.intentions?.length) return groupedIO("finishDrain", { operation: "drain" }, invocation);
     });
   }) : !structural.rejection && !recoveryRef && !descriptor.gate && !descriptor.seal
     ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
-    : descriptor.close?.receipt?.projection
-      ? closeAttempt(descriptor, task, structural.value).then(receipt => { groupedSeal = receipt; })
-      : !structural.rejection && !recoveryRef ? verifyAttempt(loop.attempt, task, structural.value) : Promise.resolve()).then(() => {
+    : !structural.rejection && !recoveryRef ? verifyAttempt(loop.attempt, task, structural.value) : Promise.resolve()).then(() => {
   descriptor.gate = loop.attempt.gate;
   const receipt = descriptor.gate?.receipt;
   const definitions = task.gates ?? task.checks;
@@ -2870,42 +3199,67 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
   if (pending.kind !== kind) throw new Error("Saved seal kind differs from its gate receipt; recovery required.");
   const reusedSealer = descriptor.taskReview?.synthesis && settledTaskSealer?.key === sealerKey(descriptor.key, pending.retry - 1)
     ? settledTaskSealer : null;
-  const retry = reusedSealer ? pending.retry - 1 : pending.retry;
-  const sealKey = sealerKey(descriptor.key, retry);
   const intent = descriptor.checkpoint;
   if (!intent) throw new Error("Missing checkpoint intention for root observation.");
-  let ref = groupedSeal ? clone(descriptor.close.ref) : { key: sealKey, agent: "pitako.checkpoint-sealer" };
-  pending.retry = retry + 1;
+  let ref;
   settledTaskSealer = null;
-  return (groupedSeal ? save().then(() => null) : reusedSealer ? Promise.resolve([reusedSealer.result])
-    : save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
-    task: JSON.stringify({ v: 1, intent, kind,
-      ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
-        const source = frameIntent(sourceKey);
-        if (!source) throw new Error("Missing authenticated restoration source intent.");
-        return source;
-      }) } : {}) }), cwd: config.root, context: "fresh", output: false, outputMode: "inline",
-    outputSchema: false, reads: false, progress: false }]))).then(results => {
-    const sealed = results?.[0];
-    if (!groupedSeal) ref = { ...nativeReference(sealKey, sealed), agent: "pitako.checkpoint-sealer" };
-    const cause = groupedSeal ? null : barrier(sealed, sealKey);
-    if (cause) throw nativeBarrier(cause, ref);
-    let observed = groupedSeal?.receipt;
-    if (typeof sealed?.output === "string" && utf8Bytes(sealed.output) <= 61440) {
-      try { observed = JSON.parse(sealed.output); } catch (_) { /* Invalid stdout is a barrier, not evidence. */ }
-    }
-    const failures = [sealed, ...(sealed?.results ?? [])].filter(Boolean);
-    if (!groupedSeal && (!sealed?.ok || sealed.agent !== "pitako.checkpoint-sealer" || !text(sealed.runId) ||
-        sealed.key !== undefined && sealed.key !== sealKey || sealed.state !== undefined || sealed.terminalOutcome ||
-        !text(sealed.asyncDir) || !text(sealed.externalAdapter?.outputArtifacts?.stdoutPath) ||
-        !text(sealed.externalAdapter?.outputArtifacts?.stderrPath) ||
-        !Array.isArray(sealed.results) || sealed.results.length !== 1 || sealed.results[0].exitCode !== 0 ||
-        failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
-          item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
-          item.exitCode !== undefined && item.exitCode !== 0)) ||
-        !observed || observed.v !== 1 || observed.kind !== kind ||
-        !["sealed", "observed", "mismatch", "open"].includes(observed.outcome))
-      throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
+  function runSealer(retry) {
+    const sealKey = sealerKey(descriptor.key, retry);
+    ref = groupedSeal ? clone(descriptor.recoveryRef ?? descriptor.close.ref) : { key: sealKey, agent: "pitako.checkpoint-sealer" };
+    pending.retry = retry + 1;
+    return (groupedSeal ? save().then(() => []) : reusedSealer ? Promise.resolve([reusedSealer.result]) :
+      save().then(() => dispatch([{ key: sealKey, agent: "pitako.checkpoint-sealer",
+        task: canonicalJSON({ v: 1, intent, kind,
+          ...(descriptor.restore ? { restoreSources: descriptor.restore.sourceKeys.map(sourceKey => {
+            const source = frameIntent(sourceKey);
+            if (!source) throw new Error("Missing authenticated restoration source intent.");
+            return source;
+          }) } : {}) }), cwd: config.root, context: "fresh", output: false, outputMode: "inline",
+        outputSchema: false, reads: false, progress: false }]))).then(([sealed]) => {
+      if (!groupedSeal) {
+        ref = { ...nativeReference(sealKey, sealed), agent: "pitako.checkpoint-sealer" };
+        const cause = barrier(sealed, sealKey);
+        if (cause) throw nativeBarrier(cause, ref, sealed);
+      }
+      const failures = [sealed, ...(sealed?.results ?? [])].filter(Boolean);
+      if (!groupedSeal && (!sealed?.ok || sealed.agent !== "pitako.checkpoint-sealer" || !text(sealed.runId) ||
+          sealed.key !== undefined && sealed.key !== sealKey || sealed.state !== undefined || sealed.terminalOutcome ||
+          !text(sealed.asyncDir) || !text(sealed.externalAdapter?.outputArtifacts?.stdoutPath) ||
+          !text(sealed.externalAdapter?.outputArtifacts?.stderrPath) ||
+          !Array.isArray(sealed.results) || sealed.results.length !== 1 || sealed.results[0].exitCode !== 0 ||
+          failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
+            item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
+            item.exitCode !== undefined && item.exitCode !== 0)))
+        throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
+      let observed = groupedSeal?.receipt;
+      if (typeof sealed?.output === "string" && utf8Bytes(sealed.output) <= 61440) {
+        try { observed = JSON.parse(sealed.output); } catch (_) { /* Invalid stdout is a barrier, not evidence. */ }
+      }
+      if (!groupedSeal && text(observed?.code) && text(observed.reason) &&
+          ["code,reason", "code,reason,recovery"].includes(Object.keys(observed).sort().join(","))) {
+        const failure = Object.assign(new Error(observed.reason), { code: observed.code, recovery: observed.recovery });
+        if (!failure.recovery && ["store-corrupt", "cursor-ahead", "store-unavailable", "store-replaced"].includes(failure.code)) {
+          // The sealer's intent reader cannot quarantine; recheck the saved head with the existing writer.
+          const cursor = executeCursor(), opKey = `${sealKey}.store-check`;
+          return checkEpochProducers().then(() => replayLoopIO(opKey, {
+            operation: "verifySelection", key: opKey, root: cursor.root, invocation: cursor.invocation,
+            storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+          })).then(() => { throw failure; });
+        }
+        throw failure;
+      }
+      if (!observed || observed.v !== 1 || observed.kind !== kind)
+        throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
+      if (!groupedSeal && observed.outcome === "store-busy" && Object.keys(observed).sort().join(",") === "kind,outcome,v") {
+        if (retry < 2) return runSealer(retry + 1);
+        throw Object.assign(new Error("Checkpoint sealer store remained busy."), { code: "store-busy" });
+      }
+      if (!["sealed", "observed", "mismatch", "open"].includes(observed.outcome))
+        throw nativeBarrier("Checkpoint sealer lacks successful terminal stdout.", ref);
+      return observed;
+    });
+  }
+  return runSealer(reusedSealer ? pending.retry - 1 : pending.retry).then(observed => {
     candidate(observed.candidate);
     if (receipt && !same(candidate(observed.candidate), candidate(receipt.after))) {
       const reason = "Sealer candidate differs from the saved gate receipt; recovery required, gates must not be rerun.";
@@ -2930,10 +3284,12 @@ function sealAndAdmit(result, descriptor, task, recoveryRef, statusRef) {
             ![entry.actual, entry.journaled].every(hash => hash === null || /^[a-f0-9]{64}$/.test(hash)) ||
             typeof entry.partiallyApplied !== "boolean"))
         throw nativeBarrier("Invalid checkpoint mismatch observation.", ref);
-      const reason = `Checkpoint journal integrity conflict: ${observed.paths.map(entry =>
-        `${entry.path}: journaled sha256 ${entry.journaled ?? "absence"}, actual sha256 ${entry.actual ?? "absence"}, last step partially applied: ${entry.partiallyApplied}`).join("; ")}.
-Return the files to their journaled bytes and resume (the sealer retries under the next .rN), or start a new mission.`;
-      loop.halt = { status: "blocked", code: "checkpoint-integrity", reason, ref };
+      const producer = groupedSeal ? descriptor.close?.ref : ref;
+      loop.halt = checkpointIntegrityHalt(observed, producer ?? ref);
+      if (text(producer?.runId))
+        inFlight.set(producer.key, { key: producer.key, runId: producer.runId,
+          role: groupedSeal ? "loop-io" : "checkpoint-sealer" });
+      const reason = loop.halt.reason;
       // A repaired candidate must be re-observed, not reuse the failed grouped seal.
       if (groupedSeal) {
         descriptor.close.receipt = receiptReference(descriptor.close.receipt);
@@ -2965,15 +3321,21 @@ Return the files to their journaled bytes and resume (the sealer retries under t
           !same(receipt.confirmedUnit, confirmed("confirmedUnit")))
         throw nativeBarrier("Invalid checkpoint restoration observation.", ref);
     }
-    // This synchronous admission consumes only this dispatch's in-memory result.
-    const admitted = admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural.rejection ? structural : undefined);
-    if (groupedSeal) {
-      descriptor.close.receipt = receiptReference(descriptor.close.receipt);
-      delete descriptor.close.input;
-    }
-    return save().then(() => admitted);
+    const settled = !groupedSeal && !reusedSealer && descriptor.taskReview?.synthesis && text(ref.runId);
+    if (settled) inFlight.set(ref.key, { key: ref.key, role: "checkpoint-sealer", runId: ref.runId });
+    return (settled ? save() : Promise.resolve()).then(() => {
+      const admitted = admitWorker(result, descriptor, task, recoveryRef, statusRef, observed, structural.rejection ? structural : undefined);
+      for (const [key, child] of inFlight)
+        if (child.role === "checkpoint-sealer" && key.startsWith(`${descriptor.key}.seal`))
+          inFlight.delete(key);
+      if (groupedSeal && descriptor.close) {
+        descriptor.close.receipt = receiptReference(descriptor.close.receipt);
+        delete descriptor.close.input;
+      }
+      return save().then(() => admitted);
+    });
   }).catch(error => {
-    if (error.spawnBudgetExhausted) { pending.retry = retry; throw error; }
+    if (error.spawnBudgetExhausted) { pending.retry--; throw error; }
     if (error.nativeBarrier) {
       loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
         code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
@@ -3068,51 +3430,6 @@ function compactSealedAttempts(body) {
       ? loop.results[index] : sealedResult({ ...entry, sealed: { key: entry.ref.key, digest } });
   });
 }
-function compactArchivedLoop() {
-  const pick = (value, fields) => Object.fromEntries(fields.filter(field => value?.[field] !== undefined)
-    .map(field => [field, value[field]]));
-  const attempt = loop.attempt;
-  // Closed does not mean disposable: failed workers and pause results still feed inspection.
-  const inspecting = loop.phase === "implementation" &&
-    (attempt?.checkpoint || attempt?.restore?.checkpoint || attempt?.restore?.sourceKeys) &&
-    (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status));
-  const results = loopResults().map(result => ({
-    ...reportResult(result),
-    ...(inspecting && result.checkpoint ? { checkpoint: result.checkpoint } : {}),
-  }));
-  const retained = pick(loop, ["number", "kind", "phase", "outcome", "startedAt", "endedAt", "archived",
-    "cursor", "manifest", "task", "review", "compliance", "closing", "halt", "resolutions", "invalidated",
-    "usage", "usageSummary", "metricSeries", "nextAdvance", "retired", "analysisGenerations"]);
-  retained.results = results;
-  if (loop.plan) retained.plan = pick(loop.plan, ["stage", "ref", "rejection"]);
-  if (loop.prepare) retained.prepare = pick(loop.prepare, ["key", "stage", "receipt"]);
-  if (loop.settlement) retained.settlement = pick(loop.settlement, ["applied"]);
-  if (attempt) {
-    retained.attempt = pick(attempt, ["key", "taskId", "stage", "launch", "number", "revival", "capturedPaths"]);
-    if (attempt.gate) retained.attempt.gate = {
-      ...pick(attempt.gate, ["key", "stage"]),
-      ...(attempt.gate.receipt ? { receipt: pick(attempt.gate.receipt, ["gates"]) } : {}),
-    };
-    if (attempt.delta) retained.attempt.delta = pick(attempt.delta, ["key", "stage"]);
-    if (attempt.result) retained.attempt.result = pick(attempt.result, ["status"]);
-    if (inspecting) {
-      if (attempt.checkpoint) retained.attempt.checkpoint = attempt.checkpoint;
-      if (attempt.restore) retained.attempt.restore = {
-        ...pick(attempt.restore, ["checkpoint", "sourceKeys"]),
-        ...(attempt.restore.authority?.confirmedUnit !== undefined
-          ? { authority: { confirmedUnit: attempt.restore.authority.confirmedUnit } } : {}),
-      };
-      if (attempt.result) retained.attempt.result = pick(attempt.result, ["status", "checkpoint"]);
-    }
-  } else if (attempt === null) retained.attempt = null;
-  // Resolve report pointers before removing the task-owned bodies.
-  for (const task of Object.values(invocation.tasks)) {
-    for (const field of ["last", "completed"])
-      if (task[field]) task[field] = pick(task[field], ["taskId", "attempt"]);
-  }
-  Object.keys(loop).forEach(field => delete loop[field]);
-  Object.assign(loop, retained);
-}
 function bodyIdentity(body) {
   const encoded = JSON.stringify(body);
   let hash = 2166136261;
@@ -3120,6 +3437,12 @@ function bodyIdentity(body) {
   return `${encoded.length}:${hash >>> 0}`; // Programming invariant, not ledger authentication.
 }
 function closingRecord() {
+  if (loop.closingSeed) {
+    const record = closingArchive(loop.closingSeed, loop.compliance, loop.complianceUsage);
+    if (loop.archivePending && bodyIdentity(record.body) !== loop.archivePending.bodyIdentity)
+      throw new Error("Closing archive source fields changed before publication.");
+    return record;
+  }
   const pending = loop.archivePending;
   const record = loopArchive(pending.frozen).record;
   if (bodyIdentity(record.body) !== pending.bodyIdentity)
@@ -3129,10 +3452,9 @@ function closingRecord() {
 // A pending loop archive keeps its identity and the inputs that may still change,
 // not a second copy of the frozen loop; publication rebuilds identical bytes.
 function frozenLoopArchive(freezeScope) {
-  const pending = loopArchive();
+  const pending = loop.closingSeed ? { expected: clone(loop.closingSeed.expected), record: closingRecord() } : loopArchive();
   pending.bodyIdentity = bodyIdentity(pending.record.body);
-  pending.frozen = { usage: clone(loop.usage), ...(loop.resolutions ? { resolutions: archiveProjection(loop.resolutions) } : {}),
-    ...(freezeScope ? { cancelledScope: clone(cancelledScope()) } : {}) };
+  pending.frozen = { usage: clone(loop.usage), ...(freezeScope ? { cancelledScope: clone(cancelledScope()) } : {}) };
   delete pending.record.body;
   return pending;
 }
@@ -3142,44 +3464,45 @@ function frozenLoopRecord(number, archive) {
     throw new Error(`Loop ${number} archive source fields changed before publication; inspect the retained loop, no replacement record.`);
   return record;
 }
+function committedLoopOpen(number, projection = storeProjection?.P) {
+  const opened = projection?.prompt.loopOpen;
+  return opened?.number === number ? opened.startedAt : undefined;
+}
 function loopArchive(frozen) {
   const body = {};
   for (const field of ["number", "cursor", "manifest", "plan", "attempt", "results",
-    "recoveries", "analysisCalls", "review", "compliance", "candidate", "resolutions", "usage", "retired", "analysisGenerations"]) {
+    ...(loop.kind === "final" ? ["kind", "startedAt", "acceptance", "acceptanceHistory", "finalAttempt"] : []),
+    "recoveries", "analysisCalls", "review", "integratedReview", "compliance", "candidate", "usage", "retired", "analysisGenerations"]) {
     const value = field === "results" ? loopResults()
-      : frozen && ["usage", "resolutions"].includes(field) ? frozen[field] : loop[field];
+      : field === "analysisCalls" ? loop.analysisCalls?.map(call =>
+        /\.task-(?:reviewer|synthesis)$/.test(call.key) && call.stage === "receipt" && call.ref.runId
+          // The unit links the exact originals. Debug paths and observation-only
+          // metadata from native status must not alter replayed archive bytes.
+          ? { key: call.key, stage: call.stage, ref: { key: call.key, agent: "pitako.reviewer", runId: call.ref.runId } }
+          : call)
+      : field === "startedAt" ? committedLoopOpen(loop.number)
+      : frozen && field === "usage" ? frozen[field] : loop[field];
+    if (field === "startedAt" && value === undefined)
+      throw new Error("Final archive lacks a committed loop-open time.");
     if (value !== undefined) body[field] = archiveProjection(value);
   }
   const scope = frozen?.cancelledScope ?? cancelledScope();
   if (scope.length) body.cancelledScope = clone(scope);
   return { expected: clone(invocation.ledger), record: { kind: "loop", loop: loop.number, body } };
 }
-function retainedResolutions() {
-  return [...(invocation?.resolutions ?? []).slice().reverse(),
-    ...(invocation?.lastClosedResolution ? [invocation.lastClosedResolution] : []),
-    ...(loop?.resolutions ?? []).slice().reverse()];
-}
 function historyReference() {
   return { ledgerPath: `${config.root}/.pi/subagents/execute/${config.invocation}`, head: invocation.ledger.head };
 }
-function validSummaries(values) {
+function validSummaries(values, number = loop.number) {
   return Array.isArray(values) && values.length > 0 && values.length <= 3 &&
     values.every((value, index) => value && Object.keys(value).sort().join(",") === "compliance,gaps,loop,rejection,review,status" &&
-      Number.isSafeInteger(value.loop) && value.loop > 0 && value.loop <= loop.number &&
+      Number.isSafeInteger(value.loop) && value.loop > 0 && value.loop <= number &&
       (!index || values[index - 1].loop < value.loop) && ["complete", "gaps"].includes(value.status) &&
       ["gaps", "review", "compliance", "rejection"].every(field => typeof value[field] === "string" && value[field].length <= 1100)) &&
-    values.at(-1).loop === loop.number;
+    values.at(-1).loop === number;
 }
 function foldLoop(summaries) {
-  const sources = [];
-  const exit = loop.manifest && loop.cursor < loop.manifest.length ? loopResults().at(-1) : null;
-  if (exit?.ok && ["gaps", "continue"].includes(exit.status))
-    sources.push({ kind: "worker", ref: exit.ref, taskId: exit.taskId, attempt: exit.attempt,
-      status: exit.status, diagnosis: excerpt(exit.diagnosis) });
-  if (loop.review?.verdict === "material-gaps")
-    sources.push({ kind: "review", ref: loop.reviewSynthesis, reason: excerpt(loop.review.reason) });
-  if (loop.compliance?.status === "gaps")
-    sources.push({ kind: "compliance", ref: loop.compliance.ref, reason: excerpt(loop.compliance.reason) });
+  const sources = loopDemandSources();
   // Replace the previous loop's pending sources; generic gaps are not inherited demands.
   invocation.demandSources = [...(invocation.demandSources ?? []).filter(item => item.loop !== loop.number),
     ...(sources.length ? [{ loop: loop.number, sources }] : [])];
@@ -3191,30 +3514,33 @@ function foldLoop(summaries) {
   invocation.closeReferences = [...invocation.closeReferences.filter(item => item.loop !== loop.number),
     { loop: loop.number, ...(ref ? { runId: ref.runId, asyncDir: ref.asyncDir,
       stdoutPath: ref.externalAdapter.outputArtifacts.stdoutPath, stderrPath: ref.externalAdapter.outputArtifacts.stderrPath } : {}) }].slice(-3);
-  const disposition = loop.resolutions?.at(-1);
-  invocation.lastClosedResolution = disposition ? Object.fromEntries(
-    ["request", "stage", "loop", "text", "currentBarrier", "hostHalt", "failedHostObservation"]
-      .filter(field => disposition[field] !== undefined).map(field => [field, clone(disposition[field])])) : null;
   foldUsage();
   delete loop.analysisCalls;
   loop.recoveries = [];
 }
+function loopDemandSources() {
+  const sources = [];
+  const exit = loop.manifest && loop.cursor < loop.manifest.length ? loopResults().at(-1) : null;
+  if (exit?.ok && ["gaps", "continue"].includes(exit.status))
+    sources.push({ kind: "worker", ref: exit.ref, taskId: exit.taskId, attempt: exit.attempt,
+      status: exit.status, diagnosis: excerpt(exit.diagnosis) });
+  if (loop.review?.verdict === "material-gaps")
+    sources.push({ kind: "review", ref: loop.reviewSynthesis, reason: excerpt(loop.review.reason) });
+  if (loop.compliance?.status === "gaps")
+    sources.push({ kind: "compliance", ref: loop.compliance.ref, reason: excerpt(loop.compliance.reason) });
+  return sources;
+}
 function archiveGaps() {
   if (loop.archived || loop.archiveQueued) return Promise.resolve();
   const pending = loop.archivePending ??= frozenLoopArchive(true);
-  // Safety margin, decided once: when the frozen loop and pending seal bodies leave
-  // too little native headroom, publish those seals before queueing the loop archive.
-  pending.drainFirst ??= !!invocation.intentions?.length && stateBytes() > DRAIN_BEFORE_ARCHIVE_BYTES;
-  return (pending.drainFirst && invocation.intentions?.length
-    ? groupedIO("finishDrain", { operation: "drain" }, invocation) : Promise.resolve()).then(() => {
-    // A drain moved the anchor after this archive was frozen; the anchor is not body content.
-    if (!invocation.intentions?.some(entry => entry.operation === "ledger")) pending.expected = clone(invocation.ledger);
-    return archiveSeal(pending);
-  });
+  if (!invocation.intentions?.some(entry => entry.operation === "ledger")) pending.expected = clone(invocation.ledger);
+  return archiveSeal(pending);
 }
 function archiveSeal(pending = invocation.sealPending) {
-  // Retained legacy publications still use their original recovery route.
-  if (pending.retry) return legacyArchiveSeal(pending);
+  queueSeal(pending);
+  return save();
+}
+function queueSeal(pending) {
   const closing = pending.record.kind === "loop";
   const previous = invocation.intentions?.findLast(entry => entry.operation === "ledger");
   const sealKey = `${key}.l${pending.record.loop}.${closing ? "gaps" : `seal${Math.max(1, pending.expected.count)}`}`;
@@ -3231,8 +3557,7 @@ function archiveSeal(pending = invocation.sealPending) {
       record: { kind: pending.record.kind, loop: pending.record.loop }, intentionKey: sealKey };
   } else {
     invocation.sealPending = null;
-    const cited = JSON.stringify(loop.resolutions ?? []);
-    loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
+    loop.recoveries = [];
     if (pending.record.body.result.status === "complete") {
       invocation.taskFrame = null;
       delete loop.interruptions;
@@ -3240,114 +3565,11 @@ function archiveSeal(pending = invocation.sealPending) {
       delete loop.attempt.restore;
     }
   }
-  return save();
 }
-function legacyArchiveSeal(pending = invocation.sealPending) {
-  const closingGap = pending.record.kind === "loop";
-  let tries = 0;
-  function publish() {
-    tries++;
-    const retry = pending.retry ?? 0;
-    const sealKey = `${key}.l${pending.record.loop}.${closingGap ? "gaps" : `seal${Math.max(1, pending.expected.count)}`}${retry ? `.r${retry}` : ""}`;
-    return Promise.resolve().then(() => {
-      if (config.preliminary.digest !== invocation.association.digest)
-        throw Object.assign(new Error("Spec digest mismatch requires reliable admitted source bytes."), { ledgerIntegrity: true });
-      pending.retry = retry + 1;
-      return save();
-    }).then(() => dispatch([{ key: sealKey, agent: "pitako.execution-ledger",
-      task: JSON.stringify({ invocation: config.invocation, expected: pending.expected, record: pending.record,
-        ...(pending.expected.count === 0 ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) }),
-      cwd: config.root, context: "fresh", output: false, outputMode: "inline", outputSchema: false,
-      reads: false, progress: false }])).then(results => {
-      const result = results[0];
-      if (result?.nativeFailure) throw Object.assign(new Error(result.nativeFailure.reason), { nativeFailure: result.nativeFailure });
-      const cause = barrier(result, sealKey);
-      if (cause) throw nativeBarrier(cause, nativeReference(sealKey, result));
-      let anchor;
-      if (typeof result?.output === "string" && utf8Bytes(result.output) <= 61440) {
-        try { anchor = JSON.parse(result.output); } catch (_) { /* Retry exact bytes through the ledger. */ }
-      }
-      if (result?.agent === "pitako.execution-ledger" && anchor &&
-          Object.keys(anchor).sort().join(",") === "error,reason" &&
-          anchor.error === "ledger-integrity" && text(anchor.reason))
-        throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${anchor.reason}`), { ledgerIntegrity: true });
-      const failures = [result, ...(result?.results ?? [])].filter(Boolean);
-      if (!result?.ok || result.agent !== "pitako.execution-ledger" || !text(result.runId) ||
-          result.key !== undefined && result.key !== sealKey || result.state !== undefined || result.terminalOutcome ||
-          !text(result.asyncDir) || !text(result.externalAdapter?.outputArtifacts?.stdoutPath) ||
-          !text(result.externalAdapter?.outputArtifacts?.stderrPath) ||
-          !Array.isArray(result.results) || result.results.length !== 1 || result.results[0].exitCode !== 0 ||
-          failures.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
-            item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
-            item.exitCode !== undefined && item.exitCode !== 0) ||
-          !anchor || Object.keys(anchor).sort().join(",") !== (closingGap ? "count,head,summaries" : "count,head") ||
-          closingGap && !validSummaries(anchor.summaries) ||
-          anchor.count !== Math.max(1, pending.expected.count) + 1 || !/^[a-f0-9]{64}$/.test(anchor.head ?? ""))
-        throw new Error("Ledger publication lacks valid successful terminal stdout/anchor.");
-      const before = { ledger: invocation.ledger, frame: invocation.taskFrame, results: loop.results,
-        recoveries: loop.recoveries, interruptions: loop.interruptions, attempt: clone(loop.attempt) };
-      invocation.ledger = { count: anchor.count, head: anchor.head };
-      if (closingGap) {
-        const beforeLoop = clone(loop), beforeTotals = clone(invocation.usageTotals);
-        loop.archived = true;
-        delete loop.archivePending;
-        foldLoop(anchor.summaries);
-        return save().then(() => {
-          persistenceFailed = false; persistenceReason = null;
-        }, error => {
-          Object.keys(loop).forEach(name => delete loop[name]); Object.assign(loop, beforeLoop);
-          loop.archivePending = pending;
-          invocation.usageTotals = beforeTotals; invocation.ledger = before.ledger;
-          throw error;
-        });
-      }
-      compactSealedAttempts(pending.record.body);
-      const cited = JSON.stringify(loop.resolutions ?? []);
-      loop.recoveries = loop.recoveries.filter(item => cited.includes(item.ref.key));
-      if (pending.record.body.result.status === "complete") {
-        invocation.taskFrame = null;
-        delete loop.interruptions;
-        delete loop.attempt.pauseSource;
-        delete loop.attempt.restore;
-      }
-      invocation.sealPending = null;
-      return save().then(() => {
-        persistenceFailed = false; persistenceReason = null;
-      }, error => {
-        invocation.ledger = before.ledger; invocation.taskFrame = before.frame;
-        loop.results = before.results; loop.recoveries = before.recoveries;
-        loop.interruptions = before.interruptions; loop.attempt = before.attempt;
-        invocation.sealPending = pending;
-        throw error;
-      });
-    }).catch(error => {
-      if (error.spawnBudgetExhausted) {
-        pending.retry = retry;
-        throw error;
-      }
-      if (error.terminalPersistence) throw error;
-      if (!error.ledgerIntegrity && !error.nativeBarrier && error.nativeFailure?.code !== "capacity" && tries < 3) {
-        persistenceFailed = false; persistenceReason = null;
-        return publish();
-      }
-      if (error.nativeBarrier) {
-        loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
-          code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
-          ref: clone(error.nativeReference ?? { key: sealKey, agent: "pitako.execution-ledger" }) };
-        return save().then(() => { throw error; }, saveError => { error.message += ` ${saveError.message}`; throw error; });
-      }
-      if (error.nativeFailure?.code === "capacity") throw error;
-      persistenceFailed = true;
-      persistenceReason = `Essential persistence failed; ${closingGap ? "loop" : "seal"} publication pending: ${error.ledgerIntegrity
-        ? error.message : `three publication attempts failed (${String(error?.message ?? error)}); repeated failure requires operator repair`}`;
-      throw new Error(persistenceReason);
-    });
-  }
-  return publish();
-}
-function validLoopAnchor(anchor) {
+function validLoopAnchor(anchor, count = Math.max(1, loop.archivePending.expected.count) + 1) {
   return anchor && Object.keys(anchor).sort().join(",") === "count,head" &&
-    anchor.count === Math.max(1, loop.archivePending.expected.count) + 1 && /^[a-f0-9]{64}$/.test(anchor.head ?? "");
+    Number.isSafeInteger(anchor.count) && anchor.count >= 2 && anchor.count === count &&
+    /^[a-f0-9]{64}$/.test(anchor.head ?? "");
 }
 function confirmedPausePending() {
   const result = loop?.attempt?.stage === "result" && loop.attempt.result;
@@ -3358,12 +3580,6 @@ function confirmedPausePending() {
 }
 // A blocked writer's close seals a pause whenever it captured paths, and that
 // seal is this result's confirmation. Without either, the block wrote nothing.
-function writeFreeWorkerBlock() {
-  const attempt = loop?.attempt, result = attempt?.stage === "result" && attempt.result;
-  return loop?.phase === "implementation" && result?.status === "blocked" && result.remainingCount > 0 &&
-    loop.halt?.code === "semantic-block" && same(loop.halt.ref, result.ref) && !attempt.restore &&
-    !attempt.capturedPaths && !result.checkpoint?.confirmation;
-}
 function retainWorkerBlock(result) {
   loop.outcome = "blocked";
   loop.halt = { status: "blocked", code: "semantic-block", reason: result.diagnosis, ref: result.ref };
@@ -3418,15 +3634,14 @@ function action(status, reason) {
   if (status === "budget-exhausted") return { actor: "foreground", operation: "relaunch the same invocation and mission as a new top-level run",
     reason, references: [], started: false };
   if (loop?.halt?.code === "needs-decision") return { actor: "human",
-    operation: "edit the backlog or deliver an amendment, then relaunch or unblock through the existing routes", reason, references: [], started: false };
+    operation: "post the ruling as Board HUMAN and start a new invocation on the same worktree and backlog", reason, references: [], started: false };
   if (loop?.halt?.code === "spawn-budget") return { actor: "human",
-    operation: "raise config.maxSubagentSpawnsPerRun or reduce the step's spawn demand", reason, references: [], started: false };
+    operation: "raise config.maxSubagentSpawnsPerRun or reduce the step's spawn demand, then start a new invocation", reason, references: [], started: false };
   const required = status !== "complete";
   const exhausted = !persistenceFailed && !loop?.halt && status === "partial" &&
     invocation?.consumedLoops >= maxCycles();
   const coordinatorHalt = !persistenceFailed && !hostHalt &&
-    !retainedResolutions().some(item => item.currentBarrier) &&
-    reason === loop?.halt?.reason && ["timeout", "state-capacity"].includes(loop?.halt?.code);
+    reason === loop?.halt?.reason && loop?.halt?.code === "timeout";
   return {
     actor: !required ? "none" : persistenceFailed ? "persistence operator" : exhausted ? "human"
       : hostHalt ? "native run operator"
@@ -3435,12 +3650,12 @@ function action(status, reason) {
       : loop?.halt?.code === "semantic-block" ? "task owner"
       : loop?.halt ? "native run operator" : "active root",
     operation: !required ? "close" : persistenceFailed ? "restore essential persistence; no dispatch authorized"
-      : hostHalt ? "reconcile the retained host observation through bounded read-only reconstruction under native policy; observed barriers still govern effects"
+      : hostHalt ? "continue only in a new invocation"
       : exhausted ? "authorize a new invocation"
       : coordinatorHalt ? loop.halt.reason
       : loop?.halt ? "resolve the concrete retained impediment; no replacement dispatch"
       : "perform the next existing phase under native authority",
-    reason, references: [hostHalt?.ref, resolution?.currentBarrier?.ref, loop?.halt?.ref, loop?.recoveries?.at(-1)?.ref,
+    reason, references: [hostHalt?.ref, loop?.halt?.ref, loop?.recoveries?.at(-1)?.ref,
       loop?.observation?.ref, loop?.attempt?.launch, loop?.plan?.ref, ...(loop?.analysisCalls ?? []).map(call => call.ref)].filter(Boolean),
     // This describes pending work, not a claim that a root was resumed.
     started: false,
@@ -3448,7 +3663,11 @@ function action(status, reason) {
 }
 function canSaveBudgetExhaustion(error) {
   return error?.spawnBudgetExhausted && invocation?.association && !persistenceFailed && !loop?.halt &&
-    !resolution?.currentBarrier && !hostHalt;
+    !hostHalt;
+}
+function spawnBudgetHalt(lastProgress) {
+  return { status: "blocked", code: "spawn-budget", lastProgress,
+    reason: "No seals admitted or loops closed since the previous budget-exhausted end; one step needs more spawns than the per-run budget. Human intervention must raise config.maxSubagentSpawnsPerRun or reduce that step's spawn demand." };
 }
 function finishBudgetExhaustion() {
   const marker = { checkpoint: invocation.lastConfirmed?.digest ?? null,
@@ -3461,40 +3680,12 @@ function finishBudgetExhaustion() {
       analyses: (loop.analysisCalls ?? []).filter(call => /\.task-(reviewer|synthesis)$/.test(call.key) &&
         call.stage === "receipt" && call.ref.runId).map(call => call.ref.runId),
     } : null };
-  const stalled = same(marker, invocation.lastBudgetProgress);
-  invocation.lastBudgetProgress = marker;
-  if (stalled) loop.halt = { status: "blocked", code: "spawn-budget",
-    reason: "No seals admitted or loops closed since the previous budget-exhausted end; one step needs more spawns than the per-run budget. Human intervention must raise config.maxSubagentSpawnsPerRun or reduce that step's spawn demand." };
-  return save().then(() => finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
+  const progress = canonicalDigest(marker);
+  const stalled = progress === invocation.lastBudgetProgress;
+  invocation.lastBudgetProgress = progress;
+  if (stalled) loop.halt = spawnBudgetHalt(progress);
+  return save(true).then(() => finish(stalled ? "blocked" : "budget-exhausted", stalled ? loop.halt.reason :
     "Native per-run spawn budget exhausted before any child in the admission group started; state saved. Automatically relaunch the same invocation and mission as a new top-level run.", true));
-}
-function blockWorkerReferenceCapacity(error) {
-  // The oversized reference remains in native storage. Only its frozen worker
-  // key and bounded byte counts enter mission state; the worker is not retried.
-  const halt = { status: "blocked", code: "state-capacity", reason: String(error.message),
-    referenceCapacity: clone(error.workerReferenceCapacity) };
-  return finishStateCapacity(halt);
-}
-function finishStateCapacity(halt = loop.halt) {
-  // Persist the disposition before publication; replay drains the same intentions.
-  loop.halt = halt;
-  return save().then(() => invocation.sealPending ? archiveSeal() : undefined).then(() =>
-    invocation.intentions?.length ? groupedIO("finishDrain", { operation: "drain" }, invocation).then(() => {
-      invocation.finishDrain.receipt = receiptReference(invocation.finishDrain.receipt);
-      delete invocation.finishDrain.input;
-    }) : undefined).then(() => {
-    loop.halt = halt;
-    return save();
-  }).then(() => finish("blocked", halt.reason, true)).catch(error => {
-    // Associated capacity-drain replay can observe a barrier before admission.
-    if (!error?.nativeBarrier || persistenceFailed) throw error;
-    if (loop.attempt) loop.attempt.interruption ??= clone(halt);
-    loop.halt = { code: "native-barrier",
-      status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
-      cause: error.nativeBarrier, reason: String(error.message),
-      ref: clone(error.nativeReference ?? loop.halt?.ref ?? invocation.finishDrain?.ref ?? { key }) };
-    return save().then(() => { throw error; });
-  });
 }
 function finish(status, reason, drained = false) {
   // Early blocks before admission validation promise no dispatch: retained intentions stay unchanged.
@@ -3505,15 +3696,33 @@ function finish(status, reason, drained = false) {
       delete invocation.finishDrain.input;
       return save().then(() => finish(status, reason, true));
     }).catch(error => {
+      if (error.code === "superseded") return finish("partial", error.message, true);
+      if (error.recovery || error.code === "wrong-cwd") throw error;
       if (canSaveBudgetExhaustion(error))
         return finishBudgetExhaustion().catch(saveError => finish("partial", `${error.message}; ${saveError.message}`, true));
-      if (error.nativeBarrier) loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
+      if (retainUnstartedDispatch(error, error.message))
+        return save().then(() => finish(loop.halt.status, loop.halt.reason, true));
+      if (error.viewOverflowHalt) {
+        loop.halt = error.viewOverflowHalt;
+        if (loop.halt.ref) retainHaltProducer(loop.halt.ref, "loop-io");
+        return save().then(() => finish(loop.halt.status, loop.halt.reason, true));
+      }
+      if (error.settlementHalt && !["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier)) {
+        retainSettledNativeHalt(error.settlementHalt);
+        return save().then(() => finish(loop.halt.status, loop.halt.reason, true));
+      }
+      if (error.nativeBarrier && error.nativeReference?.agent === "pitako.loop-io" && error.nativeReference.runId)
+        loop.halt = loopIOHalt(error.nativeReference, error.nativeBarrier);
+      else if (error.nativeBarrier) loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
         code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message),
         ...(error.nativeReference ? { ref: clone(error.nativeReference) } : {}) };
       const halted = loop?.halt?.status ?? (status === "partial" ? "partial" : "blocked");
+      const diagnostic = String(error.message);
+      const retainedReason = persistenceFailed && loop?.halt?.reason && !diagnostic.includes(loop.halt.reason)
+        ? `${loop.halt.reason} ${diagnostic}` : diagnostic;
       return (error.nativeBarrier ? save() : Promise.resolve())
-        .then(() => finish(halted, String(error.message), true),
-          saveError => finish(halted, `${error.message}; ${saveError.message}`, true));
+        .then(() => finish(halted, retainedReason, true),
+          saveError => finish(halted, `${retainedReason}; ${saveError.message}`, true));
     });
   }
   if (persistenceFailed && persistenceReason && !reason.includes(persistenceReason)) reason += ` ${persistenceReason}`;
@@ -3535,26 +3744,2570 @@ function finish(status, reason, drained = false) {
     originalProblem: originalProblem(),
   };
 }
+function retainedTimeoutDisposition(cursor, halt) {
+  const action = { actor: "foreground", operation: halt.reason, reason: halt.reason,
+    references: [halt.ref], started: false };
+  return { ...cursorDisposition(cursor, halt.status, halt.reason), action,
+    loopReport: { halt, action, pending: [{ reason: halt.reason, references: action.references }] } };
+}
+function cursorDisposition(cursor, status, reason) {
+  return {
+    status, heading: `Execution ${status}`, reason, invocation: config.invocation,
+    missionId: config.missionId, missionPath: config.missionPath,
+    boardTopicId: cursor.boardTopicId, timeouts: { values: cursor.timeouts, since: null },
+    loopsConsumed: cursor.budget.consumedLoops, maxLoops: cursor.budget.maxCycles,
+    elapsedMs: null, tokens: { status: "unavailable" }, phase: cursor.loop?.phase ?? "admission",
+    candidate: null, loopReport: null, actionRequired: status === "complete" ? "none" : reason,
+    action: { actor: status === "complete" ? "none" : "active root", operation: status === "complete" ? "close" : "replay",
+      reason, references: [], started: false },
+    publication: "not performed by workflow", references: [], cancelledScope: [],
+    // A disposition without a reconstructed projection cannot attest a gate
+    // against the current checkout. Do not inherit last run's advisory verdict.
+    ...(config.originalProblem && cursor.action.kind === "terminal" ? { originalProblem: originalProblem() } : {}),
+  };
+}
+function nextWorkerAttempt(task) {
+  const previous = loop.attempt.result;
+  let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
+    confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
+  if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
+    const source = pauseSource ?? { checkpoint: clone(frameIntent(invocation.taskFrame.sources.at(-1))),
+      confirmation: clone(loop.attempt.restore.authority.confirmedPause) };
+    pauseSource = source;
+  }
+  if (pauseSource && !invocation.taskFrame.restorationKeys.includes(loop.attempt.checkpoint.key)) {
+    invocation.taskFrame.restorationKeys.unshift(loop.attempt.checkpoint.key);
+    retainFrameIntent(loop.attempt.checkpoint, "sources", true);
+  }
+  const source = loop.attempt;
+  loop.taskReviewCursor = executeCursor().review;
+  const repair = invocation.taskFrame.reviewRepair;
+  if (repair && !repair.attempt) repair.attempt = previous.attempt + 1;
+  const projected = storeProjection?.P.control.lastAttempt;
+  const decisionSource = projected?.taskId === task.id && projected.number === source.number &&
+    projected.checkpoint?.key === source.checkpoint?.key && !source.restore && !source.halt ? projected : source;
+  const peak = decisionSource.gate?.receipt?.contextPeak ?? null;
+  const revival = { opinion: previous.revival?.opinion ?? "fresh", reason: previous.revival?.reason ?? "",
+    ...decideRevival(decisionSource, { taskId: task.id, loop: loop.number, candidate: currentCandidate,
+      halt: loop.halt, revivalContextPeak: invocation.revivalContextPeak }, peak), peak };
+  if (repair) Object.assign(revival, { decision: "fresh", code: "task-review-repair" });
+  loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
+    timeoutMs: effectiveTimeouts().workerMs,
+    revival, ...(revival.decision === "resume" && !repair ? { resume: source.launch.runId,
+      bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
+      boardPostIds: source.boardPostIds ?? [] } : {}),
+    key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
+    stage: "intention", undispatched: true, continuationRef: previous.ref,
+    ...(source.foldedNextBaseline ? { checkpoint: clone(source.foldedNextBaseline.checkpoint),
+      intent: clone(source.foldedNextBaseline.intent), foldedBaseline: clone(source.foldedNextBaseline) } : {}),
+    ...(pauseSource ? { pauseSource } : {}) };
+}
+function restoreCloseContinuation(packet) {
+  const current = loop.attempt;
+  const task = loop.task;
+  if (packet.checkpoint.key !== current.key || packet.checkpoint.attempt !== current.number ||
+      packet.attempt.number + 1 !== current.number)
+    throw new Error("Close continuation attempt integrity mismatch.");
+  invocation.tasks[task.id] = clone(packet.taskState);
+  invocation.taskFrame = clone(packet.taskFrame);
+  invocation.lastConfirmed = clone(packet.lastConfirmed);
+  invocation.intentions = [];
+  invocation.lastRequestPage = clone(packet.requests);
+  loop.results = clone(packet.results);
+  loop.recoveries = clone(packet.recoveries);
+  loop.metricSeries = clone(packet.gate.receipt.progress);
+  loop.attempt = { ...clone(packet.attempt), stage: "launched",
+    gate: { stage: "receipt", receipt: { ...clone(packet.gate.receipt), contextPeak: packet.gate.contextPeak } },
+    foldedNextBaseline: { checkpoint: clone(packet.checkpoint), intent: clone(packet.intent) } };
+  currentCandidate = candidate(packet.gate.receipt.after);
+  for (const body of packet.drained) compactSealedAttempts(body);
+  const source = loop.attempt;
+  admitWorker({ ...clone(source.launch), ok: true, structuredOutput: packet.worker.value },
+    source, task, undefined, source.launch.runId, packet.seal);
+  if (invocation.sealPending) queueSeal(invocation.sealPending);
+  nextWorkerAttempt(task);
+  const regenerated = loop.attempt;
+  loop.attempt = { ...regenerated, ...current, continuationRef: regenerated.continuationRef,
+    revival: regenerated.revival, ...(regenerated.pauseSource ? { pauseSource: regenerated.pauseSource } : {}) };
+  if (current.gate?.stage === "receipt") loop.metricSeries = clone(current.gate.receipt.progress);
+  if (current.stage === "launched") delete loop.attempt.undispatched;
+}
+function checkoutTerminalObservation(observed, childKey, association, number, count) {
+  let observation;
+  const errors = [observed, ...(observed?.results ?? [])].filter(Boolean);
+  if (!observed?.ok || !text(observed.runId) || !text(observed.asyncDir) ||
+      observed.agent !== "pitako.checkout-observer" || observed.state !== undefined || observed.terminalOutcome ||
+      (observed.key !== undefined && observed.key !== childKey) ||
+      errors.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
+        item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
+        item.exitCode !== undefined && item.exitCode !== 0) ||
+      (!Array.isArray(observed.results) || observed.results.length !== 1 || observed.results[0]?.exitCode !== 0) ||
+      !text(observed.externalAdapter?.outputArtifacts?.stdoutPath) ||
+      !text(observed.externalAdapter?.outputArtifacts?.stderrPath))
+    throw new Error(`Closing observation ${childKey} lacks successfully published terminal evidence (${observed?.error ?? "status/artifacts unavailable or invalid"}). Inspect the exact native run and output references; reconcile capture, publication or native capacity before continuation, never infer completion or redispatch.`);
+  if (typeof observed.output !== "string" || utf8Bytes(observed.output) > 61440)
+    throw new Error(`Invalid closing stdout for ${childKey}; inspect its native stdout reference, not a preview or truncated tail.`);
+  try { observation = JSON.parse(observed.output); }
+  catch { throw new Error(`Invalid closing JSON document for ${childKey}; retain stdout/stderr and reconcile the exact native producer without redispatch.`); }
+  if (observation?.code)
+    throw Object.assign(new Error(observation.reason), { code: observation.code, recovery: observation.recovery });
+  if (observation?.error === "ledger-integrity")
+    throw Object.assign(new Error(`Closing ledger integrity failure: ${observation.reason}`), { ledgerIntegrity: true });
+  if (!observation || observation.version !== 1 || observation.ok !== true ||
+      Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,store,summaries,version" ||
+      observation.root !== association.root || observation.commonDir !== association.commonDir ||
+      !validLoopAnchor(observation.ledger, count ?? observation.store?.P?.control.ledger?.count ?? null) ||
+      !same(observation.ledger, observation.store?.P?.control.ledger) ||
+      !validSummaries(observation.summaries, number) || !candidate(observation.checkout) ||
+      Object.keys(observation.checkout ?? {}).sort().join(",") !== "fingerprint,head")
+    throw new Error(`Invalid closing observation or physical workspace mismatch for ${childKey}; expected ${association.root} / ${association.commonDir}, observed ${observation?.root ?? "unavailable"} / ${observation?.commonDir ?? "unavailable"}. ${observation?.ok === false ? [observation.reason, observation.nextStep].filter(text).join(" ") : "Inspect the exact native stdout/stderr and designated cwd; preserve the snapshot and pending intention."}`);
+  // Retain only the validated candidate/workspace projection, not potentially large Git status text.
+  observation = { version: 1, ok: true, root: observation.root, commonDir: observation.commonDir,
+    checkout: candidate(observation.checkout), ledger: observation.ledger, summaries: observation.summaries,
+    store: observation.store };
+  return observation;
+}
+function validateClosingProjection(published, context) {
+  if (published?.storeId !== context.storeId || !published.head ||
+      published.head.seq < context.head.seq || !/^[a-f0-9]{64}$/.test(published.head.hash) ||
+      !published.P?.preview.closeReferences.some(reference => reference.loop === context.loop.number &&
+        reference.seq === published.head.seq && reference.digest === published.head.hash))
+    throw new Error("Invalid closing store projection.");
+}
+function replayClosingCursor(cursor) {
+  const checkoutKey = `${key}.l${cursor.loop.number}.checkout`;
+  const synthesis = cursor.action.key.endsWith(".director-synthesis");
+  let inspection;
+  function observeClosingProducer(producer, agent, classify) {
+    const target = producer.runId ?? producer.key;
+    function barrierFromOriginal(cause, runId) {
+      if (["running", "queued", "pending", "native management activity"].includes(cause))
+        throw nativeBarrier(cause, producer);
+      if (!matchesCursorRequest(cursor))
+        throw new Error("Closing barrier admission integrity mismatch.");
+      return Promise.resolve(inspection ?? host(config.inspections[0])).then(observation => {
+        if (observation.error) throw new Error(`Closing barrier native original integrity failure: ${observation.error}`);
+        capture(observation);
+        const witness = observation.haltOriginal?.closingBarriers?.find(item =>
+          item.ref.key === producer.key && item.ref.agent === agent &&
+          (!runId || item.ref.runId === runId) && item.cause === cause);
+        if (observation.binding !== cursor.admissionBinding || !witness || !text(witness.ref.runId) ||
+            !/^[a-f0-9]{64}$/.test(witness.originalDigest))
+          throw Object.assign(nativeBarrier(cause, producer), {
+            message: `Closing barrier native original integrity failure for ${producer.key}: ${cause}.`,
+          });
+        throw Object.assign(nativeBarrier(cause, witness.ref), { settlementHalt: witness });
+      });
+    }
+    return observeStatus(target, true).then(observed => {
+      if (producer.runId && observed?.runId && observed.runId !== producer.runId ||
+          observed?.key && ![producer.key, target, observed.runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== agent)
+        throw new Error(`Closing producer identity changed for ${producer.key}.`);
+      const cause = classify(observed, observed?.runId ?? target) ?? classify(observed, target);
+      return cause ? barrierFromOriginal(cause, producer.runId ?? observed?.runId) : observed;
+    }, error => {
+      if (!error.nativeBarrier) throw error;
+      return barrierFromOriginal(error.nativeBarrier, producer.runId);
+    });
+  }
+  if (!synthesis && !cursor.action.runId) {
+    // The compliance intention and native settlement can straddle a cursor save.
+    // Never pass a key-only reference to the closing writer or launch a replacement
+    // while the producer is still visible but its settlement cannot be proved.
+    const action = cursor.action;
+    if (cursor.budget.rejectedKeys.includes(canonicalDigest(action.key))) {
+      const producer = cursor.review?.slots.findLast(slot => slot.key.endsWith(".director-synthesis") && slot.runId);
+      if (producer) return replayFinalReview({ ...cursor,
+        action: { ...action, key: producer.key, runId: producer.runId } });
+    }
+    return observeClosingProducer(action, "pitako.reviewer", analysisBarrier).then(observed => {
+      if (text(observed?.runId)) {
+        const producer = { ...action, runId: observed.runId };
+        if (!terminalAnalysis(observed, producer))
+          throw new Error(`Closing replay awaits exact terminal evidence for ${action.key}.`);
+        return replayClosingCursor({ ...cursor, action: producer });
+      }
+      throw new Error(`Closing replay lacks exact compliance evidence for ${action.key}.`);
+    });
+  }
+  return host(config.inspections[0]).then(observation => {
+    inspection = observation;
+    if (inspection.error) throw new Error(inspection.error);
+    if (!matchesCursorRequest(cursor)) throw new Error("Closing replay admission integrity mismatch.");
+    if (!inspection.storeFailure) capture(inspection);
+    replayAdmissionObservation = inspection;
+    const checkout = inspection.haltOriginal?.closingCheckout;
+    const retained = cursor.inFlight.findLast(ref => ref.role === "checkout-observer" &&
+      (ref.key === checkoutKey || ref.key.startsWith(`${checkoutKey}.r`)));
+    const producer = checkout?.ref ?? retained ?? { key: checkoutKey };
+    return observeClosingProducer(producer, "pitako.checkout-observer", (status, target) =>
+      barrier(status, target) ?? inspection.haltOriginal?.closingBarriers?.find(item =>
+        item.ref.key === producer.key && item.ref.agent === "pitako.checkout-observer" &&
+        (!producer.runId || item.ref.runId === producer.runId))?.cause).then(observed => {
+      const publisher = checkout?.publisher;
+      if (!publisher) {
+        const runId = producer.runId ?? observed?.runId;
+        if (!runId) return publishCheckout(producer.key);
+        if (!checkout?.settled && !terminalAnalysis(observed, { ...producer, runId }))
+          throw new Error(`Closing replay awaits exact terminal evidence for ${producer.key}.`);
+        return publishCheckout(checkout?.ref ? checkout.nextKey : `${checkoutKey}.r1`);
+      }
+      const childKey = `${synthesis ? checkoutKey : cursor.action.key}.closing-replay.r1`;
+      const publicationProducer = publisher.key !== producer.key
+        ? observeClosingProducer(publisher, "pitako.checkout-observer", barrier) : Promise.resolve(observed);
+      return publicationProducer.then(result => {
+        if (!text(result?.runId)) return publishCheckout(publisher.key);
+        return replayLoopIO(childKey, {
+          operation: "advance", root: cursor.root, invocation: cursor.invocation,
+          key: childKey.replace(/\.r1$/, ""), storeId: cursor.storeId,
+          scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+          refs: { input: cursor.action.input, closing: {
+            key: cursor.action.key, runId: cursor.action.runId, loop: cursor.loop.number } },
+        }).then(({ receipt }) => restoreClosingCursor(cursor, receipt, publisher.key, result));
+      });
+    });
+  });
+  function publishCheckout(retryKey) {
+    // A failed halt save can leave a settled blocked compliance as the last action.
+    // Reconcile it before admitting any checkout publication.
+    const reconcileCompliance = synthesis || !cursor.action.runId ? Promise.resolve(null)
+      : observeClosingProducer(cursor.action, "pitako.reviewer", analysisBarrier).then(status => {
+        const { key, runId } = cursor.action;
+        const ref = { key, runId };
+        if (status?.structuredOutput?.status !== "blocked" &&
+            !config.recovery?.originals?.some(original =>
+              original.key === key && original.runId === runId && original.structuredOutput?.status === "blocked"))
+          return null;
+        const { metadata } = capture(inspection);
+        if (inspection.binding !== cursor.admissionBinding)
+          throw new Error("Closing compliance admission binding mismatch.");
+        const result = retainedReadOnlyOriginal(status, ref, metadata.retainedAnalyses);
+        if (!result?.ok || result.runId !== runId || result.structuredOutput?.status !== "blocked" ||
+            !text(result.structuredOutput.reason))
+          throw new Error("Closing compliance blocked original integrity mismatch.");
+        const halt = { status: "blocked", code: "semantic-block", reason: excerpt(result.structuredOutput.reason) };
+        return persistState(stateKey, { ...cursor, halt: { stage: halt.code, digest: canonicalDigest(halt) } })
+          .then(() => ({ retainedSemanticHalt: halt, ref }));
+      });
+    return reconcileCompliance.then(held => {
+      if (held) return held;
+      const request = { invocation: cursor.invocation, storeId: cursor.storeId,
+        input: { seq: cursor.action.input.seq, digest: cursor.action.input.digest },
+        compliance: synthesis ? null : { key: cursor.action.key, runId: cursor.action.runId } };
+      return retainNativeCall(runs.all([{ key: retryKey, agent: "pitako.checkout-observer",
+        task: JSON.stringify(request), cwd: cursor.root, context: "fresh",
+        output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false }])).then(([result]) => {
+        const cause = barrier(result);
+        if (cause) throw nativeBarrier(cause, nativeReference(retryKey, result), result);
+        const observation = checkoutTerminalObservation(result, retryKey,
+          { root: cursor.root, commonDir: config.preliminary.commonDir }, cursor.loop.number);
+        validateClosingProjection(observation.store, cursor);
+        return restoreClosingCursor({ ...cursor, budget: { ...cursor.budget,
+          rejectedKeys: cursor.budget.rejectedKeys.filter(digest => digest !== canonicalDigest(retryKey)) } },
+          observation.store, retryKey, result);
+      });
+    });
+  }
+}
+function restoreClosingCursor(cursor, receipt, checkoutKey, observed) {
+  const P = receipt.P, admission = P?.prompt.admission, packet = P?.prompt.closing;
+  if (!packet || !admission || receipt.storeId !== cursor.storeId ||
+      canonicalDigest(admission.association) !== cursor.associationDigest ||
+      admission.admissionBinding !== cursor.admissionBinding ||
+      admission.association.maxCycles !== cursor.budget.maxCycles)
+    throw new Error(`Closing replay admission integrity mismatch (packet=${!!packet}, admission=${!!admission}, store=${receipt.storeId === cursor.storeId}).`);
+  if (!observed?.ok || !text(observed.runId))
+    throw new Error("Closing replay producer integrity mismatch.");
+  const ref = nativeReference(checkoutKey, observed);
+  const { observation, ...body } = packet.body;
+  if (observation?.root !== cursor.root || observation.commonDir !== admission.association.commonDir)
+    throw new Error("Invalid closing replay workspace evidence.");
+  let reviewSynthesis;
+  if (body.review?.verdict === "material-gaps") {
+    const synthesis = body.integratedReview?.originals.at(-1);
+    if (!synthesis?.key.endsWith(".director-synthesis"))
+      throw new Error("Closing replay lacks the bound review synthesis original.");
+    reviewSynthesis = { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 };
+  }
+  // The closing ledger entry is already included in P. The reconstructed
+  // loop still owns its usage until foldLoop runs.
+  const usageTotals = { ...P.preview.usage };
+  for (const { tokens } of body.usage) {
+    if (tokens === null) usageTotals.unknown--;
+    else { usageTotals.known--; usageTotals.tokens -= tokens; }
+  }
+  const closingObservation = { ...observation, ledger: P.control.ledger, summaries: packet.summaries,
+    store: { head: receipt.head, P, storeId: receipt.storeId } };
+  storeProjection = { head: receipt.head, P };
+  inFlight.clear();
+  dispatchedAction = undefined;
+  return {
+    version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+    amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
+    taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
+    reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot =>
+      [slot, { key: `pitako.review.${slot}`, model: cursor.models[slot] }])),
+    timeouts: { values: clone(cursor.timeouts), since: null }, startedAt: admission.startedAt, consumedLoops: cursor.budget.consumedLoops,
+    budgetRejectedKeys: clone(cursor.budget.rejectedKeys), ledger: P.control.ledger,
+    root: cursor.root, epoch: cursor.epoch, head: receipt.head, storeId: receipt.storeId,
+    tasks: {}, taskFrame: null, intentions: [], sealPending: null,
+    ...(P.control.finishDrain ? { finishDrain: { ...P.control.finishDrain, admitted: true, stage: "receipt" } } : {}),
+    lastConfirmed: P.control.lastConfirmed, usageTotals,
+    loop: { ...body, reviewSynthesis, phase: "closing", archived: true, startedAt: body.startedAt ?? admission.startedAt,
+      closing: { candidate: observation.checkout, sameCandidate: same(observation.checkout, body.candidate),
+        observation: closingObservation, ref } },
+    planRejections: P.preview.planRejections, closeReferences: [],
+    loopSummaries: packet.summaries, demandSources: [], demandObservations: [],
+    activePlan: null,
+    backlogDigest: cursor.backlogDigest, boardTopicId: cursor.boardTopicId,
+    currentView: null, excludedScope: Object.fromEntries((body.cancelledScope ?? []).map(task => [task.id, task])),
+  };
+}
+function replayTaskReviewHalt(cursor) {
+  return host(config.inspections[0]).then(observation => {
+    replayAdmissionObservation = observation;
+    const captured = capture(observation);
+    const base = cursor.action.key.replace(/\.task-(reviewer|synthesis)$/, "");
+    const original = captured.metadata.retainedAnalyses.find(item => item.key === `${base}.seal` ||
+      item.key.startsWith(`${base}.seal.r`));
+    if (!original?.sealer && cursor.halt.stage === "native-barrier") {
+      return replayNativeInterruption(cursor, cursor.action, closingInterruptionHalt, observation)
+        .then(({ retainedActivityHalt }) => retainedActivityHalt);
+    }
+    const sealed = original?.sealer;
+    if (!sealed || canonicalDigest(sealed) !== original.digest || sealed.key !== original.key ||
+        sealed.runId !== original.runId || sealed.agent !== "pitako.checkpoint-sealer")
+      throw new Error("Task review halt sealer original integrity failure.");
+    const ref = { ...nativeReference(original.key, sealed), agent: "pitako.checkpoint-sealer" };
+    const cause = barrier(sealed, original.key);
+    let halt;
+    if (cursor.halt.stage === "native-barrier" && cause) {
+      halt = { status: ["stopped", "interrupted"].includes(cause) ? "cancelled" : "blocked",
+        code: "native-barrier", cause, reason: excerpt(`${["stopped", "interrupted"].includes(cause)
+          ? "Execution cancelled: " : ""}${nativeBarrier(cause).message}`), ref };
+      if (canonicalDigest(halt) !== cursor.halt.digest && ["stopped", "interrupted", "native permission denial"].includes(cause))
+        halt = closingInterruptionHalt({ ...ref, role: "checkpoint-sealer" }, cause);
+    } else if (cursor.halt.stage === "checkpoint-integrity" && !cause && sealed.ok) {
+      let observed;
+      try { observed = typeof sealed.output === "string" && utf8Bytes(sealed.output) <= 61440
+        ? JSON.parse(sealed.output) : null; }
+      catch { throw new Error("Sealer settlement stdout integrity failure."); }
+      if (observed?.outcome === "mismatch" && Array.isArray(observed.paths))
+        halt = checkpointIntegrityHalt(observed, ref);
+    }
+    if (!halt || canonicalDigest(halt) !== cursor.halt.digest)
+      throw new Error("Task review halt original digest integrity mismatch.");
+    return observeStatus(original.runId, true).then(current => {
+      const currentCause = current?.state === "unknown" ? null : barrier(current, original.runId);
+      const currentState = current?.state ?? managementAnalysisState(current, { runId: original.runId });
+      if (current?.runId && current.runId !== original.runId ||
+          current?.agent && current.agent !== "pitako.checkpoint-sealer" ||
+          currentCause && currentCause !== cause ||
+          cause && !currentCause && ["complete", "completed", "passed"].includes(currentState))
+        throw new Error("Task review halt sealer status integrity mismatch.");
+      return halt;
+    });
+  });
+}
+const gateRenewalBarriers = {
+  "gate-renewal-stop": "stopped",
+  "gate-renewal-interrupt": "interrupted",
+  "gate-renewal-permission": "native permission denial",
+};
+function gateRenewalHalt(timeout, cause) {
+  return { ...loopIOHalt(timeout.ref, cause), timeoutDigest: canonicalDigest(timeout) };
+}
+function verifyGateRenewalHalt(cursor, timeout) {
+  const cause = gateRenewalBarriers[cursor.halt.stage];
+  const halt = cause ? gateRenewalHalt(timeout, cause) : timeout;
+  if (canonicalDigest(halt) !== cursor.halt.digest)
+    throw new Error("Gate timeout original digest integrity mismatch.");
+  if (cause) return { retainedReviewHalt: halt };
+}
+function observeGateRenewal(cursor, halt, resume) {
+  return observeStatus(halt.ref.runId, true).then(observed => {
+    if (observed?.runId && observed.runId !== halt.ref.runId ||
+        observed?.key && ![halt.key, halt.ref.runId].includes(observed.key) ||
+        observed?.agent && observed.agent !== halt.ref.agent)
+      throw new Error("Gate timeout producer identity mismatch.");
+    const cause = analysisBarrier(observed, halt.ref.runId);
+    if (cause) throw nativeBarrier(cause, halt.ref);
+    if (!terminalAnalysis(observed, halt.ref))
+      throw new Error("Gate timeout producer is not terminal.");
+  }).then(resume, error => {
+    const stage = Object.keys(gateRenewalBarriers).find(key => gateRenewalBarriers[key] === error.nativeBarrier);
+    if (!stage) throw error;
+    // A status exception is an observation, not a replacement child original.
+    // Bind it to the verified timeout so a later status cannot erase the Stop.
+    const blocked = gateRenewalHalt(halt, error.nativeBarrier);
+    return persistState(stateKey, { ...cursor, halt: { stage, digest: canonicalDigest(blocked) } })
+      .then(() => ({ retainedReviewHalt: blocked }));
+  });
+}
+function replayGateTimeout(cursor) {
+  const producer = cursor.inFlight.find(ref => ref.role === "loop-io" &&
+    ref.key.replace(/\.r\d+$/, "") === cursor.action.opKey);
+  const worker = cursor.inFlight.find(ref => ref.role === "worker");
+  if (!producer || !worker || !cursor.loop?.attempt || !Number.isSafeInteger(cursor.action.gateTimeoutMs))
+    throw new Error("Gate timeout lacks its recorded producer and worker.");
+  return host(config.inspections[0]).then(observation => {
+    replayAdmissionObservation = observation;
+    const captured = capture(observation);
+    const original = captured.metadata.retainedAnalyses.find(item =>
+      item.key === producer.key && item.runId === producer.runId);
+    const settled = original?.gate;
+    if (!settled || canonicalDigest(settled) !== original.witnessDigest ||
+        !/^[a-f0-9]{64}$/.test(original.digest) || !nativeTimeout(settled) ||
+        settled.key !== producer.key || settled.runId !== producer.runId || settled.agent !== "pitako.loop-io")
+      throw new Error("Gate timeout original producer integrity mismatch.");
+    const ref = nativeReference(producer.key, settled);
+    const generation = Number(producer.key.match(/\.g(\d+)\.gate(?:\.r\d+)?$/)?.[1] ?? 1);
+    const halt = gateTimeoutHalt({ gate: { ref }, gateGeneration: generation },
+      "gate-transport", cursor.action.gateTimeoutMs, settled);
+    const held = verifyGateRenewalHalt(cursor, halt);
+    if (held) return held;
+    const floor = config.timeouts && !Object.keys(config.timeouts).length ? 0 :
+      config.timeouts?.gateFloorMs ?? cursor.timeouts.gateFloorMs;
+    if (floor <= halt.launchedMs || generation >= 3) return { retainedGateHalt: halt };
+    return observeGateRenewal(cursor, halt, () => {
+      const nextKey = `${worker.key}.g${generation + 1}.gate`;
+      const launchedMs = gateOperationTimeout({
+        gates: cursor.action.gateTimeouts.map(timeoutMs => ({ timeoutMs: Math.max(timeoutMs, floor) })),
+        metric: cursor.action.gateMetricMs !== 0,
+      });
+      const input = storedWorkerCloseInput({ ...cursor, intent: cursor.loop.attempt.intent,
+        gateFloorMs: floor }, worker, cursor.action.input, "gate");
+      input.key = nextKey;
+      input.refs.timeoutOriginal = { key: producer.key, runId: producer.runId,
+        path: original.path, digest: original.digest };
+      // The ordinary fresh generation both verifies the originals and returns P.
+      // No separate reconstruction child is admitted on this expected relaunch.
+      const renew = (retry = 0) => {
+        const childKey = retry ? `${nextKey}.r${retry}` : nextKey;
+        return observeStatus(childKey, true).then(observed => {
+          const cause = analysisBarrier(observed, childKey);
+          if (cause) throw nativeBarrier(cause, { key: childKey, runId: observed.runId });
+          return retainNativeCall(runs.all([loopIORequest(childKey, input, launchedMs)]));
+        }).then(([result]) => {
+          const last = result.output?.trim().split("\n").at(-1);
+          let receipt;
+          try { if (last && utf8Bytes(last) <= 61440) receipt = JSON.parse(last); } catch (_) { /* Native errors need not be JSON. */ }
+          if (receipt?.code === "store-busy" && retry < 2 && !analysisBarrier(result, childKey))
+            return renew(retry + 1);
+          return { result, receipt, childKey };
+        });
+      };
+      const frozen = floor === cursor.timeouts.gateFloorMs ? Promise.resolve() :
+        persistState(stateKey, { ...cursor, timeouts: { ...cursor.timeouts, gateFloorMs: floor } })
+          .catch(error => { throw new Error(`Essential persistence failed; dispatch halted: ${error.message}`); });
+      return frozen.then(() => renew()).then(({ result, receipt, childKey }) => {
+        const cause = analysisBarrier(result, childKey);
+        if (cause) throw nativeBarrier(cause, nativeReference(childKey, result));
+        if (receipt?.error && receipt.code)
+          throw Object.assign(new Error(receipt.reason), { code: receipt.code, recovery: receipt.recovery });
+        if (nativeTimeout(result)) {
+          const ref = nativeReference(childKey, result);
+          const halt = gateTimeoutHalt({ gate: { ref }, gateGeneration: generation + 1 },
+            "gate-transport", launchedMs, result);
+          return { renewedGateHalt: { halt, cursor: { ...cursor,
+            action: { ...cursor.action, opKey: nextKey, gateTimeoutMs: launchedMs },
+            timeouts: { ...cursor.timeouts, gateFloorMs: floor },
+            inFlight: [...cursor.inFlight.filter(ref => ref.key !== producer.key),
+              { key: childKey, runId: result.runId, role: "loop-io" }],
+            halt: { stage: "timeout", digest: canonicalDigest(halt) },
+          } } };
+        }
+        if (!terminalLoopIOResult(result, childKey, "gate") || !receipt?.P)
+          throw new Error(receipt?.reason ?? "Gate renewal has no terminal projection.");
+        return replayCursorAdmission({ ...cursor, halt: null, head: receipt.head,
+          action: { kind: "pending", op: "gate", opKey: nextKey,
+            input: receipt.P.control.operation.input } }, receipt).then(restored => {
+          restored.loop.attempt.gateGeneration = generation + 1;
+          (restored.loop.retired ??= []).push(halt.ref);
+          inFlight.delete(producer.key);
+          return restored;
+        });
+      });
+    });
+  });
+}
+function replayFinalGateTimeout(cursor) {
+  const { action } = cursor;
+  const producer = cursor.inFlight.find(ref => ref.role === "loop-io" &&
+    ref.key.replace(/\.r\d+$/, "") === action.opKey);
+  return host(config.inspections[0]).then(observation => {
+    const { metadata } = capture(observation);
+    const packet = metadata.timeoutProjection;
+    const saved = packet?.finalGateTimeout;
+    const original = metadata.retainedAnalyses.find(item => item.key === producer?.key && item.runId === producer.runId);
+    if (!saved || !producer || saved.finalGate.producer !== producer.key ||
+        !same(packet.head, cursor.head) || packet.storeId !== cursor.storeId ||
+        !same(action.input, saved.selectionInput) ||
+        !original?.gate || canonicalDigest(original.gate) !== original.witnessDigest ||
+        original.gate.agent !== "pitako.loop-io" || analysisBarrier(original.gate, producer.runId) ||
+        nativeTimeout(original.gate))
+      throw new Error("Final acceptance timeout original integrity mismatch.");
+    const restored = restoreFinalAcceptance(cursor, { ...saved, head: packet.head, P: packet.P,
+      storeId: packet.storeId }, { key: producer.key, runId: producer.runId, agent: original.gate.agent }, observation);
+    const descriptor = restored.loop.finalAttempt;
+    const generation = Number(action.opKey.match(/\.g([23])\.gate$/)?.[1] ?? 1);
+    descriptor.gateGeneration = generation;
+    descriptor.gate.timeout = true;
+    const failed = acceptanceResults(restored.loop).blocking.filter(gate => gate.status !== "pass" || gate.exit !== 0);
+    if (!failed.length || !failed.every(gate => gate.status === "timeout") || saved.receipt.mutated || saved.receipt.reused)
+      throw new Error("Final acceptance timeout receipt does not prove a renewable timeout.");
+    const launchedMs = action.gateTimeoutMs;
+    if (!Number.isSafeInteger(launchedMs)) throw new Error("Final acceptance timeout lacks its recorded deadline.");
+    const halt = gateTimeoutHalt(descriptor, "final-acceptance", launchedMs, undefined, restored.loop);
+    const held = verifyGateRenewalHalt(cursor, halt);
+    if (held) return held;
+    const floor = config.timeouts && !Object.keys(config.timeouts).length ? 0 :
+      config.timeouts?.gateFloorMs ?? cursor.timeouts.gateFloorMs;
+    if (floor <= launchedMs ||
+        generation >= 3) return { retainedGateHalt: halt };
+    return observeGateRenewal(cursor, halt, () => {
+      restored.loop.halt = halt;
+      return restored;
+    });
+  });
+}
+const reviewerRenewalCauses = ["stopped", "interrupted", "native permission denial"];
+function reviewerTimeoutAction(action) {
+  return action.kind === "launched" && action.role === "reviewer" &&
+    /\.(?:task-(?:reviewer|synthesis)|demand-observation)$/.test(action.key);
+}
+function observeReviewerTimeoutStatus(runId) {
+  return observeStatus(runId, true, message => Object.assign(new Error(message), {
+    hostHalt: { stage: "host", reason: excerpt(`Reviewer timeout status observation for ${runId}: ${message}`) },
+  }));
+}
+function checkReviewerTimeoutIdentity(observed, ref) {
+  if (observed?.runId && observed.runId !== ref.runId ||
+      observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
+      observed?.agent && observed.agent !== ref.agent)
+    throw new Error("Task review timeout producer identity mismatch.");
+}
+function reviewerRenewalHalt(timeout, cause) {
+  return { code: "native-barrier", status: cause === "native permission denial" ? "blocked" : "cancelled",
+    cause, reason: nativeBarrier(cause).message, ref: timeout.ref, timeoutDigest: canonicalDigest(timeout) };
+}
+function holdReviewerRenewal(cursor, timeout, cause) {
+  // The status barrier may be transient in the native view; bind it to the
+  // verified timeout, not to a second (nonexistent) terminal settlement.
+  const halt = reviewerRenewalHalt(timeout, cause);
+  const held = { ...cursor, halt: { stage: "reviewer-renewal-barrier", digest: canonicalDigest(halt) } };
+  return persistState(stateKey, held).then(() => ({ retainedReviewHalt: halt }));
+}
+function replayReviewerTimeout(cursor) {
+  return host(config.inspections[0]).then(observation => {
+    try { return { observation, captured: capture(observation) }; } catch (error) {
+      if (cursor.halt.stage !== "timeout" || !(observation.storeFailure || config.preliminaryStoreFailure) ||
+          !["store-corrupt", "cursor-ahead", "store-replaced", "store-unavailable", "store-busy"].includes(error.code))
+        throw error;
+      // A reader's observation is not authority to quarantine the database.
+      const opKey = `${cursor.action.key}.store-check`;
+      return checkEpochProducers(cursor.action).then(() => replayLoopIO(opKey, {
+        operation: "verifyTimeout", key: opKey, root: cursor.root, invocation: cursor.invocation, cursor,
+        storeId: cursor.storeId, expectedHead: cursor.head, scope: `exec:${cursor.invocation}.e${cursor.epoch}`,
+        capture: !config.timeoutRecovery,
+      })).then(({ receipt }) => {
+        if (!receipt?.ok) throw new Error("Timeout store verification has no terminal receipt.");
+        // Compare transient recovery against the independent inspector digest.
+        const refreshed = observation.storeFailure
+          ? host(config.inspections.find(grant => grant.key === `${config.inspections[0].key}.r1`))
+          : Promise.resolve(observation);
+        return refreshed.then(current => {
+          refreshedTimeoutAdmission = { recovery: receipt.recovery ?? config.recovery,
+            timeoutRecovery: receipt.timeoutRecovery ?? config.timeoutRecovery };
+          return { observation: current, captured: capture(current) };
+        });
+      });
+    }
+  }).then(({ observation, captured }) => {
+    replayAdmissionObservation = observation;
+    const packet = captured.metadata.timeoutProjection;
+    const original = captured.metadata.retainedAnalyses.find(item =>
+      item.key === cursor.action.key && item.runId === cursor.action.runId);
+    const settled = original?.settlement;
+    if (!packet || packet.storeId !== cursor.storeId || !same(packet.head, cursor.head) ||
+        !same(packet.P?.control.operation?.input, cursor.action.input))
+      throw new Error(`Task review timeout projection differs from its cursor head/input: packet=${!!packet}, store=${packet?.storeId === cursor.storeId}, head=${same(packet?.head, cursor.head)}, input=${canonicalJSON(packet?.P?.control.operation?.input ?? null)} expected=${canonicalJSON(cursor.action.input)}.`);
+    if (!settled || canonicalDigest(settled) !== original.digest || !nativeTimeout(settled) ||
+        settled.key !== undefined && settled.key !== cursor.action.key || settled.runId !== cursor.action.runId ||
+        settled.agent !== "pitako.reviewer")
+      throw new Error(`Task review timeout producer integrity mismatch: ${cursor.action.key}; ${original?.error ?? `settled=${!!settled}, timeout=${nativeTimeout(settled)}, key=${settled?.key}, run=${settled?.runId}, agent=${settled?.agent}`}.`);
+    const demand = cursor.action.key.endsWith(".demand-observation");
+    const generation = Number(cursor.action.key.match(/\.g([23])\.(?:task-|demand-observation$)/)?.[1] ?? 1);
+    if (!Number.isSafeInteger(original.launchedMs) || original.launchedMs < 1 || original.launchedMs > 86400000)
+      throw new Error("Task review timeout native deadline unavailable.");
+    const call = { key: cursor.action.key, timeoutMs: original.launchedMs, stage: "receipt", timeout: true };
+    const halt = analysisTimeoutHalt(call, settled, generation);
+    call.ref = clone(halt.ref);
+    if (cursor.halt.stage === "reviewer-renewal-barrier") {
+      const held = reviewerRenewalCauses.map(cause => reviewerRenewalHalt(halt, cause))
+        .find(candidate => canonicalDigest(candidate) === cursor.halt.digest);
+      if (!held) throw new Error("Reviewer renewal barrier integrity mismatch.");
+      return { retainedReviewHalt: held };
+    }
+    if (canonicalDigest(halt) !== cursor.halt.digest)
+      throw new Error(`Task review timeout halt digest integrity mismatch: ${call.key}, ${call.timeoutMs} ms, generation ${generation}.`);
+    return observeReviewerTimeoutStatus(settled.runId).then(observed => {
+      checkReviewerTimeoutIdentity(observed, call.ref);
+      const cause = analysisBarrier(observed, settled.runId);
+      if (cause) throw nativeBarrier(cause, call.ref);
+      if (!terminalAnalysis(observed, call.ref))
+        throw new Error("Task review timeout producer is not terminal.");
+    }).then(() => {
+      if ((config.timeouts?.reviewerMs ?? cursor.timeouts.reviewerMs) <= halt.launchedMs ||
+          generation >= 3) return { retainedAnalysisHalt: halt };
+      const input = packet.P.control.operation;
+      if (demand) {
+        if (!packet.advance || input.operation !== "advance" || input.loop !== cursor.loop.number)
+          throw new Error("Demand observation timeout lacks its committed advance.");
+        return replayCursorAdmission({ ...cursor, halt: null,
+          action: { kind: "pending", op: "advance", opKey: input.key, input: cursor.action.input } },
+        { ...packet.advance, head: packet.head, storeId: packet.storeId, P: packet.P }).then(restored => {
+          Object.assign(restored.loop, { halt, analysisCalls: [call],
+            analysisGenerations: { "demand-observation": generation },
+            demandOriginalsVerified: packet.verifiedOriginals });
+          restored.lastRequestReceipt = receiptReference(packet.advance);
+          dispatchedAction = clone(cursor.action);
+          return restored;
+        });
+      }
+      const worker = packet.P.prompt.execution?.worker?.reference;
+      if (!worker || packet.context?.key !== worker.key || input.operation !== "gate")
+        throw new Error("Task review timeout lacks its committed worker and delta.");
+      const receipt = { ...packet.gate, head: packet.head, storeId: packet.storeId, P: packet.P };
+      // Reuse the ordinary gate reducer without admitting a reconstruction child.
+      return replayCursorAdmission({ ...cursor, halt: null, review: null,
+        inFlight: cursor.inFlight.filter(ref => ref.role !== "worker"),
+        action: { kind: "pending", op: "gate", opKey: input.key, input: cursor.action.input } }, receipt).then(restored => {
+        const attempt = restored.loop.attempt;
+        attempt.delta = { key: `${worker.key}.delta`, retry: 0, stage: "receipt", receipt: packet.context.delta };
+        attempt.taskReview = {};
+        restored.requestObservation = packet.context.requestObservation;
+        restored.loop.analysisCalls = [call];
+        restored.loop.analysisGenerations = {};
+        for (const slot of cursor.review?.slots ?? []) {
+          if (slot.phase !== "reviewer") continue;
+          const stage = slot.key.endsWith(".task-synthesis") ? "synthesis" : "reviewer";
+          restored.loop.analysisGenerations[`${worker.key}.task-${stage}`] =
+            Number(slot.key.match(/\.g([23])\.task-/)?.[1] ?? 1);
+          if (slot.key === call.key) continue;
+          const original = captured.metadata.retainedAnalyses.find(item =>
+            item.key === slot.key && item.runId === slot.runId);
+          const result = original?.settlement;
+          if (!result || canonicalDigest(result) !== original.digest || !result.ok ||
+              result.key !== undefined && result.key !== slot.key || result.runId !== slot.runId || result.agent !== "pitako.reviewer" ||
+              !result.structuredOutput)
+            throw new Error("Task review timeout sibling original integrity mismatch.");
+          const path = result.results?.find(item => text(item.savedOutputPath))?.savedOutputPath;
+          if (!path) throw new Error("Task review timeout sibling original path unavailable.");
+          const reference = { key: slot.key, runId: slot.runId, path, digest: canonicalDigest(result.structuredOutput) };
+          attempt.taskReview[stage] = reference;
+          const task = restored.loop.task;
+          const carried = !!task.remaining?.length || (task.progress?.last5?.length ?? 0) > 0 ||
+            (task.progress?.nonImproving ?? 0) > 0;
+          (restored.taskFrame.reviewProjections ??= {})[slot.key] =
+            taskReviewProjection(result.structuredOutput, reference, carried);
+          restored.loop.analysisCalls.push({ key: slot.key, stage: "receipt", ref: nativeReference(slot.key, result) });
+          analysisResults.set(slot.key, result);
+        }
+        if (restored.foldedContinuation) {
+          restored.foldedContinuation = clone(restored.foldedContinuation);
+          restored.foldedContinuation.taskFrame.reviewProjections =
+            clone(restored.taskFrame.reviewProjections ?? {});
+        }
+        restored.loop.analysisCalls.sort((a, b) =>
+          cursor.review.slots.findIndex(slot => slot.key === a.key) -
+          cursor.review.slots.findIndex(slot => slot.key === b.key));
+        restored.loop.halt = halt;
+        dispatchedAction = clone(cursor.action);
+        return restored;
+      });
+    }, error => {
+      if (!reviewerRenewalCauses.includes(error?.nativeBarrier)) throw error;
+      return holdReviewerRenewal(cursor, halt, error.nativeBarrier);
+    });
+  }).catch(error => {
+    // Without the verified timeout original, retain the observation, not a new settlement.
+    if (!error.hostHalt && reviewerRenewalCauses.includes(error.nativeBarrier))
+      error.hostHalt = { stage: error.nativeBarrier === "native permission denial" ? "host" : "host-stop",
+        reason: excerpt(`Reviewer timeout replay for ${error.nativeReference?.key ?? cursor.action.key}: ${error.message}`) };
+    throw error;
+  });
+}
+function finalDrainInput(cursor, expectedHead = cursor.head) {
+  const { action } = cursor;
+  return { operation: "drain", root: cursor.root, invocation: cursor.invocation, key: action.opKey,
+    storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead,
+    refs: { input: action.input } };
+}
+function admitFinalDrain(cursor, receipt) {
+  const drain = receipt?.replayedDrain;
+  if (!drain || drain.key !== cursor.action.opKey || drain.loop !== cursor.loop.number ||
+      drain.outcome !== cursor.loop.outcome || !["gaps", "complete"].includes(drain.outcome) ||
+      drain.associationDigest !== cursor.associationDigest || drain.admissionBinding !== cursor.admissionBinding ||
+      receipt.storeId !== cursor.storeId || receipt.head?.seq < cursor.head.seq)
+    throw new Error("Final drain replay differs from its admitted position.");
+  return { receipt, drain };
+}
+function replayFinalDrain(cursor, producer) {
+  const { action } = cursor;
+  const anchored = finalDrainInput(cursor, { seq: action.input.seq, hash: action.input.digest });
+  const recorded = canonicalDigest(anchored) === action.drainDigest;
+  const input = recorded ? anchored : finalDrainInput(cursor);
+  const retry = Number(producer?.key.match(/\.r(\d+)$/)?.[1] ?? 0) + 1;
+  const childKey = recorded ? producer?.key ?? action.opKey : `${action.opKey}.r${retry}`;
+  if (!recorded && action.drainDigest)
+    input.refs.drain = { digest: action.drainDigest, producer: producer
+      ? { key: producer.key, runId: producer.runId } : null };
+  return replayLoopIO(childKey, input).then(({ receipt }) => ({ replayedDrain: admitFinalDrain(cursor, receipt) }));
+}
+function finishFinalDrain(retainedCursor, { receipt, drain }) {
+  const cursor = { ...retainedCursor, head: receipt.head, halt: null, action: { kind: "terminal" },
+    backlogDigest: drain.backlogDigest ?? retainedCursor.backlogDigest,
+    budget: { ...retainedCursor.budget, rejectedKeys: retainedCursor.budget.rejectedKeys.filter(
+      digest => digest !== canonicalDigest(drain.key)) },
+    inFlight: retainedCursor.inFlight.filter(ref => ref.key.replace(/\.r\d+$/, "") !== drain.key) };
+  return persistState(stateKey, cursor).then(() => {
+    const status = drain.outcome === "complete" ? "complete" : "partial";
+    return { ...cursorDisposition(cursor, status, "Final drain admitted from its committed receipt."),
+      loopReport: { work: drain.work, history: { summaries: drain.summaries } } };
+  }, error => cursorDisposition(retainedCursor, "partial",
+    `Essential persistence failed; final drain already committed: ${String(error?.message ?? error)}`));
+}
+function replayLoopIO(childKey, input, timeoutMs, maxRetries = 2) {
+  function issue(retry) {
+    const currentKey = retry ? `${childKey.replace(/\.r\d+$/, "")}.r${Number(childKey.match(/\.r(\d+)$/)?.[1] ?? 0) + retry}` : childKey;
+    const request = typeof input === "function" ? input(currentKey) : input;
+    return retainNativeCall(runs.all([loopIORequest(currentKey, request, timeoutMs)])).then(([result]) => {
+      const cause = barrier(result, currentKey);
+      const last = result.output?.trim().split("\n").at(-1);
+      let receipt;
+      try { if (last && utf8Bytes(last) <= 61440) receipt = JSON.parse(last); } catch (_) { /* Native errors need not be JSON. */ }
+      if (cause) throw nativeBarrier(cause, nativeReference(currentKey, result), result);
+      if (receipt?.code === "store-busy" && retry < maxRetries) return issue(retry + 1);
+      loopIOViewOverflow(receipt, nativeReference(currentKey, result));
+      if (receipt?.error) throw Object.assign(new Error(receipt.reason), { code: receipt.code, recovery: receipt.recovery,
+        rejectedDrain: receipt.rejectedDrain });
+      if (!receipt || !terminalLoopIOResult(result, currentKey, request.operation))
+        throw new Error(result.error ?? `Execute replay has no terminal receipt. ${excerpt(result.output ?? "")}`);
+      return { receipt, result, childKey: currentKey };
+    });
+  }
+  return issue(0);
+}
+function replayInitialAdvance({ storeId, input }, previous) {
+  const epoch = previous ? previous.epoch + 1 : 0;
+  const number = (previous?.budget.consumedLoops ?? 0) + 1;
+  const opKey = `${key}.l${number}.advance`;
+  function replayKey(index) {
+    const producer = index ? `${opKey}.r${index}` : opKey;
+    return observeStatus(producer, true).then(observed => {
+      const cause = analysisBarrier(observed, observed?.runId ?? producer) ?? analysisBarrier(observed, producer);
+      if (cause) throw nativeBarrier(cause, { key: producer, runId: observed?.runId });
+      if (observed?.key && ![producer, observed.runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.loop-io")
+        throw new Error("Initial advance replay producer identity mismatch.");
+      // A transport retry can have admitted the original params before the cut.
+      return index && !observed?.runId && !managementAnalysisState(observed, { key: producer })
+        ? producer : replayKey(index + 1);
+    });
+  }
+  return replayKey(previous ? 0 : 1).then(childKey => replayLoopIO(childKey, {
+    operation: "advance", root: config.root, invocation: config.invocation, key: opKey,
+    storeId, scope: `exec:${config.invocation}.e${epoch}`, expectedHead: { seq: input.seq, hash: input.digest },
+    refs: { input: { seq: input.seq, digest: input.digest } },
+  })).then(({ receipt }) => {
+    const admission = receipt.P?.prompt.admission, operation = receipt.P?.control.operation;
+    if (!admission || operation?.operation !== "advance" || operation.key !== opKey ||
+        !same(operation.input, input) || !same(admission.amendments ?? [], config.amendments ?? []))
+      throw new Error("Initial advance replay admission integrity mismatch.");
+    const cursor = {
+      root: config.root, invocation: config.invocation, epoch, storeId, head: receipt.head,
+      associationDigest: canonicalDigest(admission.association), admissionBinding: admission.admissionBinding,
+      action: { kind: "pending", op: "advance", opKey, input },
+      inFlight: [],
+      loop: { number, phase: "director", cursor: 0, attempt: null },
+      budget: { consumedLoops: number, maxCycles: admission.association.maxCycles,
+        rejectedKeys: previous?.budget.rejectedKeys ?? [] },
+      models: { taskReviewer: admission.models.taskReviewer, taskSynthesis: admission.models.taskSynthesis,
+        ...Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [slot, admission.models[slot].model])) },
+      timeouts: admission.timeouts?.values ?? effectiveTimeouts(),
+    };
+    if (!matchesCursorRequest(cursor) || previous && (cursor.associationDigest !== previous.associationDigest ||
+        cursor.admissionBinding !== previous.admissionBinding || storeId === previous.storeId))
+      throw new Error("Initial advance replay association integrity mismatch.");
+    return replayCursorAdmission(cursor, receipt).then(restored => ({ restored, receipt }));
+  });
+}
+function isCurrentDirector(cursor, ref) {
+  const directorKey = `${key}.l${cursor.loop?.number}.director`;
+  return ref.role === "execution-director" && (ref.key === directorKey || ref.key === `${directorKey}.d1`);
+}
+function boundInspectorDirector(cursor) {
+  return cursor.inFlight.findLast(ref => isCurrentDirector(cursor, ref));
+}
+function replayDirectorSelection(cursor, inspection, observedDirector) {
+  const action = inspection ? boundInspectorDirector(cursor) : cursor.action;
+  if (!action) throw new Error("Inspector selection replay lacks its bound director.");
+  const ref = { key: action.key, runId: action.runId };
+  return (observedDirector ? Promise.resolve(observedDirector) : observeStatus(ref.runId, true)).then(observed => {
+    const cause = analysisBarrier(observed, ref.runId);
+    if (cause) throw nativeBarrier(cause, ref);
+    if (observed?.runId !== ref.runId && !managementAnalysisState(observed, ref) ||
+        observed?.key && ![ref.key, ref.runId].includes(observed.key) ||
+        observed?.agent && observed.agent !== "pitako.execution-director" || !terminalAnalysis(observed, ref))
+      throw new Error("Selection replay awaits its exact settled director.");
+    return inspection?.observation ?? host(config.inspections[0]);
+  }).then(observation => {
+    if (!observation.storeFailure && !config.preliminaryStoreFailure) return observation;
+    if (observation.storeFailure?.code === "superseded")
+      throw Object.assign(new Error(observation.storeFailure.reason), { code: "superseded" });
+    const opKey = `${action.key}.store-check`;
+    return checkEpochProducers().then(() => replayLoopIO(opKey, {
+      operation: "verifySelection", key: opKey, root: cursor.root, invocation: cursor.invocation,
+      storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+    })).then(() => observation.storeFailure
+      ? host(config.inspections.find(grant => grant.key === `${config.inspections[0].key}.r1`))
+      : observation);
+  }).then(admitSelection);
+
+  function admitSelection(observation) {
+    capture(observation, { ...config, preliminaryStoreFailure: undefined });
+    replayAdmissionObservation = observation;
+    const { packet, digest } = observation.selectionRecovery ?? {};
+    const selectionKey = action.key.replace(/\.director(?=\.d1$|$)/, ".selectionIO");
+    if (packet && (canonicalDigest({ packet, cursorHead: clone(cursor.head), director: action.runId }) !== digest ||
+        packet.key !== selectionKey || packet.head?.seq <= cursor.head.seq))
+      throw new Error("Selection replay differs from its exact committed result.");
+    const head = packet?.head ?? cursor.head;
+    const advance = cursor.action.input;
+    const input = committedIntentReference(packet?.input ?? advance, head);
+    const producer = cursor.inFlight.findLast(item => item.role === "loop-io" &&
+      item.key.replace(/\.r\d+$/, "") === selectionKey) ?? { key: selectionKey };
+    return observeStatus(producer.runId ?? producer.key, true).then(selected => {
+      const selectionBarrier = analysisBarrier(selected, producer.runId ?? producer.key);
+      if (selectionBarrier) throw nativeBarrier(selectionBarrier, producer);
+      if (producer.runId && selected?.runId !== producer.runId && !managementAnalysisState(selected, producer) ||
+          selected?.agent && selected.agent !== "pitako.loop-io")
+        throw new Error("Selection replay producer identity mismatch.");
+      return replaySelection(producer);
+    });
+
+    function replaySelection(producer) {
+      const unimpeded = { ...cursor, inFlight: cursor.inFlight.filter(item =>
+        item.key !== producer.key && item.key !== ref.key), halt: null };
+      function pendingDrain(drainKey, head, input) {
+        if (drainKey.replace(/\.finishDrain(?:\.v[1-9]\d*)?$/, ".selectionIO") !== selectionKey.replace(/\.d1$/, "") ||
+            input.seq !== head.seq || input.digest !== head.hash || cursor.budget.consumedLoops !== cursor.budget.maxCycles)
+          throw new Error("Selection rejection replay differs from its committed drain.");
+        const pending = { ...unimpeded, head, loop: { ...cursor.loop, outcome: "gaps" },
+          action: { kind: "pending", op: "drain", opKey: drainKey, input } };
+        pending.action.drainDigest = canonicalDigest(finalDrainInput(pending));
+        return { pendingSelectionDrain: pending };
+      }
+      if (packet?.drainKey) return pendingDrain(packet.drainKey, head, input);
+      const retry = Number(producer.key.match(/\.r(\d+)$/)?.[1] ?? 0) + 1;
+      const retryKey = `${selectionKey}.r${retry}`;
+      return observeStatus(retryKey, true).then(retryStatus => {
+        const retryBarrier = analysisBarrier(retryStatus, retryKey);
+        if (retryBarrier) throw nativeBarrier(retryBarrier, { key: retryKey, runId: retryStatus.runId });
+        return replayLoopIO(retryKey, {
+          operation: "selection", root: cursor.root, invocation: cursor.invocation, key: selectionKey,
+          storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+          refs: { input: advance, director: ref, loop: cursor.loop.number,
+            consumedLoops: cursor.budget.consumedLoops, backlogDigest: cursor.backlogDigest,
+            reviewerMs: cursor.timeouts.reviewerMs,
+            ...(inspection ? { inspector: inspection.ref } : {}),
+            ...(cursor.budget.consumedLoops === cursor.budget.maxCycles ? { spec: config.preliminary.content } : {}) },
+        }).then(({ receipt }) => admitReceipt(receipt), error => {
+          const drain = !packet && error.rejectedDrain;
+          if (!drain || drain.storeId !== cursor.storeId || drain.head?.seq <= head.seq) throw error;
+          return pendingDrain(drain.key, drain.head, committedIntentReference({ seq: drain.head.seq, digest: drain.head.hash }, drain.head));
+        });
+      });
+
+      function admitReceipt(receipt) {
+        if (!packet && receipt.selectionFailure) {
+          const { plan, reason, replayRejected, usage, requestObservation, analysisCalls, previous } = receipt.selectionFailure;
+          if (receipt.head?.seq > cursor.head.seq || !same(receipt.P?.control.operation?.input, advance) ||
+              plan?.ref.key !== ref.key || plan.ref.runId !== ref.runId)
+            throw new Error("Selection rejection replay differs from its advance and director.");
+          inFlight.delete(producer.key);
+          inFlight.delete(ref.key);
+          return replayCursorAdmission({ ...unimpeded, action: {
+            kind: "pending", op: "advance", opKey: receipt.P.control.operation.key, input: advance,
+          } }, receipt).then(restored => {
+            restored.head = cursor.head;
+            restored.requestObservation = requestObservation;
+            Object.assign(restored.loop, { plan, usage, analysisCalls, recoveries: receipt.selectionFailure.recoveries ?? [],
+              ...(previous ? { directorRetry: previous } : {}), replayedSelectionFailure: { reason, replayRejected } });
+            return restored;
+          });
+        }
+        if (packet && (!same(receipt.head, head) || !same(receipt.P?.control.operation?.input, input)) ||
+            !packet && receipt.head?.seq <= head.seq ||
+            !same(receipt.P?.prompt.execution?.plan?.ref && {
+              key: receipt.P.prompt.execution.plan.ref.key, runId: receipt.P.prompt.execution.plan.ref.runId,
+            }, ref))
+          throw new Error("Selection replay differs from its committed receipt and director.");
+        inFlight.delete(producer.key);
+        inFlight.delete(ref.key);
+        return replayCursorAdmission(unimpeded, receipt, false, selectionKey);
+      }
+    }
+  }
+}
+function replayNativeInterruption(cursor, action, rebuild, capturedObservation) {
+  if (!matchesCursorRequest(cursor))
+    throw new Error("Retained interruption admission integrity mismatch.");
+  if (!action.runId) throw new Error("Retained interruption lacks its exact native original.");
+  let statusBarrier;
+  return observeStatus(action.runId, true).catch(error => {
+    if (!["stopped", "native permission denial"].includes(error.nativeBarrier)) throw error;
+    statusBarrier = error.nativeBarrier;
+  }).then(observed => {
+    if (observed?.runId && observed.runId !== action.runId ||
+        observed?.key && ![action.key, action.runId].includes(observed.key) ||
+        observed?.agent && observed.agent !== `pitako.${action.role}`)
+      throw new Error("Retained interruption producer integrity mismatch.");
+    const current = statusBarrier ?? analysisBarrier(observed, action.runId);
+    if (current && !["stopped", "interrupted", "native permission denial"].includes(current))
+      throw nativeBarrier(current, action);
+    return Promise.resolve(capturedObservation ?? host(config.inspections[0])).then(observation => {
+      const { metadata } = capture(observation);
+      const settlement = metadata.retainedAnalyses.find(ref => ref.key === action.key && ref.runId === action.runId);
+      if (observation.binding !== cursor.admissionBinding ||
+          !["stopped", "interrupted", "native permission denial"].includes(settlement?.cause) ||
+          !text(settlement.path) || !/^[a-f0-9]{64}$/.test(settlement.digest ?? ""))
+        throw new Error("Retained interruption native original integrity failure: missing or invalid settlement.");
+      const halt = rebuild(action, settlement.cause);
+      if (canonicalDigest(halt) !== cursor.halt.digest || current && current !== halt.cause ||
+          !current && ["passed", "complete", "completed"].includes(managementAnalysisState(observed, action) ?? observed?.state))
+        throw new Error("Retained interruption halt digest or status integrity mismatch.");
+      return { retainedActivityHalt: halt };
+    });
+  });
+}
+function replayCommittedHalt(cursor) {
+  if (!matchesCursorRequest(cursor)) throw new Error("Retained halt admission integrity mismatch.");
+  return host(config.inspections[0]).then(observation => {
+    if (text(observation.error)) throw new Error(`Retained halt integrity failure: ${observation.error}`);
+    capture(observation);
+    const original = observation.haltOriginal;
+    const halt = cursor.halt.stage === "spawn-budget" && cursor.budget.lastProgress && cursor.budget.rejectedKeys.length
+      ? spawnBudgetHalt(cursor.budget.lastProgress)
+      : original?.native ? settledNativeHalt(original.native)
+      : original?.checkpoint ? { status: "blocked", code: "checkpoint-integrity", ...original.checkpoint }
+      : original?.conflict ? { status: "blocked", code: cursor.halt.stage, ...original.conflict,
+          reason: excerpt(original.conflict.reason) }
+      : original?.worker ? {
+      status: "blocked", code: "semantic-block", reason: excerpt(original.worker.diagnosis), ref: original.worker.ref,
+    } : original?.needsDecision ? needsDecisionHalt(original.needsDecision)
+      : original?.acceptance && (cursor.halt.stage !== "repeat-acceptance" || original.acceptance.reused)
+        ? finalAcceptanceHalt(cursor.halt.stage, original.acceptance.reused, original.acceptance.results) : null;
+    if (observation.binding !== cursor.admissionBinding || !halt ||
+        halt.code !== (cursor.halt.stage === "native-settlement" ? "native-barrier" : cursor.halt.stage) ||
+        canonicalDigest(halt) !== cursor.halt.digest)
+      throw new Error("Retained halt native original or digest integrity mismatch.");
+    if (original?.worker) return { retainedSemanticHalt: halt, ref: halt.ref };
+    return { retainedActivityHalt: halt };
+  });
+}
+function finalGateReplayRequest(cursor, childKey) {
+  const { input } = cursor.action;
+  // The pending input is stable across the gate COMMIT and cursor save.
+  return { operation: "gate", root: cursor.root, invocation: cursor.invocation, key: childKey,
+    storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`,
+    expectedHead: { seq: input.seq, hash: input.digest },
+    refs: { input, committed: true, gateFloorMs: cursor.timeouts.gateFloorMs } };
+}
+function replayFinalAcceptance(cursor, early) {
+  const { opKey } = cursor.action;
+  if (!matchesCursorRequest(cursor)) throw new Error("Final acceptance replay admission integrity mismatch.");
+  const producer = cursor.inFlight.find(ref => ref.role === "loop-io" &&
+    ref.key.replace(/\.r\d+$/, "") === opKey) ?? { key: opKey };
+  return observeStatus(producer.runId ?? producer.key, true).then(observed => {
+    const cause = analysisBarrier(observed, producer.runId ?? producer.key);
+    if (cause) throw nativeBarrier(cause, nativeReference(producer.key, observed));
+    if (observed?.agent && observed.agent !== "pitako.loop-io" ||
+        observed?.key && ![producer.key, producer.runId].includes(observed.key) ||
+        producer.runId && observed?.runId && observed.runId !== producer.runId)
+      throw new Error("Final acceptance replay producer integrity mismatch.");
+    return host(config.inspections[0]);
+  }).then(observation => {
+    if (text(observation.error)) throw new Error([observation.error, observation.next].filter(Boolean).join(" "));
+    // The stable replay input alone cannot detect a lost saved cursor head.
+    if (observation.storeFailure?.code === "cursor-ahead") {
+      const opKey = `${cursor.action.opKey}.store-check`;
+      return checkEpochProducers().then(() => replayLoopIO(opKey, {
+        operation: "verifySelection", key: opKey, root: cursor.root, invocation: cursor.invocation,
+        storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+      })).then(() => { throw new Error("Final acceptance store check did not resolve the missing cursor head."); });
+    }
+    const admissionObservation = { ...observation, storeFailure: undefined };
+    capture(admissionObservation, { ...config, preliminaryStoreFailure: undefined });
+    const retryKey = `${opKey}.r1`;
+    return replayLoopIO(retryKey, childKey => {
+      const request = finalGateReplayRequest(cursor, childKey);
+      if (early) request.refs.analyses = early.refs;
+      return request;
+    }, cursor.action.gateTimeoutMs, early?.generation > 1 ? 0 : undefined).then(({ receipt: saved, result, childKey }) => {
+      const restored = restoreFinalAcceptance(cursor, saved, nativeReference(childKey, result), admissionObservation, early?.action);
+      inFlight.delete(producer.key);
+      if (!early) return restored;
+      if (early.action.key.endsWith(".director-synthesis") && !saved.reviewAccess)
+        throw new Error("Renewed review synthesis lacks its verified access receipt.");
+      // A renewed prepare intention can identify the generation without a settled producer.
+      const originals = early.generation > 1 ? early.refs.filter(ref => ref.runId) : early.refs;
+      return admitEarlyAnalyses(saved.analyses, originals).then(calls => {
+        restored.loop.analysisCalls = calls;
+        if (early.generation > 1) restored.loop.analysisGenerations = { "final-review": early.generation };
+        restored.loop.replayedReviewAccess = saved.reviewAccess;
+        restored.loop.replayedEarlyReview = true;
+        return restored;
+      });
+    });
+  });
+}
+function restoreFinalAcceptance(cursor, saved, gateRef, admissionObservation, action) {
+      const { opKey } = cursor.action;
+      const { head, P, finalGate, predecessor, selectionHead, selectionInput, receipt, receiptDigest,
+        selection, selectionReference, requestObservation } = saved;
+      const admission = P?.prompt.admission, execution = P?.prompt.execution;
+      const startedAt = committedLoopOpen(cursor.loop.number, P);
+      const gateTask = { id: "final-acceptance", gates: selection?.acceptance, metric: null };
+      const anchored = same(head, cursor.head) || head?.seq > cursor.head.seq &&
+        (same(predecessor, cursor.head) || same(selectionHead, cursor.head));
+      if (!admission || !execution?.plan?.ref || startedAt === undefined || !matchesCursorRequest(cursor) ||
+          canonicalDigest(admission.association) !== cursor.associationDigest ||
+          admission.admissionBinding !== cursor.admissionBinding || saved.storeId !== cursor.storeId ||
+          !anchored || finalGate?.seq !== head.seq || finalGate?.digest !== head.hash ||
+          !validGateReceipt(receipt, gateTask, "complete") ||
+          !validFinalGateRecord(finalGate, receipt, receiptDigest, opKey, cursor.invocation, cursor.epoch) ||
+          !same(selectionInput, P.control.operation?.input) || P.control.operation?.operation !== "selection" ||
+          selection?.selected !== null || selection.digest !== cursor.backlogDigest ||
+          !Number.isSafeInteger(requestObservation) || requestObservation < 1)
+        throw new Error("Final acceptance replay record integrity mismatch.");
+      storeProjection = { head, P };
+      dispatchedAction = clone(action?.kind ? action : cursor.action);
+      // Do not mistake a committed result for evidence that the checkout is still current.
+      replayAdmissionObservation = same(candidate(receipt.after), candidate(admissionObservation.checkout))
+        ? { ...admissionObservation, checkout: receipt.after } : admissionObservation;
+      return {
+        version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+        replayedFinalGate: true,
+        amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
+        taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
+        reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot =>
+          [slot, { key: `pitako.review.${slot}`, model: cursor.models[slot] }])),
+        timeouts: { values: clone(cursor.timeouts), since: null }, startedAt: admission.startedAt,
+        consumedLoops: cursor.budget.consumedLoops, ledger: P.control.ledger,
+        requestObservation, lastRequestReceipt: receiptReference(selectionReference),
+        receiptReference: receiptReference(selectionReference), budgetRejectedKeys: clone(cursor.budget.rejectedKeys),
+        lastConfirmed: P.control.lastConfirmed, usageTotals: P.preview.usage, tasks: {}, taskFrame: null,
+        loop: { kind: "final", number: cursor.loop.number, phase: "implementation", cursor: 0,
+          startedAt, manifest: [], task: null, results: [], attempt: null,
+          usage: clone(execution.usage), recoveries: clone(execution.recoveries ?? []),
+          plan: { ...execution.plan, stage: "admitted" }, completedTasks: selection.completedTasks,
+          acceptance: selection.acceptance, acceptanceHistory: selection.acceptanceHistory,
+          metricSeries: receipt.progress,
+          finalAttempt: { key: opKey.replace(/(?:\.g[23])?\.gate$/, ""), number: 1, gate: {
+            key: opKey, stage: "receipt", retry: 0, ref: gateRef,
+            task: gateTask, receipt, record: { seq: finalGate.seq, digest: finalGate.digest }, producer: finalGate.producer,
+          } } },
+        planRejections: P.preview.planRejections, closeReferences: P.preview.closeReferences,
+        loopSummaries: P.prompt.loopSummaries ?? P.preview.loopSummaries,
+        demandSources: P.prompt.demand?.sources ?? [], demandObservations: P.prompt.demand?.observations ?? [],
+        excludedScope: Object.fromEntries((selection.cancelledScope ?? []).map(task => [task.id, task])),
+        root: cursor.root, epoch: cursor.epoch, head, storeId: saved.storeId,
+        backlogDigest: selection.digest, backlogPath: selection.path,
+        boardTopicId: receipt.view.topicId, currentView: receipt.view,
+      };
+}
+function admitEarlyAnalyses(originals, refs) {
+  if (!Array.isArray(originals) || refs.some(ref => !originals.some(({ reference, digest }) =>
+    reference.key === ref.key && (!ref.runId || reference.runId === ref.runId) &&
+    (!ref.digest || digest === ref.digest))))
+    throw new Error("Early analysis replay receipt lacks its exact producers.");
+  return Promise.all(originals.map(({ reference, digest, result }) => {
+    const { key, runId, path, sha256 } = reference;
+    if (!result.ok || !text(runId) || result.runId !== runId || result.agent !== "pitako.reviewer" ||
+        !/^[a-f0-9]{64}$/.test(sha256) || canonicalDigest(clone(result.structuredOutput)) !== digest ||
+        !result.results?.some(item => item.savedOutputPath === path || item.structuredOutputPath === path))
+      throw new Error(`Early analysis replay receipt integrity mismatch for ${key}.`);
+    return observeStatus(runId, true).then(observed => {
+      const cause = analysisBarrier(observed, runId);
+      if (cause) throw nativeBarrier(cause, { key, runId });
+      if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.reviewer" || !analysisSettled(observed, reference) ||
+          observed?.structuredOutput && canonicalDigest(clone(observed.structuredOutput)) !== digest)
+        throw new Error(`Early analysis producer integrity mismatch for ${key}.`);
+      analysisResults.set(key, result);
+      inFlight.delete(key);
+      return { key, stage: "receipt", ref: nativeReference(key, result) };
+    });
+  }));
+}
+
+function replayDemandObservation(cursor) {
+  const { action } = cursor;
+  const match = action.key.match(/\.l([1-9]\d*)(\.g[23])?\.demand-observation$/);
+  const base = `${key}.l${cursor.loop.number}`;
+  if (!match || action.key !== `${base}${match[2] ?? ""}.demand-observation` ||
+      cursor.loop.number < 2 || !matchesCursorRequest(cursor))
+    throw new Error("Demand replay admission integrity mismatch.");
+  const generation = Number(match[2]?.slice(2) ?? 1);
+  const advance = `${base}.advance`;
+  const previous = `${key}.l${cursor.loop.number - 1}.nextAdvance`;
+  function observeReplayStatus(target, check) {
+    return observeStatus(target, true).then(check).catch(error => {
+      if (generation > 1 && error.nativeBarrier === "native permission denial")
+        error.hostHalt = { stage: "host",
+          reason: excerpt(`Renewed demand status observation for ${target}: ${error.message}`) };
+      throw error;
+    });
+  }
+  function observeDemand() {
+    const target = action.runId ?? action.key;
+    return observeReplayStatus(target, observed => {
+      const runId = observed?.runId ?? action.runId;
+      const cause = analysisBarrier(observed, target) ?? analysisBarrier(observed, runId);
+      if (cause) throw nativeBarrier(cause, { key: action.key, runId });
+      if (observed?.runId && action.runId && observed.runId !== action.runId ||
+          observed?.key && ![action.key, runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.reviewer")
+        throw new Error("Demand replay producer identity mismatch.");
+      return runId;
+    });
+  }
+  return observeReplayStatus(advance, observed => {
+    const cause = analysisBarrier(observed, advance);
+    if (cause) throw nativeBarrier(cause, { key: advance, runId: observed.runId });
+    return observed;
+  }).then(observed => {
+    return host(config.inspections[0]).then(observation => {
+      if (text(observation.error)) throw new Error([observation.error, observation.next].filter(Boolean).join(" "));
+      const failure = observation.storeFailure ?? config.preliminaryStoreFailure;
+      const needsWriter = ["cursor-ahead", "store-corrupt", "store-replaced", "store-unavailable", "store-busy"].includes(failure?.code);
+      const opKey = observed?.runId || terminalAnalysis(observed, { key: advance }) ? advance : previous;
+      if (needsWriter) checkAdmissionBinding(observation);
+      else capture(observation);
+      // Don't consume the single retry while a renewed producer is still active.
+      return (generation > 1 || needsWriter ? observeDemand() : Promise.resolve(action.runId)).then(runId =>
+        (needsWriter ? checkEpochProducers() : Promise.resolve()).then(() => ({ opKey, observation, needsWriter, runId })));
+    });
+  }).then(({ opKey, observation, needsWriter, runId }) => {
+    const analyses = [{ key: action.key, runId, digest: null }];
+    return replayLoopIO(`${opKey}.r1`, {
+      operation: "advance", key: opKey, root: cursor.root, invocation: cursor.invocation,
+      storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`,
+      expectedHead: cursor.head, refs: { input: action.input, analyses },
+    }, undefined, 0).catch(error => {
+      // Reuse the physical admission check rather than dispatch its host key again.
+      if (error.recovery) error.epochAdmissionObservation = observation;
+      throw error;
+    }).then(({ receipt }) => {
+      const admissionObservation = needsWriter ? { ...observation, storeFailure: undefined } : observation;
+      if (needsWriter) capture(admissionObservation, { ...config, preliminaryStoreFailure: undefined });
+      replayAdmissionObservation = admissionObservation;
+      const renewal = receipt.demandRenewal;
+      if (generation > 1 && renewal?.generation !== generation)
+        throw new Error("Renewed demand replay lacks its exact generation.");
+      if (renewal?.timeout) {
+        const ref = renewal.timeout;
+        if (ref.key !== action.key || (runId && ref.runId !== runId) || !text(ref.runId) ||
+            ref.agent !== "pitako.reviewer" || !nativeTimeout(ref))
+          throw new Error("Renewed demand timeout producer integrity mismatch.");
+        const halt = analysisTimeoutHalt({ key: action.key, timeoutMs: renewal.launchedMs }, ref, generation);
+        return persistState(stateKey, { ...cursor, action: { ...action, runId: ref.runId },
+          halt: { stage: "timeout", digest: canonicalDigest(halt) } }).then(() => ({ retainedAnalysisHalt: halt }));
+      }
+      const undispatched = renewal && renewal.launchedMs === undefined && runId === null;
+      return admitEarlyAnalyses(receipt.analyses, undispatched ? [] : analyses).then(calls =>
+        replayCursorAdmission({ ...cursor,
+          action: { kind: "pending", op: "advance", opKey, input: action.input } }, receipt).then(recovered => {
+            recovered.loop.analysisCalls = calls;
+            recovered.loop.demandOriginalsVerified = true;
+            recovered.replayedEarlyDemand = needsWriter;
+            if (renewal) {
+              recovered.loop.analysisGenerations = { "demand-observation": generation };
+              recovered.loop.retired = [renewal.retired];
+              recovered.lastRequestReceipt = receiptReference(receipt);
+              dispatchedAction = { ...action, runId: calls[0]?.ref.runId ?? null };
+              if (calls.length) Object.assign(calls[0], { timeoutMs: renewal.launchedMs, barrier: null });
+            }
+            return recovered;
+          }));
+    });
+  });
+}
+
+function replayFinalReview(cursor) {
+  if (!matchesCursorRequest(cursor)) throw new Error("Final review replay admission integrity mismatch.");
+  const request = finalReviewRequest(cursor);
+  const { key: synthesisKey, runId } = cursor.action;
+  return observeStatus(runId, true).then(observed => {
+    const cause = analysisBarrier(observed, runId);
+    if (cause) throw nativeBarrier(cause, { key: synthesisKey, runId });
+    if (observed?.runId && observed.runId !== runId ||
+        observed?.agent && observed.agent !== "pitako.reviewer" ||
+        observed?.key && ![synthesisKey, runId].includes(observed.key))
+      throw new Error("Final review replay producer integrity mismatch.");
+    return observeStatus(request.key, true);
+  }).then(observed => {
+    const cause = analysisBarrier(observed, request.key);
+    if (cause) throw nativeBarrier(cause, { key: request.key, runId: observed?.runId });
+    return replayLoopIO(`${request.key}.r1`, request);
+  }).then(({ receipt }) => {
+    const { head, P } = receipt, admission = P?.prompt.admission;
+    const gate = P?.prompt.closingSeed?.body.finalAttempt.gate;
+    if (!admission || !gate || receipt.storeId !== cursor.storeId ||
+        ![head, { seq: gate.record.seq, hash: gate.record.digest }].some(pos => same(pos, cursor.head)) ||
+        canonicalDigest(admission.association) !== cursor.associationDigest ||
+        admission.admissionBinding !== cursor.admissionBinding ||
+        !same(P.control.operation?.input, cursor.action.input))
+      throw new Error("Final review replay store integrity mismatch.");
+    const restored = { ...clone(P.prompt.closingSeed.body), phase: "compliance" };
+    admitFinalReview(receipt, request, restored);
+    if (restored.review.verdict !== "clear") restored.phase = "review";
+    const checkout = candidate(receipt.checkout);
+    if (!same(candidate(gate.receipt.after), checkout))
+      throw new Error("Final review replay checkout differs from final acceptance.");
+    storeProjection = { head, P };
+    dispatchedAction = clone(cursor.action);
+    return {
+      version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+      amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
+      taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
+      reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [slot, admission.models[slot]])),
+      timeouts: { values: clone(cursor.timeouts), since: null }, startedAt: admission.startedAt,
+      consumedLoops: cursor.budget.consumedLoops, ledger: P.control.ledger,
+      requestObservation: P.control.requestObservation, lastRequestReceipt: receiptReference(receipt.selectionReference),
+      receiptReference: receiptReference(receipt.selectionReference), budgetRejectedKeys: clone(cursor.budget.rejectedKeys),
+      lastConfirmed: P.control.lastConfirmed, usageTotals: P.preview.usage, tasks: {}, taskFrame: null,
+      loop: { ...restored, metricSeries: gate.receipt.progress, analysisCalls: [], replayedFinalReview: true },
+      planRejections: P.preview.planRejections, closeReferences: P.preview.closeReferences,
+      loopSummaries: P.prompt.loopSummaries ?? P.preview.loopSummaries,
+      demandSources: P.prompt.demand?.sources ?? [], demandObservations: P.prompt.demand?.observations ?? [],
+      excludedScope: Object.fromEntries((restored.cancelledScope ?? []).map(task => [task.id, task])),
+      root: cursor.root, epoch: cursor.epoch, head, storeId: cursor.storeId,
+      backlogDigest: cursor.backlogDigest, backlogPath: P.prompt.execution.backlogPath,
+      boardTopicId: gate.receipt.view.topicId, currentView: gate.receipt.view, reviewReplayCheckout: checkout,
+    };
+  });
+}
+function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false, selectionReplay) {
+  const retainedAction = cursor.action;
+  if (cursor.halt?.stage === "timeout" && retainedAction.kind === "launched" &&
+      retainedAction.role === "worker" && retainedAction.op === "baseline" && retainedAction.runId &&
+      !cursor.hostHalt) return host(config.inspections[0]).then(observation => {
+    const { metadata } = capture(observation);
+    const packet = metadata.timeoutProjection;
+    const original = metadata.retainedAnalyses.find(ref => ref.key === retainedAction.key && ref.runId === retainedAction.runId);
+    const settled = original?.settlement;
+    if (!packet?.baseline || !same(packet.head, cursor.head) || packet.storeId !== cursor.storeId ||
+        !same(packet.P?.control.operation?.input, retainedAction.input))
+      throw new Error("Worker timeout committed baseline integrity mismatch.");
+    if (!settled || canonicalDigest(settled) !== original.digest || !nativeTimeout(settled) ||
+        settled.runId !== retainedAction.runId || settled.agent !== "pitako.worker" ||
+        settled.results?.some(entry => entry.agent && entry.agent !== "pitako.worker") ||
+        !Number.isSafeInteger(original.launchedMs) || original.launchedMs < 1 || original.launchedMs > 86400000)
+      throw new Error("Worker timeout original integrity failure; reconcile the retained writer. No replacement dispatched.");
+    return replayCursorAdmission({ ...cursor, halt: null,
+      action: { kind: "pending", op: "baseline", opKey: `${retainedAction.key}.baseline`, input: retainedAction.input } },
+    { ...packet.baseline, head: packet.head, storeId: packet.storeId, P: packet.P }).then(restored => {
+      const attempt = restored.loop.attempt;
+      const halt = workerTimeoutHalt(attempt, settled, original.launchedMs);
+      if (canonicalDigest(halt) !== cursor.halt.digest)
+        throw new Error("Worker timeout halt digest integrity mismatch.");
+      if ((config.timeouts?.workerMs ?? cursor.timeouts.workerMs) <= halt.launchedMs ||
+          (attempt.timeoutGeneration ?? 1) >= 3) return { retainedAnalysisHalt: halt };
+      attempt.launch = clone(halt.ref);
+      attempt.timeoutMs = halt.launchedMs;
+      attempt.stage = "launched";
+      delete attempt.undispatched;
+      delete attempt.restore.undispatched;
+      restored.loop.halt = halt;
+      replayAdmissionObservation = observation;
+      dispatchedAction = clone(retainedAction);
+      return restored;
+    });
+  });
+  if (retainedAction.kind === "pending" && ["native-barrier", "native-permission"].includes(cursor.halt?.stage)) {
+    const producer = cursor.inFlight.findLast(ref => ref.role === "loop-io" &&
+      ref.key.replace(/\.r\d+$/, "") === retainedAction.opKey);
+    if (producer) return replayNativeInterruption(cursor, producer, loopIOHalt);
+  }
+  if (["needs-decision", "repeat-acceptance", "environment", "spawn-budget", "plan-conflict", "backlog-conflict", "view-overflow", "checkpoint-witness",
+      "native-settlement"].includes(cursor.halt?.stage) ||
+      cursor.halt?.stage === "checkpoint-integrity" && cursor.inFlight.some(ref =>
+        ref.role === "checkpoint-sealer" || ref.role === "loop-io" && /\.close(?:\.r\d+)?$/.test(ref.key)) ||
+      cursor.halt?.stage === "semantic-block" && retainedAction.kind === "pending")
+    return replayCommittedHalt(cursor);
+  if (retainedAction.kind === "pending" && retainedAction.op === "gate" &&
+      retainedAction.opKey === `${key}.l${cursor.loop?.number}.acceptance.gate` &&
+      !cursor.loop.taskId && !cursor.loop.attempt && !cursor.loop.outcome &&
+      ["implementation", "review"].includes(cursor.loop.phase) && !cursor.halt && !cursor.hostHalt)
+    return replayFinalAcceptance(cursor);
+  if (retainedAction.kind === "launched" && retainedAction.role === "reviewer" && !cursor.halt && !cursor.hostHalt) {
+    if (cursor.loop?.phase === "director" && retainedAction.key.endsWith(".demand-observation"))
+      return replayDemandObservation(cursor);
+    const generation = cursor.review?.generation ?? 1;
+    const renewedSynthesis = generation > 1 && !retainedAction.runId &&
+      retainedAction.key.endsWith(".review.director-synthesis");
+    if (["implementation", "review"].includes(cursor.loop?.phase) && !cursor.loop.taskId &&
+        (renewedSynthesis || /\.review\.(?:director-prepare|independent-[A-Za-z0-9_.-]+-r[12])$/.test(retainedAction.key))) {
+      const analyses = (cursor.review?.slots ?? []).filter(slot => slot.runId).map(({ key, runId, digest }) => ({ key, runId, digest }));
+      if (retainedAction.runId && !analyses.some(ref => ref.key === retainedAction.key))
+        analyses.push({ key: retainedAction.key, runId: retainedAction.runId, digest: null });
+      if (generation > 1) {
+        const prefix = reviewPrefix(generation, cursor.loop.number);
+        if (!retainedAction.key.startsWith(prefix) || analyses.some(ref => !ref.key.startsWith(prefix)))
+          throw new Error("Renewed review replay generation integrity mismatch.");
+        if (!analyses.length) analyses.push({ key: retainedAction.key, runId: null, digest: null });
+      }
+      // A denied admission may leave a null runId. The writer resolves settled
+      // siblings from the mission; a missing slot is observed before dispatch.
+      const opKey = `${key}.l${cursor.loop.number}.acceptance.gate`;
+      const action = { kind: "pending", op: "gate", opKey, input: retainedAction.input };
+      return replayFinalAcceptance({ ...cursor, action }, { action: retainedAction, refs: analyses, generation });
+    }
+  }
+  if (retainedAction.kind === "launched" && retainedAction.runId === null && cursor.halt &&
+      "reason" in cursor.halt) {
+    if (!matchesCursorRequest(cursor)) throw new Error("Immutable mission/invocation/snapshot/worktree association changed.");
+    if (config.preliminaryStoreFailure) throw new Error(`Retained pre-dispatch halt store integrity failure: ${config.preliminaryStoreFailure.reason}`);
+    const halt = noRunHalt(retainedAction, cursor.halt);
+    if (canonicalDigest(halt) !== cursor.halt.digest)
+      throw new Error("Retained pre-dispatch halt digest integrity mismatch.");
+    if (cursor.halt.stage === "native-dispatch" && retainedAction.role === "worker" &&
+        cursor.loop?.phase === "implementation" && cursor.loop.attempt?.stage === "launched" &&
+        !cursor.hostHalt) {
+      // A thrown dispatch can lose delivery of a runId without preventing the launch.
+      const { key } = retainedAction;
+      return observeStatus(key, true).then(observed => {
+        const runId = observed?.runId;
+        if (!text(runId) || !observed.ok || analysisBarrier(observed, runId) || nativeTimeout(observed) ||
+            !(observed.structuredOutput || analysisSettled(observed, { key, runId })))
+          return { retainedDispatchHalt: halt };
+        if (observed.key && ![key, runId].includes(observed.key) ||
+            observed.agent && observed.agent !== "pitako.worker")
+          throw new Error("Execute worker replay producer mismatch.");
+        inFlight.set(key, { key, runId, role: "worker" });
+        return replayCursorAdmission({ ...cursor, halt: null, action: { ...retainedAction, runId } });
+      });
+    }
+    return Promise.resolve({ retainedDispatchHalt: halt });
+  }
+  if (cursor.halt?.stage === "task-review-model" && retainedAction.kind === "launched" &&
+      retainedAction.role === "reviewer" && retainedAction.runId && /\.task-(reviewer|synthesis)$/.test(retainedAction.key)) {
+    if (!matchesCursorRequest(cursor)) throw new Error("Retained task review admission integrity mismatch.");
+    const { key, runId } = retainedAction;
+    return host(config.inspections[0]).then(observation => {
+      const original = capture(observation).metadata.retainedAnalyses.find(ref => ref.key === key && ref.runId === runId);
+      const settled = original?.settlement;
+      if (!settled || settled.runId !== runId || settled.agent !== "pitako.reviewer" ||
+          settled.key !== undefined && settled.key !== key || canonicalDigest(settled) !== original.digest ||
+          settled.ok && settled.structuredOutput || analysisBarrier(settled, key))
+        throw new Error("Retained task review model failure original integrity mismatch.");
+      const halt = taskReviewModelHalt(key, settled, cursor.models);
+      if (canonicalDigest(halt) !== cursor.halt.digest)
+        throw new Error("Retained task review model failure halt integrity mismatch.");
+      return { retainedReviewHalt: halt };
+    });
+  }
+  if (retainedAction.kind === "launched" && retainedAction.runId && !cursor.hostHalt &&
+      (cursor.halt?.stage === "native-barrier" ||
+        cursor.halt?.stage === "native-permission" && ["worker", "reviewer"].includes(retainedAction.role))) {
+    const rebuild = retainedAction.role === "worker" ? workerInterruptionHalt :
+      retainedAction.role === "execution-director" ? directorInterruptionHalt : null;
+    if (rebuild) return replayNativeInterruption(cursor, retainedAction, rebuild);
+    if (retainedAction.role === "reviewer" && !/\.task-(reviewer|synthesis)$/.test(retainedAction.key))
+      return replayNativeInterruption(cursor, retainedAction, closingInterruptionHalt);
+  }
+  if (!selectionReplay && retainedAction.kind === "launched" && retainedAction.role === "execution-inspector" &&
+      retainedAction.runId && cursor.loop?.phase === "director" &&
+      (!cursor.halt || cursor.halt.stage === "recovery") &&
+      !cursor.hostHalt) {
+    const { key, runId } = retainedAction;
+    const ref = { key, runId, agent: "pitako.execution-inspector" };
+    return observeStatus(runId, true).then(observed => {
+      if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== ref.agent)
+        throw new Error("Recovery producer/run identity conflict.");
+      const cause = analysisBarrier(observed, runId);
+      if (cause) throw nativeBarrier(cause, ref);
+      return host(config.inspections[0]).then(observation => {
+        const { metadata } = capture(observation);
+        if (observation.binding !== cursor.admissionBinding)
+          throw new Error("Recovery admission binding mismatch.");
+        const original = retainedReadOnlyOriginal(observed, ref, metadata.retainedAnalyses);
+        const value = original?.structuredOutput;
+        if (!original?.ok || original.runId !== runId || !value)
+          throw new Error("Exact retained recovery original is unavailable.");
+        if (!cursor.halt) {
+          if (!analysisSettled(observed, ref) || value.status !== "recovered" || value.originalAvailable !== true ||
+              !value.original || value.binding === "changed" || value.comparison === "different-full-json" ||
+              !text(value.reason) || !Array.isArray(value.provenance) || !value.provenance.length ||
+              !value.provenance.every(text))
+            throw new Error("Retained recovery original is not an exact settled recovery.");
+          return replayDirectorSelection(cursor, { observation, ref: { key, runId, digest: canonicalDigest(clone(value)) } });
+        }
+        const reason = `Plan recovery unresolved: ${value.reason}`;
+        const halt = { status: "blocked", code: "recovery", reason: excerpt(reason) };
+        if (value.status !== "unresolved" || !text(value.reason) ||
+            !Array.isArray(value.provenance) || !value.provenance.length || !value.provenance.every(text) ||
+            canonicalDigest(halt) !== cursor.halt.digest)
+          throw new Error("Retained plan recovery original or halt digest is unavailable or changed.");
+        return { retainedPlanImpediment: { reason, halt, ref } };
+      });
+    });
+  }
+  if (!selectionReplay && retainedAction.kind === "launched" && retainedAction.role === "execution-inspector" &&
+      !retainedAction.runId && cursor.loop?.phase === "director" && !cursor.halt && !cursor.hostHalt &&
+      cursor.budget.rejectedKeys.includes(canonicalDigest(retainedAction.key))) {
+    const director = boundInspectorDirector(cursor);
+    if (!director) throw new Error("Rejected inspector lacks its bound director.");
+    const sequence = Number(retainedAction.key.match(/\.recover([1-9]\d*)$/)?.[1]);
+    if (!Number.isSafeInteger(sequence) || retainedAction.key !== `${key}.l${cursor.loop.number}.recover${sequence}`)
+      throw new Error("Rejected inspector recovery key integrity mismatch.");
+    return observeReplayDirector(director).then(observed => {
+      if (!analysisSettled(observed, director) || observed.runId && observed.runId !== director.runId ||
+          observed.key && ![director.key, director.runId].includes(observed.key) ||
+          observed.agent && observed.agent !== "pitako.execution-director")
+        throw new Error("Rejected inspector awaits its exact settled director.");
+      // Use the launch's committed advance ref, including a previous loop's nextAdvance.
+      return replayCursorAdmission({ ...cursor, action: { ...director, kind: "launched",
+        runId: null, input: retainedAction.input } }, undefined, {
+        ...(director.key.endsWith(".d1") ? { retryDirector: { key: director.key, runId: director.runId } } : {}),
+      }).then(restored => {
+        if (sequence <= restored.recoverySeq)
+          throw new Error("Rejected inspector recovery sequence conflicts with its prior selection.");
+        restored.recoverySeq = sequence - 1;
+        restored.loop.plan ??= { ...projection(director.key, { ...observed, runId: director.runId,
+          agent: "pitako.execution-director" }), stage: "published" };
+        return restored;
+      });
+    });
+  }
+  if (retainedAction.kind === "launched" && retainedAction.role === "reviewer" && retainedAction.runId &&
+      (retainedAction.key.includes(".review.") || retainedAction.key.endsWith(".compliance")) &&
+      cursor.halt?.stage === "timeout" && !cursor.hostHalt) {
+    const { key, runId } = retainedAction;
+    return host(config.inspections[0]).then(observation => {
+      const { metadata } = capture(observation);
+      const original = metadata.retainedAnalyses.find(item => item.key === key && item.runId === runId);
+      const settled = original?.settlement;
+      if (observation.binding !== cursor.admissionBinding || !settled || canonicalDigest(settled) !== original.digest ||
+          settled.key !== undefined && settled.key !== key || settled.runId !== runId ||
+          settled.agent !== "pitako.reviewer" || !nativeTimeout(settled) ||
+          !Number.isSafeInteger(original.launchedMs) || original.launchedMs < 1 || original.launchedMs > 86400000)
+        throw new Error("Final review timeout original integrity mismatch.");
+      const generation = Number(key.match(/\.g([23])\.(?:review\.|compliance$)/)?.[1] ?? 1);
+      const halt = analysisTimeoutHalt({ key, timeoutMs: original.launchedMs }, settled, generation);
+      if (canonicalDigest(halt) !== cursor.halt.digest)
+        throw new Error("Final review timeout halt digest integrity mismatch.");
+      if ((config.timeouts?.reviewerMs ?? cursor.timeouts.reviewerMs) <= halt.launchedMs ||
+          generation >= 3) return { retainedAnalysisHalt: halt };
+      const packet = metadata.timeoutProjection;
+      const saved = packet?.finalGateTimeout;
+      if (!saved || packet.storeId !== cursor.storeId || !same(packet.head, cursor.head) ||
+          !same(saved.selectionInput, retainedAction.input))
+        throw new Error("Final review timeout lacks its committed acceptance projection.");
+      const opKey = saved.finalGate.producer.replace(/\.r\d+$/, "");
+      const restored = restoreFinalAcceptance({ ...cursor,
+        head: { seq: saved.finalGate.seq, hash: saved.finalGate.digest },
+        action: { kind: "pending", op: "gate", opKey, input: saved.selectionInput } },
+      { ...saved, P: packet.P, storeId: packet.storeId, head: { seq: saved.finalGate.seq, hash: saved.finalGate.digest } },
+      { key: saved.finalGate.producer }, observation, retainedAction);
+      const call = { key, stage: "receipt", timeout: true, timeoutMs: original.launchedMs, ref: halt.ref };
+      const target = restored.loop;
+      if (halt.class === "compliance") {
+        const seed = packet.archiveSeed;
+        if (!seed || seed.body.review.verdict !== "clear" || !same(candidate(seed.body.candidate), candidate(observation.checkout)))
+          throw new Error("Compliance timeout differs from its committed review candidate.");
+        restored.head = packet.head;
+        storeProjection = { head: packet.head, P: packet.P };
+        Object.assign(target, seed.body, { phase: "compliance", replayedFinalReview: true });
+        admitFinalReview({ storeId: packet.storeId, P: { prompt: { closingSeed: clone(seed) } } },
+          { storeId: cursor.storeId, invocation: cursor.invocation,
+            refs: { input: seed.input, originals: seed.body.integratedReview.originals } }, target);
+        target.analysisCalls.push(call);
+      } else {
+        target.phase = "review";
+        target.candidate = candidate(saved.receipt.after);
+        target.analysisCalls = (cursor.review?.slots ?? []).filter(slot => slot.key !== key).map(slot => {
+          const original = metadata.retainedAnalyses.find(ref => ref.key === slot.key &&
+            (!slot.runId || slot.runId === ref.runId));
+          const valid = original?.ok && text(original.runId) && text(original.path) &&
+            (!slot.digest || canonicalDigest(original.structuredOutput) === slot.digest);
+          return { key: slot.key, stage: valid ? "receipt" : "intention",
+            ref: valid ? { key: slot.key, runId: original.runId, agent: "pitako.reviewer" } : { key: slot.key } };
+        });
+        target.analysisCalls.push(call);
+        // Preserve the saved sibling ownership until retirement succeeds.
+        target.integratedReview = cursor.review && { phase: cursor.review.phase, originals: clone(cursor.review.slots) };
+      }
+      target.analysisGenerations = { ...target.analysisGenerations, [halt.class]: generation };
+      target.halt = halt;
+      return restored;
+    });
+  }
+  if (retainedAction.kind === "launched" && retainedAction.role === "reviewer" && retainedAction.runId &&
+      /(?:\.review\.director-(?:prepare|synthesis)|\.compliance)$/.test(retainedAction.key) &&
+      cursor.halt?.stage === "semantic-block" && !cursor.hostHalt) {
+    const { key, runId } = retainedAction;
+    const ref = { key, runId };
+    const prepare = key.endsWith(".director-prepare");
+    const synthesis = key.endsWith(".director-synthesis");
+    return observeStatus(runId, true).then(observed => {
+      const cause = analysisBarrier(observed, runId);
+      if (cause) throw nativeBarrier(cause, ref);
+      if (nativeTimeout(observed) || observed?.runId && observed.runId !== runId ||
+          observed?.key && ![key, runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.reviewer")
+        throw new Error("Retained review original producer integrity mismatch.");
+      return host(config.inspections[0]).then(observation => {
+        const { metadata } = capture(observation);
+        if (observation.binding !== cursor.admissionBinding)
+          throw new Error("Retained review admission binding mismatch.");
+        const result = retainedReadOnlyOriginal(observed, ref, metadata.retainedAnalyses);
+        const value = result?.structuredOutput;
+        const slot = cursor.review?.slots.find(slot => slot.key === key && slot.runId === runId);
+        if ((prepare || synthesis) && slot?.digest && value && canonicalDigest(clone(value)) !== slot.digest)
+          throw new Error("Retained review original integrity mismatch.");
+        if (!result?.ok || result.runId !== runId || !value)
+          throw new Error(`Complete retained analysis unavailable for ${runId}; no replacement dispatched.`);
+        if ((prepare || synthesis) && !slot?.digest)
+          throw new Error(`No admitted original digest for ${key}; no replacement dispatched.`);
+        const reason = synthesis && value.status === "ready" && value.screening?.verdict === "blocked"
+          ? value.screening.reason : value.status === "blocked" ? value.reason : null;
+        const halt = { status: "blocked", code: "semantic-block",
+          reason: excerpt(reason && value.status === "blocked" && (prepare || synthesis)
+            ? `${prepare ? "director-prepare" : "director-synthesis"}: ${reason}` : reason) };
+        if (!text(reason) || canonicalDigest(halt) !== cursor.halt.digest)
+          throw new Error("Retained review original integrity mismatch.");
+        const disposition = { retainedSemanticHalt: halt, ref };
+        if (!synthesis) return disposition;
+        const prefix = key.slice(0, -"director-synthesis".length);
+        const slots = cursor.review.slots.filter(slot => slot.key.startsWith(`${prefix}independent-`));
+        if (!slots.length) throw new Error("Retained synthesis lacks its independent originals.");
+        return Promise.all(slots.map(slot => {
+          if (!slot.runId || !slot.digest) throw new Error("Retained synthesis original identity unavailable.");
+          return observeStatus(slot.runId, true).then(observed => {
+            const cause = analysisBarrier(observed, slot.runId);
+            if (cause) throw nativeBarrier(cause, slot);
+            if (observed?.runId && observed.runId !== slot.runId ||
+                observed?.key && ![slot.key, slot.runId].includes(observed.key) ||
+                observed?.agent && observed.agent !== "pitako.reviewer" || nativeTimeout(observed))
+              throw new Error("Retained synthesis original producer integrity mismatch.");
+            const original = metadata.retainedAnalyses.find(item => item.key === slot.key && item.runId === slot.runId);
+            const result = retainedReadOnlyOriginal(observed, slot, metadata.retainedAnalyses);
+            if (!result?.ok || result.runId !== slot.runId || !text(original?.path) ||
+                !result.structuredOutput || canonicalDigest(clone(result.structuredOutput)) !== slot.digest)
+              throw new Error("Retained synthesis original integrity mismatch.");
+            return { id: `${slot.key}.v1.a1`, key: slot.key, path: original.path, digest: slot.digest };
+          });
+        })).then(() => disposition);
+      });
+    });
+  }
+  if (retainedAction.kind === "launched" && retainedAction.runId && cursor.halt?.stage === "capacity" &&
+      !cursor.hostHalt) {
+    const { key, runId, role } = retainedAction;
+    return observeStatus(runId, true).then(observed => {
+      const cause = barrier(observed, runId);
+      if (cause) throw nativeBarrier(cause, { key, runId });
+      if (observed?.ok !== false || observed.runId !== runId ||
+          observed.key && ![key, runId].includes(observed.key) ||
+          observed.agent && observed.agent !== `pitako.${role}`)
+        throw new Error("Retained capacity producer identity or refusal is unavailable.");
+      const halt = { status: "partial", ...nativeFailure(key, observed.error, observed) };
+      if (halt.code !== "capacity" || canonicalDigest(halt) !== cursor.halt.digest)
+        throw new Error("Retained capacity receipt integrity mismatch.");
+      return { retainedDispatchHalt: halt };
+    });
+  }
+  if (retainedAction.kind === "launched" && retainedAction.role === "worker" && retainedAction.runId &&
+      cursor.halt?.stage === "worker-activity" && !cursor.hostHalt) {
+    const { key, runId } = retainedAction;
+    function retainActivityBarrier(error) {
+      const cause = error.nativeBarrier;
+      if (!["stopped", "interrupted", "native permission denial"].includes(cause)) throw error;
+      const halt = workerInterruptionHalt(retainedAction, cause);
+      const held = { ...cursor, halt: {
+        stage: "native-barrier", digest: canonicalDigest(halt),
+      } };
+      return persistState(stateKey, held).then(() => ({ retainedActivityHalt: halt }));
+    }
+    return observeStatus(runId, true).then(observed => {
+      if (observed?.runId && observed.runId !== runId ||
+          observed?.key && ![key, runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.worker")
+        throw new Error("Retained active worker producer identity is unavailable.");
+      const cause = barrier(observed, runId);
+      if (cause) return retainActivityBarrier(nativeBarrier(cause, { key, runId }));
+      if (observed?.runId !== runId && !managementAnalysisState(observed, { key, runId }))
+        throw new Error("Retained active worker producer identity is unavailable.");
+      if (!analysisSettled(observed, { key, runId }) && !(observed?.ok && observed.structuredOutput))
+        throw new Error("Retained active worker awaits exact terminal success.");
+      return replayCursorAdmission({ ...cursor, halt: null });
+    }, retainActivityBarrier);
+  }
+  if (!selectionReplay && cursor.action.kind === "launched" && cursor.action.role === "execution-director" &&
+      cursor.action.runId && cursor.loop?.phase === "director" && !cursor.hostHalt &&
+      (!cursor.halt || cursor.halt.stage === "recovery"))
+    return replayDirectorSelection(cursor);
+  if (!selectionReplay && !observedGrouped && retainedAction.kind === "launched" &&
+      isCurrentDirector(cursor, retainedAction) && !retainedAction.runId &&
+      cursor.loop?.phase === "director" && !cursor.halt && !cursor.hostHalt) {
+    return observeReplayDirector(retainedAction).then(observed => {
+      if (text(observed?.runId)) {
+        // The native child can settle before the cursor binds its runId.
+        // Select from that exact original rather than dispatching the director again.
+        return replayDirectorSelection({ ...cursor, action: { ...retainedAction, runId: observed.runId } }, null, observed);
+      }
+      if (retainedAction.key.endsWith(".d1"))
+        return replayCursorAdmission(cursor, undefined, { retryDirector: { key: retainedAction.key, runId: null } });
+      return replayCursorAdmission(cursor, committedAdvance, true);
+    });
+  }
+  const selectionCancellation = retainedAction.kind === "pending" && retainedAction.op === "drain" &&
+    retainedAction.opKey.startsWith(`${key}.l${cursor.loop?.number}.cancellationDrain`) &&
+    cursor.loop?.phase === "implementation" && !cursor.loop.attempt && cursor.loop.cursor === 0;
+  if (!selectionReplay && retainedAction.kind === "pending" && (retainedAction.op === "selection" || selectionCancellation) &&
+      (cursor.loop?.phase === "director" ||
+        cursor.loop?.phase === "implementation" && cursor.loop.cursor === 0) &&
+      !cursor.loop.attempt && !cursor.halt && !cursor.hostHalt) {
+    const { input } = retainedAction;
+    const opKey = selectionCancellation ? `${key}.l${cursor.loop.number}.selectionIO` : retainedAction.opKey;
+    const nativeKey = retainedAction.opKey;
+    const producer = cursor.inFlight.findLast(ref => ref.role === "loop-io" &&
+      ref.key.replace(/\.r\d+$/, "") === nativeKey) ?? { key: nativeKey };
+    // This cursor already anchors the committed result, not the director's
+    // selection input. Do not reuse the native key of that other replay.
+    return observeStatus(producer.runId ?? nativeKey, true).then(observed => {
+      const cause = analysisBarrier(observed, producer.runId ?? opKey);
+      if (cause) throw nativeBarrier(cause, producer);
+      if (producer.runId && observed?.runId !== producer.runId && !managementAnalysisState(observed, producer) ||
+          observed?.agent && observed.agent !== "pitako.loop-io")
+        throw new Error("Committed selection producer identity mismatch.");
+      return replayLoopIO(`${opKey}.committed.r1`, { operation: "selection", key: opKey,
+        root: cursor.root, invocation: cursor.invocation, storeId: cursor.storeId,
+        scope: `exec:${cursor.invocation}.e${cursor.epoch}`, expectedHead: cursor.head,
+        refs: { input, committed: true, ...(selectionCancellation ? { cancellationDrain: nativeKey } : {}) },
+      });
+    }).then(({ receipt }) => {
+      const committedKey = receipt.P?.control.operation?.key;
+      if (committedKey !== opKey && !(selectionCancellation && committedKey === `${opKey}.d1`))
+        throw new Error("Selection replay differs from its committed operation.");
+      return replayCursorAdmission({ ...cursor,
+        action: { kind: "pending", op: "selection", opKey: committedKey, input }, loop: { ...cursor.loop, phase: "director" } },
+        receipt, false, committedKey);
+    });
+  }
+  if (!observedGrouped && cursor.action.kind === "pending" && ["close", "drain"].includes(cursor.action.op) &&
+      (!cursor.halt || cursor.halt.stage === "recovery") && !cursor.hostHalt) {
+    const producer = cursor.inFlight.findLast(ref => ref.role === "loop-io" &&
+      ref.key.replace(/\.r\d+$/, "") === cursor.action.opKey);
+    const ref = producer ?? { key: cursor.action.opKey };
+    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+      const cause = barrier(observed, ref.runId ?? ref.key);
+      if (cause) throw nativeBarrier(cause, ref);
+      const management = managementAnalysisState(observed, ref);
+      if (producer && (observed?.runId !== producer.runId && !management ||
+          observed.agent && observed.agent !== "pitako.loop-io"))
+        throw new Error("Grouped replay producer identity mismatch.");
+      if (producer && !terminalAnalysis(observed, ref) && management !== "passed")
+        throw new Error("Grouped replay awaits exact terminal producer evidence.");
+      if (cursor.action.op === "drain" &&
+          cursor.action.opKey.startsWith(`${key}.l${cursor.loop.number}.cancellationDrain`) &&
+          cursor.loop.outcome === "gaps" && cursor.budget.consumedLoops < cursor.budget.maxCycles) {
+        const opKey = `${key}.l${cursor.loop.number}.nextAdvance`;
+        return replayLoopIO(`${opKey}.r1`, { ...finalDrainInput(cursor), operation: "advance",
+          key: opKey, refs: { input: cursor.action.input, cancellationDrain: cursor.action.opKey } })
+          .then(({ receipt }) => replayCursorAdmission({ ...cursor, halt: null,
+            action: { kind: "pending", op: "advance", opKey, input: cursor.action.input } }, receipt));
+      }
+      return cursor.action.op === "drain" ? replayFinalDrain(cursor, producer ??
+        (observed?.runId && terminalAnalysis(observed, ref) ? { ...ref, runId: observed.runId } : null))
+        : replayCursorAdmission({ ...cursor, halt: null }, committedAdvance,
+          { ...ref, committed: !!cursor.halt || !!producer ||
+            terminalAnalysis(observed, { ...ref, runId: observed?.runId }) });
+    });
+  }
+  if (["timeout", "reviewer-renewal-barrier"].includes(cursor.halt?.stage) &&
+      reviewerTimeoutAction(cursor.action) && !cursor.hostHalt)
+    return replayReviewerTimeout(cursor);
+  if (cursor.action.kind === "pending" && cursor.action.op === "gate" &&
+      (cursor.halt?.stage === "timeout" || Object.hasOwn(gateRenewalBarriers, cursor.halt?.stage)) &&
+      !cursor.hostHalt)
+    return /\.acceptance(?:\.g[23])?\.gate$/.test(cursor.action.opKey)
+      ? replayFinalGateTimeout(cursor) : replayGateTimeout(cursor);
+  // A lost cursor advance can retain the committed gate action after the
+  // result settled. Recover the completed review rather than running the gate.
+  if (cursor.action.kind === "pending" && cursor.action.op === "gate" &&
+      cursor.loop?.attempt?.stage === "result" && !cursor.halt && !cursor.hostHalt) {
+    const synthesisKey = cursor.action.opKey.replace(/\.gate$/, ".task-synthesis");
+    const synthesis = cursor.review?.slots.find(slot => slot.key === synthesisKey && slot.phase === "reviewer");
+    if (synthesis?.runId)
+      return replayCursorAdmission({ ...cursor, action: { kind: "launched", role: "reviewer",
+        key: synthesis.key, runId: synthesis.runId, input: cursor.action.input } });
+  }
+  // A transport exception after dispatch is not an undispatched worker or a native Stop.
+  let interruptedWorker = cursor.action.kind === "launched" && cursor.action.role === "worker" &&
+    cursor.halt?.stage === "recovery" &&
+    !cursor.hostHalt;
+  if (interruptedWorker) cursor = { ...cursor, halt: null };
+  // dispatch retains a sealer here only when its native response was active.
+  // Re-observe that producer before interpreting a seal file as settled work.
+  const reviewSealerKey = cursor.action.kind === "launched" && cursor.action.role === "reviewer" &&
+    cursor.action.key.endsWith(".task-synthesis")
+    ? `${cursor.action.key.slice(0, -".task-synthesis".length)}.seal` : null;
+  const activeSealer = cursor.inFlight.find(ref => ref.role === "checkpoint-sealer" &&
+    (ref.key === reviewSealerKey || ref.key.startsWith(`${reviewSealerKey}.r`)));
+  if (activeSealer && cursor.halt?.stage === "sealer-activity" &&
+      !cursor.hostHalt) {
+    return observeStatus(activeSealer.runId, true).then(observed => {
+      const cause = observed?.state === "unknown" ? null : barrier(observed, activeSealer.runId);
+      if (["stopped", "interrupted", "native permission denial"].includes(cause)) {
+        if (observed?.runId && observed.runId !== activeSealer.runId ||
+            observed?.key && ![activeSealer.key, activeSealer.runId].includes(observed.key) ||
+            observed?.agent && observed.agent !== "pitako.checkpoint-sealer")
+          throw new Error("Sealer activity producer integrity mismatch.");
+        const halt = closingInterruptionHalt(activeSealer, cause);
+        return persistState(stateKey, { ...cursor, halt: { stage: "native-barrier", digest: canonicalDigest(halt) } })
+          .then(() => ({ retainedReviewHalt: halt }));
+      }
+      if (cause) throw nativeBarrier(cause, activeSealer);
+      if (observed?.runId && observed.runId !== activeSealer.runId ||
+          observed?.agent && observed.agent !== "pitako.checkpoint-sealer")
+        throw new Error("Sealer producer/run identity conflicts with the pending seal.");
+      if (observed?.runId !== activeSealer.runId && !managementAnalysisState(observed, activeSealer) ||
+          !terminalAnalysis(observed, activeSealer))
+        throw new Error("Sealer activity has no exact terminal observation; no replacement dispatch.");
+      return replayCursorAdmission({ ...cursor, halt: null });
+    });
+  }
+  if (cursor.action.kind === "launched" && cursor.action.role === "reviewer" &&
+      (cursor.action.key.endsWith(".compliance") ||
+        cursor.loop?.phase === "closing" && cursor.action.runId && cursor.action.key.endsWith(".director-synthesis")) &&
+      !cursor.halt && !cursor.hostHalt)
+    return replayClosingCursor(cursor);
+  if (retainedAction.kind === "launched" && retainedAction.role === "reviewer" && retainedAction.runId &&
+      retainedAction.key.endsWith(".director-synthesis") && !cursor.loop?.taskId &&
+      ["review", "compliance"].includes(cursor.loop?.phase) && !cursor.halt && !cursor.hostHalt)
+    return replayFinalReview(cursor);
+  if (cursor.action.kind === "launched" && cursor.action.role === "reviewer" &&
+      /\.task-(reviewer|synthesis)$/.test(cursor.action.key) &&
+      ["checkpoint-integrity", "native-barrier"].includes(cursor.halt?.stage) &&
+      !cursor.hostHalt)
+    return replayTaskReviewHalt(cursor).then(halt => ({ retainedReviewHalt: halt }));
+  if (cursor.halt && !["recovery", "timeout"].includes(cursor.halt.stage))
+    throw new Error(`Retained ${cursor.halt.stage} original integrity failure; no replay or dispatch.`);
+  const reviewAction = cursor.action;
+  const reviewRecovery = cursor.action.kind === "launched" && cursor.action.role === "reviewer" &&
+    /\.task-(reviewer|synthesis)$/.test(cursor.action.key) && cursor.loop?.phase === "implementation" &&
+    !cursor.halt && !cursor.hostHalt;
+  const base = reviewRecovery ? cursor.action.key.replace(/\.task-(reviewer|synthesis)$/, "") : null;
+  const reviewedNative = new Map();
+  let reviewAdmission, unadmittedReview;
+  const inspectReviewAdmission = () => reviewAdmission ??= host(config.inspections[0]).then(observation => {
+    if (text(observation.error)) throw new Error(observation.error);
+    checkAdmissionBinding(observation);
+    // Store failures still go to the existing deterministic recovery writer.
+    if (!observation.storeFailure && !config.preliminaryStoreFailure) {
+      capture(observation);
+      replayAdmissionObservation = observation;
+    }
+    return observation;
+  });
+  const verifyReviewAdmission = reviewRecovery && cursor.budget.rejectedKeys.length
+    ? inspectReviewAdmission() : Promise.resolve();
+  return verifyReviewAdmission.then(() => reviewRecovery ? Promise.all((cursor.action.key.endsWith(".task-synthesis")
+      ? ["reviewer", "synthesis"] : ["reviewer"]).filter(stage =>
+        !cursor.budget.rejectedKeys.includes(canonicalDigest(`${base}.task-${stage}`))).map(stage => {
+      const ref = cursor.review?.slots.find(ref => ref.key === `${base}.task-${stage}` && ref.phase === "reviewer");
+      if (!ref) throw new Error("Missing task review recovery producer.");
+      function settled(observed, producer) {
+        const cause = analysisBarrier(observed, producer.runId ?? producer.key);
+        if (cause) throw nativeBarrier(cause, producer);
+        if (!observed?.ok || !text(observed.runId) || producer.runId && observed.runId !== producer.runId ||
+            !observed.structuredOutput && !analysisSettled(observed, producer) ||
+            observed.key && ![producer.key, observed.runId].includes(observed.key) ||
+            observed.agent && observed.agent !== "pitako.reviewer")
+          throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
+        if (observed.structuredOutput) reviewedNative.set(ref.key, canonicalDigest(clone(observed.structuredOutput)));
+        return { key: ref.key, runId: observed.runId };
+      }
+      return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+        if (ref.key !== reviewAction.key || reviewAction.runId !== null || ref.runId !== null ||
+            ref.digest !== null || observed?.state !== "unknown" ||
+            !/(?:^|\n| failed: )(?:Async run not found\. Provide id or dir\.|Run not found\. Provide id or runId\.)$/.test(observed.output))
+          return settled(observed, ref);
+        // Key-only status cannot distinguish absence from admission by a prior root.
+        return inspectReviewAdmission().then(observation => {
+          if (observation.storeFailure || config.preliminaryStoreFailure) capture(observation);
+          const native = config.recovery?.references?.find(item => item.key === ref.key);
+          if (text(native?.runId)) {
+            const producer = { key: ref.key, runId: native.runId };
+            return observeStatus(producer.runId, true).then(observed => settled(observed, producer));
+          }
+          if (native?.runId !== null)
+            throw new Error("Task review recovery producer identity or settlement integrity mismatch.");
+          unadmittedReview = true;
+          retainedAnalysisDeadline = { key: ref.key, ms: cursor.timeouts.reviewerMs };
+          return null;
+        });
+      });
+    })).then(refs => refs.filter(Boolean)) : Promise.resolve(null)).then(reviewRefs => {
+  if (reviewRecovery) {
+    cursor = clone(cursor);
+    const worker = cursor.review?.slots.find(ref => ref.key === base && ref.phase === "worker");
+    if (!worker?.runId) throw new Error("Missing task review worker producer.");
+    cursor.inFlight.push({ key: worker.key, runId: worker.runId, role: "worker" });
+    cursor.action = { kind: "pending", op: "gate", opKey: `${base}.gate`, input: cursor.action.input };
+    cursor.loop.attempt = { ...cursor.loop.attempt, number: Number(base.match(/\.a(\d+)$/)[1]), stage: "launched" };
+  }
+  const action = cursor.action;
+  const pendingBaseline = action.kind === "pending" && action.op === "baseline" &&
+    cursor.loop?.phase === "implementation" && ["intention", "launched"].includes(cursor.loop.attempt?.stage) &&
+    action.opKey === `${key}.l${cursor.loop.number}.t${cursor.loop.cursor + 1}.a${cursor.loop.attempt.number}.baseline` &&
+    !cursor.halt && !cursor.hostHalt;
+  const retainedWorker = action.kind === "pending" && ["close", "gate"].includes(action.op)
+    ? cursor.inFlight.find(ref => ref.role === "worker" && [ `${ref.key}.${action.op}`,
+      ...[2, 3].map(generation => `${ref.key}.g${generation}.${action.op}`) ].includes(action.opKey)) : null;
+  const pendingGate = action.kind === "pending" && action.op === "gate";
+  const savedGate = pendingGate && !retainedWorker &&
+    cursor.loop?.phase === "implementation" && cursor.loop.attempt?.stage === "launched" &&
+    cursor.loop.outcome === null && !cursor.halt && !cursor.hostHalt;
+  const pendingClose = action.kind === "pending" && action.op === "close" &&
+    cursor.loop?.phase === "implementation" && cursor.loop.attempt?.stage === "launched" &&
+    cursor.loop.outcome === null && !cursor.halt && !cursor.hostHalt;
+  if (pendingClose && !retainedWorker && !observedGrouped.committed &&
+      cursor.budget.rejectedKeys.includes(canonicalDigest(action.opKey))) {
+    // A complete worker may have already committed its gate before the close was denied.
+    const gateKey = action.opKey.replace(/\.close$/, ".gate");
+    return replayCursorAdmission({ ...cursor,
+      action: { ...action, op: "gate", opKey: gateKey } });
+  }
+  let pendingCloseReplay = false;
+  let uncertainFirstWorker = false;
+  let interruptedBaseline, observedWorker;
+  let worker = pendingBaseline ? { key: action.opKey.slice(0, -".baseline".length), runId: null } : retainedWorker ?? action;
+  return (pendingClose && retainedWorker && cursor.loop.attempt.number > 1
+    ? observeStatus(action.opKey, true).then(observed => {
+      const cause = barrier(observed, action.opKey);
+      if (cause) throw nativeBarrier(cause, action);
+      const metadata = observed?.output?.split("\n") ?? [];
+      const completed = ["passed", "completed", "complete"].includes(observed?.state) ||
+        metadata[0] === `Run: ${observed?.runId}` &&
+          /^State: (complete|completed|passed)$/.test(metadata.find(line => line.startsWith("State: ")) ?? "");
+      pendingCloseReplay = !observed?.ok || !completed;
+  }) : Promise.resolve()).then(() => action.kind === "launched" && action.role === "worker" &&
+    ["selection", "baseline"].includes(action.op) && worker.runId && !cursor.halt && !cursor.hostHalt
+    ? observeStatus(worker.runId, true).then(observed => {
+      observedWorker = observed;
+      const cause = barrier(observed, worker.runId);
+      if (cause !== "interrupted" && !interruptedWorker) return;
+      assertFallbackProducer(observed, worker);
+      if (observed?.key && ![worker.key, worker.runId].includes(observed.key))
+        throw new Error("Execute worker replay producer mismatch.");
+      if (nativeTimeout(observed))
+        throw new Error("Retained restoration reports a native timeout; no baseline replay authorized.");
+      // Rebuild the checkpoint-first path from the committed baseline, not
+      // a worker output the interruption may have prevented from publishing.
+      if (!observed?.ok || !observed.structuredOutput) {
+        interruptedWorker = true;
+        interruptedBaseline = { ...nativeReference(worker.key, observed), agent: "pitako.worker",
+          runId: worker.runId, launchedMs: cursor.timeouts.workerMs };
+      }
+    })
+    : action.kind === "launched" && action.role === "worker" && !worker.runId
+    ? observeStatus(worker.key, true).then(observed => {
+    const cause = barrier(observed, worker.key);
+    if (cause === "interrupted" && !cursor.halt && !cursor.hostHalt) {
+      assertFallbackProducer(observed, { key: worker.key });
+      if (observed.key && ![worker.key, observed.runId].includes(observed.key))
+        throw new Error("Execute worker replay producer mismatch.");
+      if (barrier({ ...observed, interrupted: false, state: observed.state === "interrupted" ? undefined : observed.state,
+        results: observed.results?.map(item => ({ ...item, interrupted: false })) }, worker.key) === "stopped")
+        throw nativeBarrier("stopped", worker);
+      // The original launch settled by interruption. Reconstruct its intent,
+      // but never redispatch that worker key as if this were a pre-launch cut.
+      interruptedWorker = true;
+      return;
+    }
+    if (cause) throw nativeBarrier(cause, worker);
+    if (text(observed?.runId) && observed.ok && !["running", "queued", "pending"].includes(observed.state)) {
+      if (observed.agent && observed.agent !== "pitako.worker")
+        throw new Error("Execute worker replay producer mismatch.");
+      worker = { ...worker, runId: observed.runId };
+      inFlight.set(worker.key, { key: worker.key, runId: worker.runId, role: "worker" });
+    } else if (action.op === "selection") {
+      if (observed?.agent && observed.agent !== "pitako.worker" ||
+          observed?.key && ![worker.key, observed.runId].includes(observed.key))
+        throw new Error("Execute worker replay producer mismatch.");
+      uncertainFirstWorker = true;
+    }
+  }) : Promise.resolve()).then(() => {
+  const undispatchedWorker = pendingBaseline || pendingCloseReplay || action.kind === "launched" && action.role === "worker" &&
+    (!worker.runId || interruptedBaseline) &&
+    cursor.loop?.phase === "implementation" && cursor.loop.attempt?.stage === "launched" &&
+    ["selection", "baseline", "close"].includes(action.op) && !cursor.halt && !cursor.hostHalt &&
+    worker.key === `${key}.l${cursor.loop.number}.t${cursor.loop.cursor + 1}.a${cursor.loop.attempt.number}`;
+  const workerLaunch = !undispatchedWorker && (action.kind === "launched" && action.role === "worker" || retainedWorker) &&
+    cursor.loop?.phase === "implementation" && cursor.loop.attempt?.stage === "launched" &&
+    text(worker.runId) &&
+    !cursor.halt && !cursor.hostHalt &&
+    worker.key === `${key}.l${cursor.loop.number}.t${cursor.loop.cursor + 1}.a${cursor.loop.attempt.number}`;
+  const retryDirector = observedGrouped?.retryDirector;
+  const directorLaunch = action.kind === "launched" && isCurrentDirector(cursor, action) && action.runId === null &&
+    (!action.key.endsWith(".d1") || retryDirector);
+  // COMMIT may have advanced the store while the cursor still names the last close.
+  const committedTransition = action.kind === "pending" && action.op === "close" &&
+    cursor.loop?.outcome === "gaps" && cursor.budget.consumedLoops < cursor.budget.maxCycles;
+  const closedReceipt = pendingClose && !retainedWorker;
+  if (!(action.kind === "pending" && action.op === "advance") && !selectionReplay && !directorLaunch && !committedTransition && !workerLaunch && !undispatchedWorker && !closedReceipt && !savedGate)
+    return Promise.reject(new Error(`Recorded execute action has no admitted root projection: ${action.kind} ${action.op ?? action.role} ${action.opKey ?? action.key} (halt=${cursor.halt?.stage ?? "none"}, hostHalt=${cursor.hostHalt?.stage ?? "none"}).`));
+  const transitionKey = `${key}.l${cursor.loop?.number}.nextAdvance`;
+  const operation = pendingGate ? "gate" : workerLaunch || closedReceipt ? "close" : undispatchedWorker ? action.op : "advance";
+  const input = reviewRecovery ? { operation: "gate", root: cursor.root, invocation: cursor.invocation,
+    key: reviewRefs.length ? `${reviewRefs.at(-1).key}.review-recovery` : `${base}.review-context-recovery`,
+    storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`,
+    expectedHead: cursor.head, refs: { input: action.input, reviewRecovery: reviewRefs } }
+    : workerLaunch ? storedWorkerCloseInput({ ...cursor, intent: cursor.loop.attempt.intent,
+    gateFloorMs: cursor.timeouts.gateFloorMs }, worker, action.input, operation)
+    : { operation, root: cursor.root, invocation: cursor.invocation,
+    ...(!directorLaunch && !undispatchedWorker ? { key: committedTransition ? transitionKey : action.opKey } : {}),
+    storeId: cursor.storeId, scope: `exec:${cursor.invocation}.e${cursor.epoch}`,
+    expectedHead: cursor.head, refs: { input: action.input, ...(retryDirector ? { retryDirector } : {}),
+      ...((uncertainFirstWorker || interruptedBaseline) && undispatchedWorker && operation === "selection"
+        ? { uncertainWorker: cursor.loop.attempt.intent,
+          ...(worker.runId ? { worker: { key: worker.key, runId: worker.runId } } : {}) } : {}),
+      ...(pendingCloseReplay ? { intent: cursor.loop.attempt.intent,
+        worker: { key: worker.key, runId: worker.runId } } : {}) } };
+  const replayKey = committedTransition ? transitionKey : directorLaunch ? `${action.key}.advance-replay` : action.opKey;
+  const recoveringWorker = workerLaunch && action.kind === "launched";
+  if (recoveringWorker) input.key = `${worker.key}.recover`;
+  const committedCloseReplay = pendingClose && !pendingCloseReplay &&
+    (observedGrouped?.committed || cursor.loop.attempt.number > 1 || closedReceipt);
+  if (committedCloseReplay) input.refs.committed = true;
+  if (savedGate) input.refs.committed = true;
+  const observePendingGate = (retry = 0, committed = false) => {
+    if (!workerLaunch || !pendingGate || reviewRecovery) return Promise.resolve(null);
+    const childKey = retry ? `${action.opKey}.r${retry}` : action.opKey;
+    if (cursor.budget.rejectedKeys.includes(canonicalDigest(childKey)))
+      return Promise.resolve({ childKey, committed, retry });
+    return observeStatus(childKey, true).then(observed => {
+      const cause = analysisBarrier(observed, childKey);
+      if (cause) throw nativeBarrier(cause, { key: childKey, runId: observed.runId });
+      if (observed?.agent && observed.agent !== "pitako.loop-io" ||
+          observed?.key && ![childKey, observed.runId].includes(observed.key))
+        throw new Error("Gate replay producer identity mismatch.");
+      const ref = { key: childKey, runId: observed?.runId };
+      if (!observed?.runId) return { childKey, committed, retry };
+      const passed = terminalLoopIOResult(observed, childKey, "gate") ||
+        analysisSettled(observed, ref);
+      if (!nativeTimeout(observed) && terminalAnalysis(observed, ref) && retry < 2)
+        return observePendingGate(retry + 1, committed || passed);
+      throw new Error(`Gate replay lacks an available retry for ${childKey}.`);
+    });
+  };
+  let settledReviewSealer, retiredReviewSealer;
+  const observeReviewSealer = () => {
+    if (reviewRefs?.length !== 2) return;
+    const seal = `${base}.seal`;
+    const ref = cursor.inFlight.findLast(ref => ref.role === "checkpoint-sealer" &&
+      ref.key.replace(/\.r\d+$/, "") === seal) ?? { key: seal };
+    if (cursor.budget.rejectedKeys.includes(canonicalDigest(ref.key))) return;
+    return observeStatus(ref.runId ?? ref.key, true).then(observed => {
+      if (observed?.state === "unknown") return; // Unknown is not settlement or a positive barrier.
+      const cause = analysisBarrier(observed, ref.runId ?? ref.key);
+      if (cause) throw nativeBarrier(cause, ref);
+      if (observed?.runId && ref.runId && observed.runId !== ref.runId ||
+          observed?.key && ![ref.key, ref.runId, observed.runId].includes(observed.key) ||
+          observed?.agent && observed.agent !== "pitako.checkpoint-sealer")
+        throw new Error("Task review sealer recovery producer identity mismatch.");
+      if (ref.runId && (observed?.runId === ref.runId || managementAnalysisState(observed, ref))) {
+        if (terminalAnalysis(observed, ref)) retiredReviewSealer = ref.key;
+        if (analysisSettled(observed, ref)) settledReviewSealer = ref.key;
+      }
+    });
+  };
+  const childKey = reviewRecovery ? `${input.key}.r1` :
+    pendingCloseReplay ? `${worker.key}.pending-close-replay.r1` :
+    undispatchedWorker ? `${worker.key}.${operation}-replay.r1` : recoveringWorker ? `${worker.key}.recover.r1` :
+    committedCloseReplay ? `${action.opKey}.r${Number(observedGrouped?.key?.match(/\.r(\d+)$/)?.[1] ?? 0) + 1}` :
+    workerLaunch ? `${worker.key}.${operation}` : closedReceipt ? action.opKey : `${replayKey}.r1`;
+  return (committedAdvance ? Promise.resolve({ receipt: committedAdvance }) : (workerLaunch ?
+    (observedWorker === undefined ? observeStatus(worker.runId, true) : Promise.resolve(observedWorker)).then(observed => {
+    const cause = barrier(observed, worker.runId);
+    if (cause) throw nativeBarrier(cause, worker);
+    if (observed?.runId && observed.runId !== worker.runId ||
+        observed?.key && ![worker.key, worker.runId].includes(observed.key) ||
+        observed?.agent && observed.agent !== "pitako.worker")
+      throw new Error("Execute worker replay producer mismatch.");
+  }) : Promise.resolve()).then(observeReviewSealer).then(() => observePendingGate()).then(gate => {
+    if (gate?.committed) input.refs.committed = true;
+    return replayLoopIO(gate?.childKey ?? childKey, input, workerLaunch ? action.gateTimeoutMs : undefined,
+      unadmittedReview ? 0 : gate ? 2 - gate.retry : undefined);
+  })).then(({ receipt, result, childKey: replayedKey }) => {
+    if (pendingGate) receipt = readTaskGateWire(receipt, receipt.gateTask?.gates ?? receipt.P?.prompt.selectedTask?.gates,
+      receipt.P?.prompt.execution?.worker?.reference);
+    if (reviewRecovery && receipt?.committedAdvance) {
+      const advance = receipt.committedAdvance;
+      const operation = advance.P?.control.operation;
+      if (operation?.operation !== "advance" || operation.key !== `${key}.l${cursor.loop.number}.nextAdvance` ||
+          operation.loop !== cursor.loop.number + 1 || advance.storeId !== cursor.storeId)
+        throw new Error("Task review committed advance position integrity mismatch.");
+      // Rebuild the committed transition locally; never reissue its native key with new params.
+      return replayCursorAdmission({ ...cursor, head: advance.head,
+        action: { kind: "pending", op: "advance", opKey: operation.key, input: operation.input },
+        loop: { ...cursor.loop, outcome: "gaps", attempt: null } }, advance);
+    }
+    const restorationBaseline = !pendingBaseline && !pendingCloseReplay && action.role === "worker" &&
+      receipt.replayOperation === "baseline" &&
+      receipt.P?.prompt.execution?.checkpoint?.attempt === cursor.loop.attempt.number + 1;
+    const replayedBaseline = restorationBaseline ||
+      undispatchedWorker && (operation === "baseline" || receipt.replayOperation === "baseline");
+    const replayedClose = undispatchedWorker && operation === "close";
+    if (uncertainFirstWorker && receipt.checkpointCaptured) interruptedWorker = true;
+    if (!pendingGate && !replayedBaseline) receiptReference(receipt);
+    const admission = receipt.P?.prompt.admission;
+    if (selectionReplay && (cursor.action.kind === "pending" && cursor.action.op === "selection"
+        ? (receipt.selectionCancellation ? receipt.head.seq < cursor.head.seq : !same(receipt.head, cursor.head)) ||
+          !same(receipt.P?.control.operation?.input, cursor.action.input)
+        : receipt.head?.seq <= cursor.head.seq))
+      throw new Error("Selection replay receipt differs from its committed head.");
+    if (selectionReplay && (receipt.P?.control.operation?.operation !== "selection" ||
+        receipt.P.control.operation.key !== selectionReplay))
+      throw new Error("Selection replay receipt differs from its committed operation.");
+    let execution = receipt.P?.prompt.execution;
+    let continuation = execution?.continuation;
+    if (restorationBaseline) {
+      const source = worker;
+      worker = { key: source.key.replace(/\.a\d+$/, `.a${cursor.loop.attempt.number + 1}`), runId: null };
+      if (continuation?.attempt.restore?.producer.key !== source.key ||
+          (continuation.attempt.restore.producer.runId ?? null) !== (source.runId ?? null))
+        throw new Error("Execute restoration replay differs from its source producer.");
+      inFlight.delete(source.key);
+    }
+    const closedPacket = pendingClose && !pendingCloseReplay ? execution?.foldedContinuation : null;
+    if (pendingClose && !pendingCloseReplay && closedPacket?.attempt.number !== cursor.loop.attempt.number)
+      throw new Error(`Committed close continuation integrity mismatch: expected attempt ${cursor.loop.attempt.number}, observed ${closedPacket?.attempt.number ?? "missing"}.`);
+    if (closedPacket && closedPacket.attempt.number === cursor.loop.attempt.number) {
+      execution = { ...execution, checkpoint: closedPacket.attempt.checkpoint, worker: closedPacket.worker };
+      continuation = closedPacket;
+    }
+    if (closedReceipt || savedGate) worker = {
+      key: action.opKey.replace(/(?:\.g[23])?\.(close|gate)$/, ""), runId: execution?.worker?.reference.runId };
+    const workerPosition = workerLaunch || undispatchedWorker || closedReceipt || savedGate;
+    if ((workerLaunch || undispatchedWorker) && cursor.loop.attempt.number > 1 &&
+        !continuation && !execution?.foldedContinuation)
+      throw new Error("Execute worker continuation reference integrity mismatch.");
+    const prepared = selectionReplay || undispatchedWorker && operation === "selection" && !replayedBaseline ? groupedStep(receipt, "apply") : workerPosition ? {
+      selected: receipt.P.prompt.selectedTask, digest: cursor.backlogDigest,
+      view: replayedBaseline ? continuation?.view : pendingGate ? receipt.view : receipt.projection.view,
+    } : groupedStep(receipt, "prepare");
+    const preparedNumber = selectionReplay ? cursor.loop.number
+      : workerPosition ? execution?.checkpoint?.loop : receipt.P?.control.operation?.loop;
+    const directorPosition = cursor.loop?.phase === "director" && !cursor.loop.attempt &&
+      preparedNumber === cursor.loop.number;
+    const nextLoopPosition = cursor.loop?.outcome === "gaps" &&
+      preparedNumber === cursor.loop.number + 1 &&
+      cursor.budget.consumedLoops < cursor.budget.maxCycles;
+    if (!admission || canonicalDigest(admission.association) !== cursor.associationDigest ||
+        admission.admissionBinding !== cursor.admissionBinding ||
+        admission.association.maxCycles !== cursor.budget.maxCycles ||
+        receipt.storeId !== cursor.storeId || !(directorPosition || nextLoopPosition || workerPosition && preparedNumber === cursor.loop.number) ||
+        cursor.halt || cursor.hostHalt)
+      throw new Error("Execute replay lacks its bound admission and unimpeded director position.");
+    const requests = replayedBaseline ? continuation?.requests :
+      pendingGate ? { requests: [], next: null } : groupedStep(receipt, workerLaunch || closedReceipt || replayedClose ? "nextRequests" : "requests");
+    if ((requests.requests.length || requests.next !== null) && !receipt.P.prompt.transition && !selectionReplay)
+      throw new Error("Execute advance replay requires reconciliation of its committed request page.");
+    const { view, ...prepareReceipt } = prepared;
+    storeProjection = { head: receipt.head, P: receipt.P };
+    if (workerLaunch && !recoveringWorker && !reviewRecovery && inFlight.get(worker.key)?.runId === worker.runId)
+      inFlight.delete(worker.key);
+    const restoredLoop = { number: preparedNumber,
+      startedAt: committedLoopOpen(preparedNumber, receipt.P) ?? admission.startedAt, phase: "director",
+      cursor: 0, manifest: null, plan: null, attempt: null, results: [], recoveries: [], usage: [],
+      prepare: { stage: "receipt", receipt: prepareReceipt },
+      ...(!pendingGate && !replayedBaseline ? { advance: { key: receipt.P.control.operation.key, stage: "receipt", retry: 0,
+        admitted: true, receipt: receiptReference(receipt) } } : {}) };
+    const retryContext = retryDirector && receipt.retryDirector;
+    if (retryDirector) {
+      const { plan, rejection, requestObservation, ...context } = retryContext ?? {};
+      if (!same(receipt.head, cursor.head) || !text(rejection?.diagnostic) ||
+          (retryDirector.runId === null ? plan !== undefined :
+            plan?.ref?.key !== retryDirector.key || plan.ref.runId !== retryDirector.runId))
+        throw new Error("Director replay lacks its exact retry selection context.");
+      Object.assign(restoredLoop, context, { plan: plan ?? null, directorRetry: rejection });
+    }
+    if (selectionReplay) Object.assign(restoredLoop, {
+      plan: clone(execution.plan), usage: clone(execution.usage),
+      ...(execution.recoveries ? { recoveries: clone(execution.recoveries) } : {}),
+      ...(execution.checkpoint ? { initialCheckpoint: clone(execution.checkpoint) } : {}),
+      replayedSelection: receipt,
+    });
+    if (workerPosition) {
+      const checkpoint = execution?.checkpoint;
+      const intent = committedIntentReference(reviewRecovery ? {
+        seq: receipt.P.control.intent.seq, digest: receipt.P.control.intent.digest,
+      } : replayedBaseline ? receipt.intent : cursor.loop.attempt.intent, receipt.head);
+      if (checkpoint?.key !== worker.key || checkpoint.taskId !== cursor.loop.taskId ||
+          checkpoint.attempt !== cursor.loop.attempt.number + (restorationBaseline ? 1 : 0) ||
+          prepared.selected?.id !== checkpoint.taskId ||
+          !execution.plan?.ref || !undispatchedWorker && !restorationBaseline && (!execution.worker?.value ||
+          execution.worker.reference.key !== worker.key || execution.worker.reference.runId !== worker.runId))
+        throw new Error("Execute worker replay lacks its committed selection and intent.");
+      const { selected, completedTasks, ...selection } = prepared;
+      Object.assign(restoredLoop, {
+        usage: clone(execution.usage ?? []),
+        phase: "implementation", cursor: cursor.loop.cursor, kind: "task", task: selected,
+        taskBacklogDigest: prepared.digest, metricSeries: clone(selected.progress ?? { nonImproving: 0, last5: [] }),
+        manifest: [selected.id], plan: { ...execution.plan, stage: "admitted" },
+        selection: { stage: "receipt", receipt: { ...selection, selected: selected.id,
+          ...(!pendingGate && !replayedBaseline ? { groupedReference: receiptReference(receipt) } : {}) } },
+        attempt: { taskId: selected.id, index: cursor.loop.cursor, number: checkpoint.attempt, key: worker.key,
+          stage: undispatchedWorker || restorationBaseline ? "intention" : "launched", intent, checkpoint, baseline: checkpoint.baseline,
+          bindingKey: worker.key, timeoutMs: cursor.timeouts.workerMs,
+          ...(undispatchedWorker || restorationBaseline ? { undispatched: true, continuationRef: continuation?.attempt.continuationRef ?? null,
+            foldedBaseline: { checkpoint, intent } } : {
+          launch: { key: worker.key, agent: "pitako.worker", runId: worker.runId,
+            outputReference: execution.worker.reference.path },
+          received: { ok: true, agent: "pitako.worker", key: worker.key, runId: worker.runId,
+            structuredOutput: execution.worker.value } }),
+          ...(pendingGate ? { gate: { key: action.opKey, stage: "receipt", retry: 0,
+            ref: nativeReference(childKey, result),
+            receipt: Object.fromEntries(Object.entries(receipt).filter(([key]) => !["head", "P", "storeId"].includes(key))) } } :
+            recoveringWorker && execution.worker?.value.status === "complete" ? {
+              gate: { key: `${worker.key}.gate`, stage: "intention", retry: 0,
+                gateFloorMs: cursor.timeouts.gateFloorMs, task: {
+                  id: selected.id, gates: selected.gates.map(gate => ({ ...gate,
+                    timeoutMs: Math.max(gate.timeoutMs ?? 1800000, cursor.timeouts.gateFloorMs) })),
+                  metric: selected.metric ?? null,
+                  progress: clone(selected.progress ?? { nonImproving: 0, last5: [] }) } } } :
+            !recoveringWorker && !undispatchedWorker && !restorationBaseline ? { close: { key: childKey, stage: "receipt", retry: 0, admitted: true,
+            ref: nativeReference(childKey, result), receipt } } : {}) },
+      });
+      restoredLoop.plan.association = { ...admission.association, loop: preparedNumber };
+      delete restoredLoop.advance;
+      if (continuation) {
+        if (continuation.attempt.key !== worker.key || continuation.attempt.number !== checkpoint.attempt)
+          throw new Error("Execute worker continuation differs from its committed intent.");
+        restoredLoop.results = clone(continuation.results);
+        restoredLoop.recoveries = clone(continuation.recoveries);
+        restoredLoop.usage = clone(continuation.usage ?? execution.usage ?? []);
+        restoredLoop.metricSeries = clone(continuation.metricSeries);
+        restoredLoop.attempt = { ...clone(continuation.attempt), ...restoredLoop.attempt };
+        if (workerLaunch && !restorationBaseline) {
+          delete restoredLoop.attempt.undispatched;
+          if (restoredLoop.attempt.restore) delete restoredLoop.attempt.restore.undispatched;
+        }
+        if (continuation.attempt.revival) restoredLoop.attempt.revival = clone(continuation.attempt.revival);
+      }
+      if (interruptedWorker && undispatchedWorker && !restorationBaseline) {
+        restoredLoop.attempt.stage = "launched";
+        restoredLoop.attempt.launch = interruptedBaseline ?? { key: worker.key, agent: "pitako.worker" };
+        delete restoredLoop.attempt.undispatched;
+        if (restoredLoop.attempt.restore) delete restoredLoop.attempt.restore.undispatched;
+      }
+      if (savedGate) {
+        restoredLoop.metricSeries = clone(receipt.progress);
+        restoredLoop.attempt.boardPostIds = clone(receipt.boardPostIds);
+        restoredLoop.attempt.gate.task = clone(receipt.gateTask);
+      }
+      if (pendingGate && receipt.reviewContext) restoredLoop.attempt.delta = {
+        key: `${worker.key}.delta`, retry: 0, stage: "receipt", receipt: clone(receipt.reviewContext.delta),
+      };
+      if (reviewRecovery) {
+        restoredLoop.taskReviewCursor = clone(cursor.review);
+        restoredLoop.metricSeries = clone(receipt.progress);
+        const originals = execution.taskReviewRecovery?.originals;
+        if (!originals || originals.length !== reviewRefs.length) throw new Error("Missing recovered task review originals.");
+        restoredLoop.attempt.taskReview = {};
+        restoredLoop.analysisCalls = originals.map(({ reference, body }, index) => {
+          if (reference.key !== reviewRefs[index].key || reference.runId !== reviewRefs[index].runId ||
+              canonicalDigest(body) !== reference.digest ||
+              reviewedNative.has(reference.key) && reviewedNative.get(reference.key) !== reference.digest)
+            throw new Error("Task review recovery original integrity mismatch.");
+          restoredLoop.attempt.taskReview[index ? "synthesis" : "reviewer"] = clone(reference);
+          const original = { ok: true, key: reference.key, agent: "pitako.reviewer",
+            runId: reference.runId, structuredOutput: body, results: [{ savedOutputPath: reference.path }] };
+          analysisResults.set(reference.key, original);
+          return { key: reference.key, stage: "receipt", ref: nativeReference(reference.key, original) };
+        });
+        restoredLoop.attempt.reviewRecovered = true;
+        if (cursor.budget.consumedLoops === cursor.budget.maxCycles && originals.length === 2)
+          restoredLoop.replayedDrainAnchor = { head: clone(cursor.head), input: clone(cursor.action.input) };
+        restoredLoop.attempt.delta = { key: `${worker.key}.delta`, retry: 0, stage: "receipt",
+          receipt: clone(execution.taskReviewRecovery.delta) };
+        restoredLoop.attempt.recoveredRequests = clone(execution.taskReviewRecovery.requests);
+        restoredLoop.attempt.recoveryRef = nativeReference(childKey, result);
+        if (execution.taskReviewRecovery.baseline)
+          restoredLoop.attempt.foldedNextBaseline = clone(execution.taskReviewRecovery.baseline);
+        for (const drain of execution.taskReviewRecovery.drains ?? []) {
+          const slot = drain.key.slice(drain.key.lastIndexOf(".") + 1);
+          restoredLoop[slot] = { key: drain.key, retry: 0, stage: "receipt", receipt: clone(drain) };
+        }
+      }
+      if (pendingCloseReplay) {
+        const original = receipt.recoveredWorker;
+        if (original?.reference.key !== worker.key || original.reference.runId !== worker.runId)
+          throw new Error("Pending close worker original integrity mismatch.");
+        const id = `${original.reference.runId}:0`, reported = original.usage;
+        if (!restoredLoop.usage.some(value => value.id === id)) restoredLoop.usage.push({ id,
+          tokens: reported && ["input", "output", "cacheRead", "cacheWrite"].every(field =>
+            Number.isFinite(reported[field]) && reported[field] >= 0)
+            ? ["input", "output", "cacheRead", "cacheWrite"].reduce((total, field) => total + reported[field], 0) : null });
+        Object.assign(restoredLoop.attempt, { stage: "launched", launch: { key: worker.key,
+          agent: "pitako.worker", runId: worker.runId, outputReference: original.reference.path },
+          boardPostIds: view.posts.map(post => post.id),
+          received: { ok: true, agent: "pitako.worker", key: worker.key, runId: worker.runId,
+            structuredOutput: original.value } });
+        delete restoredLoop.attempt.undispatched;
+        delete restoredLoop.attempt.close;
+      }
+      if (pendingClose && !pendingCloseReplay) {
+        const gate = groupedStep(receipt, "gate");
+        gate.receipt = readTaskGateWire(gate.receipt, selected.gates, gate.workerOriginal);
+        restoredLoop.metricSeries = clone(gate.receipt.progress);
+        restoredLoop.attempt.gate = { key: `${worker.key}.gate`, stage: "receipt",
+          receipt: { ...gate.receipt, view: receipt.projection.view, contextPeak: gate.contextPeak } };
+        restoredLoop.attempt.close.input = { operation: "close", refs: { input: receipt.P.control.operation.input } };
+        if (closedPacket?.checkpoint.attempt === cursor.loop.attempt.number + 1) restoredLoop.attempt.foldedNextBaseline = {
+          checkpoint: clone(closedPacket.checkpoint), intent: clone(closedPacket.intent) };
+      }
+      const consumingOp = (pendingCloseReplay ? receipt.recoveredWorker.value : execution.worker?.value)?.status === "complete" ? "gate" : "close";
+      dispatchedAction = restorationBaseline ? undefined : recoveringWorker || pendingCloseReplay ? { kind: "pending", op: consumingOp,
+        opKey: `${worker.key}.${consumingOp}`, gateTimeoutMs: action.gateTimeoutMs,
+        ...(consumingOp === "gate" ? { gateTimeouts: prepared.selected.gates.map(gate => gate.timeoutMs ?? 1800000),
+          gateMetricMs: prepared.selected.metric ? 1800000 : 0 } : {}) }
+        : reviewRecovery ? clone(reviewAction)
+        : (interruptedWorker) && undispatchedWorker ? clone(action) : undefined;
+    }
+    const restoredFrame = continuation ? clone(continuation.taskFrame) :
+      { taskId: prepared.selected?.id, identities: [], evidence: [], operations: [], restorationKeys: [] };
+    if (reviewRecovery) {
+      const task = prepared.selected;
+      const carried = !!task.remaining?.length || (task.progress?.last5?.length ?? 0) > 0 ||
+        (task.progress?.nonImproving ?? 0) > 0;
+      restoredFrame.reviewProjections ??= {};
+      for (const { reference, body } of execution.taskReviewRecovery.originals) {
+        const projection = taskReviewProjection(body, reference, carried);
+        restoredFrame.reviewProjections[reference.key] = projection;
+        if (reference.key.endsWith(".task-synthesis")) {
+          if (!projection.admitted) restoredFrame.reviewRepair = {
+            ...(restoredFrame.reviewRepair?.attempt ? { attempt: restoredFrame.reviewRepair.attempt } : {}),
+            source: reference, exhausted: !!restoredFrame.reviewRepair?.attempt || projection.conflict };
+          const observed = clone(execution.taskReviewRecovery.seal);
+          const retainedSealer = cursor.inFlight.find(ref => ref.role === "checkpoint-sealer" &&
+            (ref.key === sealerKey(worker.key, 0) || ref.key.startsWith(`${worker.key}.seal.r`)));
+          if (!observed && !retainedSealer) continue;
+          if (!observed && retainedSealer.key !== retiredReviewSealer)
+            throw new Error("Task review sealer has no exact terminal observation; no replacement dispatch.");
+          const retry = retainedSealer ? Number(retainedSealer.key.match(/\.r(\d+)$/)?.[1] ?? 0) + 1 : 1;
+          restoredLoop.attempt.seal = { kind: projection.admitted ? "unit" : "pause", retry };
+          if (!observed) continue;
+          observed.kind ??= restoredLoop.attempt.seal.kind;
+          if (observed.kind !== restoredLoop.attempt.seal.kind)
+            throw new Error("Task review recovery seal differs from its original verdict.");
+          // A file is not settlement evidence for a retained native producer.
+          // Keep its intention so observePendingSealer checks activity before reuse.
+          if (!retainedSealer || retainedSealer.key === settledReviewSealer)
+            restoredLoop.attempt.recoveredSeal = { receipt: observed };
+        }
+      }
+    }
+    const restored = {
+      version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+      amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
+      taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
+      reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [
+        slot, { key: `pitako.review.${slot}`, model: cursor.models[slot] },
+      ])), timeouts: { values: clone(cursor.timeouts), since: null }, startedAt: admission.startedAt,
+      consumedLoops: cursor.budget.consumedLoops + (nextLoopPosition ? 1 : 0), ledger: receipt.P.control.ledger,
+      requestObservation: retryContext ? retryContext.requestObservation : receipt.P.control.requestObservation,
+      ...(selectionReplay ? { lastRequestReceipt: receiptReference(receipt) } : {}),
+      ...(receipt.reviewContext ? { requestObservation: receipt.reviewContext.requestObservation } : {}),
+      ...(reviewRecovery ? { requestObservation: execution.taskReviewRecovery.observation?.number ??
+        execution.taskReviewRecovery.requestObservation } : {}),
+      budgetRejectedKeys: cursor.budget.rejectedKeys.filter(digest => digest !== canonicalDigest(replayedKey ?? childKey)),
+      sealPending: null, recoverySeq: Math.max(0, ...restoredLoop.recoveries.map(recovery =>
+        Number(recovery.ref.key.match(/\.recover(\d+)$/)?.[1] ?? 0))), lastRecoveryRef: null,
+      ...(receipt.P.control.finishDrain?.key.startsWith(`${key}.l${restoredLoop.number}.finishDrain`) ? {
+        finishDrain: { ...clone(receipt.P.control.finishDrain), admitted: true, stage: "receipt" },
+      } : {}),
+      lastConfirmed: receipt.admittedPause?.checkpoint ?? continuation?.lastConfirmed ?? receipt.P.control.lastConfirmed,
+      ...(continuation ? { intentions: clone(continuation.intentions ?? []), lastRequestPage: clone(continuation.requests) } : {}),
+      usageTotals: receipt.P.preview.usage,
+      tasks: workerPosition ? { [prepared.selected.id]: continuation
+        ? clone(continuation.taskState) : { admitted: [], completed: null, last: null } } : {},
+      taskFrame: workerPosition ? restoredFrame : null, loop: restoredLoop,
+      ...(execution?.foldedContinuation && !closedPacket ? { foldedContinuation: execution.foldedContinuation } : {}),
+      ...(closedPacket ? { closedDrained: closedPacket.drained } : {}),
+      planRejections: receipt.P.preview.planRejections, closeReferences: receipt.P.preview.closeReferences,
+      loopSummaries: receipt.P.prompt.loopSummaries ?? receipt.P.preview.loopSummaries,
+      activePlan: null,
+      demandSources: receipt.P.prompt.demand?.sources ?? [],
+      demandObservations: receipt.P.prompt.demand?.observations ?? [],
+      root: cursor.root, epoch: cursor.epoch, head: receipt.head, storeId: receipt.storeId,
+      receiptReference: reviewRecovery ? execution.taskReviewRecovery.receiptReference :
+        replayedBaseline ? continuation.receiptReference ?? null :
+        pendingGate ? savedGate ? receiptReference(receipt.receiptReference) : null : receiptReference(receipt),
+      backlogDigest: prepared.digest, backlogPath: prepared.path ?? execution?.backlogPath,
+      boardTopicId: view.topicId, currentView: view,
+      excludedScope: Object.fromEntries((prepared.cancelledScope ?? []).map(task => [task.id, task])),
+      ...(nextLoopPosition && receipt.P.prompt.transition ? {
+         transitionReplay: { ...clone(receipt.P.prompt.transition), requests: clone(requests),
+          receipt: receiptReference(receipt), number: cursor.loop.number },
+      } : {}),
+    };
+    const demand = retryContext?.analysisCalls?.findLast(call =>
+      call.key.endsWith(".demand-observation") && call.stage === "receipt" && !call.barrier);
+    if (demand) {
+      const ref = demand.ref;
+      retainDemandObservation(restored, preparedNumber, nativeReference(ref.key, ref));
+    }
+    return restored;
+  });
+  });
+  });
+}
+function checkEpochProducers(timeoutAction) {
+  // The live map also includes producers admitted since the last cursor save.
+  const refs = [...inFlight.values()];
+  // Timeout receipts leave inFlight, but the bound producer can still expose a native barrier.
+  if (timeoutAction?.runId && !refs.some(ref => ref.runId === timeoutAction.runId))
+    refs.push(timeoutAction);
+  return refs.reduce((chain, ref) => chain.then(() => timeoutAction
+    ? observeReviewerTimeoutStatus(ref.runId) : observeStatus(ref.runId, true)).then(observed => {
+    if (timeoutAction?.runId === ref.runId)
+      checkReviewerTimeoutIdentity(observed, { ...ref, agent: "pitako.reviewer" });
+    const cause = (timeoutAction ? analysisBarrier : barrier)(observed, ref.runId);
+    if (cause) throw nativeBarrier(cause, ref);
+    if (observed?.runId !== ref.runId && !(observed?.runId === undefined && managementAnalysisState(observed, ref)) ||
+        observed.agent && observed.agent !== `pitako.${ref.role}` ||
+        !terminalAnalysis(observed, ref))
+      throw new Error(`Store epoch recovery awaits exact terminal producer evidence for ${ref.key}.`);
+  }), Promise.resolve());
+}
+function recoverStoreEpoch(error, cursor) {
+  if (!["store-corrupt", "cursor-ahead", "store-replaced"].includes(error.code) ||
+      !error.recovery?.storeId || error.recovery.root !== cursor.root) return false;
+  if (cursor.hostHalt || cursor.halt && !["recovery", "timeout", "worker-activity"].includes(cursor.halt.stage))
+    throw new Error("Store integrity failure at a retained terminal halt; no replay or dispatch.");
+  // The native inspection key is single-use, including when replay failed before admission completed.
+  const observation = error.epochAdmissionObservation ?? (admissionValidated
+    ? { version: config.preliminary.version, binding: invocation.admissionBinding, checkout: currentCandidate }
+    : inspectedEpochAdmission);
+  return beginStoreEpoch(cursor, observation);
+}
+function beginStoreEpoch(cursor, observation, timeoutAction) {
+  return checkEpochProducers(timeoutAction).then(() => {
+    recoveredEpochCursor = clone(cursor);
+    key = `invoke-${config.invocation}.e${cursor.epoch + 1}`;
+    inFlight.clear();
+    dispatchedAction = undefined;
+    storeProjection = undefined;
+    invocation = undefined;
+    activePlan = null;
+    loop = null;
+    replay = admissionValidated = false;
+    replayAdmissionObservation = observation;
+    checkpointObservation = undefined;
+    refreshedTimeoutAdmission = undefined;
+    return true;
+  });
+}
+while (true) {
+let retainedCursor;
 try {
   if (config.timeouts !== undefined && (!config.timeouts || typeof config.timeouts !== "object" ||
       Array.isArray(config.timeouts) || Object.entries(config.timeouts).some(([name, ms]) =>
         !["reviewerMs", "workerMs", "gateFloorMs"].includes(name) || !Number.isSafeInteger(ms) || ms < 1 || ms > 86400000)))
     return finish("blocked", "Expected timeouts {reviewerMs?, workerMs?, gateFloorMs?}: safe integers in 1..86400000, no unknown keys.");
-  if ((config.unblock !== undefined || config.resolution !== undefined) &&
-      (config.unblock !== true || !config.resolution ||
-        Object.keys(config.resolution).sort().join(",") !== "loop,text" ||
-        !Number.isSafeInteger(config.resolution.loop) || config.resolution.loop < 0 ||
-        !text(config.resolution.text) || config.resolution.text.includes("\0")))
-    return finish("blocked", "--unblock requires current human resolution: {loop, text}.");
+  for (const argument of ["unblock", "resolution"])
+    if (Object.hasOwn(config, argument)) return finish("blocked", `Unsupported execution argument: ${argument}.`);
   if (!text(config.missionId) || !text(config.missionPath) || !text(config.invocation))
     return finish("blocked", "Existing native missionId and actually returned missionPath are required.");
-  invocation = expandWorkerReferences(await state.get(key));
+  retainedCursor = recoveredEpochCursor ? null : await state.get(stateKey);
+  if (retainedCursor?.invocation === config.invocation) {
+    if (retainedCursor.version !== config.stateVersion)
+      return cursorDisposition(retainedCursor, "blocked", `Retained execution created by an incompatible Pitako contract v${retainedCursor.version}. No migration or replay is supported; retained unchanged.`);
+    validateExecuteCursor(stateKey, retainedCursor);
+    if (retainedCursor.root !== config.root)
+      return cursorDisposition(retainedCursor, "blocked", "Execute cursor belongs to the wrong cwd.");
+    if (retainedCursor.epoch > 0) key += `.e${retainedCursor.epoch}`;
+    if (retainedCursor.hostHalt) {
+      const { stage, reason, digest } = retainedCursor.hostHalt;
+      if (!matchesCursorRequest(retainedCursor) || config.verifiedHostHalt !== canonicalDigest(clone(retainedCursor)) ||
+          hostHaltCursor(retainedCursor, { stage, reason }).digest !== digest)
+        return cursorDisposition(retainedCursor, "blocked", "Retained host halt integrity failure; no replay or dispatch.");
+      return hostHaltDisposition(retainedCursor, hostHaltReport(retainedCursor.action, retainedCursor.hostHalt));
+    }
+    if (retainedCursor.action.kind === "terminal" && !retainedCursor.halt) {
+      if (!matchesCursorRequest(retainedCursor))
+        return cursorDisposition(retainedCursor, "blocked",
+          "Immutable mission/invocation/snapshot/worktree association changed; retained unchanged. Restore reliable exact bytes.");
+      try {
+        // A terminal result still depends on the admitted chain and frozen amendments.
+        const observed = await host(config.inspections[0]);
+        if (observed.error) throw new Error(`${observed.error}${observed.next ? ` ${observed.next}` : ""}`);
+        capture(observed);
+        if (observed.admission || observed.initialAdvance)
+          throw new Error("Terminal execute cursor unavailable to native admission.");
+      } catch (error) {
+        return cursorDisposition(retainedCursor, "blocked", String(error.message ?? error));
+      }
+      return cursorDisposition(retainedCursor, retainedCursor.loop.outcome === "complete" ? "complete" : "partial",
+        "Retained terminal execute disposition; no replay or dispatch.");
+    }
+    for (const ref of retainedCursor.inFlight) inFlight.set(ref.key, clone(ref));
+    try {
+      if (config.initialAdvance) {
+        const observation = await host(config.inspections[0]);
+        checkAdmissionBinding(observation);
+        if (observation.error || !same(observation.initialAdvance, config.initialAdvance) ||
+            !matchesCursorRequest(retainedCursor))
+          throw new Error(observation.error || "Initial advance preliminary/native replay integrity mismatch.");
+        await beginStoreEpoch(retainedCursor, observation,
+          retainedCursor.halt?.stage === "timeout" && reviewerTimeoutAction(retainedCursor.action)
+            ? retainedCursor.action : undefined);
+      } else invocation = await replayCursorAdmission(retainedCursor);
+      if (invocation?.pendingSelectionDrain) {
+        const pending = invocation.pendingSelectionDrain;
+        await persistState(stateKey, pending);
+        retainedCursor = pending;
+        invocation = await replayCursorAdmission(pending);
+      }
+    }
+    catch (error) {
+      if (error.hostHalt && (!retainedCursor.halt ||
+          retainedCursor.halt.stage === "timeout" && reviewerTimeoutAction(retainedCursor.action) &&
+          matchesCursorRequest(retainedCursor))) {
+        const held = { ...retainedCursor, hostHalt: hostHaltCursor(retainedCursor, error.hostHalt) };
+        await persistState(stateKey, held);
+        return hostHaltDisposition(held, hostHaltReport(held.action, held.hostHalt));
+      }
+      if (error.viewOverflowHalt && !retainedCursor.halt) {
+        const halt = error.viewOverflowHalt, { ref } = halt;
+        const held = { ...retainedCursor, halt: { stage: halt.code, digest: canonicalDigest(halt) },
+          inFlight: ref ? [...retainedCursor.inFlight.filter(item => item.key !== ref.key), { ...ref, role: "loop-io" }] : retainedCursor.inFlight };
+        await persistState(stateKey, held);
+        return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
+      }
+      if (error.nativeReference?.agent === "pitako.loop-io" && error.nativeReference.runId &&
+          retainedCursor.action.kind === "pending" && ["close", "drain", "gate"].includes(retainedCursor.action.op) &&
+          error.nativeReference.key.replace(/\.r\d+$/, "") === retainedCursor.action.opKey &&
+          ["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) && !retainedCursor.halt) {
+        const halt = loopIOHalt(error.nativeReference, error.nativeBarrier);
+        const held = { ...retainedCursor, halt: { stage: halt.code, digest: canonicalDigest(halt) },
+          inFlight: [...retainedCursor.inFlight.filter(item => item.key.replace(/\.r\d+$/, "") !== retainedCursor.action.opKey),
+            { key: halt.ref.key, runId: halt.ref.runId, role: "loop-io" }] };
+        await persistState(stateKey, held);
+        return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
+      }
+      if (error.settlementHalt && !retainedCursor.halt) {
+        const halt = settledNativeHalt(error.settlementHalt), { key, runId, agent } = halt.ref;
+        const held = { ...retainedCursor, halt: { stage: "native-settlement", digest: canonicalDigest(halt) },
+          inFlight: [...retainedCursor.inFlight.filter(item => item.key !== key),
+            { key, runId, role: agent.slice("pitako.".length) }] };
+        await persistState(stateKey, held);
+        return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
+      }
+      if (!await recoverStoreEpoch(error, retainedCursor)) {
+        return cursorDisposition(retainedCursor,
+          error.code === "superseded" ? "partial" :
+            ["stopped", "interrupted"].includes(error.nativeBarrier) ||
+              error.nativeBarrier && /\.task-(reviewer|synthesis)$/.test(error.nativeReference?.key ?? "") ? "cancelled" : "blocked",
+          String(error.message ?? error));
+      }
+    }
+  }
+  if (invocation?.retainedReviewHalt) {
+    const halt = invocation.retainedReviewHalt;
+    return { ...cursorDisposition(retainedCursor, halt.status, halt.reason), loopReport: { halt } };
+  }
+  if (invocation?.retainedGateHalt || invocation?.retainedAnalysisHalt)
+    return retainedTimeoutDisposition(retainedCursor, invocation.retainedGateHalt ?? invocation.retainedAnalysisHalt);
+  if (invocation?.retainedPlanImpediment) {
+    const { reason, halt, ref } = invocation.retainedPlanImpediment;
+    return { ...cursorDisposition(retainedCursor, "blocked", reason),
+      action: { actor: "evidence owner", operation: "resolve the concrete retained impediment; no replacement dispatch",
+        reason, references: [ref], started: false },
+      loopReport: { halt, pending: [{ reason, references: [ref] }] } };
+  }
+  if (invocation?.retainedSemanticHalt) {
+    const halt = invocation.retainedSemanticHalt;
+    const disposition = cursorDisposition(retainedCursor, halt.status, halt.reason);
+    const loopReport = { type: "execution-loop", invocation: retainedCursor.invocation,
+      loop: retainedCursor.loop.number, phase: retainedCursor.loop.phase, maxLoops: retainedCursor.budget.maxCycles,
+      status: halt.status, reason: halt.reason, halt, actionRequired: halt.reason,
+      next: "resolve observed impediment", pending: [{ reason: halt.reason, references: [invocation.ref] }] };
+    if (typeof emit === "function") emit(loopReport);
+    return { ...disposition, loopReport };
+  }
+  if (invocation?.retainedDispatchHalt || invocation?.retainedActivityHalt) {
+    const halt = invocation.retainedDispatchHalt ?? invocation.retainedActivityHalt;
+    return { ...cursorDisposition(retainedCursor, halt.status, halt.reason),
+      ...(halt.code === "spawn-budget" ? { action: { actor: "human", reason: halt.reason,
+        operation: "raise config.maxSubagentSpawnsPerRun or reduce the step's spawn demand, then start a new invocation",
+        references: [], started: false } } : {}),
+      loopReport: { halt, pending: [{ references: [halt.ref ?? invocation.ref].filter(Boolean) }] } };
+  }
+  if (invocation?.replayedDrain) return await finishFinalDrain(retainedCursor, invocation.replayedDrain);
+  if (invocation?.renewedGateHalt) {
+    const { cursor, halt } = invocation.renewedGateHalt;
+    await persistState(stateKey, cursor);
+    return retainedTimeoutDisposition(cursor, halt);
+  }
+  if (invocation && retainedCursor) invocation.lastBudgetProgress = retainedCursor.budget.lastProgress;
   // Incompatible retained state fails before any resume or dispatch.
   if (!Number.isSafeInteger(config.stateVersion)) return finish("blocked", "Missing resolved execute state contract version.");
   if (invocation && invocation.version !== config.stateVersion)
-    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${invocation.version}; start a new mission. No migration or replay is supported; retained unchanged.`);
+    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${invocation.version}. No migration or replay is supported; retained unchanged.`);
   activePlan = invocation?.activePlan;
   loop = invocation?.loop;
+  if (invocation?.transitionReplay) {
+    const replay = invocation.transitionReplay;
+    const nextLoop = loop;
+    loop = { number: replay.number, phase: "implementation", cursor: 0, archived: true,
+      outcome: "gaps", results: [], recoveries: [], usage: [],
+      ...(replay.drained ? { cancellation: { stage: "receipt", receipt: replay.drained } } : {}),
+      nextAdvance: { stage: "receipt", receipt: replay.receipt } };
+    invocation.loop = loop;
+    invocation.consumedLoops--;
+    invocation.tasks = replay.tasks;
+    invocation.requestObservation = replay.requestObservation + 1;
+    invocation.lastRequestReceipt = replay.receipt;
+    dispatchedAction = { kind: "pending", op: "advance", opKey: `${key}.l${loop.number}.nextAdvance` };
+    await admitRequests(replay.requests);
+    if (replay.drained) invocation.receiptReference = receiptReference(replay.drainedReference);
+    if (!invocation.currentView) delete nextLoop.advance;
+    invocation.tasks = {};
+    invocation.consumedLoops++;
+    loop = nextLoop;
+    invocation.loop = loop;
+    dispatchedAction = undefined;
+    delete invocation.transitionReplay;
+  }
+  if (invocation?.closedDrained) {
+    for (const body of invocation.closedDrained) compactSealedAttempts(body);
+    delete invocation.closedDrained;
+  }
+  if (invocation?.foldedContinuation) {
+    restoreCloseContinuation(invocation.foldedContinuation);
+    delete invocation.foldedContinuation;
+  }
   // Validate the stored request before even read-only reconstruction. Snapshot
   // equality is checked against the inspector below, never repaired from input.
   if (invocation?.association) {
@@ -3568,140 +6321,60 @@ try {
         !same(expected.sourceRefs ?? [], config.sourceRefs ?? []))
       return finish("blocked", "Immutable mission/invocation/worktree request changed; retained unchanged.");
   }
-  if (invocation?.hostHalt) {
-    hostHalt = invocation.hostHalt;
-    if (!same(hostHalt.request, hostRequest()))
-      return finish("blocked", "Retained host observation belongs to a different immutable request; retained unchanged.");
-  }
-  const legacy = await state.get("pitako-execution");
-  if (legacy && legacy.version !== config.stateVersion)
-    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${legacy.version}; start a new mission. No migration or replay is supported; retained unchanged.`);
-  if (legacy && (legacy.version !== invocation?.version || !same(legacy.association, invocation?.association) ||
-      legacy.association.invocation !== config.invocation))
-    return finish("blocked", "Native mission already belongs to another immutable invocation; no replacement writer dispatched.");
-  if (loop?.halt?.code === "state-capacity") return await (invocation.sealPending || invocation.intentions?.length
-    ? finishStateCapacity() : finish("blocked", loop.halt.reason, true));
+  if (dispatchedAction?.kind === "pending" && loop?.attempt?.received) await save();
+  if (retainedCursor?.action.kind === "launched" && retainedCursor.action.role === "reviewer" &&
+      retainedCursor.action.runId === null &&
+      retainedCursor.budget.rejectedKeys.includes(canonicalDigest(retainedCursor.action.key)))
+    retainedAnalysisDeadline = { key: retainedCursor.action.key, ms: retainedCursor.timeouts.reviewerMs };
   if (invocation?.association) await updateTimeouts();
-  if (!config.unblock && loop?.halt?.code === "repeat-acceptance")
-    return finish(loop.halt.status, loop.halt.reason);
-  let admissionObservation;
-  const resolvedHost = hostHalt && !["queued", "running", "pending"].includes(hostHalt.observedState) &&
-    (invocation.hostReconstruction?.stage === "admitted" && same(invocation.hostReconstruction.source, hostHalt) &&
-        !hostHalt.observedBarrier && hostHalt.status !== "cancelled" && !["stopped", "interrupted"].includes(hostHalt.observedState) ||
-      retainedResolutions().some(item => ["accepted", "applied"].includes(item.stage) &&
-        !item.failedHostObservation && same(item.hostHalt, hostHalt)));
-  // Operational input never clears a retained native/human/host barrier.
-  if (loop?.halt?.code === "timeout" && (!hostHalt || resolvedHost) &&
-      !retainedResolutions().some(item => item.currentBarrier)) {
-    if (resolvedHost) hostHalt = undefined;
+  let admissionObservation = replayAdmissionObservation;
+  let consumedCheckpointObservation = false;
+  if (loop?.halt?.code === "timeout") {
     if (["gate-transport", "final-acceptance"].includes(loop.halt.class)
       ? effectiveTimeouts().gateFloorMs > 0 : (loop.halt.class === "worker"
         ? effectiveTimeouts().workerMs : effectiveTimeouts().reviewerMs) > loop.halt.launchedMs) {
       // Verify resolve's retained originals before retirement changes their projection.
-      admissionObservation = await host(config.inspections[0]);
+      admissionObservation = replayAdmissionObservation ?? await host(config.inspections[0]);
       if (text(admissionObservation.error))
         throw new Error([admissionObservation.error, admissionObservation.next].filter(Boolean).join(" "));
       const captured = capture(admissionObservation);
       if (loop.halt.class === "worker") checkpointObservation = captured.metadata.checkpointObservation;
     }
     const workerRenewal = loop.halt.class === "worker";
-    await renewAnalysisTimeout();
+    const renewal = await renewAnalysisTimeout(retainedCursor);
+    if (renewal?.retainedReviewHalt) {
+      const halt = renewal.retainedReviewHalt;
+      return { ...cursorDisposition(retainedCursor, halt.status, halt.reason), loopReport: { halt } };
+    }
     await renewGateTimeout();
     await renewWorkerTimeout();
     if (loop.halt?.code === "timeout") return finish(loop.halt.status, loop.halt.reason);
-    if (workerRenewal) admissionObservation = undefined;
+    if (workerRenewal) consumedCheckpointObservation = true;
   }
-  if (!config.unblock && invocation?.lastBudgetProgress) {
-    if (loop?.halt) return finish(loop.halt.status, loop.halt.reason);
-    const blockedResolution = retainedResolutions().find(item => item.currentBarrier);
-    if (blockedResolution) return finish(["stopped", "interrupted"].includes(blockedResolution.currentBarrier.cause) ? "cancelled" : "blocked",
-      `Current continuation encountered a native barrier: ${blockedResolution.currentBarrier.cause}; this input does not authorize another interruption.`);
-    if (hostHalt && !resolvedHost) return finish(hostHalt.status, hostHalt.reason);
-  }
-  const sealBarrier = invocation?.sealPending && loop?.halt?.code === "native-barrier" &&
-    ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause);
-  if (sealBarrier && !config.unblock) return finish(loop.halt.status, loop.halt.reason);
-  if (invocation?.sealPending && !sealBarrier) await archiveSeal();
-  if (!config.unblock) {
-    // A durable human input survives technical replay without another flag.
-    // Matching its original observation does not settle subsequent intentions.
-    const retained = retainedResolutions();
-    if (retained.some(item => !same(item.request, hostRequest())))
-      return finish("blocked", "Retained continuation input association conflicts; retained unchanged.");
-    // Keep the latest disposition, including a later native barrier. Falling
-    // back to an older successful input could otherwise revive its authority.
-    resolution = retained.find(item => same(item.request, hostRequest()));
-  }
-  if (config.unblock) {
-    const existing = retainedResolutions().find(item => item.text === config.resolution.text && item.loop === config.resolution.loop);
-    const target = config.resolution.loop === 0 ? invocation : loop?.number === config.resolution.loop && !loop.archived ? loop : null;
-    if ((!target && !existing) || (!existing && (config.resolution.loop !== (loop?.number ?? 0) ||
-        !(hostHalt || loop?.halt || loop?.outcome === "blocked" || loop?.outcome === "cancelled"))))
-      return finish("blocked", "Current resolution must name the retained interrupted loop/request, not a new invocation or an unrelated loop.");
-    resolution = existing;
-    if (!resolution) {
-      resolution = { ...clone(config.resolution), request: hostRequest(), stage: "intention",
-        ...(loop?.halt ? { halt: clone(loop.halt) } : {}),
-        ...(hostHalt ? { hostHalt: clone(hostHalt) } : {}),
-        operations: [
-          ...(loop?.phase === "director" && loop.plan ? [clone(loop.plan.ref)] : []),
-          ...(loop?.attempt && (!loop.attempt.result || confirmedPausePending()) ? [clone(loop.attempt.launch ?? { key: loop.attempt.key })] : []),
-          ...(loop?.analysisCalls ?? []).map(call => clone(call.ref)),
-        ] };
-      (target.resolutions ??= []).push(resolution);
-      // Retain the actual input and original impediment before any observation.
-      await save();
-    }
-  }
-  if (resolution) {
-    if (!same(resolution.request, hostRequest()) || !["intention", "accepted", "applied"].includes(resolution.stage) ||
-        !Number.isSafeInteger(resolution.loop) || !text(resolution.text))
-      return finish("blocked", "Current resolution request association conflicts; retained unchanged.");
-    if (resolution.failedHostObservation) {
-      if (!hostHalt || !same(resolution.failedHostObservation, hostHalt))
-        return finish("blocked", "Later host observation conflicts with the retained continuation; retained unchanged.");
-      if (hostHalt.observedBarrier || hostHalt.status === "cancelled" ||
-          ["queued", "running", "pending", "stopped", "interrupted"].includes(hostHalt.observedState))
-        return finish("blocked", "This continuation encountered a native host barrier; new useful current input is required.");
-      // The old answer has no authority over this new operation. An unknown
-      // transport failure instead takes the same bounded pure reconstruction
-      // route as one without a human answer; retain both original observations.
-      resolution = undefined;
-    }
-    if (resolution && hostHalt && same(resolution.hostHalt, hostHalt)) {
-      if (["queued", "running", "pending"].includes(hostHalt.observedState))
-        return finish("blocked", "Retained host observation is positively pending; no replacement inspection.");
-      hostHalt = undefined;
-    }
-  }
-  if (hostHalt && !resolution) {
-    // A transport exception is not Stop or permission evidence. Reconstruct
-    // read-only state once, durably, without demanding redundant human input.
-    // This does not settle any retained writer, inspector or model intention.
-    if (hostHalt.observedBarrier || hostHalt.status === "cancelled" ||
-        ["queued", "running", "pending", "stopped", "interrupted"].includes(hostHalt.observedState))
-      return finish(hostHalt.status, `${hostHalt.reason} Retained native barrier requires reconciliation or current continuation input.`);
-    hostReconstruction = invocation.hostReconstruction;
-    if (hostReconstruction && (!same(hostReconstruction.source, hostHalt) || !["intention", "admitted"].includes(hostReconstruction.stage)))
-      return finish("blocked", `Bounded host reconstruction is unresolved or failed; retain the exact operation, no replacement inspection authorized. ${hostReconstruction.failure?.reason ?? ""}`);
-    // A committed intention has no admitted observation yet. Only the fixed
-    // pure inspection/capture projections below may repeat: this is neither
-    // reattachment nor evidence that an earlier host call or writer settled.
-    // Pending model queries and modifying operations keep their own barriers.
-    if (!hostReconstruction) {
-      hostReconstruction = invocation.hostReconstruction = { source: clone(hostHalt), stage: "intention" };
-      await save();
-    }
-    hostHalt = undefined;
-  }
-  if (hostHalt) return finish("blocked", hostHalt.reason);
-  const current = admissionObservation ?? await host(config.inspections[0]);
+  if (invocation?.lastBudgetProgress && loop?.halt) return finish(loop.halt.status, loop.halt.reason, true);
+  if (invocation?.sealPending && !loop?.halt) await archiveSeal();
+  const recoveredReviewCheckout = invocation?.reviewReplayCheckout;
+  const current = recoveredReviewCheckout ? { checkout: recoveredReviewCheckout } :
+    admissionObservation ?? await host(config.inspections[0]);
   if (text(current.error)) throw new Error([current.error, current.next].filter(Boolean).join(" "));
-  const captured = capture(current);
+  const captured = recoveredReviewCheckout ? { metadata: { root: invocation.association.root,
+    commonDir: invocation.association.commonDir,
+    selected: { source: invocation.association.source, digest: invocation.association.digest } } } :
+    capture(current, invocation?.replayedFinalGate || invocation?.replayedEarlyDemand
+      ? { ...config, preliminaryStoreFailure: undefined } : undefined);
   let metadata = captured.metadata;
+  if (!invocation && current.initialAdvance) {
+    const { restored, receipt } = await replayInitialAdvance(current.initialAdvance, recoveredEpochCursor);
+    invocation = restored;
+    loop = invocation.loop;
+    if (recoveredEpochCursor) {
+      // The projection already includes the committed observation number.
+      invocation.lastRequestReceipt = invocation.receiptReference;
+      await admitRequests(groupedStep(receipt, "requests"));
+    } else await save();
+  }
   if (!invocation?.association) {
-    const requestState = invocation;
-    const admitted = current.admission ?? {};
+    const admitted = recoveredEpochCursor ? { maxCycles: recoveredEpochCursor.budget.maxCycles } : current.admission ?? {};
     if (text(admitted.error)) throw new Error(admitted.error);
     if (!Number.isSafeInteger(admitted.maxCycles) || admitted.maxCycles < 1)
       throw new Error("Invalid pitako.execute.maxCycles admission receipt.");
@@ -3735,11 +6408,23 @@ try {
       admissionBinding: current.binding, amendments: clone(config.amendments ?? []), startedAt: Date.now(), consumedLoops: 0, ledger: { count: 0, head: null }, sealPending: null,
       recoverySeq: 0, lastRecoveryRef: null, lastConfirmed: null, usageTotals: { tokens: 0, known: 0, unknown: 0 },
       tasks: {}, taskFrame: null, loop: null,
-      planRejections: [], closeReferences: [], loopSummaries: [], lastClosedResolution: null, activePlan: null,
-      ...(requestState?.hostHalt ? { hostHalt: requestState.hostHalt } : {}),
-      ...(requestState?.resolutions ? { resolutions: requestState.resolutions } : {}),
-      ...(requestState?.hostReconstruction ? { hostReconstruction: requestState.hostReconstruction } : {}),
+      planRejections: [], closeReferences: [], loopSummaries: [], activePlan: null,
     };
+    if (recoveredEpochCursor) {
+      const cursor = recoveredEpochCursor;
+      invocation.association.maxCycles = cursor.budget.maxCycles;
+      if (canonicalDigest(invocation.association) !== cursor.associationDigest ||
+          invocation.admissionBinding !== cursor.admissionBinding)
+        throw new Error("Store epoch recovery immutable admission integrity mismatch.");
+      invocation.epoch = cursor.epoch + 1;
+      invocation.consumedLoops = cursor.budget.consumedLoops;
+      invocation.budgetRejectedKeys = clone(cursor.budget.rejectedKeys);
+      invocation.timeouts = { values: clone(cursor.timeouts), since: null };
+      invocation.taskReviewer = cursor.models.taskReviewer;
+      invocation.taskSynthesis = cursor.models.taskSynthesis;
+      invocation.reviewModels = Object.fromEntries(["r1", "r2", "synthesis"].map(slot =>
+        [slot, { key: `pitako.review.${slot}`, model: cursor.models[slot] }]));
+    }
     if (metadata.root !== config.root) throw new Error("Designated worktree mismatch.");
     await updateTimeouts();
     await save();
@@ -3761,20 +6446,8 @@ try {
     invocation.activePlan = null;
   }
   admissionValidated = true;
-  if (!legacy) {
-    try { await persistState("pitako-execution", { version: invocation.version, association: invocation.association }); }
-    catch (error) { persistenceFailed = true; throw new Error(`Essential persistence failed; dispatch halted: ${String(error)}`); }
-  }
-  if (hostReconstruction?.stage === "intention") {
-    hostReconstruction.observation = {
-      ref: clone(references.filter(ref => ref.key === config.inspections[0].key).at(-1) ?? { key: config.inspections[0].key }),
-      candidate: candidate(current.checkout), source: metadata.selected.source, digest: metadata.selected.digest,
-    };
-    hostReconstruction.stage = "admitted";
-    await save();
-  }
   inspectedAnalyses = metadata.retainedAnalyses ?? [];
-  checkpointObservation = metadata.checkpointObservation;
+  checkpointObservation = consumedCheckpointObservation ? undefined : metadata.checkpointObservation;
   currentCandidate = candidate(current.checkout);
   loop = invocation.loop;
   // Older readers promoted a saved non-blocked pause into a human impediment.
@@ -3786,121 +6459,13 @@ try {
     delete loop.outcome;
     await save();
   }
-  if (resolution?.currentBarrier)
-    return finish(["stopped", "interrupted"].includes(resolution.currentBarrier.cause) ? "cancelled" : "blocked",
-      `Current continuation encountered a native barrier: ${resolution.currentBarrier.cause}; this input does not authorize another interruption.`);
-  if (resolution && resolution.loop !== loop?.number && loop?.halt?.code === "native-barrier" &&
-      ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause))
-    return finish(loop.halt.status, loop.halt.reason);
-  if (resolution?.stage === "intention") {
-    resolution.stage = "accepted";
-    await save();
-  }
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived && !confirmedPausePending())
-    await reconcileRetainedRecoveries();
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
-      loop.halt?.code === "native-barrier" && (!confirmedPausePending() ||
-        invocation.sealPending && loop.halt.ref?.agent === "pitako.execution-ledger" ||
-        loop.halt.ref?.agent === "pitako.loop-io") &&
-      ["stopped", "interrupted", "native permission denial"].includes(loop.halt.cause))
-    await reconcileInterruptedOperations();
-  if (invocation.sealPending && !loop?.halt) await archiveSeal();
-  // A cut after accepting input must still drain that exact queue before restoration.
-  if (["accepted", "applied"].includes(resolution?.stage) && !loop?.halt) {
-    for (const owner of [invocation, loop, loop?.attempt ?? {}]) {
-      for (const [slot, pending] of Object.entries(owner ?? {})) {
-        if (pending?.input?.operation === "drain" && !pending.admitted && text(pending.reconciled) &&
-            pending.reconciled === resolution.halt?.ref?.key)
-          await groupedIO(slot, pending.input, owner);
-      }
-    }
-  }
-  if (resolution?.stage === "accepted" && (resolution.loop === 0 || resolution.loop === loop?.number && !loop.archived) && resolution.hostHalt && !loop?.halt) {
-    // The bounded reconstruction is applied, not a claim that a historical
-    // host receipt or a later writer has settled.
-    resolution.stage = "applied";
-    await save();
-  }
-  // Only an admitted cooperative pause with pending work consumes current input.
-  // A checkpoint alone does not resolve an unrelated semantic/product impediment.
-  const paused = loop?.attempt?.stage === "result" && loop.attempt.result;
-  const resolvedSealPause = !invocation.sealPending && !loop?.halt &&
-    ["pitako.execution-ledger", "pitako.loop-io"].includes(resolution?.halt?.ref?.agent) && resolution.observations?.length;
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived && confirmedPausePending() &&
-      (resolvedSealPause || same(resolution.halt, loop.halt) && (loop.halt?.code === "semantic-block" ||
-        (loop.halt?.code === "native-barrier" && ["stopped", "interrupted"].includes(loop.halt.cause))))) {
-    const ref = loop.attempt.launch ?? paused.ref;
-    resolution.stage = "applied";
-    let observed;
-    try {
-      observed = await observeStatus(ref.runId ?? ref.key, true);
-      assertFallbackProducer(observed, ref);
-    } catch (error) {
-      if (error.nativeBarrier) {
-        resolution.currentBarrier = { cause: error.nativeBarrier, ref: clone(ref) };
-        loop.halt = { status: ["stopped", "interrupted"].includes(error.nativeBarrier) ? "cancelled" : "blocked",
-          code: "native-barrier", cause: error.nativeBarrier, reason: String(error.message), ref: clone(ref) };
-      }
-      throw error;
-    }
-    delete loop.halt;
-    delete loop.outcome;
-    // Admission and the exact restoration intention share one essential save.
-    await checkpointFallback(observed, ref, { id: paused.taskId });
-  }
-  // A write-free worker block has no pause to restore. Current input answering
-  // that exact block continues the same task in this loop with a fresh attempt.
-  // Restoring attempts are excluded: their capturedPaths counts only their own
-  // journal, and a blocked restorer may hold unreceipted restored bytes.
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
-      writeFreeWorkerBlock() && same(resolution.halt, loop.halt)) {
-    resolution.stage = "applied";
-    loop.attempt.humanContinuation = { loop: resolution.loop, halt: clone(resolution.halt) };
-    delete loop.halt;
-    delete loop.outcome;
-    await save();
-  }
   // Recover the old result-committed/outcome-not-committed cut before plan recovery.
   if (loop?.attempt?.stage === "result" && loop.attempt.result?.status === "blocked" &&
-      !loop.attempt.humanContinuation && (!loop.halt || loop.halt.code === "semantic-block"))
+      (!loop.halt || loop.halt.code === "semantic-block"))
     retainWorkerBlock(loop.attempt.result);
-  // Historical read-only parser rejection is re-evaluated from exact originals,
-  // not a new authorization or an extra implementation slot.
-  if (loop?.halt?.code === "semantic-block" && ["review", "compliance"].includes(loop.phase)) {
-    delete loop.halt;
-    delete loop.outcome;
-    await save();
-  }
-  // After the human returns the files to their journaled bytes, current input
-  // clears the integrity halt; replay re-seals under the next sealer key.
-  if (resolution?.stage === "accepted" && resolution.loop === loop?.number && !loop.archived &&
-      loop.halt?.code === "checkpoint-integrity" && same(resolution.halt, loop.halt)) {
-    resolution.stage = "applied";
-    delete loop.halt;
-    delete loop.outcome;
-    await save();
-  }
-  if (loop?.halt?.code === "needs-decision") {
-    if (resolution?.stage !== "accepted" || resolution.loop !== loop.number || !same(resolution.halt, loop.halt))
-      return finish(loop.halt.status, loop.halt.reason);
-    resolution.stage = "applied";
-    delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
-    invocation.currentView = null; activePlan = null;
-    await save();
-  }
-  if (loop?.halt?.code === "repeat-acceptance") {
-    if (resolution?.stage !== "accepted" || resolution.loop !== loop.number || !same(resolution.halt, loop.halt))
-      return finish(loop.halt.status, loop.halt.reason);
-    resolution.stage = "applied";
-    delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
-    invocation.currentView = null; activePlan = null;
-    invocation.freshAcceptanceAuthorized = true;
-    await save();
-  }
-  if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity", "task-review-model"].includes(loop?.halt?.code))
-    return finish(loop.halt.status, loop.halt.reason);
-  // A prior barrier is not a historical universal hold. Recovery re-observes the
-  // exact writer or analysis producer before any further external dispatch.
+  if (["capacity", "native-dispatch", "semantic-block", "checkpoint-integrity", "task-review-model",
+      "needs-decision", "repeat-acceptance"].includes(loop?.halt?.code))
+    return finish(loop.halt.status, loop.halt.reason, true);
   // A completed verdict is reusable only for the same closing candidate.
   if (loop?.outcome === "complete" && same(loop.closing?.candidate, currentCandidate))
     return finish("complete", "Whole-spec fulfillment, mandatory checks and review remain bound to this candidate. No more loops required.");
@@ -3910,7 +6475,7 @@ try {
     await save();
   }
   if (loop?.halt?.code === "native-barrier" &&
-      !["stopped", "native permission denial"].includes(loop.halt.cause) && loop.attempt && !loop.attempt.result) {
+      ["running", "queued", "pending"].includes(loop.halt.cause) && loop.attempt && !loop.attempt.result) {
     // Re-observe retained activity, not an automatic effect. Historical activity
     // is not a recorded user Stop or proof that its successor is still pending.
     loop.attempt.interruption ??= clone(loop.halt);
@@ -3918,24 +6483,15 @@ try {
     delete loop.outcome;
     await save();
   }
-  if (!["review", "compliance"].includes(loop?.phase) && loop?.halt?.code === "native-barrier" &&
-      ["stopped", "native permission denial"].includes(loop.halt.cause))
-    return finish(loop.halt.status, loop.halt.reason);
+  if (loop?.halt?.code === "native-barrier")
+    return finish(loop.halt.status, loop.halt.reason, true);
   if (loop?.outcome === "blocked" || loop?.outcome === "cancelled")
-    return finish(loop.outcome, "Retained native/decision impediment requires explicit resolution; slots are not renewed.");
-  if (loop?.halt?.code === "backlog-conflict") {
-    loop.plan.rejection = { diagnostic: loop.halt.reason, ref: clone(loop.plan.ref) };
-    delete loop.halt; loop.outcome = "gaps"; loop.endedAt = Date.now();
-    invocation.currentView = null; activePlan = null;
-    await save();
-  }
+    return finish(loop.outcome, "Retained impediment; continue only in a new invocation.", true);
   // A technical halt raised before any director plan or writer names no retained
   // producer: replay re-runs the same retained pre-director intention, which
   // re-halts if its cause persists. Discharge it durably before that dispatch so
   // no later writer launches under a stale halt the checkpoint hook refuses.
   if (loop?.halt?.code === "recovery" && loop.phase === "director" && !loop.plan && !loop.attempt && !loop.archived) {
-    if (resolution?.stage === "accepted" && resolution.loop === loop.number && same(resolution.halt, loop.halt))
-      resolution.stage = "applied";
     delete loop.halt;
     await save();
   }
@@ -3949,16 +6505,17 @@ try {
       if (loop.halt) return finish(loop.halt.status, loop.halt.reason);
     }
     if (!loop || loop.outcome) {
-      if (invocation.consumedLoops >= maxCycles()) return finish("partial", `${maxCycles()} authorized loops consumed; remaining work requires new human authorization.`);
+      if (invocation.consumedLoops >= maxCycles()) return await finish("partial", `${maxCycles()} authorized loops consumed; remaining work requires new human authorization.`);
 
       activePlan = null;
       const prepared = invocation.currentView && (invocation.preparedNext ?? loop?.prepare);
-      loop = { ...(prepared ? { prepare: clone(prepared) } : {}), number: invocation.consumedLoops + 1, startedAt: Date.now(), phase: "director",
+      const number = invocation.consumedLoops + 1;
+      loop = { ...(prepared ? { prepare: clone(prepared) } : {}), number,
+        startedAt: committedLoopOpen(number) ?? Date.now(), phase: "director",
         cursor: 0, manifest: null, plan: null, attempt: null, results: [], recoveries: [], usage: [] };
       invocation.loop = loop;
       delete invocation.preparedNext;
       invocation.consumedLoops++;
-      resolution = undefined;
       invocation.tasks = {};
       invocation.taskFrame = null;
       // Slot is consumed durably BEFORE calling a fresh read-only director.
@@ -3969,7 +6526,9 @@ try {
         await advanceLoop();
       }
       const directorKey = `${key}.l${loop.number}.director${loop.directorRetry ? ".d1" : ""}`;
-      if (!loop.plan || budgetRejected(directorKey)) {
+      const replayedSelection = loop.replayedSelection;
+      const replayedFailure = loop.replayedSelectionFailure;
+      if (!replayedSelection && !replayedFailure && (!loop.plan || budgetRejected(directorKey))) {
         const observation = loop.directorRetry ? null : await observeDemands();
         loop.plan = { stage: "intention", ref: { key: directorKey } };
         await save();
@@ -3986,7 +6545,7 @@ inheriting questioned expansions. No ceremonial response to each observation is 
 READ-ONLY BACKLOG SELECTION ONLY. Do not delegate, implement, run checks/review or supervise execution.
 Read the complete backlog at ${invocation.backlogPath} (if absent, derive it from the full spec).
 CURRENT BACKLOG DIGEST: ${JSON.stringify(invocation.backlogDigest)}
-CURRENT BOARD VIEW: ${JSON.stringify(invocation.currentView)}
+CURRENT BOARD VIEW: ${canonicalJSON(invocation.currentView)}
 ${loop.directorRetry ? `PREVIOUS SELECTION REJECTED: ${loop.directorRetry.diagnostic}\nCorrect the validation error and publish one replacement selection.` : ""}
 Return exactly {select, changes, reason}: select the single most important pending task whose dependencies are done.
 Changes are keyed add | split | obsolete | update operations, each with a reason; first creation uses only add.
@@ -3998,7 +6557,7 @@ Alternatively, split with a reason obsoletes the stalled parent and creates new 
 loop-io apply rejects unchanged re-selection as gaps: "stalled task re-selected without a changed definition".
 Each stall increments progress.stalls and records the definition digest and diagnosis in history; todo rows show stalls N/2.
 The second stall of the same task ID halts needs-decision for the human with task ID, metric series and both stall diagnoses.
-The human edits the backlog or delivers an amendment, then relaunches or unblocks through existing routes.
+The human edits the backlog or delivers an amendment, then posts the ruling as Board HUMAN and starts a new invocation on the same worktree and backlog.
 New and updated tasks require a non-empty title of at most 80 characters; legacy titles fall back to the ID for display. New tasks follow the supplied backlog task schema. Gates are focused commands, not the complete suite.
 Tasks needing multiple attempts declare a numeric metric {command, unit, target}.
 Never reuse IDs or reopen done/obsolete tasks. Reconcile changed spec/amendment authority with reasons.
@@ -4014,7 +6573,7 @@ Do not run the acceptance commands; the final phase runs them.
 Publish one selection with the native output binding then END. Native permissions and Stop apply.`,
           planSchema);
         loop.plan = { ...projection(directorKey, result), stage: "published" };
-        if (barrier(result)) throw nativeBarrier(barrier(result));
+        if (barrier(result)) throw nativeBarrier(barrier(result), loop.plan.ref, result);
         // Publication and admission are separate durable cuts.
         await save();
         if (!result?.ok && !text(result?.runId))
@@ -4023,14 +6582,8 @@ Publish one selection with the native output binding then END. Native permission
         if (!activePlan && !(await recoverPlan()))
           throw new Error("No authoritative complete new backlog selection survives.");
         planAuthority(activePlan, result?.structuredOutput ? result : undefined);
-        // Some boundaries return complete binding content as output; never parse
-        // file-only previews or use them as an alternate task definition.
-        if (text(result.output) && /^[\s]*\{/.test(result.output)) {
-          let binding;
-          try { binding = JSON.parse(result.output); } catch (_) { planConflict("Invalid complete backlog selection binding JSON."); }
-          if (!same(binding, activePlan)) planConflict("Changed/conflicting backlog selection binding.");
-        }
-      } else if (!loop.task || replay) {
+        if (!result?.structuredOutput) planAuthority(activePlan, result);
+      } else if (!replayedSelection && !replayedFailure && (!loop.task || replay)) {
         replay = false;
         if (!await recoverPlan()) {
           if (loop.plan.ok === false) throw new Error("No authoritative complete new backlog selection survives.");
@@ -4039,14 +6592,38 @@ Publish one selection with the native output binding then END. Native permission
           continue;
         }
       }
-      planAuthority(activePlan);
-      validatePlan(activePlan);
+      if (!replayedSelection && !replayedFailure) {
+        planAuthority(activePlan);
+        validatePlan(activePlan);
+      }
       let applied;
+      let rejectionArchive;
+      let transport;
       try {
+        if (replayedFailure) {
+          delete loop.replayedSelectionFailure;
+          throw Object.assign(new Error(replayedFailure.reason), {
+            selectionRejected: true, replayRejected: replayedFailure.replayRejected,
+          });
+        }
         if (loop.selection?.stage === "receipt") assertSelection();
-        if (text(activePlan.select)) loop.initialCheckpoint ??= checkpointIntent(activePlan.select, 1, `${key}.l${loop.number}.t1.a1`);
-        await save();
-        const transport = await groupedIO(`selectionIO${loop.directorRetry ? ".d1" : ""}`, { operation: "selection",
+        if (!replayedSelection && text(activePlan.select))
+          loop.initialCheckpoint ??= checkpointIntent(activePlan.select, 1, `${key}.l${loop.number}.t1.a1`);
+        if (!replayedSelection) await save();
+        // On the last budgeted loop, selection may be the last writer before the drain.
+        if (!replayedSelection && invocation.consumedLoops >= maxCycles()) {
+          const generation = invocation.finishDrain?.admitted ? (invocation.finishDrain.generation ?? 0) + 1 : 0;
+          const archive = loopArchive();
+          rejectionArchive = { ...archive, key: `${key}.l${loop.number}.finishDrain${generation ? `.v${generation}` : ""}`,
+            ...(archive.expected.count === 0 ? { spec: { content: config.preliminary.content,
+              digest: invocation.association.digest } } : {}),
+            ...(loop.directorRetry ? { previous: archiveProjection(loop.directorRetry) } : {}) };
+        }
+        transport = replayedSelection ?? await groupedIO(`selectionIO${loop.directorRetry ? ".d1" : ""}`, { operation: "selection",
+          ...(committedLoopOpen(loop.number) === undefined ? { loopStartedAt: loop.startedAt } : {}),
+          plan: clone(loop.plan), usage: clone(loop.usage),
+          ...(loop.recoveries.length ? { recoveries: clone(loop.recoveries) } : {}),
+          ...(rejectionArchive ? { rejectionArchive } : {}),
           apply: { root: config.root, specId: config.id, expectedDigest: invocation.backlogDigest,
             key: `${key}.l${loop.number}.selection${loop.directorRetry ? ".d1" : ""}`,
             invocation: config.invocation, loop: loop.number, authority: backlogAuthority(), director: activePlan },
@@ -4056,13 +6633,14 @@ Publish one selection with the native output binding then END. Native permission
         loop.task = selected; loop.taskBacklogDigest = applied.digest;
         loop.selection = { stage: "receipt", receipt: { ...receipt, selected: selected?.id ?? null,
           ...(!selected ? { completedTasks } : {}), groupedReference: receiptReference(transport) } };
-        await save();
+        if (!replayedSelection) await save();
         if (loop.initialCheckpoint) loop.selectionBaseline = groupedStep(transport, "baseline");
         loop.selectionRequests = { reference: receiptReference(transport), page: groupedStep(transport, "requests") };
       } catch (error) {
         const diagnostic = String(error?.message ?? error);
         if (!error.selectionRejected || error.backlogConflict) throw error;
-        if (!loop.directorRetry && !error.replayRejected) {
+        inFlight.delete(loop.plan.ref.key);
+        if (!loop.directorRetry && !error.replayRejected && !loop.plan.ref.key.endsWith(".d1")) {
           loop.directorRetry = { diagnostic: diagnostic.slice(0, 2000), rejectedRef: clone(loop.plan.ref) };
           loop.plan = null; delete loop.selection; delete loop.initialCheckpoint; activePlan = null;
           await save(); continue;
@@ -4070,8 +6648,22 @@ Publish one selection with the native output binding then END. Native permission
         loop.plan.stage = "rejected"; loop.plan.rejection = { diagnostic, ref: clone(loop.plan.ref),
           ...(loop.directorRetry ? { previous: clone(loop.directorRetry) } : {}) };
         loop.outcome = "gaps"; loop.endedAt = Date.now(); activePlan = null; invocation.currentView = null;
+        if (rejectionArchive) {
+          const saved = error.rejectedDrain;
+          if (saved?.storeId !== invocation.storeId || saved.head?.seq <= invocation.head.seq)
+            throw new Error("Final selection rejection lacks its committed drain.");
+          const input = committedIntentReference({ seq: saved.head?.seq, digest: saved.head?.hash }, saved.head);
+          invocation.head = clone(saved.head);
+          const opKey = rejectionArchive.key;
+          invocation.finishDrain = { key: opKey, retry: 0, stage: "intention" };
+          dispatchedAction = { kind: "pending", op: "drain", opKey, input };
+          const receipt = await loopIO("finishDrain", finalDrainInput(executeCursor()), invocation);
+          const cursor = executeCursor();
+          return await finishFinalDrain(cursor, admitFinalDrain(cursor, receipt, null));
+        }
         await save(); loopReport("gaps", diagnostic); continue;
       }
+      inFlight.delete(loop.plan.ref.key);
       invocation.backlogDigest = applied.digest;
       invocation.excludedScope = Object.fromEntries((applied.cancelledScope ?? []).map(task => [task.id, task]));
       invocation.currentView = applied.view; invocation.boardTopicId = applied.view.topicId;
@@ -4089,7 +6681,13 @@ Publish one selection with the native output binding then END. Native permission
       loop.manifest = applied.selected ? [applied.selected.id] : [];
       invocation.tasks = Object.fromEntries(loop.manifest.map(id => [id, { admitted: [], completed: null, last: null }]));
       loop.plan.association = association(loop.number); loop.plan.stage = "admitted";
+      if (loop.initialCheckpoint) loop.initialCheckpoint = admitBaseline(loop.initialCheckpoint, loop.selectionBaseline,
+        transport.head);
+      delete loop.selectionBaseline;
+      delete loop.replayedSelection;
       loop.phase = "implementation";
+      // The committed selection already carries the final-loop director binding.
+      if (replayedSelection && loop.kind === "final") replay = false;
       // Full views remain replayable until this selection-admission save.
       for (const slot of ["prepare", "selection"]) {
         const receipt = loop[slot]?.receipt;
@@ -4097,11 +6695,19 @@ Publish one selection with the native output binding then END. Native permission
           viewDigest: receipt.viewDigest, viewBytes: receipt.viewBytes };
       }
       activePlan = null;
-      await save();
-      await observeGroupedRequests(loop.selectionRequests.reference, false, loop.selectionRequests.page);
+      if (replayedSelection?.selectionCancellation) {
+        const saved = replayedSelection.selectionCancellation;
+        invocation.requestObservation = saved.number;
+        invocation.backlogDigest = saved.backlogDigest;
+        invocation.receiptReference = receiptReference(saved.receipt);
+        invocation.excludedScope = Object.fromEntries(saved.cancelledScope.map(task => [task.id, task]));
+        invocation.tasks[loop.task.id].cancel = clone(invocation.excludedScope[loop.task.id].cancel);
+        await save();
+      } else {
+        await save();
+        await observeGroupedRequests(loop.selectionRequests.reference, false, loop.selectionRequests.page);
+      }
       delete loop.selectionRequests;
-      if (loop.initialCheckpoint) loop.initialCheckpoint = admitBaseline(loop.initialCheckpoint, loop.selectionBaseline);
-      delete loop.selectionBaseline;
       for (const slot of ["selectionIO", "selectionIO.d1"]) if (loop[slot]?.stage === "receipt") {
         loop[slot].receipt = receiptReference(loop[slot].receipt); delete loop[slot].input;
       }
@@ -4118,7 +6724,7 @@ Publish one selection with the native output binding then END. Native permission
         assertFallbackProducer(attemptObservation, ref);
       }
       // On recovery compare original full values/binding before another edit.
-      if (loop.kind === "task" && !loop.task || replay) {
+      if (loop.kind === "task" && !loop.task || replay && loop.finalAttempt?.gate?.stage !== "receipt") {
         replay = false;
         if (!await recoverPlan()) {
           loop.outcome = "gaps"; loop.endedAt = Date.now(); await save();
@@ -4141,41 +6747,13 @@ Publish one selection with the native output binding then END. Native permission
         if (loop.attempt?.stage === "result") {
           // Result is committed before cursor movement: do not repeat completed edits.
           const previous = loop.attempt.result;
-          const human = !!loop.attempt.humanContinuation;
-          if (previous.status === "blocked" && !human) return finish("blocked", loop.halt.reason);
+          if (previous.status === "blocked") return finish("blocked", loop.halt.reason);
           if (previous.status === "complete") {
             await settleTask();
             loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
           }
-          if (!previous.usefulContinuation && !human) break;
-          let pauseSource = confirmedPausePending() ? { checkpoint: clone(loop.attempt.checkpoint),
-            confirmation: clone(previous.checkpoint.confirmation) } : loop.attempt.pauseSource && clone(loop.attempt.pauseSource);
-          if (loop.attempt.restore && !confirmedPausePending() && loop.attempt.restore.authority?.confirmedPause) {
-            const source = pauseSource ?? { checkpoint: clone(frameIntent(invocation.taskFrame.sources.at(-1))),
-              confirmation: clone(loop.attempt.restore.authority.confirmedPause) };
-            pauseSource = source;
-          }
-          if (pauseSource && !invocation.taskFrame.restorationKeys.includes(loop.attempt.checkpoint.key)) {
-            invocation.taskFrame.restorationKeys.unshift(loop.attempt.checkpoint.key);
-            retainFrameIntent(loop.attempt.checkpoint, "sources", true);
-          }
-          const source = loop.attempt;
-          const repair = invocation.taskFrame.reviewRepair;
-          if (repair && !repair.attempt) repair.attempt = previous.attempt + 1;
-          const peak = source.gate?.receipt?.contextPeak ?? null;
-          const revival = { opinion: previous.revival?.opinion ?? "fresh", reason: previous.revival?.reason ?? "",
-            ...decideRevival(source, { taskId: task.id, loop: loop.number, candidate: currentCandidate,
-              halt: loop.halt, revivalContextPeak: invocation.revivalContextPeak }, peak), peak };
-          if (repair) Object.assign(revival, { decision: "fresh", code: "task-review-repair" });
-          loop.attempt = { taskId: task.id, index: loop.cursor, number: previous.attempt + 1,
-            timeoutMs: effectiveTimeouts().workerMs,
-            revival, ...(revival.decision === "resume" && !repair ? { resume: source.launch.runId,
-              bindingKey: source.bindingKey ?? source.key, resumeAfter: source.gate.receipt.after,
-              boardPostIds: source.boardPostIds ?? [] } : {}),
-            key: `${key}.l${loop.number}.t${loop.cursor + 1}.a${previous.attempt + 1}`,
-            stage: "intention", undispatched: true, continuationRef: previous.ref,
-            ...(source.foldedNextBaseline ? { checkpoint: clone(source.foldedNextBaseline), foldedBaseline: clone(source.foldedNextBaseline) } : {}),
-            ...(pauseSource ? { pauseSource } : {}) };
+          if (!previous.usefulContinuation) break;
+          nextWorkerAttempt(task);
           await save();
         } else if (loop.attempt && !loop.attempt.undispatched && !loop.attempt.restore?.undispatched && !budgetRejected(loop.attempt.key)) {
           // Never call an unresolved writer key as if native reuse were read-only.
@@ -4208,7 +6786,7 @@ Publish one selection with the native output binding then END. Native permission
             key: `${key}.l${loop.number}.t${loop.cursor + 1}.a1`, stage: "intention", continuationRef: null };
           await save();
         }
-        if (loop.attempt.restore || loop.attempt.resumeRejection) await observeMainRequests();
+        if (loop.attempt.restore && !loop.attempt.foldedBaseline || loop.attempt.resumeRejection) await observeMainRequests();
         if (invocation.tasks[task.id]?.cancel) {
           loop.cursor++; loop.attempt = null; invocation.taskFrame = null; await save(); continue;
         }
@@ -4220,9 +6798,22 @@ Publish one selection with the native output binding then END. Native permission
           await save();
         }
         const folded = loop.attempt.foldedBaseline ?? (loop.attempt.number === 1 ? loop.initialCheckpoint : null);
-        const baseline = folded ? { candidate: folded.baseline } : await loopIO("baselineIO", { operation: "baseline", root: config.root,
-          intent: clone(loop.attempt.checkpoint) }, loop.attempt);
-        if (folded) loop.attempt.checkpoint = clone(folded);
+        const baseline = folded ? { candidate: folded.checkpoint.baseline } : await loopIO("baselineIO", { operation: "baseline", root: config.root,
+          intent: clone(loop.attempt.checkpoint),
+          continuation: { attempt: clone(loop.attempt), taskState: clone(invocation.tasks[task.id]),
+            taskFrame: clone(invocation.taskFrame), results: clone(loop.results), recoveries: clone(loop.recoveries),
+            usage: clone(loop.usage),
+            metricSeries: clone(loop.metricSeries ?? task.progress), view: clone(invocation.currentView),
+            requests: clone(invocation.lastRequestPage),
+            receiptReference: clone(invocation.receiptReference ?? null),
+            intentions: clone(invocation.intentions ?? []), lastConfirmed: clone(invocation.lastConfirmed ?? null) } }, loop.attempt);
+        const admitted = folded ?? admitBaseline(loop.attempt.checkpoint, { ...baseline, captured: true }, baseline.head);
+        loop.attempt.checkpoint = clone(admitted.checkpoint);
+        loop.attempt.intent = clone(admitted.intent);
+        for (const [childKey] of inFlight)
+          if (childKey !== loop.attempt.key && /\.a\d+(?:\.task-(?:reviewer|synthesis))?$/.test(childKey))
+            inFlight.delete(childKey);
+        delete loop.taskReviewCursor;
         if (loop.attempt.number === 1) delete loop.initialCheckpoint;
         loop.attempt.baseline = clone(baseline.candidate);
         loop.attempt.checkpoint.baseline = clone(baseline.candidate);
@@ -4247,7 +6838,6 @@ Publish one selection with the native output binding then END. Native permission
           await save();
         }
         // Hook identity must be durable while the worker is running, not only after it settles.
-        await observeWorkerStateCapacity();
         loop.attempt.bindingKey ??= loop.attempt.key;
         const posts = invocation.currentView?.posts ?? [];
         const newPosts = posts.filter(post => !(loop.attempt.boardPostIds ?? []).includes(post.id));
@@ -4255,12 +6845,6 @@ Publish one selection with the native output binding then END. Native permission
         delete loop.attempt.undispatched;
         loop.attempt.stage = "launched";
         await save();
-        const capacity = workerStateCapacity();
-        if (capacity.total > 262144) return await finishStateCapacity({
-          status: "blocked", code: "state-capacity", capacity,
-          reason: `Worker state capacity U + S + K + R = ${capacity.total} > 262144 bytes ` +
-            `(U=${capacity.U}, S=${capacity.S}, K=${JSON.stringify(capacity.K)}, R=${capacity.R}); use a new mission.`,
-        });
         const descriptor = clone(loop.attempt);
         if (descriptor.restore) descriptor.restore.checkpoint = descriptor.restore.sourceKeys.map(sourceKey => {
           const source = frameIntent(sourceKey);
@@ -4279,20 +6863,20 @@ COMPLETE SHARED CONTEXT:\n${JSON.stringify(sharedContext())}
 DIRECT PREREQUISITE COMPLETED RESULTS (historical references, not current check evidence):
 ${JSON.stringify(prerequisites)}
 Read relevant full results and check current assumptions; do not automatically repeat all prerequisite gates.
-COMPLETE SELECTED TASK:\n${JSON.stringify(task)}
+COMPLETE SELECTED TASK:\n${canonicalJSON(task)}
 TASK CONTINUATION (data):
-${JSON.stringify({ metricSeries: loop.metricSeries ?? task.progress ?? null,
+${canonicalJSON({ metricSeries: loop.metricSeries ?? task.progress ?? null,
   handoff: workerKnowledge(invocation.tasks[task.id]?.last)?.handoff ?? "",
   board: invocation.currentView ?? null,
   gateFailures: invocation.tasks[task.id]?.last?.gateFailures ?? null,
-  previousResult: descriptor.continuationRef?.outputReference ?? descriptor.continuationRef?.outputArtifactPath ?? null })}
+   previousResult: descriptor.continuationRef?.path ?? descriptor.continuationRef?.outputReference ?? descriptor.continuationRef?.outputArtifactPath ?? null })}
 TASK REVIEW REPAIR (blocking findings and synthesis original; read that original in full):
-${JSON.stringify(taskReviewRepair() ?? null)}
+${canonicalJSON(taskReviewRepair() ?? null)}
 No other agents of this execution run concurrently. resource_snapshot is enough for host load;
 do not ask the supervisor about concurrency. Current DECISIONs are binding working rules:
 no reconfirmation is needed and they cannot expand scope. Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
 ${descriptor.restore ? `CHECKPOINT FALLBACK (same pending task, not a metadata repair):
-${JSON.stringify(descriptor.restore)}
+${canonicalJSON(descriptor.restore)}
 Validate the complete exact associated checkpoint manifest with the owned helper before effects.
 Writer observation is best-effort, not a terminal certificate. Missing receipts remain unknown.
 Your FIRST checkout effect MUST be the owned helper restore operation for restore.checkpoint
@@ -4311,7 +6895,7 @@ This is direct writer execution evidence, not an independent inspector attestati
 receipt means do NOT restore again after later task edits. Then use the normal write tools with the NEW checkpoint intention below
 for pending work. Complete only this task; the workflow runs the required gates after you settle.
 ` : ""}PRE-WRITE CHECKPOINT INTENTION (not a backup until published):
-${JSON.stringify(descriptor.checkpoint)}
+${canonicalJSON(descriptor.checkpoint)}
 Write code with edit, write or apply_patch; use bash for commands, tests and builds.
 The checkpoint extension captures first-touch preimages and journals each call before allowing it.
 Newly discovered paths are captured in this same attempt. Journal failures block writes;
@@ -4331,11 +6915,11 @@ activity and native Stop/refusal/permission/capacity remain barriers; never fabr
 Restore only journal-attributable effects, retaining partial bytes first; never reset/clean Git
 or roll back consumed slots/history. Returned position is for existing root state reconciliation,
 not permission to overwrite native mission state or promote stale checks.
-ORIGINAL COMPLETE PLAN REFERENCES (fallback, never previews): ${JSON.stringify(loop.plan.ref)}
+ORIGINAL COMPLETE PLAN REFERENCES (fallback, never previews): ${canonicalJSON(clone(loop.plan.ref))}
 If the selected task is unavailable inline, read it from ${invocation.backlogPath}; verify its ID ${JSON.stringify(task.id)}
 and admitted backlog digest ${invocation.backlogDigest} before effects. Never reconstruct a task from director previews.
 No definition => report blocked, never reconstruct scopes. Continuation reads the exact preceding result
-${JSON.stringify(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
+${canonicalJSON(descriptor.continuationRef)} and addresses only useful diagnosed pending work on THIS task.
 Report {work, status, remaining, knowledge:{findings, handoff}, continuation?:{mode:"resume"|"fresh", reason}}.
 The optional continuation opinion has a reason of at most 200 characters; missing means fresh. The workflow decides whether to resume. The workflow runs the metric and gates
  after you settle. Complete file-writing tasks with passing gates receive a read-only three-question
@@ -4379,8 +6963,14 @@ Return structured_output after all owned journaled writes settle.`,
             ["agent", "timedOut", "terminalOutcome", "exitCode", "state", "structuredOutputPath", "savedOutputPath"]
               .filter(field => entry[field] !== undefined).map(field => [field, entry[field]])));
         }
-        assertWorkerReferenceCapacity(launch, result);
         loop.attempt.launch = launch;
+        if (descriptor.restore && result?.ok === false && !result.runId && text(result.error) && !barrier(result)) {
+          // No second restorer is authorized after a native failure without a
+          // producer identity. Keep the bounded diagnostic at the exact action.
+          const failure = nativeFailure(descriptor.key, result.error, result);
+          throw Object.assign(new Error(failure.reason), { nativeFailure: failure,
+            nativeDispatch: { key: descriptor.key, role: "worker" } });
+        }
         if (descriptor.resume && !result?.ok && !result?.runId && !barrier(result)) {
           await save();
           throw new Error("Resume failed without a definitive no-child refusal; replacement is not authorized.");
@@ -4397,9 +6987,11 @@ Return structured_output after all owned journaled writes settle.`,
         }
         if (barrier(result)) {
           loop.attempt.stage = "launched";
-          throw nativeBarrier(barrier(result));
+          throw nativeBarrier(barrier(result), nativeReference(descriptor.key, result), result);
         }
         loop.attempt.stage = "launched";
+        if (result?.ok && result.structuredOutput)
+          recordWorkerClose(loop.attempt, result, task);
         await save();
         if (!result?.ok) await observeMainRequests();
         if (!result?.ok) {
@@ -4439,32 +7031,21 @@ Return structured_output after all owned journaled writes settle.`,
       if (!Array.isArray(loop.acceptance) || !loop.acceptance.length)
         throw new Error("Final phase requires non-empty acceptance commands from the backlog receipt.");
       const finalAttempt = loop.finalAttempt ??= { key: `${key}.l${loop.number}.acceptance`, number: 1 };
-      let acceptanceTask = finalAttempt.gate?.task ?? { id: "final-acceptance",
+      const acceptanceTask = finalAttempt.gate?.task ?? { id: "final-acceptance",
         gates: effectiveGates(loop.acceptance), metric: null };
-      let exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
+      const exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
       const previous = invocation.lastFinalAcceptance;
-      const reuse = !finalAttempt.freshAuthorized && previous?.loop < loop.number && same(previous.exec, exec) ? previous : undefined;
-      let receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} }, reuse);
-      if (receipt.reused && !currentAcceptance() && invocation.freshAcceptanceAuthorized && !receipt.mutated) {
-        // Consume authorization with the fresh intention, before any command can launch.
-        invocation.freshAcceptanceAuthorized = false;
-        finalAttempt.freshAuthorized = true;
-        finalAttempt.gate = { key: `${finalAttempt.key}.fresh.gate`, stage: "intention", retry: 0 };
-        acceptanceTask = { id: "final-acceptance", gates: effectiveGates(loop.acceptance), metric: null };
-        finalAttempt.gate.task = gateTaskFor(acceptanceTask);
-        exec = acceptanceTask.gates.map(({ id, command, cwd, timeoutMs }) => ({ id, command, cwd, timeoutMs }));
-        await save();
-        receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} });
-      }
-      invocation.freshAcceptanceAuthorized = false;
+      const reuse = previous?.loop < loop.number && same(previous.exec, exec) ? previous : undefined;
+      const receipt = await verifyAttempt(finalAttempt, acceptanceTask, { status: "complete", knowledge: {} }, reuse);
       if (!receipt.reused && !receipt.mutated && !acceptanceResults().blocking.some(gate => ["timeout", "error"].includes(gate.status))) {
-        invocation.lastFinalAcceptance = { loop: loop.number, gateKey: finalAttempt.gate.ref?.key ?? finalAttempt.gate.key,
+        invocation.lastFinalGate = finalAttempt.gate.record;
+        invocation.lastFinalAcceptance = { loop: loop.number, gateKey: finalAttempt.gate.producer,
           candidate: candidate(receipt.after), exec, results: clone(receipt.gates) };
       }
       await save();
       if (receipt.reused && !currentAcceptance()) {
-        loop.halt = { status: "blocked", code: "repeat-acceptance",
-          reason: `Repeated final acceptance from loop ${receipt.reused.loop} (${receipt.reused.gateKey}) still fails: ${acceptanceResults().blocking.filter(gate => gate.status !== "pass" || gate.exit !== 0).map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; ")}` };
+        retainFinalAcceptanceHalt("repeat-acceptance", receipt,
+          acceptanceResults().blocking.filter(gate => gate.status !== "pass" || gate.exit !== 0));
         await save(); return finish("blocked", loop.halt.reason);
       }
       recordOriginalProblem(acceptanceTask, receipt, finalAttempt);
@@ -4476,7 +7057,7 @@ Return structured_output after all owned journaled writes settle.`,
           await haltGateTimeout(finalAttempt, "final-acceptance", launchedMs);
           return finish("partial", loop.halt.reason);
         }
-        loop.halt = { status: "blocked", code: "environment", reason: `Final acceptance environment failure: ${environment.map(gate => `${gate.id}: ${gate.status} (${gate.logRef})`).join("; ")}` };
+        retainFinalAcceptanceHalt("environment", receipt, environment);
         await save(); return finish("blocked", loop.halt.reason);
       }
       if (!currentAcceptance()) {
@@ -4484,7 +7065,7 @@ Return structured_output after all owned journaled writes settle.`,
         if (failed.length) await recordFinalGaps("acceptance", failed.map(gate => ({
           reason: `Final acceptance gate ${gate.id} failed (exit ${gate.exit}): ${gate.logRef}`,
           source: `Final acceptance gate ${gate.id}`,
-        })), failed.map(gate => ({ key: finalAttempt.gate.key, path: gate.logRef })));
+        })), failed.map(gate => ({ key: finalAttempt.gate.key, logRef: gate.logRef })));
         loop.outcome = "gaps"; loop.endedAt = Date.now(); await save();
         loopReport("gaps", `Final acceptance failed or candidate changed: ${JSON.stringify(receipt)}`);
         continue;
@@ -4494,33 +7075,47 @@ Return structured_output after all owned journaled writes settle.`,
     }
     if (loop.phase === "review") {
       if (loop.kind !== "final" || !currentAcceptance()) throw new Error("Final review requires current acceptance gates on the same candidate.");
-      await reconcileAnalysis();
+      if (!loop.replayedFinalReview) await reconcileAnalysis();
       progress();
-      let reviewBudgetError;
+      let reviewDispatchError, reviewDispatchBarrier;
       // reviewPhase owns its fixed+risk angles mirrored over two slots, then synthesis.
       // Replay reconciles each retained call; repeating a key is not observation.
-      // The deterministic access verifier is idempotent, model-free and writes only
-      // receipts: dispatch it directly, not as a retained model analysis call.
+      // Normally dispatch the model-free access verifier directly. A renewed
+      // synthesis intention already has a verifier; observe its verified receipt instead.
       const reviewRuns = { all: requests => (requests.every(request => request.agent === "pitako.access-verifier")
-        ? dispatch(requests.map(request => ({ ...request, cwd: config.root, reads: false, progress: false })))
+        ? loop.replayedReviewAccess && requests.length === 1 && requests[0].key === loop.replayedReviewAccess.key
+          ? observeStatus(loop.replayedReviewAccess.runId, true).then(observed => {
+            const { key, runId, agent } = loop.replayedReviewAccess;
+            const cause = analysisBarrier(observed, runId);
+            if (cause) throw nativeBarrier(cause, { key, runId, agent });
+            if (observed?.runId && observed.runId !== runId || observed?.key && ![key, runId].includes(observed.key) ||
+                observed?.agent && observed.agent !== agent || !analysisSettled(observed, { key, runId }))
+              throw new Error("Renewed review access verifier producer integrity mismatch.");
+            return [loop.replayedReviewAccess];
+          })
+          : dispatch(requests.map(request => ({ ...request, cwd: config.root, reads: false, progress: false })))
         : analysisDispatch(requests.map(request => ({
         ...request, cwd: config.root, reads: false, progress: false,
       }))).then(results => {
         results.forEach((result, index) => usage(result, requests[index].key));
         return results;
       })).catch(error => {
-        if (error?.spawnBudgetExhausted) reviewBudgetError = error;
+        if (error?.spawnBudgetExhausted || persistenceFailed && error?.nativeBarrier) reviewDispatchError = error;
+        if (error?.nativeBarrier && error.nativeReference) reviewDispatchBarrier = error;
         throw error;
       }) };
-      const reviewed = await reviewPhase({
+      const reviewed = loop.review?.status === "completed" && ["clear", "material-gaps"].includes(loop.review.verdict) ? {
+        status: "completed", phase: loop.review.phase, references: loop.review.references,
+        screening: { verdict: loop.review.verdict, reason: loop.review.reason, assessments: loop.review.unresolved },
+      } : await reviewPhase({
         workDescription: `Loop ${loop.number} result — ${(selectedTasks().map(task => task.goal)).map(goal => goal.replace(/\s+/g, " ").trim()).join("; ")}`,
         brief: `${fullContext()}\nReview the COMPLETE authorized result against ALL specs, not director tasks alone.
-Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
+Admitted COMPLETE plan references: ${canonicalJSON(clone(loop.plan.ref))}.
 Assess single-outcome decomposition and necessary dependencies independently; schema cannot certify semantics.
 Do not repeat correct completed implementation merely to improve its past decomposition.
 Candidate including WIP: ${JSON.stringify(loop.candidate)}.
 Actual final checks/result references: ${JSON.stringify(loopResults())}.
-Done/obsolete tasks (bounded summary: title or clipped goal and last reason; omitted counts tasks beyond the cap): ${JSON.stringify(loop.completedTasks)}.
+Done/obsolete tasks (bounded summary: title or clipped goal and last reason; omitted counts tasks beyond the cap): ${canonicalJSON(loop.completedTasks)}.
 Complete goals and histories of every task: ${invocation.backlogPath}.
 Authority: spec, frozen amendments and current HUMAN rulings (most recent human source wins; cite it) > DECISION > FINDING > HANDOFF; code wins over any map.
 Current Board HUMAN rulings, DECISIONs and authority: ${JSON.stringify(invocation.currentView)}.
@@ -4530,13 +7125,18 @@ No own writer is active. Do not run checks or repair. Only clear screening permi
           material: `Entire designated checkout ${config.root}, immutable full specs above and native work/check artifacts.
 Read the actual sources and full referenced reports, not previews. Candidate: ${JSON.stringify(loop.candidate)}.` },
       }, reviewRuns, { prefix: reviewPrefix(), mode: "execute",
+        enclosingLoop: loop, persist: save,
         models: invocation.reviewModels,
         decisionReference: { stateKey: key, loop: loop.number, plan: loop.plan.ref, candidate: loop.candidate,
           generation: loop.analysisGenerations?.["final-review"] ?? 1 },
         access: { missionPath: config.missionPath, namespace: `execute-${config.invocation}` },
       });
+      if (reviewDispatchError?.nativeBarrier) throw reviewDispatchError;
+      if (reviewDispatchBarrier?.nativeDispatch) throw reviewDispatchBarrier;
       if (persistenceFailed) throw new Error(persistenceReason);
-      if (reviewBudgetError && loop.halt?.code !== "timeout") throw reviewBudgetError;
+      if (reviewDispatchError && loop.halt?.code !== "timeout") throw reviewDispatchError;
+      if (reviewed.code === "store-busy")
+        return cursorDisposition(executeCursor(), "partial", reviewed.error);
       // A second failed observation must not erase the original lookup refs.
       const reviewRefs = new Map((loop.review?.references ?? []).map(ref => [ref.key, ref]));
       reviewed.references.forEach(ref => reviewRefs.set(ref.key, {
@@ -4552,9 +7152,18 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       for (const call of loop.analysisCalls ?? []) if (reviewRefs.has(call.key))
         call.ref = { key: call.key, ...(text(call.ref.runId) ? { runId: call.ref.runId } : {}) };
       const reviewBarrier = reviewed.references.map(ref => barrier(ref)).find(Boolean);
-      if (reviewBarrier) throw nativeBarrier(reviewBarrier);
-      if (reviewed.nativeBarrier) throw nativeBarrier(reviewed.nativeBarrier);
+      if (reviewBarrier) throw reviewDispatchBarrier?.nativeBarrier === reviewBarrier
+        ? reviewDispatchBarrier : nativeBarrier(reviewBarrier);
+      if (reviewed.nativeBarrier) throw reviewDispatchBarrier?.nativeBarrier === reviewed.nativeBarrier
+        ? reviewDispatchBarrier : nativeBarrier(reviewed.nativeBarrier);
       if (loop.halt?.code === "timeout") return finish(loop.halt.status, loop.halt.reason);
+      if (reviewed.code) {
+        // The native host key cannot be reissued within this root. Reuse the verified
+        // admission binding and the checkout observed by the committed final gate.
+        throw Object.assign(new Error(reviewed.error), { code: reviewed.code, recovery: reviewed.recovery,
+          epochAdmissionObservation: { version: config.preliminary.version,
+            binding: invocation.admissionBinding, checkout: loop.candidate } });
+      }
       if (reviewed.status !== "completed" || reviewed.screening?.verdict === "blocked") {
         const reason = reviewed.screening?.reason ?? reviewed.error ?? "Adversarial review blocked; no compliance or repair launched.";
         loop.halt = reviewed.nativeFailure
@@ -4563,6 +7172,7 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
         await save();
         return finish(loop.halt.status, loop.halt.reason);
       }
+      await compactIntegratedReview();
       if (reviewed.screening.verdict !== "clear")
         await recordFinalGaps("review", [{ reason: loop.review.reason }],
           [findingOutput(loop.review.references.find(ref => ref.key.endsWith(".director-synthesis")))]);
@@ -4570,29 +7180,13 @@ Read the actual sources and full referenced reports, not previews. Candidate: ${
       await save();
     }
     if (["compliance", "closing"].includes(loop.phase) && loop.review?.status === "completed") {
-      const reviewKey = reviewStateKey(), retained = await state.get(reviewKey);
-      if (retained?.decision?.reference?.loop === loop.number && retained.originals.some(original => !original.sha256)) {
-        const originals = retained.originals.map(original => ({ ...original,
-          path: findingOutput(loop.review.references.find(ref => ref.key === original.key)).path,
-        }));
-        const compact = await loopIO("reviewOriginals", { operation: "reviewOriginals", originals });
-        await state.set(reviewKey, { ...retained, originals: compact.originals });
-        const synthesis = compact.originals.find(original => original.key.endsWith(".director-synthesis"));
-        loop.reviewSynthesis = { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 };
-        delete loop.reviewOriginals;
-        await save();
-      } else if (retained?.decision?.reference?.loop === loop.number && !loop.reviewSynthesis) {
-        const synthesis = retained.originals.find(original => original.key.endsWith(".director-synthesis"));
-        loop.reviewSynthesis = { key: synthesis.key, path: synthesis.path, sha256: synthesis.sha256 };
-        delete loop.reviewOriginals;
-        await save();
-      }
+      await compactIntegratedReview();
     }
     if (loop.phase === "compliance") {
       if (loop.kind !== "final" || !currentAcceptance() || loop.review?.verdict !== "clear")
         throw new Error("Final compliance requires current acceptance and clear review on the same candidate.");
-      await reconcileAnalysis();
-      const completedReview = await state.get(reviewStateKey());
+      if (!loop.replayedFinalReview) await reconcileAnalysis();
+      const completedReview = loop.integratedReview;
       const complianceKey = `${generationKey(`${key}.l${loop.number}`, "compliance")}.compliance`;
       const result = await collect(complianceKey, "pitako.reviewer",
         { label: "Check whole-spec compliance", phase: "compliance" }, `${fullContext()}
@@ -4625,7 +7219,7 @@ Reasoned shared adversarial clear: ${JSON.stringify(loop.review)}.
 Completed review originals: ${JSON.stringify(completedReview.originals)}.
 Read completed originals from their paths and verify SHA-256 before consumption; a missing or mismatched
 file blocks with the expected digest, never reconstruct its value from a summary.
-Admitted COMPLETE plan references: ${JSON.stringify(loop.plan.ref)}.
+Admitted COMPLETE plan references: ${canonicalJSON(clone(loop.plan.ref))}.
 Independently assess single-outcome decomposition and dependency completeness against the full spec;
 structural validation cannot prove them. Do not repeat correct work to improve past decomposition.
 Read the actual full reports and sources via exact refs. Green/TODO/completed is not fulfillment.
@@ -4634,32 +7228,27 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
         complianceSchema, false, analysisDispatch);
       const value = result?.structuredOutput;
       const complianceRef = loop.compliance?.ref;
+      if (barrier(result)) throw nativeBarrier(barrier(result), nativeReference(complianceKey, result), result);
+      if (!result?.ok || !value)
+        throw new Error(`Compliance lacks a meaningful source/reason/current-evidence requirements inventory. ${excerpt(result?.error ?? result?.output ?? "")}`);
       // The judged candidate is workflow-known (it is in the prompt); never a model echo.
+      // Native SDK originals may cross VM realms; hash their JSON value, not their prototype.
       loop.compliance = { ...projection(complianceKey, result), candidate: candidate(loop.candidate),
+        original: { key: complianceKey, runId: result.runId,
+          path: result.results?.[0]?.savedOutputPath ?? result.results?.[0]?.structuredOutputPath,
+          digest: canonicalDigest(clone(value)) },
         reason: excerpt(value?.reason),
         unresolved: Array.isArray(value?.requirements) ? value.requirements.filter(item => ["gap", "blocked"].includes(item?.status))
           .map(item => ({ id: item.id, source: item.source, status: item.status, reason: item.reason })) : [] };
       loop.compliance.ref = { ...complianceRef, ...loop.compliance.ref };
-      if (barrier(result)) throw nativeBarrier(barrier(result));
-      if (!result?.ok || !["fulfilled", "gaps", "blocked"].includes(value?.status) || !text(value.reason) ||
-          !Array.isArray(value.requirements) || !value.requirements.length ||
-          new Set(value.requirements.map(item => item?.id)).size !== value.requirements.length ||
-          value.requirements.some(item => !text(item?.id) || !text(item.source) || !text(item.reason) ||
-            !["fulfilled", "gap", "blocked", "not-applicable"].includes(item.status) ||
-            !Array.isArray(item.evidence) || !item.evidence.length ||
-            !Array.isArray(item.checks) || !item.evidence.every(text) || !item.checks.every(text)) ||
-          (value.status === "fulfilled" && (!value.requirements.some(item => item.status === "fulfilled") ||
-            value.requirements.some(item => !["fulfilled", "not-applicable"].includes(item.status)))))
-        throw new Error("Compliance lacks a meaningful source/reason/current-evidence requirements inventory.");
+      loop.compliance = closingCompliance(value, loop.compliance.original, candidate(loop.candidate), cancelledScope());
+      loop.closingPublication.compliance = { key: complianceKey, runId: result.runId };
+      if (complianceKey !== loop.closingSeed.complianceKey)
+        loop.closingSeed = { ...loop.closingSeed, complianceTimeoutMs: effectiveTimeouts().reviewerMs };
+      loop.complianceUsage = result.results?.[0]?.usage;
       if (value.status === "blocked") {
         loop.halt = { status: "blocked", code: "semantic-block", reason: excerpt(value.reason) };
         await save(); return finish("blocked", loop.halt.reason);
-      }
-      if (unfulfilledCancellations().length) {
-        loop.compliance.status = "gaps";
-        loop.compliance.reason = unfulfilledCancellations().map(task => `${task.id}: ${task.cancel.reason}`).join("; ");
-        loop.compliance.unresolved.push(...unfulfilledCancellations().map(task => ({ id: task.id,
-          source: "main-session request", status: "gap", reason: task.cancel.reason })));
       }
       if (loop.compliance.status === "gaps")
         await recordFinalGaps("compliance", loop.compliance.unresolved.length ? loop.compliance.unresolved : [{ reason: loop.compliance.reason }],
@@ -4668,6 +7257,11 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
     }
     if (loop.phase === "closing") {
       if (invocation.intentions?.length) await groupedIO("closingDrain", { operation: "drain" });
+      if (!loop.compliance && loop.review?.verdict === "material-gaps") {
+        // Adversarial gaps close without a compliance child; synthesis anchors the replay.
+        const { key, runId } = loop.review.references.find(ref => ref.key.endsWith(".director-synthesis"));
+        dispatchedAction = { kind: "launched", role: "reviewer", key, runId };
+      }
       progress();
       const retainedClosing = !!(loop.closing || loop.observation);
        // Reconcile the retained producer first; a new retry key publishes only
@@ -4688,10 +7282,9 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
            throw new Error("Closing observation intention conflicts with this invocation/loop; inspect the retained exact operation, no replacement dispatch.");
          let observed;
          try {
+           if (!loop.closingPublication) throw new Error("Closing publication integrity: missing archive seed reference.");
            observed = fresh ? (await dispatch([{ key: intention.key, agent: "pitako.checkout-observer",
-             task: JSON.stringify({ expected: { invocation: config.invocation, ...loop.archivePending.expected },
-               body: { record: closingRecord(), ...(loop.archivePending.expected.count === 0
-                 ? { spec: { content: config.preliminary.content, digest: invocation.association.digest } } : {}) } }), cwd: config.root, context: "fresh",
+             task: JSON.stringify(loop.closingPublication), cwd: config.root, context: "fresh",
              output: false, outputMode: "inline", outputSchema: false, reads: false, progress: false }]))[0]
              : await observeStatus(intention.ref?.runId ?? intention.key, true);
          } catch (error) {
@@ -4704,7 +7297,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
              intention.ref?.asyncDir && observed?.asyncDir !== undefined && observed.asyncDir !== intention.ref.asyncDir)
            throw new Error(`Closing producer identity changed for ${intention.key}; expected ${intention.ref.runId ?? "unavailable"}, observed ${observed?.runId ?? "unavailable"}. Inspect retained native references; no replacement dispatch.`);
          const cause = barrier(observed, intention.ref?.runId ?? intention.key);
-         if (cause && (intention.validated || !fresh)) throw nativeBarrier(cause, intention.ref);
+         if (cause && (intention.validated || !fresh)) throw nativeBarrier(cause, intention.ref ?? nativeReference(intention.key, observed), observed);
          let observation = intention.validated;
          if (observation) {
            if (intention.stage !== "receipt" || intention.ref?.key !== intention.key ||
@@ -4713,7 +7306,7 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
                !text(intention.ref?.externalAdapter?.outputArtifacts?.stdoutPath) ||
                !text(intention.ref?.externalAdapter?.outputArtifacts?.stderrPath) ||
                utf8Bytes(JSON.stringify(observation)) > 61440 || observation.version !== 1 || observation.ok !== true ||
-               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,summaries,version" ||
+               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,store,summaries,version" ||
                observation.root !== invocation.association.root || observation.commonDir !== invocation.association.commonDir ||
                Object.keys(observation.checkout ?? {}).sort().join(",") !== "fingerprint,head" ||
                !candidate(observation.checkout) || !validLoopAnchor(observation.ledger) || !validSummaries(observation.summaries))
@@ -4725,33 +7318,9 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
            intention.stage = "receipt";
            references.push(intention.ref);
            await save();
-           if (cause) throw nativeBarrier(cause, intention.ref);
-           const errors = [observed, ...(observed?.results ?? [])].filter(Boolean);
-           if (!observed?.ok || !text(observed.runId) || !text(observed.asyncDir) ||
-               observed.agent !== "pitako.checkout-observer" || observed.state !== undefined || observed.terminalOutcome ||
-               (observed.key !== undefined && observed.key !== intention.key) ||
-               errors.some(item => item.error || item.outputSaveError || item.metadataSaveError || item.transcriptError ||
-                 item.outputPartial || item.truncation || item.timedOut || item.processSignal ||
-                 item.exitCode !== undefined && item.exitCode !== 0) ||
-               (!Array.isArray(observed.results) || observed.results.length !== 1 || observed.results[0]?.exitCode !== 0) ||
-               !text(observed.externalAdapter?.outputArtifacts?.stdoutPath) ||
-               !text(observed.externalAdapter?.outputArtifacts?.stderrPath))
-             throw new Error(`Closing observation ${intention.key} lacks successfully published terminal evidence (${observed?.error ?? "status/artifacts unavailable or invalid"}). Inspect the exact native run and output references; reconcile capture, publication or native capacity before continuation, never infer completion or redispatch.`);
-           if (typeof observed.output !== "string" || utf8Bytes(observed.output) > 61440)
-             throw new Error(`Invalid closing stdout for ${intention.key}; inspect its native stdout reference, not a preview or truncated tail.`);
-           try { observation = JSON.parse(observed.output); }
-           catch { throw new Error(`Invalid closing JSON document for ${intention.key}; retain stdout/stderr and reconcile the exact native producer without redispatch.`); }
-           if (observation?.error === "ledger-integrity")
-             throw Object.assign(new Error(`Ledger integrity requires human reconciliation: ${observation.reason}`), { ledgerIntegrity: true });
-           if (!observation || observation.version !== 1 || observation.ok !== true ||
-               Object.keys(observation).sort().join(",") !== "checkout,commonDir,ledger,ok,root,summaries,version" ||
-               observation.root !== invocation.association.root || observation.commonDir !== invocation.association.commonDir ||
-               !validLoopAnchor(observation.ledger) || !validSummaries(observation.summaries) || !candidate(observation.checkout) ||
-               Object.keys(observation.checkout ?? {}).sort().join(",") !== "fingerprint,head")
-             throw new Error(`Invalid closing observation or physical workspace mismatch for ${intention.key}; expected ${invocation.association.root} / ${invocation.association.commonDir}, observed ${observation?.root ?? "unavailable"} / ${observation?.commonDir ?? "unavailable"}. ${observation?.ok === false ? [observation.reason, observation.nextStep].filter(text).join(" ") : "Inspect the exact native stdout/stderr and designated cwd; preserve the snapshot and pending intention."}`);
-           // Retain only the validated candidate/workspace projection, not potentially large Git status text.
-           observation = { version: 1, ok: true, root: observation.root, commonDir: observation.commonDir,
-             checkout: candidate(observation.checkout), ledger: observation.ledger, summaries: observation.summaries };
+           if (cause) throw nativeBarrier(cause, intention.ref, observed);
+           observation = checkoutTerminalObservation(observed, intention.key, invocation.association, loop.number,
+             Math.max(1, loop.archivePending.expected.count) + 1);
            intention.validated = observation;
            await save();
          }
@@ -4762,18 +7331,28 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
                previous.stderrPath === producer.externalAdapter.outputArtifacts.stderrPath)))
            throw new Error("Closing observation reuses another loop's native evidence; inspect the exact producer references before continuation.");
          const oldLedger = invocation.ledger;
+         const published = observation.store;
+         validateClosingProjection(published, invocation);
+         const oldProjection = storeProjection, oldHead = invocation.head;
+         storeProjection = { head: published.head, P: published.P };
+         invocation.head = clone(published.head);
          invocation.ledger = observation.ledger;
          loop.closing = { candidate: candidate(observation.checkout),
            sameCandidate: same(candidate(observation.checkout), loop.candidate),
            observation, ref: intention.ref };
          intention.stage = "receipt";
-         try { await save(); } catch (error) { invocation.ledger = oldLedger; delete loop.closing; throw error; }
+         try { await save(); } catch (error) {
+           invocation.ledger = oldLedger; invocation.head = oldHead; storeProjection = oldProjection;
+           delete loop.closing; throw error;
+         }
          intention.stage = "complete";
          delete intention.validated;
         } catch (error) {
-          if (error.terminalPersistence || error.spawnBudgetExhausted || error.ledgerIntegrity || error.nativeBarrier || error.nativeFailure?.code === "capacity" ||
+          if (error.code && error.code !== "store-busy" || error.terminalPersistence || error.spawnBudgetExhausted ||
+              error.ledgerIntegrity || error.nativeBarrier || error.nativeFailure?.code === "capacity" ||
               /Closing archive source fields changed|Invalid retained closing evidence|producer identity changed|reuses another loop/.test(error.message)) throw error;
-          if (closeTries >= 3) throw new Error(`Checkout publication pending: three attempts failed (${error.message}); repeated failure requires operator repair.`);
+          if (closeTries >= 3)
+            throw error.code === "store-busy" ? error : new Error(`Checkout publication pending: three attempts failed (${error.message}).`);
           persistenceFailed = false; persistenceReason = null;
           // Validated bytes can be admitted again after a state-save cut. Otherwise
           // reobserve and let the ledger reject a changed post-publication retry.
@@ -4808,17 +7387,26 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
           throw error;
         }
       }
-      if (fulfilled) return finish("complete", "Whole-spec fulfillment and mandatory checks verified for the current candidate. No more loops required.");
+      if (fulfilled) return await finish("complete", "Whole-spec fulfillment and mandatory checks verified for the current candidate. No more loops required.");
       loopReport("gaps", !loop.closing.sameCandidate ? "Candidate changed; affected checks and analyses are stale."
         : "Material adversarial or compliance gaps remain; next director receives exact evidence.");
     }
   }
 } catch (error) {
   let reason = String(error?.message ?? error);
-  if (error?.workerReferenceCapacity && admissionValidated && !persistenceFailed) {
-    try { return await blockWorkerReferenceCapacity(error); }
-    catch (blockedError) { error = blockedError; reason = String(blockedError?.message ?? blockedError); }
+  if (invocation?.head && error?.recovery) {
+    const cursor = executeCursor();
+    try {
+      if (await recoverStoreEpoch(error, cursor)) continue;
+    } catch (barrierError) {
+      return cursorDisposition(cursor,
+        ["stopped", "interrupted"].includes(barrierError.nativeBarrier) ? "cancelled" : "blocked",
+        String(barrierError.message ?? barrierError));
+    }
   }
+  // The replacement root owns the fixed key; never save or drain this root again.
+  if (error?.code === "superseded") return finish("partial", reason, true);
+  if (error?.code === "wrong-cwd") return finish("blocked", "Execute cursor belongs to the wrong cwd.", true);
   if (canSaveBudgetExhaustion(error)) {
     try {
       return await finishBudgetExhaustion();
@@ -4826,20 +7414,24 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
   if (error?.hostHalt) {
     hostHalt = error.hostHalt;
-    references.push(hostHalt.ref);
-    // Before snapshot capture there is no admitted association to invent. Keep
-    // only the concrete request/operation observation on the existing state key.
-    if (resolution) resolution.failedHostObservation = clone(hostHalt);
-    if (hostReconstruction) {
-      hostReconstruction.stage = "failed";
-      hostReconstruction.failure = clone(hostHalt);
+    const cursor = !admissionValidated && retainedCursor?.halt?.stage === "timeout" && reviewerTimeoutAction(retainedCursor.action) &&
+        matchesCursorRequest(retainedCursor)
+      ? { ...retainedCursor, hostHalt: hostHaltCursor(retainedCursor, hostHalt) }
+      : invocation?.head ? executeCursor() : null;
+    const halt = hostHaltReport(cursor?.action, hostHalt);
+    if (!cursor) {
+      references.push(error.hostRef);
+      return finish(halt.status, halt.reason);
     }
-    try { await persistState(key, { ...(invocation ?? { version: config.stateVersion }), hostHalt }); }
+    try {
+      await persistState(stateKey, cursor);
+      return hostHaltDisposition(cursor, halt);
+    }
     catch (saveError) {
       persistenceFailed = true;
       persistenceReason = `Essential persistence failed; host observation could not be retained: ${String(saveError?.message ?? saveError)}`;
     }
-    return finish(hostHalt.status, `${hostHalt.reason} ${reason}`);
+    return finish(halt.status, halt.reason);
   }
   // Child timeout is partial, NOT invocation cancellation. Native Stop is reported
   // only from an observed barrier, not inferred from an exception's task wording.
@@ -4850,15 +7442,54 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
     loop?.halt ? loop.halt.status : error?.nativeFailure || persistenceFailed ? "partial" : "blocked";
   if (loop?.halt?.reason && !reason.includes(loop.halt.reason))
     reason = `${loop.halt.reason} ${reason}`;
-  if (loop && !persistenceFailed && admissionValidated) {
-    if (error?.backlogConflict) loop.halt = { status: "blocked", code: "backlog-conflict", reason: excerpt(reason) };
-    if (error?.nativeBarrier) {
-      const ref = error.nativeReference ?? resolution?.currentBarrier?.ref ?? loop.attempt?.launch ?? loop.halt?.ref ?? { key };
-      if (resolution) resolution.currentBarrier = { cause: error.nativeBarrier, ref: clone(ref) };
-      if (loop.halt && loop.attempt) loop.attempt.interruption ??= clone(loop.halt);
-      loop.halt = { status, code: "native-barrier", cause: error.nativeBarrier,
-        reason: excerpt(reason), ref: clone(ref) };
+  if (loop && admissionValidated && retainUnstartedDispatch(error, reason)) {
+    reason = loop.halt.reason;
+  } else if (loop && admissionValidated && error?.nativeBarrier) {
+    const ref = error.nativeReference ?? loop.attempt?.launch ?? loop.halt?.ref ?? { key };
+    if (loop.halt && loop.attempt) loop.attempt.interruption ??= clone(loop.halt);
+    const genericHalt = loop.halt = { status, code: "native-barrier", cause: error.nativeBarrier,
+      reason: excerpt(reason), ref: clone(ref) };
+    const stage = Object.keys(noRunBarrier).find(stage => noRunBarrier[stage] === error.nativeBarrier);
+    if (stage && dispatchedAction?.kind === "launched" && !dispatchedAction.runId &&
+        (!error.nativeReference || error.nativeReference.key === dispatchedAction.key && !error.nativeReference.runId))
+      loop.halt = noRunHalt(dispatchedAction, { stage, reason: excerpt(reason) });
+    if (["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) &&
+        dispatchedAction?.kind === "pending" && ref.agent === "pitako.loop-io" && ref.runId &&
+        ref.key.replace(/\.r\d+$/, "") === dispatchedAction.opKey)
+      loop.halt = loopIOHalt(ref, error.nativeBarrier);
+    if (["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) &&
+        dispatchedAction?.kind === "launched" && dispatchedAction.role === "worker" && dispatchedAction.runId &&
+        ref.key === dispatchedAction.key && ref.runId === dispatchedAction.runId &&
+        !hostHalt && (storeProjection?.P.control.operation?.operation === "baseline" ||
+          storeProjection?.P.control.operation?.operation === "selection"))
+      loop.halt = workerInterruptionHalt(dispatchedAction, error.nativeBarrier);
+    if (stopped && ["stopped", "interrupted"].includes(error.nativeBarrier) &&
+        dispatchedAction?.kind === "launched" && dispatchedAction.role === "execution-director" && dispatchedAction.runId &&
+        loop.plan?.ref.key === dispatchedAction.key && loop.plan.ref.runId === dispatchedAction.runId &&
+        !hostHalt)
+      loop.halt = directorInterruptionHalt(dispatchedAction, error.nativeBarrier);
+    if (["stopped", "interrupted", "native permission denial"].includes(error.nativeBarrier) &&
+        text(ref.runId) && !hostHalt &&
+        loop.analysisCalls?.some(call => call.key === ref.key && call.ref.runId === ref.runId)) {
+      dispatchedAction = { kind: "launched", role: "reviewer", key: ref.key, runId: ref.runId };
+      loop.halt = closingInterruptionHalt(dispatchedAction, error.nativeBarrier);
     }
+    const witness = error.settlementHalt;
+    const reviewedSealer = witness?.ref.agent === "pitako.checkpoint-sealer" &&
+      dispatchedAction?.kind === "launched" && /\.task-(reviewer|synthesis)$/.test(dispatchedAction.key) &&
+      ["stopped", "interrupted", "native permission denial"].includes(witness.cause);
+    if (witness && !reviewedSealer && loop.halt === genericHalt) {
+      retainSettledNativeHalt(witness);
+      reason = loop.halt.reason;
+    }
+  }
+  if (loop && !persistenceFailed && admissionValidated) {
+    if (error?.viewOverflowHalt) {
+      loop.halt = error.viewOverflowHalt;
+      if (loop.halt.ref) retainHaltProducer(loop.halt.ref, "loop-io");
+    }
+    if (error?.backlogConflict) loop.halt = { status: "blocked", code: "backlog-conflict", reason: excerpt(reason),
+      ...(error.conflictRef ? { ref: error.conflictRef, originalDigest: error.originalDigest } : {}) };
     loop.halt = loop.halt ?? { status, ...(error?.nativeFailure ?? {
       code: error?.nativeBarrier ? "native-barrier" : "recovery", reason: excerpt(reason),
       ...(error?.nativeBarrier ? { cause: error.nativeBarrier } : {}),
@@ -4871,4 +7502,5 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
 } finally {
   // Join original native promises even when helpers await derived chains.
   await Promise.allSettled(nativeCalls);
+}
 }

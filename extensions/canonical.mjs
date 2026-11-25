@@ -8,12 +8,32 @@ export function sha256(bytes) {
 
 /** Sorted-key JSON for plain JSON values; anything else is rejected, never coerced. */
 export function canonicalJSON(value) {
-  if (value === null || typeof value === "string" || typeof value === "boolean") return JSON.stringify(value);
-  if (typeof value === "number" && Number.isFinite(value)) return JSON.stringify(value);
-  if (Array.isArray(value)) return "[" + Array.from(value, item => canonicalJSON(item)).join(",") + "]";
-  if (value && Object.getPrototypeOf(value) === Object.prototype)
-    return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + canonicalJSON(value[key])).join(",") + "}";
-  throw new Error("Canonical JSON requires JSON values only.");
+  let indexed = false;
+  const normalize = value => {
+    if (value === null || typeof value === "string" || typeof value === "boolean") return value;
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    if (Array.isArray(value)) return Array.from(value, normalize);
+    if (value && Object.getPrototypeOf(value) === Object.prototype) {
+      const sorted = Object.create(null);
+      for (const key of Object.keys(value).sort()) {
+        if (String(key >>> 0) === key && key !== "4294967295") indexed = true;
+        sorted[key] = normalize(value[key]);
+      }
+      return sorted;
+    }
+    throw new Error("Canonical JSON requires JSON values only.");
+  };
+  // Copy first: native serialization must never invoke an input's toJSON.
+  const normalized = normalize(value);
+  if (!indexed) return JSON.stringify(normalized);
+  // Native object enumeration sorts array-index keys numerically, not lexicographically.
+  const serialize = value => {
+    if (Array.isArray(value)) return "[" + value.map(serialize).join(",") + "]";
+    if (value && typeof value === "object")
+      return "{" + Object.keys(value).sort().map(key => JSON.stringify(key) + ":" + serialize(value[key])).join(",") + "}";
+    return JSON.stringify(value);
+  };
+  return serialize(normalized);
 }
 
 /** Digest of the canonical form: reformatting and key order do not change it. */

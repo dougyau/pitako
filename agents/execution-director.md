@@ -2,11 +2,12 @@
 name: execution-director
 package: pitako
 description: Read-only loop planner; selects one pending backlog task and ends before workers.
-tools: read, grep, find, ls, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, codemode
+tools: read, grep, find, ls, git_worktree_list, git_status, git_diff, git_log, git_show, resource_snapshot, file_sha256, pitako_store, codemode
 extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/pitako-store-tool.ts
 acceptanceRole: read-only
 defaultContext: fresh
 timeoutMs: 7200000

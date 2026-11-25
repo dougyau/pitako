@@ -2,10 +2,14 @@ import { checkoutEvidence, designatedWorkspace, discoverSpec, executionAmendment
 import { readFileSync } from "node:fs";
 import { createHash } from "node:crypto";
 import path from "node:path";
-import { boundRetainedAnalyses, retainedAnalyses } from "../../extensions/execute-retained.ts";
-import { checkpointEvidence, previousUnitMatches } from "../../extensions/execute-checkpoint.ts";
+import { boundRetainedAnalyses, earlyAnalysisReplayGap, retainedAnalyses, retainedExecuteHalt } from "../../extensions/execute-retained.ts";
+import { checkpointEvidence } from "../../extensions/execute-checkpoint.ts";
 import { isDeepStrictEqual } from "node:util";
-import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState, expandWorkerReferences } from "../../extensions/execute-state.ts";
+import { executionStatePath } from "../../extensions/execute-state.ts";
+import { EXECUTE_CURSOR_KEY, validateExecuteCursor, type ExecuteCursor } from "../../extensions/execute-cursor.ts";
+import { readExecuteIntentContext, type ExecuteIntentBody } from "../../extensions/execute-intent.ts";
+import { boundEpochAdvanceReplay, boundExecuteTimeoutProjection, readExecuteAdmission, readExecuteSelectionReplay, readInitialAdvanceReplay } from "../../extensions/execute-progress.ts";
+import { StoreError } from "../../extensions/pitako-store.ts";
 
 type Inspection = { root: string; id: string; source: string; part?: string; context?: string; agentDir?: string; lines: string[] };
 function emitBounded(run: Inspection, value: unknown) {
@@ -15,41 +19,40 @@ function emitBounded(run: Inspection, value: unknown) {
 }
 // The exact mission is the same durable state read by the active root. Absence
 // is admission; a partial/conflicting association is never a fresh invocation.
-function admittedInvocation({ root, id, part }: Inspection, context: any) {
+function admittedInvocation({ root, id, part }: Inspection, context: any): ExecuteCursor | false {
   let mission: any;
   try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-  const invocation = mission?.[`invoke-${context.invocation}`], legacy = mission?.["pitako-execution"];
-  if (invocation === undefined && legacy === undefined) return false;
-  // Three-way gate: absent (new admission), current contract, or explicit failure.
-  for (const retained of [invocation, legacy]) if (retained !== undefined && retained?.version !== EXECUTE_STATE_VERSION)
-    throw new Error(incompatibleExecuteState(retained?.version));
-  if (!invocation) throw new Error("Incompatible retained invocation; no settings admission.");
-  if (invocation.association && !isDeepStrictEqual(invocation.amendments ?? [], context.amendments ?? []))
-    throw new Error("Immutable admission amendments changed; preserve the retained path, SHA-256 and provenance. Do not merge or replace references on recovery.");
-  const association = invocation.association;
-  if (association && part === "admission" && !/^[a-f0-9]{64}$/.test(invocation.admissionBinding ?? ""))
-    throw new Error("Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence; inspect actual native state. A terminal root cannot resume.");
-  if (association === undefined) {
-    const request = invocation.hostHalt?.request;
-    if (legacy || !request || invocation.hostHalt.code !== "host-observation" ||
-        Object.keys(invocation).some(key => !["version", "hostHalt", "resolutions", "hostReconstruction", "activePlan"].includes(key)) ||
-        (invocation.activePlan !== undefined && invocation.activePlan !== null) ||
-        request.missionId !== context.missionId || request.missionPath !== context.missionPath ||
-        request.invocation !== context.invocation || request.root !== root || request.id !== id ||
-        typeof request.inspectionCommand !== "string" ||
-        !isDeepStrictEqual(request.sourceRefs, context.sourceRefs))
-      throw new Error("Incomplete retained invocation; no settings admission.");
-    return false;
+  const value = mission?.[EXECUTE_CURSOR_KEY];
+  if (value === undefined) return false;
+  validateExecuteCursor(EXECUTE_CURSOR_KEY, value);
+  if (value.invocation !== context.invocation) return false;
+  let retained;
+  try {
+    retained = readExecuteAdmission(root, value);
+  } catch (error) {
+    // A failed store read must not hide a native key collision from the demand replay.
+    if (part === "admission" && error instanceof StoreError &&
+        !["superseded", "wrong-cwd"].includes(error.code) &&
+        value.action.kind === "launched" && value.action.key.endsWith(".demand-observation")) {
+      const gap = earlyAnalysisReplayGap(value, context.missionPath, context.missionId);
+      if (gap) throw new Error(gap);
+    }
+    throw error;
   }
+  const { cursor, admission } = retained;
+  if (!isDeepStrictEqual(admission.amendments ?? [], context.amendments ?? []))
+    throw new Error("Immutable admission amendments changed; preserve the retained path, SHA-256 and provenance. Do not merge or replace references on recovery.");
+  const association = admission.association;
+  if (part === "admission" && !/^[a-f0-9]{64}$/.test(cursor.admissionBinding))
+    throw new Error("Retained execution predates bound native admission; no migration or replay is supported. Preserve its evidence; inspect actual native state. A terminal root cannot resume.");
   if (!association || association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
       association.invocation !== context.invocation || association.root !== root ||
       typeof association.source !== "string" || typeof association.digest !== "string" ||
       !Number.isSafeInteger(association.maxCycles) || association.maxCycles < 1 ||
-      !isDeepStrictEqual(association.sourceRefs, context.sourceRefs) ||
-      (legacy && !isDeepStrictEqual(legacy.association, association)))
+      !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
     throw new Error("Incompatible retained association; no settings admission.");
-  return true;
+  return cursor;
 }
 // Planning validates only the root; execution uses the named resource's exact
 // inspections. No writes. Returns the exact stdout of the inspect.mjs argument vector.
@@ -61,7 +64,6 @@ export async function inspect(argv: string[]): Promise<string> {
     try {
       const observed = preliminarySpec(root, id, source || undefined);
       const context = JSON.parse(run.context ?? "null");
-      const admitted = admittedInvocation(run, context);
       executionAmendments(observed.root, context.amendments, true);
       const { sourceRefs, agentDir } = context.admission;
       for (const ref of sourceRefs) {
@@ -70,8 +72,31 @@ export async function inspect(argv: string[]): Promise<string> {
         const actual = createHash("sha256").update(content).digest("hex");
         if (actual !== ref.digest) throw new Error(`Complete spec source hash mismatch: ${ref.path}; expected ${ref.digest}, observed ${actual}`);
       }
+      let admitted, recovery, checkpointObservation, timeoutRecovery, selectionRecovery, storeFailure, haltOriginal, initialAdvance;
+      try {
+        admitted = admittedInvocation(run, context);
+        if (admitted) {
+          const gap = earlyAnalysisReplayGap(admitted, context.missionPath, context.missionId);
+          if (gap) {
+            emitBounded(run, { version: 1, error: gap });
+            return run.lines.join("\n");
+          }
+          recovery = boundRetainedAnalyses(observed.root, observed.commonDir, observed.source,
+            observed.digest, observed.binding, context);
+          if (admitted.halt?.stage !== "checkpoint-witness")
+            checkpointObservation = observeCheckpoint({ root: observed.root, commonDir: observed.commonDir, selected: observed }, context);
+          timeoutRecovery = boundExecuteTimeoutProjection(observed.root, context);
+          selectionRecovery = readExecuteSelectionReplay(observed.root, admitted);
+          haltOriginal = retainedExecuteHalt(observed.root, admitted);
+        } else initialAdvance = readInitialAdvanceReplay(observed.root, context, observed);
+      } catch (error) {
+        if (!(error instanceof StoreError)) throw error;
+        storeFailure = { code: error.code, reason: error.message };
+        if (error.code === "store-replaced")
+          initialAdvance = boundEpochAdvanceReplay(observed.root, context, observed);
+      }
       let admission;
-      if (!admitted) {
+      if (!admitted && !storeFailure && !initialAdvance) {
         if (!agentDir || !path.isAbsolute(agentDir)) throw new Error("Expected absolute host agent directory for settings admission.");
         const { executeMaxCycles, executeRevivalContextPeak, executeTaskReviewer, executeTaskSynthesis,
           DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } = await import("../../extensions/execute-settings.ts");
@@ -90,11 +115,11 @@ export async function inspect(argv: string[]): Promise<string> {
           ...(revivalContextPeak !== 120000 ? { revivalContextPeak } : {}) };
       }
       const { head, fingerprint } = checkoutEvidence(observed.root);
-      const recovery = admitted ? boundRetainedAnalyses(observed.root, observed.commonDir, observed.source,
-        observed.digest, observed.binding, context) : undefined;
-      const checkpointObservation = admitted ? observeCheckpoint({ root: observed.root, commonDir: observed.commonDir, selected: observed }, context) : undefined;
       emitBounded(run, { version: 1, binding: observed.binding, checkout: { head, fingerprint }, ...(admission ? { admission } : {}),
-        ...(recovery ? { recoveryDigest: recovery.digest } : {}), ...(checkpointObservation ? { checkpointObservation } : {}) });
+        ...(recovery ? { recoveryDigest: recovery.digest } : {}), ...(checkpointObservation ? { checkpointObservation } : {}),
+        ...(timeoutRecovery ? { timeoutDigest: timeoutRecovery.digest } : {}),
+        ...(selectionRecovery ? { selectionRecovery } : {}), ...(storeFailure ? { storeFailure } : {}),
+        ...(haltOriginal ? { haltOriginal } : {}), ...(initialAdvance ? { initialAdvance } : {}) });
     } catch (error) {
       const message = String(error instanceof Error ? error.message : error);
       const next = "Reconcile the identified input and explicitly prepare admission with the intended version. For an admitted invocation preserve its snapshot, restore reliable exact originals and deliver desired changes as a human addendum; unavailable originals remain blocked. Native barriers require supported native inspection/reconciliation, not source correction.";
@@ -202,59 +227,57 @@ async function inspectSelected(run: Inspection) {
   }
 }
 
-function observeCheckpoint(found: { root: string; commonDir: string; selected?: { source: string; digest: string } }, context: any) {
+export function observeCheckpoint(found: { root: string; commonDir: string; selected?: { source: string; digest: string } }, context: any) {
   let observation;
   if (context && found.selected) {
     let mission;
     try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
-    const invocation = expandWorkerReferences(mission?.[`invoke-${context.invocation}`]);
-    if (invocation !== undefined && invocation?.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(invocation?.version));
-    const loop = invocation?.loop, attempt = loop?.attempt;
-    if (loop?.phase === "implementation" && (attempt?.checkpoint || attempt?.restore?.checkpoint || attempt?.restore?.sourceKeys) && (attempt.stage !== "result" || ["blocked", "continue", "gaps"].includes(attempt.result?.status))) {
-      const association = invocation.association;
+    if (mission?.[EXECUTE_CURSOR_KEY] !== undefined) {
+      const cursor = mission[EXECUTE_CURSOR_KEY];
+      validateExecuteCursor(EXECUTE_CURSOR_KEY, cursor);
+      if (cursor.invocation !== context.invocation) return undefined;
+      if (cursor.loop?.phase !== "implementation" || !cursor.loop.attempt?.intent) return undefined;
+      const { intent, records, confirmed } = readExecuteIntentContext(found.root, cursor);
+      const association = intent.association;
       if (association.root !== found.root || association.commonDir !== found.commonDir ||
           association.source !== found.selected.source || association.digest !== found.selected.digest ||
           association.missionId !== context.missionId || association.missionPath !== context.missionPath ||
-          association.invocation !== context.invocation || !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
+          !isDeepStrictEqual(association.sourceRefs, context.sourceRefs))
         throw new Error("Checkpoint observation association mismatch.");
-      const retainedSources = (attempt.restore?.sourceKeys ?? invocation.taskFrame?.restorationKeys ?? []).map((key: string) => {
-        const intent = invocation.taskFrame?.intents?.[key];
-        if (!intent) throw new Error("Missing authenticated restoration source intent.");
-        return intent;
-      });
-      const sources = [attempt.checkpoint, ...retainedSources.filter((item: any) => item.key !== attempt.checkpoint?.key)].filter(Boolean);
-      const subject = { key: attempt.key, taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor };
+      const subject = { key: intent.key, taskId: intent.taskId, attempt: intent.attempt,
+        loop: intent.loop, cursor: intent.cursor };
       try {
-        if (sources.some(source => !isDeepStrictEqual(source.association, association) || source.taskId !== subject.taskId ||
-            source.loop !== subject.loop || source.cursor !== subject.cursor || source.attempt > subject.attempt))
-          throw new Error("Checkpoint observation pending-task mismatch.");
-        const confirmed = invocation.lastConfirmed;
-        const unit = attempt.restore?.authority?.confirmedUnit ?? (confirmed?.kind === "unit" && confirmed.position.loop === loop.number ? confirmed : undefined);
-        if (unit) {
-          const { taskId, attempt: number, resultRef, ...receipt } = unit;
-          const pending = attempt.checkpoint ?? retainedSources[0];
-          if (unit.position.loop < loop.number) {
-            if (!pending || !previousUnitMatches(pending, unit) ||
-                unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${unit.resultRef.key}/unit.json`)
-              throw new Error("Confirmed unit conflicts with admitted pending progress.");
-          } else {
-            const result = loop.results.map((item: any) => {
-              if (item.ref) return item;
-              const completed = invocation.tasks?.[item.taskId]?.completed;
-              return completed?.attempt === item.attempt ? completed : undefined;
-            }).find((item: any) => item?.taskId === taskId && item.attempt === number && isDeepStrictEqual(item.ref, resultRef));
-            if (!result || result.status !== "complete" || !isDeepStrictEqual(result.checkpoint?.confirmation, receipt) ||
-                !isDeepStrictEqual(unit.position, { loop: loop.number, cursor: loop.cursor, phase: "implementation" }) ||
-                unit.checkpointRef !== `${found.root}/.pi/subagents/checkpoints/${result.checkpoint.key}/unit.json`)
-              throw new Error("Confirmed unit conflicts with admitted pending progress.");
+        // Earlier captures may be the only surviving preimages of a resumed slot.
+        // Only committed originals within this cursor's head can contribute.
+        const earlier = records.flatMap(row => {
+          const source = row.kind === "intent" ? row.body as Partial<ExecuteIntentBody> : undefined;
+          return source && source.version === 2 && isDeepStrictEqual(source.association, association) &&
+            source.taskId === intent.taskId && source.loop === intent.loop && source.cursor === intent.cursor &&
+            source.phase === intent.phase && source.attempt! < intent.attempt ? [source as ExecuteIntentBody] : [];
+        }).sort((a, b) => b.attempt - a.attempt);
+        const sources = [intent, ...earlier.filter((source, index) =>
+          earlier.findIndex(other => other.key === source.key) === index)];
+        // The capture predates its result admission. Use logical progress at the
+        // saved head so a later baseline cannot turn that same admission into new evidence.
+        const admitted = structuredClone(intent.progress!.admitted);
+        for (const row of records) {
+          if (row.seq <= cursor.loop.attempt.intent.seq || row.kind !== "ledger") continue;
+          for (const entry of (row.body as { entries: { kind: string; loop: number;
+            body: { result?: { taskId: string; status: string }; results?: { taskId: string; status: string }[] } }[] }).entries) {
+            if (entry.kind !== "unit" || entry.loop !== intent.loop) continue;
+            for (const result of [...(entry.body.results ?? []), ...(entry.body.result ? [entry.body.result] : [])]) {
+              const states = admitted[result.taskId] ??= [];
+              if (!states.includes(result.status)) states.push(result.status);
+            }
           }
         }
-        observation = { ...subject, evidence: checkpointEvidence(sources, { consumedLoops: invocation.consumedLoops,
-          admitted: Object.fromEntries(Object.entries(invocation.tasks).filter(([, task]: [string, any]) => task.admitted.length)
-            .map(([id, task]: [string, any]) => [id, task.admitted])) }, unit) };
+        observation = { ...subject, evidence: checkpointEvidence(sources,
+          { consumedLoops: cursor.budget.consumedLoops, admitted }, confirmed?.kind === "unit" ? confirmed : undefined) };
       } catch (error) { observation = { ...subject, error: String(error instanceof Error ? error.message : error) }; }
+      return observation;
     }
+
   }
   return observation;
 }

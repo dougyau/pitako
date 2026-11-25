@@ -3,16 +3,16 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { gitPort } from "./git-port.ts";
-import { isDeepStrictEqual } from "node:util";
 import { Type } from "typebox";
 import { parseApplyPatch } from "pi-codex-tools";
-import { beginHookEffect, closeHookEffect, recordContextPeak, createCheckpoint, previousUnitMatches, type CheckpointIntent } from "./execute-checkpoint.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath, incompatibleExecuteState, expandWorkerReferences } from "./execute-state.ts";
+import { beginHookEffect, closeHookEffect, recordContextPeak, createCheckpoint, type CheckpointIntent } from "./execute-checkpoint.ts";
+import { executionStatePath } from "./execute-state.ts";
 import { effectiveProfile } from "./profile.ts";
+import { EXECUTE_CURSOR_KEY } from "./execute-cursor.ts";
+import { readExecuteIntent, type CheckpointBinding } from "./execute-intent.ts";
 
 const namespace = "pitako.checkpoint/1";
-type Binding = { association: CheckpointIntent["association"]; key: string };
-const equal = isDeepStrictEqual;
+type Binding = CheckpointBinding;
 
 // Native child extensionBindings is launch-scoped, not model-authored tool input.
 // Capture it during factory loading: in-process children restore the environment.
@@ -27,31 +27,8 @@ export default function checkpointCreate(pi: ExtensionAPI): void {
     const association = binding.association;
     if (association.root !== cwd || typeof association.invocation !== "string" ||
         typeof association.missionPath !== "string") throw new Error("Checkpoint execution workspace mismatch.");
-    const record = expandWorkerReferences(JSON.parse(readFileSync(executionStatePath(association), "utf8"))[`invoke-${association.invocation}`]);
-    if (record && record.version !== EXECUTE_STATE_VERSION) throw new Error(incompatibleExecuteState(record.version));
-    if (!record || !equal(record.association, association))
-      throw new Error("Checkpoint durable association mismatch.");
-    const loop = record.loop, attempt = loop?.attempt;
-    if (!loop || loop.phase !== "implementation" || loop.halt || record.outcome ||
-        (hook ? attempt?.bindingKey !== binding.key : attempt?.key !== binding.key) || attempt.index !== loop.cursor || attempt.result ||
-        !(hook ? attempt.stage === "launched" : ["intention", "launched"].includes(attempt.stage)) || loop.plan?.stage !== "admitted" ||
-        loop.manifest?.[loop.cursor] !== attempt.taskId)
-      throw new Error("Checkpoint execution is stale, stopped or not a pending writer unit.");
-    const intent: CheckpointIntent = { version: 2, association, key: attempt.key,
-      ...(attempt.baseline ? { baseline: attempt.baseline } : {}),
-      taskId: attempt.taskId, attempt: attempt.number, loop: loop.number, cursor: loop.cursor,
-      phase: "implementation", planRef: loop.plan.ref,
-      progress: { consumedLoops: record.consumedLoops,
-        admitted: Object.fromEntries(Object.entries(record.tasks).filter(([, task]: [string, any]) => task.admitted.length)
-          .map(([id, task]: [string, any]) => [id, task.admitted])),
-        previous: record.lastConfirmed?.kind === "unit"
-          ? (({ taskId, attempt, resultRef, checkpointRef, digest }) =>
-            ({ taskId, attempt, resultRef, checkpointRef, digest }))(record.lastConfirmed) : null } };
-    if (record.lastConfirmed?.kind === "unit" && record.lastConfirmed.position.loop !== loop.number &&
-        !previousUnitMatches(intent, record.lastConfirmed))
-      throw new Error("Confirmed unit lacks admitted pending-position provenance.");
-    if (!equal(attempt.checkpoint, intent)) throw new Error("Checkpoint intention/progress differs from durable execution context.");
-    return intent;
+    const mission = JSON.parse(readFileSync(executionStatePath(association), "utf8"));
+    return readExecuteIntent(cwd, mission[EXECUTE_CURSOR_KEY], binding, hook);
   }
   pi.on("turn_end", (_event, ctx) => {
     if (!binding && !bindingError) return;

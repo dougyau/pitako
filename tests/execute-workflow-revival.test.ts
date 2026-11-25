@@ -53,7 +53,8 @@ test("missing/invalid peak and context, halt or candidate limits select fresh", 
 });
 
 const { fixture } = executeControllerFixture();
-const lastAttempt = (host: ReturnType<typeof fixture>) => [...host.snapshots].reverse().find(s => s.loop?.attempt?.taskId === "change1").loop.attempt;
+const lastAttempt = (host: ReturnType<typeof fixture>) =>
+  host.records().filter((row: any) => row.kind === "unit" && row.body.taskId === "change1").at(-1)!.body;
 function continuingHost(options: { realCheckout?: boolean; reject?: boolean; missingPeak?: boolean; stagnant?: boolean; drift?: boolean; refusal?: string } = {}) {
   const host = fixture(undefined, { realCheckout: options.realCheckout || options.drift, humanPosts: [{ id: 2, type: "FINDING", content: "Already loaded" }] });
   let workers = 0, gates = 0;
@@ -94,26 +95,19 @@ test("controller resumes a new keyed attempt without bindings and sends only del
   const first = host.calls.find(request => request.agent === "pitako.worker")!;
   const resumed = host.calls.find(request => request.resume && request.key.includes(".t1."))!;
   expect(resumed.key).toBe("invoke-human-1.l1.t1.a2");
-  expect(resumed.resume).toBe(`native-${first.key}`);
+  expect(resumed.resume).toBe(host.native.get(first.key)!.runId!);
   expect(resumed).not.toHaveProperty("extensionBindings");
   expect(resumed).not.toHaveProperty("agent");
   for (const label of ["ATTEMPT:", "GATE FAILURES:", "METRIC SERIES:", "NEW BOARD POSTS:", "PREVIOUS RESULT:", "checkpoint hook"])
     expect(resumed.task).toContain(label);
   expect(resumed.task).toContain("New useful fact");
   expect(resumed.task).not.toContain("Already loaded");
-  for (const state of host.snapshots) {
-    const attempt = state.loop?.attempt;
-    if (attempt?.gate?.receipt && attempt.close?.admitted) {
-      expect(attempt.gate.receipt).not.toHaveProperty("view");
-      expect(attempt.close.receipt.projection).not.toHaveProperty("view");
-    }
-  }
+  expect(host.snapshots.every(state => !Object.hasOwn(state, "currentView"))).toBe(true);
   for (const repeated of ["COMPLETE IMMUTABLE SPECS", "COMPLETE SELECTED TASK", '"goal":', "PRE-WRITE CHECKPOINT INTENTION"])
     expect(resumed.task).not.toContain(repeated);
   const attempt = lastAttempt(host);
-  expect(attempt).toMatchObject({ key: resumed.key, number: 2, bindingKey: first.key,
-    checkpoint: { key: resumed.key, attempt: 2 }, revival: { decision: "resume", code: "eligible" } });
-  expect(attempt.gate.ref.key).toContain("a2");
+  expect(attempt.result).toMatchObject({ attempt: 2, checkpoint: { key: resumed.key, confirmation: { kind: "unit" } },
+    revival: { decision: "resume", code: "eligible" } });
   const directory = path.join(host.root, ".pi/subagents/checkpoints", resumed.key);
   expect(existsSync(path.join(directory, "unit.json"))).toBe(true);
   const manifest = JSON.parse(JSON.parse(readFileSync(path.join(directory, "manifest.json"), "utf8")).data);
@@ -123,8 +117,7 @@ test("controller resumes a new keyed attempt without bindings and sends only del
 
 test("close replay keeps fresh Board delivery after its transient view is transferred", async () => {
   const host = continuingHost({ realCheckout: true });
-  host.setFailSave(state => state.loop?.attempt?.gate?.stage === "receipt" &&
-    !!state.loop.attempt.close && !state.loop.attempt.close.receipt.projection.view);
+  host.setFailSave(() => host.native.has("invoke-human-1.l1.t1.a1.close"));
   expect((await host.execute()).reason).toContain("Essential persistence failed");
   host.setFailSave();
   const output = await host.execute();
@@ -143,8 +136,8 @@ test("explicit rejected resume records refusal and dispatches a fresh new key/bi
   expect(workers.map(request => request.key)).toEqual(["invoke-human-1.l1.t1.a1", "invoke-human-1.l1.t1.a3"]);
   expect((workers[1] as any).extensionBindings["pitako.checkpoint/1"].key).toBe(workers[1].key);
   expect(workers[1].task).toContain("COMPLETE SELECTED TASK");
-  expect(lastAttempt(host)).toMatchObject({ number: 3, bindingKey: workers[1].key,
-    revival: { decision: "fresh", code: "resume-rejected" }, resumeRejection: { reason: "Run not found. Provide id or runId." } });
+  expect(lastAttempt(host).result).toMatchObject({ attempt: 3, revival: { decision: "fresh", code: "resume-rejected" } });
+  expect(host.native.get("invoke-human-1.l1.t1.a2")?.error).toBe("Run not found. Provide id or runId.");
 });
 
 test.each(["missingPeak", "drift"] as const)("controller keeps fresh on %s", async mode => {
@@ -152,14 +145,14 @@ test.each(["missingPeak", "drift"] as const)("controller keeps fresh on %s", asy
   await host.execute();
   expect(host.calls.some(request => request.resume && request.key.includes(".t1."))).toBe(false);
   expect(host.calls.filter(request => request.agent === "pitako.worker")).toHaveLength(2);
-  expect(lastAttempt(host).revival.code).toBe(mode === "missingPeak" ? "missing-peak" : "candidate-changed");
+  expect(lastAttempt(host).result.revival.code).toBe(mode === "missingPeak" ? "missing-peak" : "candidate-changed");
 });
 
 test("a revived non-improving worker is not revived twice", async () => {
   const host = continuingHost({ stagnant: true });
   expect((await host.execute()).status).toBe("complete");
   expect(host.calls.filter(request => request.resume && request.key.includes(".t1."))).toHaveLength(1);
-  expect(lastAttempt(host).revival.code).toBe("revived-no-improvement");
+  expect(lastAttempt(host).result.revival.code).toBe("revived-no-improvement");
 });
 
 test.each(["Blocked by pi-subagents permission rule: 'run' is denied.", "Uncertain native transport failure"])("resume refusal never bypasses barriers or uncertainty: %s", async refusal => {
@@ -187,7 +180,7 @@ test("admitted context setting controls dispatch and remains retained", async ()
   host.setHostResponse((key, value) => key.startsWith("inspect-initial") && value.admission
     ? { ...value, admission: { ...value.admission, revivalContextPeak: 50 } } : value);
   expect((await host.execute()).status).toBe("complete");
-  expect(host.current().revivalContextPeak).toBe(50);
+  expect(host.admitted().revivalContextPeak).toBe(50);
   expect(host.calls.some(request => request.resume && request.key.includes(".t1."))).toBe(false);
-  expect(lastAttempt(host).revival.code).toBe("context-peak");
+  expect(lastAttempt(host).result.revival.code).toBe("context-peak");
 });

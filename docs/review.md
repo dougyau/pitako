@@ -11,13 +11,44 @@ profile for exactly two angles, each independently reviewed by both model slots
 is `evidence-contract` for `diff`, `solution`, `codebase`, and `issue`, or
 `decision-fidelity` for `plan`; the director selects one distinct risk angle.
 Models use the [`pitako.review.*` settings](configuration.md#package-and-session-settings).
+Only a matching nonterminal `pitako-review` cursor freezes those settings. A
+different input replaces the one bounded cursor; an identical terminal pass is
+not restarted implicitly.
 Before synthesis, the model-free `pitako.access-verifier`
 compares the canonical JSON digest of each published original with the digest
-saved in review state and writes a no-clobber receipt in the mission directory.
+admitted by the review and writes a no-clobber receipt in `access:review-<scopeId>`.
 Reviewers read the verified originals by path; a contradictory or unavailable
-original blocks that phase with an explanation. Receipts follow mission
-retention; `access_receipt_verify` and `extensions/access-receipts.mjs check`
-recompute them read-only and report drift or a pruned mission.
+original blocks that phase with an explanation. Check receipts read-only with
+`access_receipt_verify` or `extensions/access-receipts.mjs check`, from the
+designated worktree using the mission path, namespace and gate.
+
+The cursor holds at most six reviewer settlement references and one verifier
+reference. The model-free `pitako.store-io` saves the final outcome once to the
+cwd-local SQLite store. It rechecks native journals and exact file digests and
+does not relaunch models or rerun the verifier. If the final cursor save was
+lost, the same operation key returns the committed result. Missing or altered
+native originals fail closed. After proven store loss or replacement, the
+final writer matches reconstructed path-only receipt bytes against the native
+verifier result; it saves no receipt copy. If a receipt is missing or corrupt
+in the same store, the authorized final writer rechecks it under a write lock
+and quarantines the store before using that same proof. A cut before the cursor
+save can leave settlements in the native journal. One read-only observation
+verifies and returns those bodies
+when they fit. To stay within 61440 bytes, it replaces only as many successful
+bodies as needed with key, run ID and digest, and only if the current root's
+native reuse source contains the exact settlement. The workflow checks the
+reused body against that digest before consuming it. If the receipt still does
+not fit (for example, after a save denial with several large reports and no
+native reuse), `review-recovery-overflow` reports the measured size and slot
+count and halts before any producer dispatch or SQLite write. The workflow
+saves the diagnostic once in the terminal `pitako-review` cursor. Later
+relaunches of the same review return it without dispatching any children or
+saving again. An isolated save-denial fixture with four 20,000-byte coverage
+strings measured 82,713 bytes for five settled slots. Failed settlements keep
+their exact bodies; a retained Stop holds without another child or write.
+The SQLite fence detects a foreign terminal cursor on relaunch; native cursor
+saves are not atomic with COMMIT. Different input can start a review after
+same-cwd store loss without overwriting a surviving fence.
 
 Every reviewer sees the complete target. The caller supplies a target kind,
 reference, and material, plus requirements and evidence. A label or branch name

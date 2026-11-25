@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import planExecute, { executionResource } from "../extensions/plan-execute.ts";
@@ -52,28 +52,23 @@ test("resolver passes valid options only in config, leaving host admission reque
 
 test("sticky fields merge on relaunch, omission retains, and empty object resets with effective reporting", async () => {
   const host = fixture();
-  host.setFailSave(value => value.loop?.attempt?.stage === "intention");
-  await host.execute({ timeouts: { reviewerMs: 20000000, workerMs: 21000000 } });
-  expect(host.current().timeouts).toEqual({ values: { reviewerMs: 20000000, workerMs: 21000000 }, since: { loop: 0, attempt: 0 } });
-  const association = structuredClone(host.current().association);
-  const binding = host.current().admissionBinding;
-  const backlogPath = path.join(host.root, ".pitako/backlog/spec.json");
-  const backlog = readFileSync(backlogPath, "utf8");
-  const digest = host.current().backlogDigest;
+  // Hold at the committed advance so each merge tests the same admitted invocation.
+  host.setFailSave(value => value.action?.role === "execution-director");
+  const first = await host.execute({ timeouts: { reviewerMs: 20000000, workerMs: 21000000 } });
+  expect(first.reason).toContain("Essential persistence failed");
+  expect(host.current().timeouts).toEqual({ reviewerMs: 20000000, workerMs: 21000000, gateFloorMs: 0 });
+  const { associationDigest, admissionBinding, backlogDigest, head } = host.current();
   const output = await host.execute({ timeouts: { gateFloorMs: 22000000 } });
-  expect(host.current().timeouts.values).toEqual({ reviewerMs: 20000000, workerMs: 21000000, gateFloorMs: 22000000 });
+  expect(host.current().timeouts).toEqual({ reviewerMs: 20000000, workerMs: 21000000, gateFloorMs: 22000000 });
   expect(output.timeouts).toEqual(output.loopReport.timeouts);
   expect(output.timeouts.since).toEqual({ loop: 1, attempt: 0 });
   await host.execute();
-  expect(host.current().timeouts).toEqual({ values: output.timeouts.values, since: output.timeouts.since });
+  expect(host.current().timeouts).toEqual(output.timeouts.values);
   const reset = await host.execute({ timeouts: {} });
-  expect(host.current().timeouts.values).toEqual({});
+  expect(host.current().timeouts).toEqual({ reviewerMs: 14400000, workerMs: 14400000, gateFloorMs: 0 });
   expect(reset.timeouts.values).toEqual({ reviewerMs: 14400000, workerMs: 14400000, gateFloorMs: 0 });
   expect(reset.loopReport.timeouts).toEqual(reset.timeouts);
-  expect(host.current().association).toEqual(association);
-  expect(host.current().admissionBinding).toBe(binding);
-  expect(readFileSync(backlogPath, "utf8")).toBe(backlog);
-  expect(host.current().backlogDigest).toBe(digest);
+  expect(host.current()).toMatchObject({ associationDigest, admissionBinding, backlogDigest, head });
 });
 
 test("an essential timeout save failure prevents subsequent dispatch", async () => {
@@ -81,5 +76,6 @@ test("an essential timeout save failure prevents subsequent dispatch", async () 
   host.setFailSave(value => !!value.timeouts);
   const result = await host.execute({ timeouts: { workerMs: 20000000 } });
   expect(result.reason).toContain("Essential persistence failed");
-  expect(host.launches).toHaveLength(0);
+  expect(host.launches.map(call => call.key)).toEqual(["invoke-human-1.l1.advance"]);
+  expect(host.current()).toBeUndefined();
 });

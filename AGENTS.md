@@ -33,6 +33,7 @@ Registration and instruction sources:
 | Pi codemode | Native tool composition/discovery, not a separate Pitako runtime or MCP bridge. [extensions/profile-policy.ts](extensions/profile-policy.ts) preserves analysis mutation policy for nested calls. |
 | Pitako dev-tools | [extensions/dev-tools/index.ts](extensions/dev-tools/index.ts) registers Git, SSH, Python, Cargo and `resource_snapshot`. [extensions/resource-sampler/index.ts](extensions/resource-sampler/index.ts) is the owned sampler library consumed by resource tooling, **not a second extension**. |
 | Pitako hashes | [extensions/file-sha256.ts](extensions/file-sha256.ts) registers read-only `file_sha256` and writer-only `file_sha256_save`; inspect structured `ok` and publication, not display text alone. |
+| Pitako store reader | [extensions/pitako-store-tool.ts](extensions/pitako-store-tool.ts) registers read-only `pitako_store` for foreground and all eight profiles; bounded pages include continuation fields and lossless byte fragments. See [store inspection](docs/engineering.md#cwd-local-workflow-store). |
 | External `pi-lsp-client` | `node_modules/pi-lsp-client/src/index.ts` registers six LSP tools. Pitako installs the TypeScript/JavaScript, Python, and PHP server dependencies, but does not own their implementations. Rust uses the host's `rust-analyzer`. See [configuration](docs/configuration.md). |
 | Other composition | [extensions/index.ts](extensions/index.ts) and [extensions/profile.ts](extensions/profile.ts) assemble profile instructions; [extensions/catalog.ts](extensions/catalog.ts) advertises skills. [extensions/todo.ts](extensions/todo.ts) adapts rpiv-todo; [extensions/board/index.ts](extensions/board/index.ts) owns Board. CodeGraph, Codex patch tools, memory and web entries are linked in the stack manifest. |
 
@@ -43,11 +44,11 @@ worker allows `ast_rewrite`; the other three allow only `ast_search`.
 The execute root workflow owns
 dispatch; its director only publishes a read-only plan and ends. No packaged
 child delegates; the worker is the only writer of product content. Root-dispatched
-deterministic runtime agents (checkpoint sealer, execution and architecture ledgers, observers and
+deterministic runtime agents (checkpoint sealer, execution and architecture ledgers, standalone review store writer, observers and
 access verifier) write only Pitako metadata such as seals under
 `.pi/subagents/checkpoints`, ledger records and access receipts. The exception is
 `pitako.loop-io`: its grouped operations may write only the backlog file under
-`.pitako/backlog/`, Board posts, logs/receipts/metadata under `.pi/`, seal files
+`.pitako/backlog/`, Board posts, cwd-store logs/receipts/metadata, seal files
 under `.pi/subagents/checkpoints`, execution-ledger records, and gitignored
 build outputs produced by gate commands. It writes no product content and runs
 only after the worker settles, with no writer active. There is no command allow-list;
@@ -58,6 +59,35 @@ coding/analysis mutation policy: shell is not a sandbox, query Git can write
 metadata, and Python/Cargo/SSH are not read-only merely because of annotations.
 `git_commit` pushes by default; workers must set `push:false` without publication
 authority.
+
+The cwd-local workflow store (`extensions/pitako-store.ts`) is deterministic-host
+metadata at `.pi/pitako/pitako.db`, not product content or native mission state.
+Only deterministic loop-io, the execution and architecture ledgers, the
+checkpoint sealer, checkout and request observers, `pitako.store-io`, the access
+verifier, and the foreground todo projection may write it. The
+architecture ledger is limited to its `arch:<consultation>` scopes and the
+architecture admission fence. It may recover a lost consultation from verified
+native ledger originals, but may not reclaim a different active architecture
+scope or write native originals or steering journals. Steering outcomes are
+stored only in the round-close record. The workflow writes only its bounded
+`pitako-architecture` mission cursor; native observations and ledger projections
+are not additional state keys. `pitako.store-io` is limited to the standalone
+review final record and its `review:<scopeId>` fence. It does not dispatch
+models, rerun gates, or write native records. Its recovery-only observation
+reads native settlements and writes nothing. Foreground todo appends requests
+and display receipts only to `todo:<invocation>`; the access verifier appends
+only no-clobber `access:<namespace>` receipts. The completed architecture
+memo receipt stays a file under HUMAN #4224 and is not copied into SQLite.
+`access_receipt_verify` cannot write or quarantine a store. Execute's existing
+loop-io and standalone review's final store writer recheck corrupt or missing
+references before quarantine.
+Model children may only read verified store history through
+`pitako_store`; they do not write SQLite, including through shell or codemode.
+`checkpoint_create` writes no store rows; checkpoint images stay files.
+Creation adds `/.pi/pitako/` once to Git's `info/exclude`; never restore or include
+store files in checkout evidence. Execute and its integrated review use the
+existing deterministic children; `/plan` context writes no state.
+See [store inspection](docs/engineering.md#cwd-local-workflow-store).
 
 ## Keep changes scoped
 

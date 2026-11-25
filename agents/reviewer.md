@@ -10,6 +10,7 @@ tools:
   - git_show
   - resource_snapshot
   - file_sha256
+  - pitako_store
   - codemode
   - read
   - grep
@@ -33,6 +34,7 @@ extensions:
 subagentOnlyExtensions:
   - ../extensions/dev-tools/index.ts
   - ../extensions/file-sha256.ts
+  - ../extensions/pitako-store-tool.ts
   - ../node_modules/@vndv/pi-codegraph/extensions/codegraph.ts
   - ../node_modules/pi-lsp-client/src/index.ts
   - ../node_modules/@nicknisi/pi-ast-grep/index.ts
@@ -117,10 +119,12 @@ for those ranges. Do not claim to have reviewed unavailable bytes.
 For execute per-task review, the supplied slot diff replaces `watchdog_diff`,
 `git_diff` and HEAD comparisons, which include earlier loops' WIP. Its `a/` is
 the slot baseline before attempt 1; `b/` is the current candidate across all slot
-attempts. Verify its supplied `sha256` with `file_sha256` before reading; a missing
-or mismatched diff is a blocking finding of uncertain provenance. Read the absolute
-path with `read` offset paging using the index start lines (grep skips gitignored
-`.pi/`). Non-`rendered` statuses are declared limits: do not claim to have reviewed
+attempts. Read the `task-delta` record with `pitako_store` (`op: record`, supplied
+`storeId`, `scope`, `seq`). Follow `next` through all pages, reconstruct the JSON
+from its base64 fragments, and match the verified record's `digest` to the supplied
+digest. A missing or mismatched record is a blocking finding of uncertain
+provenance. Read `body.patch` using the index start lines.
+Non-`rendered` statuses are declared limits: do not claim to have reviewed
 unavailable bytes or deduct for that alone. The diff covers only this loop; for
 carried tasks, earlier-loop work is visible only in current source.
 

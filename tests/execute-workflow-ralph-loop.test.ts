@@ -1,11 +1,22 @@
 import { expect, test } from "bun:test";
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { fileURLToPath } from "node:url";
 import { validateToolArguments } from "@earendil-works/pi-ai";
-import { TASK_UPDATE_KEYS, readBacklog } from "../skills/execute/loop.ts";
+import { TASK_UPDATE_KEYS, gate as runGate, readBacklog, taskGateWire, topicOwner } from "../skills/execute/loop.ts";
 import { executeControllerFixture, copy, type Result } from "./fixtures/execute-workflow.ts";
 import { realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
+import { PitakoStore } from "../extensions/pitako-store.ts";
+import { openSqliteSync } from "../extensions/board/sqlite.ts";
+import { openBoard } from "../extensions/board/store.ts";
+import { repositoryIdentity } from "../extensions/board/workspace.ts";
+import { appendExecuteTodoRecords } from "../extensions/execute-todo-projection.ts";
+import { MAX_SPEC_BYTES, SPEC_SECTIONS, inspectionSnapshot, validateSpec } from "../extensions/spec-plans.ts";
+import { canonicalDigest, canonicalJSON, sha256 } from "../extensions/canonical.mjs";
+import { executeStore } from "../skills/execute/ledger.mjs";
+import { resolveStoredGroupedInput, commitFinalGate, commitStoredGate } from "../skills/execute/loop-io.mjs";
 
 const acceptanceComposition = realCheckoutCompositionFixture();
 const { fixture } = executeControllerFixture(acceptanceComposition.fake);
@@ -17,7 +28,12 @@ function acceptanceCheckout(host: ReturnType<typeof fixture>, request: { agent?:
       { ...acceptanceScripts, root: host.root, inlineSealer: true }, undefined);
 }
 const isGate = (call: { agent?: string; task: string }) => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "gate";
+const isFinalGate = (call: { agent?: string; task: string }) => isGate(call) && JSON.parse(call.task).task?.id === "final-acceptance";
 const taskFixture = (realCheckout = false) => { const host = fixture(undefined, { realCheckout }); host.setLimit(1); return host; };
+function committed(host: ReturnType<typeof fixture>, cursor = host.current()) {
+  const { store, scope } = executeStore(host.root, cursor.invocation, false, cursor.epoch);
+  return store.read(scope, cursor.head);
+}
 const checkOrigin = (ref: string) => {
   expect(Buffer.byteLength(ref)).toBeLessThanOrEqual(512);
   const output = JSON.parse(ref);
@@ -29,6 +45,7 @@ const gateReceipt = (normal: () => Result) => {
   const result = normal();
   return { result, receipt: JSON.parse(result.output!) };
 };
+const storeBody = <T>(body: unknown) => body as T;
 
 test("a complete worker with failed focused gates seals pause and continues the same task", async () => {
   const host = taskFixture();
@@ -71,34 +88,51 @@ test("a complete worker with failed focused gates seals pause and continues the 
   expect(workers[1]!.task).toContain("Current DECISIONs are binding working rules");
   expect(workers[1]!.task).toContain("COMPLETE IMMUTABLE SPEC SNAPSHOT");
   expect(host.calls.filter(call => isGate(call)).every(call => call.timeoutMs === 14400000)).toBe(true);
-  expect(host.snapshots.some(value => value.loop?.attempt?.gate?.stage === "receipt" && !value.loop?.attempt.seal)).toBe(true);
+  expect(host.snapshots.some(value => value.action?.op === "gate" && committed(host, value).records.some(row =>
+    row.opKey === `worker-gate:${value.action.opKey}`))).toBe(true);
 });
 
-test.each(["intact", "id-conflict", "digest-conflict", "legacy", "legacy-conflict"])("compact selection receipt survives admission save failure: %s", async mode => {
+test.each(["intact", "id-conflict", "digest-conflict"])("compact selection receipt survives admission save failure: %s", async mode => {
   const host = taskFixture();
-  host.setFailSave(value => value.loop?.plan?.stage === "admitted");
-  expect((await host.execute()).status).not.toBe("complete");
-  const retained = copy(host.current());
-  expect(retained.loop.selection.receipt.selected).toBe(retained.loop.task.id);
-  expect(retained.loop.selection.receipt.digest).toBe(retained.loop.taskBacklogDigest);
-  if (mode.startsWith("legacy")) {
-    retained.loop.selection.receipt.selected = copy(retained.loop.task);
-    delete retained.loop.taskBacklogDigest;
-    if (mode === "legacy-conflict") retained.loop.selection.receipt.selected.goal = "Conflicting full task";
+  const selectionKey = "invoke-human-1.l1.selectionIO";
+  let selection: { path: string; head: { seq: number; hash: string } } | undefined;
+  host.setLaunchRespond(async (request, normal) => {
+    const result = await normal();
+    if (request.key === selectionKey) selection = JSON.parse(result.output!);
+    return result;
+  });
+  host.setFailSave(() => Boolean(selection));
+  expect((await host.execute()).reason).toContain("Essential persistence failed");
+  const cursor = host.current();
+  const { records, P } = committed(host, { ...cursor, head: selection!.head });
+  const { digest, backlog } = readBacklog(host.root, "spec");
+  const retained = storeBody<{ result: { steps: { operation: string; result: { selected: { id: string }; digest: string } }[] } }>(records.at(-1)!.body);
+  const applied = retained.result.steps.find(step => step.operation === "apply")!.result;
+  expect(P.prompt.selectedTask?.id).toBe(backlog!.tasks[0]!.id);
+  expect(applied.selected.id).toBe(P.prompt.selectedTask!.id);
+  expect(applied.digest).toBe(digest!);
+  if (mode !== "intact") {
+    const transport = copy(retained);
+    const changed = transport.result.steps.find(step => step.operation === "apply")!.result;
+    if (mode === "id-conflict") changed.selected.id = "other";
+    else changed.digest = "f".repeat(64);
+    const db = openSqliteSync(new PitakoStore(host.root).file);
+    try { db.prepare("UPDATE records SET body=? WHERE scope=? AND seq=?")
+      .run(canonicalJSON(transport), "exec:human-1.e0", selection!.head.seq); }
+    finally { db.close(); }
+    expect(() => committed(host, { ...cursor, head: selection!.head })).toThrow("Record body mismatch");
   }
-  if (mode === "id-conflict") retained.loop.selection.receipt.selected = "other";
-  if (mode === "digest-conflict") retained.loop.selection.receipt.digest = "f".repeat(64);
-  host.storage.set("invoke-human-1", retained);
   host.setFailSave(undefined);
-  const before = host.calls.length, output = await host.execute();
-  if (["intact", "legacy"].includes(mode)) {
+  const output = await host.execute();
+  if (mode === "intact") {
     expect(output.status, output.reason).toBe("partial");
     expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   } else {
-    expect(output.status).toBe("blocked");
-    expect(output.reason).toContain("Selected task ID or backlog digest conflicts");
-    expect(host.calls.slice(before).some(call => call.agent === "pitako.worker")).toBe(false);
+    expect(output.status, output.reason).toBe("blocked");
+    expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
   }
+  expect(host.launches.filter(call => call.key.startsWith(selectionKey)).map(call => call.key))
+    .toEqual(mode === "intact" ? [selectionKey, `${selectionKey}.r1`] : [selectionKey]);
   expect(host.calls.filter(call => call.agent === "pitako.loop-io" && JSON.parse(call.task).operation === "apply" && !JSON.parse(call.task).settle)).toHaveLength(1);
 });
 
@@ -115,7 +149,9 @@ test("malformed knowledge does not reject an otherwise valid worker result", asy
   const request = host.calls.find(call => call.agent === "pitako.worker")!;
   expect(Object.keys(request.outputSchema.properties)).toEqual(["work", "status", "remaining", "knowledge", "continuation"]);
   expect(request.outputSchema.required).not.toContain("knowledge");
-  const knowledge = JSON.parse(host.calls.find(call => isGate(call))!.task).knowledge;
+  const unit = host.records().find((record: { kind: string }) => record.kind === "unit")!;
+  const { frame } = storeBody<{ frame: { workerKnowledge: Record<string, { handoff: string; findings: string[] }> } }>(unit.body);
+  const knowledge = Object.values(frame.workerKnowledge)[0]!;
   expect(Buffer.byteLength(knowledge.handoff)).toBe(2048);
   expect(knowledge.findings).toEqual([]);
   expect(host.history()[0]!.results.every((value: any) => value.status === "complete")).toBe(true);
@@ -123,19 +159,40 @@ test("malformed knowledge does not reject an otherwise valid worker result", asy
 
 test("a saved gate receipt is reused after the seal intention survives a failed result save", async () => {
   const host = taskFixture();
-  host.setFailSave(value => value.loop?.attempt?.stage === "result");
+  let sealed = false;
+  host.setLaunchRespond(async (request, normal) => {
+    const result = await normal();
+    if (request.agent === "pitako.checkpoint-sealer") sealed = true;
+    return result;
+  });
+  host.setFailSave(() => sealed);
   const first = await host.execute();
-  expect(first.status).not.toBe("complete");
-  expect(host.current().loop.attempt.gate.stage).toBe("receipt");
-  expect(host.current().loop.attempt.seal).toBeDefined();
-  const key = host.current().loop.attempt.key;
-  const gatesBefore = host.calls.filter(call => isGate(call)).length;
+  expect(first.reason).toContain("Essential persistence failed");
+  const key = "invoke-human-1.l1.t1.a1";
+  expect(committed(host).records.some(row => row.opKey === `worker-gate:${key}.gate`)).toBe(true);
+  expect(host.native.get(`${key}.seal`)?.ok).toBe(true);
+  const gatesBefore = host.gateExecutions();
   host.setFailSave(undefined);
-  expect((await host.execute()).status).toBe("partial");
-  expect(host.calls.filter(call => isGate(call) && call.key.startsWith(key))).toHaveLength(1);
+  host.setLaunchRespond(undefined);
+  const resumed = await host.execute();
+  expect(resumed.status, resumed.reason).toBe("partial");
+  expect(host.gateExecutions()).toBe(gatesBefore);
   expect(host.calls.filter(call => call.agent === "pitako.worker" && call.key === key)).toHaveLength(1);
   expect(gatesBefore).toBe(1);
 });
+
+function expectBoundedStallProjection(host: ReturnType<typeof fixture>, loop: number) {
+  const { store, scope } = executeStore(host.root, "human-1");
+  const prefix = `invoke-human-1.l${loop}.t1.`;
+  const keys = [1, 2, 3].map(n => `${prefix}a${n}.close`);
+  const closes = store.readRecords(scope).records.filter(row => row.kind === "receipt" &&
+    keys.includes(storeBody<{ key: string }>(row.body).key));
+  expect(closes.map(row => storeBody<{ key: string }>(row.body).key)).toEqual(keys);
+  for (const row of closes) {
+    const { P } = store.read(scope, { seq: row.seq, hash: row.digest });
+    expect(Buffer.byteLength(JSON.stringify(P))).toBeLessThanOrEqual(61440);
+  }
+}
 
 test("three non-improving gate attempts end the task loop", async () => {
   const host = taskFixture(); host.setLimit(1);
@@ -149,39 +206,13 @@ test("three non-improving gate attempts end the task loop", async () => {
     }
     return normal();
   });
-  expect((await host.execute()).status).toBe("partial");
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("partial");
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(3);
   expect(host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind)).toEqual(["pause", "pause", "pause"]);
   expect(host.calls.some(call => call.key.includes(".review."))).toBe(false);
   expect(host.history()[0]!.results.at(-1)!.diagnosis).toContain("Three consecutive non-improving");
-});
-
-test("a retained native barrier with an admitted result does not block task settlement", async () => {
-  const host = taskFixture();
-  let attempts = 0;
-  host.setRespond((request, normal) => {
-    const result = normal();
-    if (isGate(request)) {
-      const receipt = JSON.parse(result.output!);
-      receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1;
-      receipt.progress.nonImproving = ++attempts; receipt.stalled = attempts >= 3;
-      result.output = JSON.stringify(receipt);
-    }
-    return result;
-  });
-  host.setFailSave(value => value.loop?.settlement?.applied);
-  await host.execute();
-  const retained = copy(host.current());
-  expect(retained.loop.attempt.result).toBeDefined();
-  retained.loop.halt = { status: "blocked", code: "native-barrier", cause: "capacity",
-    reason: "Previously observed native barrier" };
-  host.storage.set("invoke-human-1", retained);
-  host.setFailSave(undefined);
-  const output = await host.execute();
-  expect(output.status).toBe("partial");
-  expect(host.history()[0]!.outcome).toBe("gaps");
-  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.progress.stalls).toBe(1);
-  expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(3);
+  expectBoundedStallProjection(host, 1);
 });
 
 test("the sealer cannot admit a candidate changed after gates", async () => {
@@ -193,7 +224,8 @@ test("the sealer cannot admit a candidate changed after gates", async () => {
   const output = await host.execute();
   expect(output.status).toBe("blocked");
   expect(output.reason).toContain("Sealer candidate differs from the saved gate receipt");
-  expect(host.current().lastConfirmed).toBeNull();
+  expect(host.records().filter((record: { kind: string; body: unknown }) => record.kind === "unit" &&
+    storeBody<{ checkpoint: unknown }>(record.body).checkpoint)).toHaveLength(0);
   expect(host.calls.filter(call => isGate(call))).toHaveLength(1);
 });
 
@@ -219,11 +251,11 @@ test("v5 retained state is rejected before any resume or dispatch", async () => 
   const host = taskFixture();
   expect((await host.execute()).status).toBe("partial");
   const retained = copy(host.current()); retained.version = 5;
-  host.storage.set("invoke-human-1", retained);
+  host.storage.set("pitako-execute", retained);
   const count = host.calls.length;
   const output = await host.execute();
   expect(output.status).toBe("blocked");
-  expect(output.reason).toContain("incompatible Pitako contract v5; start a new mission");
+  expect(output.reason).toContain("incompatible Pitako contract v5. No migration or replay is supported; retained unchanged.");
   expect(host.calls).toHaveLength(count);
 });
 
@@ -267,12 +299,35 @@ test.each([false, true])("a no-write complete attempt is admitted as unit (gate 
   const kinds = host.calls.filter(call => call.agent === "pitako.checkpoint-sealer").map(call => JSON.parse(call.task).kind);
   expect(kinds).toEqual(continuation ? ["pause", "unit"] : ["unit"]);
   // No fabricated journal receipt or confirmed checkpoint for an observed unit.
-  expect(host.current().lastConfirmed).toBeNull();
+  expect(host.records().filter((record: { kind: string; body: unknown }) => record.kind === "unit" &&
+    storeBody<{ checkpoint: unknown }>(record.body).checkpoint)).toHaveLength(0);
 });
 
 test("the gate-before-seal controller is portable through the native workflow sandbox", async () => {
-  const host = taskFixture();
-  expect((await host.executeNative()).status).toBe("partial");
+  const host = taskFixture(true), dbPath = `${host.root}/.pi/task-gate-board.db`;
+  const board = await openBoard(dbPath);
+  try {
+    const workspace = repositoryIdentity(host.root);
+    const topic = board.ensureOwnedTopic(workspace, topicOwner(host.root, "spec"), { title: "Gate evidence" });
+    board.post(workspace, { topicId: topic.id, type: "DECISION", content: "x".repeat(5200) });
+  } finally { board.close(); }
+  host.setRespond(async (request, normal) => {
+    if (request.agent === "pitako.execution-director") {
+      const plan = normal();
+      Object.assign(plan.structuredOutput.changes[0].task.gates[0], { id: "focused".repeat(440), command: "true" });
+      return plan;
+    }
+    if (!isGate(request) || isFinalGate(request)) return normal();
+    const { operation, ...envelope } = JSON.parse(request.task);
+    const input = envelope.refs ? resolveStoredGroupedInput(operation, envelope) : envelope;
+    const receipt = await runGate({ ...input, dbPath });
+    expect(Buffer.byteLength(JSON.stringify(receipt))).toBeGreaterThan(8191);
+    return { ok: true, agent: request.agent, key: request.key, runId: `native-${request.key}`,
+      output: JSON.stringify(taskGateWire(commitStoredGate(input, receipt) as typeof receipt)), results: [{ exitCode: 0 }] } as Result;
+  });
+  const output = await host.executeNative();
+  expect(output.status, output.reason).toBe("partial");
+  expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.status).toBe("done");
   expect(host.calls.some(call => isGate(call))).toBe(true);
 });
 
@@ -295,8 +350,9 @@ test.each(["selection", "unknown-update", "reused-id"])("invalid director %s ret
     : mode === "unknown-update" ? "Cannot change unknown task or tombstone" : "Task ID never reused");
   expect(host.calls.filter(call => call.agent === "pitako.worker").map(call => call.key)).toEqual(["invoke-human-1.l1.t1.a1"]);
   expect(host.history()[0]!.plan.stage).toBe("admitted");
-  const rejected = host.snapshots.find(value => value.loop?.directorRetry)?.loop.directorRetry;
-  expect(rejected.rejectedRef.key).toBe("invoke-human-1.l1.director");
+  const rejected = committed(host).records.find(row => row.opKey === "operation:invoke-human-1.l1.selectionIO");
+  expect(storeBody<{ request: { plan: { ref: { key: string } } } }>(rejected?.body).request.plan.ref.key)
+    .toBe("invoke-human-1.l1.director");
 });
 
 test.each(["conflict", "schema", "decisions"])("backlog %s halts without a writer", async mode => {
@@ -328,11 +384,16 @@ test.each(["conflict", "schema", "decisions"])("backlog %s halts without a write
 test.each(["unchanged", "changed", "second-stall"])("stalled task selection: %s", async mode => {
   const host = fixture(); host.setLimit(mode === "changed" ? 2 : 3);
   const attempts = new Map<string, number>();
+  let persistedFirstStall = false;
   host.setRespond((request, normal) => {
     const result = normal();
-    if (request.agent === "pitako.execution-director" && request.key.endsWith(".l2.director") && mode !== "unchanged")
-      result.structuredOutput.changes.push({ kind: "update", id: "change1",
+    if (request.agent === "pitako.execution-director" && request.key.endsWith(".l2.director")) {
+      const persisted = readBacklog(host.root, "spec").backlog!;
+      persistedFirstStall = persisted.lastApplied?.key === "invoke-human-1.l1.settlement" &&
+        persisted.tasks[0]!.progress.nonImproving === 3 && persisted.tasks[0]!.progress.stalls === 1;
+      if (mode !== "unchanged") result.structuredOutput.changes.push({ kind: "update", id: "change1",
         patch: { goal: "Narrowed task definition" }, reason: "Address the first stall by narrowing the goal" });
+    }
     if (isGate(request) && (request.key.includes(".l1.") || mode === "second-stall")) {
       const receipt = JSON.parse(result.output!);
       const loop = request.key.match(/\.l\d+\./)![0];
@@ -345,8 +406,11 @@ test.each(["unchanged", "changed", "second-stall"])("stalled task selection: %s"
   });
   const output = await host.execute();
   const task = readBacklog(host.root, "spec").backlog!.tasks[0]!;
-  expect(host.calls.find(call => call.key.endsWith(".l2.director"))!.task).toContain("Three consecutive non-improving");
-  expect(host.snapshots.some(state => state.loop?.settlement?.applied && state.loop?.metricSeries?.nonImproving === 3)).toBe(true);
+  const secondDirector = host.calls.find(call => call.key.endsWith(".l2.director"));
+  expect(secondDirector, output.reason).toBeDefined();
+  expect(secondDirector!.task).toContain("Three consecutive non-improving");
+  expect(persistedFirstStall).toBe(true);
+  expectBoundedStallProjection(host, 1);
   if (mode === "unchanged") {
     expect(output.status).toBe("partial");
     expect(host.history()[1]).toMatchObject({ outcome: "gaps", plan: { stage: "rejected",
@@ -372,22 +436,16 @@ test.each(["unchanged", "changed", "second-stall"])("stalled task selection: %s"
     expect(output.reason).toContain(JSON.stringify(diagnoses));
     expect(task.progress.stalls).toBe(2);
     expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(6);
+    expectBoundedStallProjection(host, 2);
     expect(host.calls.filter(call => call.agent === "pitako.execution-director")).toHaveLength(2);
     expect(host.calls.some(call => call.key.includes(".review."))).toBe(false);
     const count = host.calls.length;
-    expect((await host.execute()).status).toBe("needs-decision");
+    const held = await host.execute();
+    expect(held.status, held.reason).toBe("needs-decision");
     expect(host.calls.slice(count).some(call => ["pitako.worker", "pitako.execution-director"].includes(call.agent!))).toBe(false);
     expect(readBacklog(host.root, "spec").backlog!.tasks[0]!.progress.stalls).toBe(2);
     expect(host.emits.some(value => value.schema === "pitako.execute-todo" && value.tasks.some((row: any) => row.subject.includes("stalls 2/2")))).toBe(true);
-    // The human can retire the task and use the existing explicit unblock route.
-    const human = readBacklog(host.root, "spec");
-    human.backlog!.tasks[0]!.status = "obsolete"; human.backlog!.lastApplied = null;
-    writeFileSync(human.path, JSON.stringify(human.backlog));
-    host.setRespond(undefined);
-    const resolved = await host.execute({ unblock: true, resolution: { loop: 2, text: "Retired the task in the backlog after reviewing both stalls" } });
-    expect(resolved.status, resolved.reason).toBe("complete");
-    expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(6);
-    expect(host.current().consumedLoops).toBe(3);
+
   }
 });
 
@@ -399,7 +457,7 @@ test("relaunch adopts a human backlog after a digest conflict without reusing it
     if (request.agent === "pitako.execution-director" && !edited) {
       edited = true;
       const selection = result.structuredOutput;
-      const payload = { version: 1, specId: "spec", authority: { specDigest: host.current().association.digest, amendmentDigests: [] },
+      const payload = { version: 1, specId: "spec", authority: { specDigest: committed(host).P.prompt.admission!.association.digest, amendmentDigests: [] },
         acceptance: selection.acceptance, acceptanceHistory: [], lastApplied: null,
         tasks: selection.changes.map((change: any) => ({ ...change.task, goal: "Human backlog goal" })) };
       mkdirSync(`${host.root}/.pitako/backlog`, { recursive: true });
@@ -409,16 +467,24 @@ test("relaunch adopts a human backlog after a digest conflict without reusing it
   });
   expect((await host.execute()).reason).toContain("backlog-conflict");
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(0);
+  const count = host.launches.length;
+  const held = await host.execute();
+  expect(held.reason).toContain("backlog-conflict");
+  expect(host.launches).toHaveLength(count);
+  host.setInvocation("human-2");
+  host.setLimit(1);
   expect((await host.execute()).status).toBe("partial");
   expect(host.calls.filter(call => call.agent === "pitako.execution-director").map(call => call.key)).toEqual([
-    "invoke-human-1.l1.director", "invoke-human-1.l2.director"]);
+    "invoke-human-1.l1.director", "invoke-human-2.l1.director"]);
   expect(readBacklog(host.root, "spec").backlog!.tasks[0]).toMatchObject({ goal: "Human backlog goal", status: "done" });
 });
 
 
-test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates before completion", async mode => {
+test.each(["pass", "fail", "stale", "missing-log", "missing-review-receipt"])("final acceptance %s uses workflow gates before completion", async mode => {
   const host = fixture(undefined, { realCheckout: true }); host.setLimit(3);
-  let acceptanceRan = false, driftVersion = 0;
+  const missingLog = mode === "missing-log", missingReceipt = mode === "missing-review-receipt";
+  let acceptanceRan = false, driftVersion = 0, quarantine: string | undefined;
+  let priorBudget: { consumedLoops: number; maxCycles: number } | undefined;
   let persistedRepairs: NonNullable<ReturnType<typeof readBacklog>["backlog"]>["tasks"] = [];
   let selectedRepair = null as string | null;
   host.setRespond((request, normal) => {
@@ -428,9 +494,9 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
       return host.result(request, { status: "complete", work: "No product changes", remaining: [] });
     const result = normal();
     if (request.agent === "pitako.execution-director" && request.key.includes(".l1."))
-      result.structuredOutput.acceptance = [{ id: "acceptance", command: mode === "fail"
+      result.structuredOutput.acceptance = [{ id: "acceptance", command: mode === "fail" || missingLog
         ? "false" : "true", cwd: "." }];
-    if (isGate(request) && JSON.parse(request.task).task.id === "final-acceptance") {
+    if (isFinalGate(request)) {
       acceptanceRan = true;
       if (mode === "stale") host.changeCheckout(++driftVersion);
     }
@@ -440,13 +506,52 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
       selectedRepair = result.structuredOutput.select;
     return result;
   });
+  if (missingLog || missingReceipt) host.setLaunchRespond(async (request, normal) => {
+    if (request.agent === "pitako.execution-director" && request.key.startsWith("invoke-human-1.e1."))
+      throw new Error("Controlled cut after epoch admission");
+    if (request.agent !== "pitako.loop-io") return normal();
+    const input = JSON.parse(request.task);
+    const gaps = input.intentions?.find((entry: { input: { recordGaps?: boolean } }) => entry.input.recordGaps)?.input;
+    if (missingLog ? !gaps : input.operation !== "reviewOriginals" || !request.key.endsWith(".reviewOriginals")) return normal();
+    priorBudget = host.current().budget;
+    const db = openSqliteSync(new PitakoStore(host.root).file);
+    try {
+      if (missingLog) db.prepare("DELETE FROM blobs WHERE digest=?").run(gaps.finalGapOutputs[0].logRef);
+      else {
+        const { store } = host.verifications.find(entry => entry.request.gate.endsWith(".review.synthesis"))!.output.receipt;
+        expect(db.prepare("SELECT seq FROM records WHERE scope=? AND seq=?").get(store.scope, store.seq)).toBeDefined();
+        db.prepare("DELETE FROM records WHERE scope=? AND seq=?").run(store.scope, store.seq);
+      }
+    }
+    finally { db.close(); }
+    const response = missingLog
+      ? await acceptanceScripts.runDeterministic(request.key, request, { ...acceptanceScripts, root: host.root }, undefined)
+      : await normal();
+    const failure = JSON.parse(response.output!);
+    expect(failure, response.output).toMatchObject({ code: "store-corrupt" });
+    quarantine = failure.recovery?.quarantine;
+    return response;
+  });
   const output = await host.execute();
   expect(acceptanceRan).toBe(true);
   expect(output.status === "complete").toBe(mode === "pass");
-  const gate = host.calls.findIndex(call => isGate(call) && JSON.parse(call.task).task.id === "final-acceptance");
+  const gate = host.calls.findIndex(isFinalGate);
   const review = host.calls.findIndex(call => call.key.endsWith("review.director-prepare"));
   if (mode === "pass") expect(review).toBeGreaterThan(gate);
   const repairs = readBacklog(host.root, "spec").backlog!.tasks.filter(task => task.origin.kind === "final-phase");
+  if (missingLog || missingReceipt) {
+    expect(quarantine && existsSync(quarantine), output.reason).toBe(true);
+    expect(host.current().epoch).toBe(1);
+    expect(host.current().budget.maxCycles).toBe(priorBudget!.maxCycles);
+    expect(host.current().budget.consumedLoops).toBeGreaterThanOrEqual(priorBudget!.consumedLoops);
+    expect(repairs).toEqual([]);
+    expect(host.calls.filter(isFinalGate)).toHaveLength(1);
+    if (missingReceipt) {
+      expect(review).toBeGreaterThan(gate);
+      expect(host.calls.some(call => call.key.endsWith(".compliance"))).toBe(false);
+    }
+    return;
+  }
   if (mode === "fail") {
     expect(review).toBe(-1);
     const pending = persistedRepairs.filter(task => task.origin.kind === "final-phase");
@@ -454,8 +559,12 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
     expect(pending[0]).toMatchObject({ status: "pending", origin: { kind: "final-phase" },
       specRefs: ["Final acceptance gate acceptance"] });
     expect(pending[0]!.origin.ref).toContain("invoke-human-1.l2.acceptance");
-    expect(pending[0]!.origin.ref).toContain("0.log");
-    expect(checkOrigin(pending[0]!.origin.ref).key).toBe("invoke-human-1.l2.acceptance.gate");
+    const origin = JSON.parse(pending[0]!.origin.ref);
+    expect(Object.keys(origin).sort()).toEqual(["key", "logRef"]);
+    expect(Buffer.byteLength(pending[0]!.origin.ref)).toBeLessThanOrEqual(512);
+    const { logRef } = origin;
+    expect(new PitakoStore(host.root).readBlob(logRef).truncated).toBe(false);
+    expect(origin.key).toBe("invoke-human-1.l2.acceptance.gate");
     expect(repairs).toHaveLength(1);
     expect(repairs[0]).toMatchObject({ id: pending[0]!.id, status: "done", origin: pending[0]!.origin });
     const director = host.calls.find(call => call.key.endsWith(".l3.director"))!;
@@ -470,25 +579,197 @@ test.each(["pass", "fail", "stale"])("final acceptance %s uses workflow gates be
   if (mode === "fail") expectProcessBudget([host.processes(), acceptanceComposition.processes()], 81);
 });
 
-
-test.each(["intact", "missing", "stale"])("final acceptance %s receipt on replay cannot authorize stale completion", async mode => {
-  const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
-  host.setFailSave(value => value.loop?.phase === "closing");
-  expect((await host.execute()).status).toBe("partial");
-  const retained = copy(host.current());
-  expect(retained.loop.kind).toBe("final");
-  expect(retained.loop.finalAttempt.gate.stage).toBe("receipt");
-  if (mode === "missing") delete retained.loop.finalAttempt.gate.receipt;
-  if (mode === "stale") {
-    retained.loop.finalAttempt.gate.receipt.before.fingerprint = "f".repeat(64);
-    retained.loop.finalAttempt.gate.receipt.after.fingerprint = "f".repeat(64);
-  }
-  host.storage.set("invoke-human-1", retained);
-  host.setFailSave(undefined);
-  const gates = host.calls.filter(isGate).length;
+test("a no-task final loop resumes its committed mandatory checks and closes complete", async () => {
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(1);
+  const gateKey = "invoke-human-1.l1.acceptance.gate";
+  const reviewKey = "invoke-human-1.l1.review.director-prepare";
+  let cut: ReturnType<typeof host.current>, initialReview: string | undefined, comparedReview = false;
+  host.setSaveObserver(value => {
+    if (value.action?.opKey === gateKey && value.loop.phase === "review") cut = copy(value);
+  });
+  host.setLaunchRespond((request, normal) => {
+    if (request.key === reviewKey && initialReview === undefined) {
+      initialReview = request.task;
+      throw new Error("Controlled interruption before native review dispatch");
+    }
+    if (request.key === reviewKey) {
+      expect(request.task).toBe(initialReview!);
+      comparedReview = true;
+    }
+    return normal();
+  });
+  host.setRespond((request, normal) => {
+    if (request.agent === "pitako.execution-director") {
+      const plan = normal();
+      plan.structuredOutput.acceptance = ["typecheck", "suite"].map(id => ({
+        id, command: "echo run >> .pi/final-gate-runs", cwd: ".",
+      }));
+      return plan;
+    }
+    if (!request.key.endsWith(".compliance")) return normal();
+    // A compliance child can certify only checks it can recover from committed evidence.
+    const evidence = /Blocking final acceptance \(mandatory checks\): (.*)\.\n/.exec(request.task)?.[1];
+    const { store: ref, digest, gates, after, mutated, currentAcceptance } = JSON.parse(evidence ?? "null") ?? {};
+    const store = new PitakoStore(host.root);
+    const saved = ref && store.readRecords(ref.scope, { seq: ref.seq, hash: digest });
+    const row = saved?.records.at(-1);
+    const committedReceipt = storeBody<{ receipt: { after: { fingerprint: string }; gates: typeof gates } }>(row?.body)?.receipt;
+    const passed = saved?.identity.storeId === ref?.storeId && row?.digest === digest && currentAcceptance && !mutated &&
+      after.fingerprint === host.observedCandidate().fingerprint &&
+      after.fingerprint === committedReceipt?.after.fingerprint &&
+      ["typecheck", "suite"].every(id => gates.some((gate: any) =>
+        gate.id === id && gate.status === "pass" && gate.exit === 0 &&
+        committedReceipt?.gates.some((stored: any) => stored.id === id && stored.logRef === gate.logRef &&
+          stored.status === "pass" && stored.exit === 0)));
+    return passed ? normal() : host.result(request, { status: "blocked", reason: "no mandatory checks" });
+  });
+  await host.execute();
+  expect(initialReview).toBeDefined();
+  expect(cut).toBeDefined();
+  host.storage.set("pitako-execute", cut);
+  const before = host.launches.length, gateRuns = host.gateExecutions(), candidate = host.observedCandidate();
   const output = await host.execute();
-  expect(output.status === "complete").toBe(mode === "intact");
-  expect(host.calls.filter(isGate)).toHaveLength(gates);
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.history().at(-1)!.outcome).toBe("complete");
+  expect(comparedReview).toBe(true);
+  expect(host.launches.slice(before).filter(call => call.key.startsWith(gateKey)).map(call => call.key)).toEqual([`${gateKey}.r1`]);
+  expect(host.launches.slice(0, before).filter(call => call.key.startsWith(gateKey)).map(call => call.key)).toEqual([gateKey]);
+  expect(host.gateExecutions()).toBe(gateRuns);
+  expect(readFileSync(`${host.root}/.pi/final-gate-runs`, "utf8")).toBe("run\nrun\n");
+  expect(host.observedCandidate()).toEqual(candidate);
+  expect(host.launches.filter(call => call.agent === "pitako.checkout-observer")).toHaveLength(1);
+  expect(host.launches.some(call => call.agent === "pitako.worker")).toBe(false);
+});
+
+
+test.each(["intact", "store-ahead", "pre-commit", "paginated", "retry-diagnostic", "stale"])("final acceptance %s receipt on replay authorizes only current completion", async mode => {
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0 }); host.setLimit(mode === "intact" ? 2 : 1);
+  const gateKey = "invoke-human-1.l1.acceptance.gate", runLog = `${host.root}/.pi/final-gate-runs`;
+  let beforeGate: ReturnType<typeof host.current>;
+  const paginated = mode === "paginated" || mode === "retry-diagnostic";
+  const retryDiagnostic = mode === "retry-diagnostic";
+  const interrupted = mode === "pre-commit" || retryDiagnostic;
+  const losesSave = mode === "store-ahead" || paginated || interrupted;
+  let originalDigest: string | undefined, retryTask: string | undefined;
+  if (losesSave) {
+    host.setSaveObserver(value => {
+      if (!beforeGate && value.action?.opKey === gateKey) beforeGate = copy(value);
+    });
+    host.setRespond(async (request, normal) => {
+      if (request.agent === "pitako.execution-director") {
+        const plan = normal();
+        plan.structuredOutput.acceptance = [{ id: "suite", command: "echo run >> .pi/final-gate-runs", cwd: "." }];
+        return plan;
+      }
+      if (paginated && request.agent === "pitako.request-observer" &&
+          (request.key.endsWith(".selectionIO.requests") || /\.l1\.requests-\d+$/.test(request.key))) {
+        if (request.key.endsWith(".selectionIO.requests")) {
+          appendExecuteTodoRecords(host.root, "human-1", "request", Array.from({ length: 140 }, (_, i) => ({
+            v: 1, invocation: "human-1", kind: "cancel", origin: "fixture", taskId: "unselected",
+            at: 1, requestId: `${i}-${"x".repeat(240)}`,
+          })));
+        }
+        const output = execFileSync(process.execPath, [fileURLToPath(new URL("../skills/execute/observe.mjs", import.meta.url)), "--requests"],
+          { cwd: host.root, input: request.task, encoding: "utf8" });
+        return { ...normal(), output };
+      }
+      if (retryDiagnostic && request.key === `${gateKey}.r1`) {
+        if (retryTask !== undefined) {
+          expect(request.task).toBe(retryTask);
+          return normal();
+        }
+        retryTask = request.task;
+        const { operation, ...envelope } = JSON.parse(request.task);
+        const resolved = resolveStoredGroupedInput(operation, envelope);
+        const input = (resolved.finalAcceptanceReplay as { request: Parameters<typeof runGate>[0] }).request;
+        expect(canonicalDigest(input)).toBe(originalDigest!);
+        await runGate({ ...input, dbPath: `${host.root}/.pi/final-gate-board.db` },
+          { digest: originalDigest!, producer: request.key });
+        throw new Error("Controlled second interruption after the retry diagnostic, before the final gate commit");
+      }
+      if (!isFinalGate(request)) return normal();
+      const { operation: _, ...input } = JSON.parse(request.task);
+      originalDigest = canonicalDigest(input);
+      if (retryDiagnostic) {
+        mkdirSync(`${host.root}/.pi/subagents/execute/human-1/gates/${gateKey}`, { recursive: true });
+        return { ok: false, agent: request.agent, key: request.key, runId: `native-${request.key}`,
+          output: "Controlled missing receipt from the first gate transport", results: [{ exitCode: 1 }] } as Result;
+      }
+      const receipt = await runGate({ ...input, dbPath: `${host.root}/.pi/final-gate-board.db` },
+        { digest: originalDigest, producer: request.key });
+      if (interrupted) throw new Error("Controlled interruption before the final gate commit");
+      return { ok: true, agent: request.agent, key: request.key, runId: `native-${request.key}`,
+        output: JSON.stringify(receipt), results: [{ exitCode: 0 }] } as Result;
+    });
+  }
+  host.setFailSave(value => value.action?.key?.endsWith(".review.director-prepare"));
+  const first = await host.execute();
+  if (interrupted) expect(first.status).not.toBe("complete");
+  else expect(first.status).toBe("partial");
+  const retained = interrupted ? beforeGate! : copy(host.current());
+  expect(retained.loop.taskId).toBeNull();
+  expect(retained.action.opKey).toBe(gateKey);
+  if (!interrupted) expect(committed(host, retained).records.at(-1)!.opKey).toBe(`final-gate:${gateKey}`);
+  if (paginated) {
+    const { store, scope } = executeStore(host.root, retained.invocation);
+    const intervening = store.readRecords(scope).records.slice(beforeGate!.head.seq);
+    expect(intervening.some(row => row.kind === "observation")).toBe(true);
+    if (retryDiagnostic) {
+      expect(retryTask).toBeDefined();
+      expect(intervening.at(-1)!.opKey).toBe(`gate:${gateKey}.r1`);
+    }
+  }
+  if (mode === "stale") host.changeCheckout();
+  host.storage.set("pitako-execute", losesSave ? beforeGate! : retained);
+  host.setFailSave(undefined);
+  const gates = host.gateExecutions(), launches = host.launches.length;
+  const output = await host.execute();
+  expect(output.status === "complete", output.reason).toBe(mode !== "stale");
+  expect(host.gateExecutions()).toBe(gates);
+  expect(host.launches.slice(launches).filter(call => call.key.startsWith(gateKey)).map(call => call.key)).toEqual([`${gateKey}.r1`]);
+  if (mode === "intact") {
+    // Valid-looking stdout is not sufficient when it differs from the committed receipt.
+    host.storage.set("pitako-execute", copy(retained));
+    const beforeMismatch = host.launches.length;
+    host.setLaunchRespond(async (request, normal) => {
+      const response = await normal();
+      if (request.key !== `${gateKey}.r1`) return response;
+      const replay = JSON.parse(response.output!);
+      replay.receipt.gates[0].logRef += "-mismatch";
+      return { ...response, output: JSON.stringify(replay) };
+    });
+    const mismatch = await host.execute();
+    expect(mismatch.status).not.toBe("complete");
+    expect(mismatch.reason).toContain("Final acceptance replay record integrity mismatch");
+    expect(host.launches.slice(beforeMismatch).map(call => call.key)).toEqual([`${gateKey}.r1`]);
+    expect(host.gateExecutions()).toBe(gates);
+
+    const cut = copy(retained);
+    cut.head = { seq: cut.head.seq + 1, hash: "f".repeat(64) };
+    host.storage.set("pitako-execute", cut);
+    const beforeCheck = host.launches.length;
+    let quarantine: string | undefined;
+    host.setLaunchRespond(async (request, normal) => {
+      if (request.key === "invoke-human-1.e1.l2.director")
+        throw new Error("Controlled cut after new epoch admission, before gates");
+      if (request.key !== `${gateKey}.store-check`) return normal();
+      const response = await acceptanceScripts.runDeterministic(request.key, request,
+        { ...acceptanceScripts, root: host.root }, undefined);
+      quarantine = JSON.parse(response.output!).recovery.quarantine;
+      return response;
+    });
+    await host.execute();
+    expect(quarantine && existsSync(quarantine)).toBe(true);
+    expect(host.current().epoch).toBe(1);
+    expect(host.launches.slice(beforeCheck).filter(call => call.key.startsWith(gateKey)).map(call => call.key))
+      .toEqual([`${gateKey}.store-check`]);
+    expect(host.gateExecutions()).toBe(gates);
+  }
+  if (losesSave) expect(readFileSync(runLog, "utf8")).toBe("run\n");
+  if (paginated) {
+    expect(host.current().epoch).toBe(0);
+    expect(readdirSync(`${host.root}/.pi/pitako`).filter(name => name.startsWith("pitako.db.v"))).toEqual([]);
+  }
   expect(host.calls.some(call => call.agent === "pitako.worker")).toBe(false);
 });
 
@@ -507,8 +788,8 @@ test.each(["timeout", "error"])("final acceptance %s retains actionable logs wit
   expect(output.status).toBe(status === "timeout" ? "partial" : "blocked");
   expect(output.reason).toContain(status === "timeout" ? "gateFloorMs strictly greater" : "environment failure");
   expect(output.reason).toContain("/owned/final-suite.log");
-  expect(host.current().loop.halt.code).toBe(status === "timeout" ? "timeout" : "environment");
-  expect(host.current().lastFinalAcceptance).toBeUndefined();
+  expect(host.current().halt.stage).toBe(status === "timeout" ? "timeout" : "environment");
+  expect(host.records().some((record: any) => record.kind === "loop" && record.body.kind === "final")).toBe(false);
   expect(host.calls.some(call => call.agent === "pitako.worker" || call.key.includes(".review.") || call.key.endsWith(".compliance"))).toBe(false);
   expect(readBacklog(host.root, "spec").backlog!.tasks).toEqual([]);
 });
@@ -519,25 +800,28 @@ test.each(["review", "compliance"])("final-phase %s findings become durable task
   let peakBytes = 0, consumed = false;
   host.setSaveObserver((value, bytes, serialized) => {
     peakBytes = Math.max(peakBytes, bytes);
-    const retained = host.storage.get("review-invoke-human-1");
-    for (const original of retained?.originals ?? []) expect(original).not.toHaveProperty("value");
+    for (const original of value.review?.slots ?? []) expect(original).not.toHaveProperty("value");
     expect(serialized).not.toContain("LARGE_REVIEW_");
-    if (value.loop?.task && !value.loop.archived) {
-      expect(value.loop.selection.receipt.selected).toBe(value.loop.task.id);
-      expect(JSON.stringify(value.loop.selection.receipt)).not.toContain(value.loop.task.origin.ref);
+    if (value.loop?.taskId && !value.loop.outcome) {
+      const selected = committed(host, value).P.prompt.selectedTask;
+      expect(selected?.id).toBe(value.loop.taskId);
+      expect(serialized).not.toContain(storeBody<{ ref: string }>(selected?.origin).ref);
     }
   });
   host.setRespond((request, normal) => {
     if (request.key.endsWith(".l2.director")) {
-      const retained = host.storage.get("review-invoke-human-1");
+      const retained = host.records().find((record: any) => record.kind === "loop" && record.loop === 1).body.integratedReview;
       expect(retained.originals.length).toBeGreaterThan(0);
       for (const original of retained.originals) {
         expect(Object.keys(original).sort()).toEqual(["id", "key", "path", "runId", "sha256"]);
         expect(original.sha256).toBe(createHash("sha256").update(readFileSync(original.path)).digest("hex"));
       }
-      const source = host.current().demandSources[0].sources.find((source: any) => source.kind === phase);
       if (phase === "review") {
-        expect(Object.keys(source.ref).sort()).toEqual(["key", "path", "sha256"]);
+        const advance = committed(host).records.filter(row => /^operation:invoke-human-1\.l[12]\.(?:nextAdvance|advance)$/.test(row.opKey)).at(-1);
+        const demand = storeBody<{ request: { demand: { sources: { loop: number; sources: { kind: string; ref: unknown }[] }[] } } }>(advance?.body)
+          .request.demand;
+        const source = demand.sources.find(item => item.loop === 1)?.sources.find(item => item.kind === phase)!;
+        expect(Object.keys(source.ref as object).sort()).toEqual(["key", "path", "sha256"]);
         expect(source).not.toHaveProperty("references");
       }
       consumed = true;
@@ -602,10 +886,10 @@ test("final review receives done and obsolete reasons, current DECISIONs, and fo
   expect(review.task).toContain("Workflow-confirmed gated unit");
   expect(review.task).toContain("Superseded by selected implementation");
   expect(review.task).toContain("Keep required boundary validation");
-  const gateIndex = host.calls.findIndex(call => isGate(call) && JSON.parse(call.task).task.id === "final-acceptance");
+  const gateIndex = host.calls.findIndex(isFinalGate);
   expect(host.calls.indexOf(review)).toBeGreaterThan(gateIndex);
   expect(host.calls.findIndex(call => call.key.endsWith(".compliance"))).toBeGreaterThan(host.calls.indexOf(review));
-  expect(host.current().consumedLoops).toBe(2);
+  expect(host.current().budget.consumedLoops).toBe(2);
 });
 
 test.each(["pass", "fail", "timeout", "error", "superseded", "blocking-failure"])("final verdict honors only current HUMAN exceptions: %s", async mode => {
@@ -663,7 +947,7 @@ test.each(["pass", "fail", "timeout", "error", "superseded", "blocking-failure"]
 });
 
 
-const finalGates = (host: ReturnType<typeof fixture>) => host.calls.filter(call => isGate(call) && JSON.parse(call.task).task.id === "final-acceptance");
+const finalGates = (host: ReturnType<typeof fixture>) => host.calls.filter(isFinalGate);
 function repeatedAcceptanceFixture() {
   const humanPosts: any[] = [];
   const host = fixture(undefined, { realCheckout: true, taskCount: 0, humanPosts }); host.setLimit(5);
@@ -693,8 +977,8 @@ test("fresh then reused acceptance failure halts with original logs and relaunch
   const { host } = repeatedAcceptanceFixture();
   const output = await host.execute();
   expect(output.status, output.reason).toBe("blocked");
-  expect(host.current().loop.halt.code).toBe("repeat-acceptance");
-  const record = copy(host.current().lastFinalAcceptance);
+  expect(output.loopReport?.halt?.code, output.reason).toBe("repeat-acceptance");
+  const record = JSON.parse(finalGates(host)[1]!.task).reuse;
   expect(record).toMatchObject({ loop: 1, gateKey: "invoke-human-1.l1.acceptance.gate" });
   expect(Object.keys(record).sort()).toEqual(["candidate", "exec", "gateKey", "loop", "results"]);
   expect(finalGates(host)).toHaveLength(2);
@@ -706,57 +990,37 @@ test("fresh then reused acceptance failure halts with original logs and relaunch
   expect(replay.status).toBe("blocked");
   expect(replay.reason).toBe(output.reason);
   expect(host.calls).toHaveLength(calls);
-  expect(host.hostCalls).toHaveLength(hostCalls);
-  expect(host.current().lastFinalAcceptance).toEqual(record);
-  expect(host.current().consumedLoops).toBe(3);
+  expect(host.hostCalls.slice(hostCalls)).toEqual(["inspect-initial"]);
+  expect(replay.loopReport.halt).toEqual(output.loopReport.halt);
+  expect(host.current().budget.consumedLoops).toBe(3);
 });
 
-test.each(["human", "fresh", "mismatch", "ceiling"])("repeat acceptance unblock preserves budget and re-evaluates before a one-shot fresh run: %s", async mode => {
-  const { host, authorizeException } = repeatedAcceptanceFixture();
-  if (mode === "ceiling") host.setLimit(3);
-  expect((await host.execute()).status).toBe("blocked");
-  const record = copy(host.current().lastFinalAcceptance);
-  if (mode === "human") authorizeException();
-  const calls = host.calls.length;
-  const output = await host.execute({ unblock: true, resolution: { loop: mode === "mismatch" ? 2 : 3, text: "Resolve repeated acceptance" } });
-  if (mode === "mismatch") {
-    expect(output.status).toBe("blocked");
-    expect(output.reason).toContain("must name the retained interrupted loop");
-    expect(host.calls).toHaveLength(calls);
-    expect(host.current().loop.halt.code).toBe("repeat-acceptance");
-  } else if (mode === "human") {
-    expect(output.status, output.reason).toBe("complete");
-    expect(output.heading).toBe("Execution complete with exceptions");
-    expect(output.exceptions![0]).toMatchObject({ id: "suite", humanRef: 42, logRef: record.results[1].logRef });
-    expect(finalGates(host)).toHaveLength(3);
-    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\n");
-    expect(host.current().consumedLoops).toBe(4);
-    expect(host.current().lastFinalAcceptance).toEqual(record);
-  } else if (mode === "fresh") {
-    expect(output.status, output.reason).toBe("partial");
-    const gates = finalGates(host);
-    expect(gates).toHaveLength(4);
-    expect(JSON.parse(gates[2]!.task).reuse).toEqual(record);
-    expect(JSON.parse(gates[3]!.task).reuse).toBeUndefined();
-    expect(gates[3]!.key).toContain(".fresh.gate");
-    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
-    expect(host.current().lastFinalAcceptance.loop).toBe(4);
-    expect(host.current().freshAcceptanceAuthorized).toBe(false);
-    expect(host.current().consumedLoops).toBe(5);
-    const count = host.calls.length;
-    expect((await host.execute()).status).toBe("partial");
-    expect(host.calls).toHaveLength(count);
-  } else {
-    expect(output.status).toBe("partial");
-    expect(host.current().consumedLoops).toBe(3);
-    expect(finalGates(host)).toHaveLength(2);
-    expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\n");
-  }
-});
+
 
 test("a reused passing receipt proceeds through review on the unchanged candidate", async () => {
-  const host = fixture(undefined, { taskCount: 0, findings: true }); host.setLimit(3);
-  host.setRespond((request, normal) => {
+  const host = fixture(undefined, { realCheckout: true, taskCount: 0, findings: true }); host.setLimit(3);
+  const gateKey = "invoke-human-1.l3.acceptance.gate";
+  let pending: ReturnType<typeof host.current>, original: string | undefined;
+  host.setSaveObserver(value => {
+    if (!pending && value.action?.opKey === gateKey) pending = copy(value);
+  });
+  host.setRespond(async (request, normal) => {
+    if (request.key === gateKey) {
+      original = request.task;
+      throw new Error("Controlled cut before the reused gate commits");
+    }
+    if (request.key === `${gateKey}.r1`) {
+      const { operation, ...envelope } = JSON.parse(request.task);
+      const resolved = resolveStoredGroupedInput(operation, envelope);
+      const pendingGate = resolved.finalAcceptanceReplay as { request: Parameters<typeof runGate>[0] } | undefined;
+      if (pendingGate) {
+        const { request: gate } = pendingGate;
+        expect(canonicalJSON({ operation, ...gate })).toBe(canonicalJSON(JSON.parse(original!)));
+        const receipt = await runGate({ ...gate, dbPath: `${host.root}/.pi/final-gate-board.db` },
+          { digest: canonicalDigest(gate), producer: request.key });
+        commitFinalGate(gate, receipt, request.key);
+      }
+    }
     const result = normal();
     if (request.key.includes(".l1.") && request.key.endsWith("director-synthesis")) {
       result.structuredOutput.screening.verdict = "material-gaps";
@@ -765,38 +1029,32 @@ test("a reused passing receipt proceeds through review on the unchanged candidat
     }
     return result;
   });
-  expect((await host.execute()).status).toBe("complete");
+  expect((await host.execute()).status).not.toBe("complete");
+  expect(original).toBeDefined();
+  host.storage.set("pitako-execute", pending!);
+  const launches = host.launches.length, gateRuns = host.gateExecutions();
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("complete");
+  expect(host.launches.slice(launches).filter(call => isGate(call)).map(call => call.key)).toEqual([`${gateKey}.r1`]);
+  expect(host.gateExecutions()).toBe(gateRuns);
   const gates = finalGates(host);
   expect(gates).toHaveLength(2);
   expect(JSON.parse(gates[1]!.task).reuse.loop).toBe(1);
-  expect(host.current().loop.finalAttempt.gate.receipt.reused.loop).toBe(1);
+  expect(storeBody<{ finalAttempt: { gate: { receipt: { reused: { loop: number } } } } }>(host.records().at(-1)!.body)
+    .finalAttempt.gate.receipt.reused.loop).toBe(1);
   expect(host.calls.some(call => call.key === "invoke-human-1.l3.review.director-prepare")).toBe(true);
 });
 
 
-test.each(["before-launch", "after-receipt"])("one-shot fresh acceptance survives a persistence cut %s without extra command execution", async cut => {
-  const { host } = repeatedAcceptanceFixture();
-  expect((await host.execute()).status).toBe("blocked");
-  host.setFailSave(value => value.loop?.finalAttempt?.freshAuthorized &&
-    (cut === "before-launch" ? value.loop.finalAttempt.gate.stage === "intention" : value.loop.outcome === "gaps"));
-  expect((await host.execute({ unblock: true, resolution: { loop: 3, text: "Run fresh once" } })).status).not.toBe("complete");
-  expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe(cut === "before-launch" ? "run\n" : "run\nrun\n");
-  host.setFailSave(undefined);
-  const output = await host.execute();
-  expect(output.status, output.reason).toBe("partial");
-  expect(readFileSync(`${host.root}/.pi/suite-runs`, "utf8")).toBe("run\nrun\n");
-  expect(finalGates(host).filter(call => call.key.includes(".fresh.gate"))).toHaveLength(1);
-  expect(host.current().freshAcceptanceAuthorized).toBe(false);
-  // Measured 106 including IPC Git and one shared runtime, plus eleven.
-  expectProcessBudget([host.processes(), acceptanceComposition.processes()], 117);
-});
+
 
 test("a new invocation has no reusable final acceptance record", async () => {
   const first = fixture(undefined, { taskCount: 0 }); first.setLimit(1);
   expect((await first.execute()).status).toBe("complete");
-  expect(first.current().lastFinalAcceptance).toBeDefined();
+  expect(committed(first).records.find(row => row.opKey === "final-gate:invoke-human-1.l1.acceptance.gate")?.body).toBeDefined();
   const second = fixture(undefined, { taskCount: 0 }); second.setLimit(1);
-  expect((await second.execute({ invocation: "human-2" })).status).toBe("complete");
+  second.setInvocation("human-2");
+  expect((await second.execute()).status).toBe("complete");
   expect(finalGates(second)).toHaveLength(1);
   expect(JSON.parse(finalGates(second)[0]!.task)).not.toHaveProperty("reuse");
 });
@@ -813,7 +1071,8 @@ test.each(["missing", "changed"])("a compact review demand blocks on a %s origin
       result.structuredOutput.screening.assessments[0].material = true;
     }
     if (request.agent === "pitako.checkout-observer" && request.key.includes(".l1.")) {
-      const ref = host.storage.get("review-invoke-human-1").originals.at(-1);
+      const publication = committed(host).records.filter(row => row.kind === "review-originals").at(-1);
+      const ref = storeBody<{ originals: { path: string; sha256: string }[] }>(publication?.body).originals.at(-1)!;
       expected = ref.sha256;
       if (mode === "missing") unlinkSync(ref.path);
       else writeFileSync(ref.path, "{}");
@@ -830,22 +1089,98 @@ test.each(["missing", "changed"])("a compact review demand blocks on a %s origin
 
 
 test.each(["before", "after"])("consumed review compaction survives a %s persistence cut without replaying reviewers", async cut => {
-  const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1);
-  host.setFailSave(value => cut === "before" ? value.loop?.reviewOriginals?.stage === "receipt" : Boolean(value.loop?.reviewSynthesis));
-  expect((await host.execute()).status).not.toBe("complete");
-  const retained = host.storage.get("review-invoke-human-1");
-  expect(retained.originals.every((original: any) => !Object.hasOwn(original, "value") &&
-    (cut === "before" ? Boolean(original.digest) : Boolean(original.sha256)))).toBe(true);
+  const template = "---\npitako-spec: 1\nid: spec\nstatus: complete\n---\n" +
+    SPEC_SECTIONS.map(section => `## ${section}\nAgreed ${section}.\n`).join("");
+  const content = template + "\\".repeat(MAX_SPEC_BYTES - Buffer.byteLength(template));
+  expect(validateSpec(content, "spec")).toBeNull();
+  expect(inspectionSnapshot({}, content).packets).toHaveLength(26);
+  const host = fixture(content, { taskCount: 0 });
+  const loop = cut === "before" ? 2 : 1;
+  host.setLimit(loop);
+  if (loop === 2) host.setObservationResponse((key, observation) => key === "invoke-human-1.l1.checkout"
+    ? { ...observation, checkout: { ...observation.checkout, fingerprint: "f".repeat(64) } } : observation);
+  const base = `invoke-human-1.l${loop}`, synthesis = `${base}.review.director-synthesis`;
+  const publicationKey = `${base}.reviewOriginals`;
+  let reached = false, publicationHead: { seq: number; hash: string } | undefined;
+  let normalPublication: string | undefined, recoveredPublication: string | undefined, normalCompliance: string | undefined;
+  host.setSaveObserver(value => {
+    if (cut === "before" && value.action.key === synthesis && value.action.runId) reached = true;
+  });
+  host.setLaunchRespond(async (request, normal) => {
+    if (cut === "after" && request.key === `${base}.compliance` && normalCompliance === undefined) {
+      normalCompliance = request.task;
+      throw new Error("Observe the uninterrupted compliance prompt without settling the child");
+    }
+    const result = await normal();
+    if (cut === "after" && request.key === publicationKey) {
+      normalPublication = result.output;
+      publicationHead = JSON.parse(result.output!).head;
+    }
+    if (request.key === `${publicationKey}.r1`) recoveredPublication = result.output;
+    return result;
+  });
+  host.setFailSave(() => reached);
+  const initial = await host.execute();
+  if (cut === "before") expect(initial.reason).toContain("Essential persistence failed");
+  else expect(normalCompliance).toBeDefined();
+  // Use the same store rows and native originals for the byte comparison.
+  const retained = cut === "after" ? [...host.snapshots].reverse().find(value => value.action.key === synthesis && value.action.runId) : copy(host.current());
+  expect(retained.action).toMatchObject({ kind: "launched", role: "reviewer", key: synthesis });
+  expect(typeof retained.action.runId).toBe("string");
+  expect(retained.review.slots.every((original: any) => !Object.hasOwn(original, "value") && Boolean(original.digest))).toBe(true);
+  expect(committed(host, { ...retained, head: publicationHead ?? retained.head }).records
+    .some(row => row.kind === "review-originals" && row.opKey === `review-originals:${publicationKey}`)).toBe(cut === "after");
+  if (loop === 2) expect(host.launches.some(call =>
+    ["invoke-human-1.l1.nextAdvance", "invoke-human-1.l2.advance"].includes(call.key))).toBe(false);
   const reviewers = host.calls.filter(call => call.key.includes(".review.")).length;
+  const before = host.launches.length, hostReads = host.hostCalls.length;
   host.setFailSave(undefined);
+  if (cut === "after") await host.state.set("pitako-execute", retained);
   const output = await host.execute();
   expect(output.status, output.reason).toBe("complete");
   expect(host.calls.filter(call => call.key.includes(".review."))).toHaveLength(reviewers);
-  expect(host.storage.get("review-invoke-human-1").originals.every((original: any) => !Object.hasOwn(original, "value") && Boolean(original.sha256))).toBe(true);
+  expect(host.launches.slice(before).map(call => call.key)).toEqual([
+    `${publicationKey}.r1`, `${base}.compliance`, `${base}.checkout`, `${base}.finishDrain`,
+  ]);
+  if (cut === "after") expect(recoveredPublication).toBe(normalPublication!);
+  expect(host.hostCalls).toHaveLength(hostReads);
+  const genesis = host.records()[0]!;
+  expect(canonicalJSON(genesis)).toBe(canonicalJSON({
+    prev: null, seq: 0, kind: "spec", loop: 0, body: { content, digest: sha256(content) },
+  }));
+  const archive = storeBody<{ startedAt: number; integratedReview: { originals: { sha256: string }[] } }>(host.records().at(-1)!.body);
+  expect(archive.integratedReview.originals.every(original => !Object.hasOwn(original, "value") && Boolean(original.sha256))).toBe(true);
   expect(host.current().loop).not.toHaveProperty("reviewOriginals");
-  const compliance = host.calls.find(call => call.key.endsWith(".compliance"))!;
+  if (loop === 2) {
+    const selection = committed(host).records.find(row => row.opKey === `operation:${base}.selectionIO`);
+    expect(archive.startedAt).toBe(storeBody<{ request: { loopStartedAt: number } }>(selection?.body).request.loopStartedAt);
+  }
+  const compliance = host.calls.find(call => call.key === `${base}.compliance`)!;
   expect(compliance.task).toContain("Completed review originals:");
-  expect(compliance.task).toContain(retained.originals[0].sha256 ?? host.storage.get("review-invoke-human-1").originals[0].sha256);
+  expect(compliance.task).toContain(archive.integratedReview.originals[0]!.sha256);
+  if (cut === "after") {
+    expect(compliance.task).toBe(normalCompliance!);
+  } else {
+    const invalid = fixture(undefined, { taskCount: 0, findings: true });
+    invalid.setLimit(1);
+    const invalidSynthesis = "invoke-human-1.l1.review.director-synthesis";
+    invalid.setLaunchRespond(async (request, normal) => {
+      const result = await normal();
+      if (request.key === invalidSynthesis)
+        result.structuredOutput.dispositions[0].classification = "uncertain";
+      return result;
+    });
+    const reason = "Director returned invalid finding scope or unsupported inclusion.";
+    expect((await invalid.execute()).reason).toContain(reason);
+    const pending = invalid.snapshots.find(value => value.action.key === invalidSynthesis && value.action.runId);
+    expect(pending).toBeDefined();
+    await invalid.state.set("pitako-execute", pending);
+    const beforeReplay = invalid.launches.length;
+    expect((await invalid.execute()).reason).toContain(reason);
+    expect(invalid.launches.slice(beforeReplay).map(call => call.key)).toEqual(["invoke-human-1.l1.reviewOriginals.r1"]);
+    expect(committed(invalid).records.some(row => row.kind === "review-originals")).toBe(false);
+    expect(invalid.launches.some(call => call.key.endsWith(".compliance"))).toBe(false);
+  }
 });
 
 
@@ -869,26 +1204,32 @@ test("director guidance and update schema match the runtime update whitelist", a
 });
 
 
-test.each(["HUMAN + DECISION overflow", "Gate receipt exceeds 8 KiB"])("%s stops for consolidation without redispatching the gate", async reason => {
+test.each(["HUMAN + DECISION overflow: ask the human to consolidate", "Gate receipt exceeds 8 KiB"])("%s halts without redispatching the gate", async reason => {
   const host = taskFixture();
   host.setRespond((request, normal) => {
     if (!isGate(request)) return normal();
-    return { ok: false, agent: "pitako.loop-io", runId: "overflow-gate",
+    return { ...host.result(request, null), ok: false,
       output: JSON.stringify({ error: "loop-io", reason, viewOverflow: true }) };
   });
   const output = await host.execute();
   expect(output.status).toBe("blocked");
-  expect(output.reason).toContain("ask the human to consolidate");
+  expect(output.reason).toBe(reason);
   expect(host.calls.filter(isGate)).toHaveLength(1);
   expect(host.calls.filter(call => call.agent === "pitako.worker")).toHaveLength(1);
   expect(host.calls.some(call => call.agent === "pitako.checkpoint-sealer")).toBe(false);
+  const launches = [...host.launches], cursor = host.current();
+  host.setRespond();
+  const held = await host.execute();
+  expect(held.loopReport.halt).toEqual(output.loopReport.halt);
+  expect(host.launches).toEqual(launches);
+  expect(host.current()).toEqual(cursor);
 });
 
 test("prepare binding overflow stops before any worker launch", async () => {
   const host = taskFixture();
   host.setRespond((request, normal) => {
     if (request.agent !== "pitako.loop-io" || JSON.parse(request.task).operation !== "prepare") return normal();
-    return { ok: false, agent: "pitako.loop-io", runId: "overflow-prepare",
+    return { ...host.result(request, null), ok: false,
       output: JSON.stringify({ error: "loop-io", reason: "HUMAN + DECISION overflow: ask the human to consolidate", viewOverflow: true }) };
   });
   const output = await host.execute();
@@ -936,19 +1277,24 @@ test("attempt metadata preserves a resume opinion alongside gate diagnosis and p
     if (request.agent === "pitako.worker") result.structuredOutput.continuation = { mode: "resume", reason: "Context remains useful" };
     if (isGate(request)) {
       const input = JSON.parse(request.task);
-      expect(input.checkpoint.key).toBe(request.key.replace(/\.gate$/, ""));
+      const intent = input.refs?.intent;
+      const checkpoint = input.checkpoint ?? committed(host).records.find(row =>
+        row.kind === "intent" && row.seq === intent?.seq && row.digest === intent.digest)?.body;
+      expect(checkpoint.key).toBe(request.key.replace(/\.gate$/, ""));
       const receipt = JSON.parse(result.output!); receipt.contextPeak = 1234;
       if (first) { first = false; receipt.gates[0].status = "fail"; receipt.gates[0].exit = 1; receipt.gates[0].tail = "Fix this assertion"; }
       result.output = JSON.stringify(receipt);
     }
     return result;
   });
-  expect((await host.execute()).status).toBe("partial");
-  const firstResult = host.snapshots.find(state => state.loop?.attempt?.number === 1 && state.loop.attempt.stage === "result")!.loop.attempt.result;
+  const output = await host.execute();
+  expect(output.status, output.reason).toBe("partial");
+  const firstResult = host.records().find((record: { kind: string; body: { attempt?: number } }) =>
+    record.kind === "unit" && record.body.attempt === 1)?.body.result;
+  expect(firstResult).toBeDefined();
   expect(firstResult.status).toBe("continue"); expect(firstResult.usefulContinuation).toBe(true);
   expect(firstResult.diagnosis).toContain("change1-check: fail");
   expect(firstResult.diagnosis).toContain("/native/gates/invoke-human-1.l1.t1.a1.gate/change1-check.log");
   expect(firstResult.diagnosis).not.toContain("Fix this assertion");
   expect(firstResult.revival).toEqual({ opinion: "resume", reason: "Context remains useful", decision: "fresh", code: "fresh-dispatch", peak: 1234 });
-  expect(host.snapshots.some(state => state.loop?.attempt?.revival?.peak === 1234)).toBe(true);
 });
