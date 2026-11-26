@@ -101,7 +101,9 @@ test("30 single-task loops retain constant state across recoveries", async () =>
       ? host.calls.find(call => host.native.get(call.key)?.runId === reference)?.key ?? reference : reference;
     expect(key).toMatch(/\.l\d+\./);
   }
-}, 20_000); // Human decision m01583: AGENTS.md timeout exception for the 30-loop workload.
+// Human decision m01583: AGENTS.md timeout exception for the 30-loop workload.
+// Human decision: macOS process startup is an accepted host limitation; the full suite takes about 35 s there.
+}, process.platform === "darwin" ? 60_000 : 20_000);
 
 test.each([
   ["an unknown selection", (selection: any) => { selection.select = "missing"; }, "Selected task must be pending"],

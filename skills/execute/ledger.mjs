@@ -534,7 +534,13 @@ export function executeStore(root, invocation, writer = false, epoch = invocatio
   const store = context?.store ?? new PitakoStore(root, executeProjection), scope = executeScope(invocation, epoch);
   let head;
   if (writer) {
-    head = existsSync(store.file) ? store.readRecords(scope).head : null;
+    head = null;
+    if (existsSync(store.file)) {
+      try { head = store.readRecords(scope).head; }
+      catch (error) {
+        if (!(error instanceof StoreError && error.code === "store-unavailable")) throw error;
+      }
+    }
     // v9 has no explicit admission call. Its first deterministic writer admits the scope.
     if (head === null) {
       store.activate(scope);

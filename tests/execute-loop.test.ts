@@ -999,16 +999,26 @@ test("shared binding band rejects prepare overflow and leaves room for the gate 
       expect(JSON.parse(result.stdout)).toMatchObject({ error: "loop-io", viewOverflow: true });
     }
   } finally { board.close(); }
-});
+// Human decision: macOS process startup is an accepted host limitation; 21 launches exceed 10 s under suite load there.
+}, process.platform === "darwin" ? 30_000 : undefined);
 
 test("gate receipt overhead overflow is explicitly marked by loop-io", () => {
   const f = fixture(), input = attempt(f);
-  input.task.gates = Array.from({ length: 60 }, (_, n) => ({ id: `gate-${n}`, command: "true", cwd: ".", timeoutMs: 1000 }));
+  // Legacy gate requests above the packed receipt limit retain their IDs on the wire.
+  input.task.gates = Array.from({ length: 17 }, (_, n) => ({
+    id: `gate-${n}-${"x".repeat(512)}`, command: "true", cwd: ".", timeoutMs: 1000,
+  }));
   const result = spawnSync("node", [path.resolve("skills/execute/loop-io.mjs")], {
     cwd: f.root, input: JSON.stringify({ operation: "gate", ...input }), encoding: "utf8",
   });
   expect(result.status).toBe(1);
-  expect(JSON.parse(result.stdout)).toMatchObject({ error: "loop-io", viewOverflow: true });
+  expect(JSON.parse(result.stdout)).toMatchObject({ error: "loop-io", viewOverflow: true,
+    reason: "HUMAN + DECISION overflow: Board view cannot retain binding rules; human consolidation required" });
+  const receipt = new PitakoStore(f.root).readRecords("exec:exec1.e0").records
+    .find(row => row.opKey === "gate:attempt1.gate")?.body as GateReceipt;
+  expect(receipt.view.posts).toEqual([]);
+  expect(receipt.gates.map(({ id, status }) => ({ id, status })))
+    .toEqual(input.task.gates.map(({ id }) => ({ id, status: "pass" })));
 });
 
 

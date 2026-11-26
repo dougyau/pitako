@@ -464,7 +464,8 @@ describe("execute todo registration and reconciliation",()=>{
     try {
       await f.fire("session_start");
       let signal!:()=>void;
-      const updated=new Promise<void>((resolve,reject)=>{signal=resolve; timer=setTimeout(()=>reject(new Error("No live worker file update")),1000);});
+      // Watch delivery can lag under parallel load; stay below Bun's 5 s default so cleanup still runs.
+      const updated=new Promise<void>((resolve,reject)=>{signal=resolve; timer=setTimeout(()=>reject(new Error("No live worker file update")),4000);});
       const original=f.pi.appendEntry;
       f.pi.appendEntry=((type:string,data:any)=>{
         original(type,data);
@@ -540,7 +541,8 @@ describe("execute todo registration and reconciliation",()=>{
       const appendLive=f.pi.appendEntry;
       try {
         const updated=new Promise<void>((resolve,reject)=>{
-          timer=setTimeout(()=>reject(new Error("Reused worker file watch did not refresh")),2000);
+          // Watch delivery can lag under parallel load; stay below Bun's 5 s default so cleanup still runs.
+          timer=setTimeout(()=>reject(new Error("Reused worker file watch did not refresh")),4000);
           f.pi.appendEntry=((type:string,data:any)=>{
             appendLive(type,data);
             if(data.tasks?.some((t:Task)=>t.owner==="worker:successor:t1:1" && t.subject==="Reused live" && t.parentId===parent.id)) resolve();

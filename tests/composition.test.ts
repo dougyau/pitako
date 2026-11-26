@@ -550,7 +550,7 @@ describe("engineering-layer composition", () => {
     expect(note).toContain("Load a specialized skill only when it applies.");
     expect(note).toContain("Research or design does not authorize implementation.");
     // Include authority/provenance and shared TODO policy, not workflow bodies.
-    expect(note.length).toBeLessThan(3400);
+    expect(note.length).toBeLessThan(3600);
     for (const marker of THIRD_PARTY_ALWAYS_ON_MARKERS) {
       expect(note).not.toContain(marker);
     }

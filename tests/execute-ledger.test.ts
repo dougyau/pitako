@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { createHash } from "node:crypto";
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { buildExternalCliPrompt } from "../node_modules/pi-subagents/src/runs/shared/external-cli-runner.js";
@@ -9,7 +9,7 @@ import { canonicalJSON } from "../extensions/canonical.mjs";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
 const entry = path.resolve("skills/execute/ledger.mjs");
-const { appendLedger, verifyLedger, executeStore, loopSummaries } = await import(entry);
+const { appendLedger, verifyLedger, executeStore, loopSummaries, withExecuteStore } = await import(entry);
 const roots: string[] = [];
 let git: ReturnType<typeof gitFakeFixture>;
 beforeEach(() => { git = gitFakeFixture(); });
@@ -143,6 +143,23 @@ describe("execution ledger", () => {
     expect(reused).toEqual(cached);
     expect(() => appendLedger(workspace, invocation, request(reused))).toThrow();
     expect(readFileSync(stored(workspace).store.file)).toEqual(damaged);
+  });
+
+  test("an opened but uninitialized store is unavailable to readers and can publish its first ledger entry", async () => {
+    const workspace = root(), { store, scope } = stored(workspace);
+    mkdirSync(path.dirname(store.file), { recursive: true });
+    const creator = openSqliteSync(store.file);
+    const before = readFileSync(store.file), inode = statSync(store.file).ino;
+    try {
+      creator.exec("BEGIN IMMEDIATE");
+      expect(() => store.readRecords(scope)).toThrow(expect.objectContaining({ code: "store-unavailable" }));
+      expect(readFileSync(store.file)).toEqual(before);
+    } finally { creator.close(); }
+
+    const anchor = await withExecuteStore(workspace, invocation, () => appendLedger(workspace, invocation, request()));
+    expect(verifyLedger(workspace, invocation, anchor)).toHaveLength(2);
+    expect(statSync(store.file).ino).toBe(inode);
+    expect(readdirSync(path.dirname(store.file)).filter(name => name.startsWith("pitako.db.v"))).toEqual([]);
   });
 
   test("exclusive publication races accept identical contenders and never overwrite conflicting ones", async () => {

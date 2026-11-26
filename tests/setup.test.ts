@@ -160,19 +160,18 @@ test("setup respects an overridden index directory and preserves its database", 
     expect(readFileSync(path.join(overrideDir, "codegraph.db"), "utf8")).toBe("custom index");
   }));
 
-test("setup falls back to the existing default index for invalid directory overrides", () =>
-  withSetup(({ checkout, run }) => {
-    const indexDir = path.join(checkout, ".codegraph");
-    mkdirSync(indexDir);
-    writeFileSync(path.join(indexDir, "codegraph.db"), "existing index");
-    for (const invalid of [".", "..", "../outside", "nested/index", "nested\\index", "/absolute", "a..b", "   "]) {
+test.each([".", "..", "../outside", "nested/index", "nested\\index", "/absolute", "a..b", "   "])(
+  "setup falls back to the existing default index for invalid directory override %j", invalid =>
+    withSetup(({ checkout, run }) => {
+      const indexDir = path.join(checkout, ".codegraph");
+      mkdirSync(indexDir);
+      writeFileSync(path.join(indexDir, "codegraph.db"), "existing index");
       const result = run({ CODEGRAPH_DIR: invalid });
       expect(result.status).toBe(0);
       expect(result.stderr).not.toContain("Warning:");
       expect(result.calls).not.toContain("codegraph|");
-    }
-    expect(readFileSync(path.join(indexDir, "codegraph.db"), "utf8")).toBe("existing index");
-  }));
+      expect(readFileSync(path.join(indexDir, "codegraph.db"), "utf8")).toBe("existing index");
+    }));
 
 test("setup warns but succeeds when optional indexing or its lookup fails", () =>
   withSetup(({ run }) => {
