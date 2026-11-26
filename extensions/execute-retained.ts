@@ -478,9 +478,9 @@ function retainedProjection(root: string, source: string, digest: string, contex
 		throw new Error("Expected exact mission and invocation for retained analysis inspection.");
 	const mission = readJson(executionStatePath({ missionPath: context.missionPath, missionId: context.missionId }));
 	const value = record(mission) ? mission[EXECUTE_CURSOR_KEY] : undefined;
-	if (value === undefined) return undefined;
+	if (value === undefined || record(value) && typeof value.invocation === "string" &&
+		value.invocation && value.invocation !== context.invocation) return undefined;
 	const { cursor, records } = readExecuteProgress(root, value);
-	if (cursor.invocation !== context.invocation) return undefined;
 	const loop = cursor.loop;
 	if (!loop || !["director", "implementation", "review", "compliance"].includes(loop.phase)) return undefined;
 	const rootKey = `invoke-${cursor.invocation}${cursor.epoch ? `.e${cursor.epoch}` : ""}`;

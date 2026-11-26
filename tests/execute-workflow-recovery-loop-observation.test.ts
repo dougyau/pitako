@@ -7,10 +7,12 @@ import { executeStore } from "../skills/execute/ledger.mjs";
 import { applyCheckpoint, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { readExecuteIntentContext } from "../extensions/execute-intent.ts";
 import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
+import { executionResource } from "../extensions/plan-execute.ts";
+import { inspect } from "../skills/execute/inspect.ts";
 import { validateToolArguments } from "@earendil-works/pi-ai";
 import { validateWorkflowScript } from "../node_modules/pi-subagents/src/workflows/scripted-workflow.js";
 import { MISSION_STATE_MAX_BYTES } from "../node_modules/pi-subagents/src/missions/workflow-state.js";
-import { digest, MAX_SPEC_BYTES } from "../extensions/spec-plans.ts";
+import { digest, MAX_SPEC_BYTES, SPEC_SECTIONS } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, executeField, source, copy, gaps, closedInterruptedProducer, cutAt, config, candidate, expectImpediment, publicationWitness, type Result } from "./fixtures/execute-workflow.ts";
 import { childResponse, realCheckoutCompositionFixture } from "./fixtures/plan-execute-composition.ts";
 import { expectProcessBudget } from "./fixtures/process-budget.ts";
@@ -1089,7 +1091,7 @@ describe("workflow-owned execute controller", () => {
       const halt = denied ? initial.loopReport.halt : expectOpenHalt(host, initial);
       expect(halt).toMatchObject({ code: "native-barrier", cause: denied ? "native permission denial" : "stopped",
         ref: { key: target, runId: producer.runId } });
-      expect(original).toMatchObject({ version: 10,
+      expect(original).toMatchObject({ version: EXECUTE_STATE_VERSION,
         halt: { stage: denied ? "native-permission" : "native-barrier", digest: canonicalDigest(halt) },
         loop: { number: 1, phase }, action: { kind: "launched", key: target, runId: producer.runId } });
       host.setStatus(ref => ref !== producer.runId ? copy(host.native.get(ref)!) :
@@ -1637,19 +1639,36 @@ describe("workflow-owned execute controller", () => {
     }
   });
 
-  test("new human invocation replaces the fixed cursor without changing old store or native records", async () => {
-    const host = fixture(undefined, { taskCount: 0 }); host.setLimit(1); expect((await host.execute()).status).toBe("complete");
+  test("new human invocation replaces a previous invocation's v10 cursor without changing its records", async () => {
+    const spec = "---\npitako-spec: 1\nid: spec\nstatus: complete\n---\n" +
+      SPEC_SECTIONS.map(section => `## ${section}\nRetain the exact admitted subject.\n`).join("\n");
+    const host = fixture(spec, { taskCount: 0, realCheckout: true });
+    host.setLimit(1);
+    expect((await host.execute()).status).toBe("complete");
     const previous = copy(host.current());
     const prior = atCursor(host, previous);
     const originals = copy([...host.native.entries()]);
+    const { association } = host.admitted();
+    await host.state.set("pitako-execute", { ...previous, version: 10 });
+    const { root, source, missionId, missionPath } = association;
+    const invocation = "human-2";
+    const args = { id: "spec", root, source, missionId, missionPath, invocation };
+    expect(executionResource().resolve(args).hostCommands[0]?.key).toBe("inspect-initial");
+    writeFileSync(path.join(root, ".pi", "settings.json"), '{"pitako":{"execute":{"maxCycles":4}}}');
+    const observed = JSON.parse(await inspect([root, "spec", source, "admission", JSON.stringify({
+      ...args, amendments: [], admission: { sourceRefs: [], agentDir: path.join(root, "private-agent") },
+    })]));
+    expect(observed).toMatchObject({ version: 1, admission: { maxCycles: 4 } });
+    expect(observed.error).toBeUndefined();
     host.setLimit(4);
-    host.setInvocation("human-2");
+    host.setInvocation(invocation);
+    host.setHostResponse((key, value) => key === "inspect-initial" ? observed : value);
     host.setRespond((request, normal) => request.agent === "pitako.execution-director"
       ? { ...normal(), ok: false, stopped: true } : normal());
     expect(await host.execute()).toMatchObject({ status: "cancelled", maxLoops: 4 });
     expect(host.calls.at(-1)?.key).toBe("invoke-human-2.l1.director");
     expect([...host.storage.keys()]).toEqual(["pitako-execute"]);
-    expect(host.current()).toMatchObject({ version: 10, invocation: "human-2", storeId: previous.storeId,
+    expect(host.current()).toMatchObject({ version: EXECUTE_STATE_VERSION, invocation: "human-2", storeId: previous.storeId,
       budget: { maxCycles: 4, consumedLoops: 1 } });
     expect(atCursor(host).P.prompt.admission?.association.invocation).toBe("human-2");
     expect(atCursor(host, previous)).toEqual(prior);
@@ -1774,10 +1793,12 @@ describe("workflow-owned execute controller", () => {
     const cut = copy(host.current()), before = storeTipRows(host), admissions = copy(host.launches);
     expect(cut.loop).toMatchObject({ number: 1, cursor: 0, taskId: "change1", attempt: { number: 1, stage: "launched" } });
     expect(cut.action).toMatchObject({ kind: "pending", op: "close", opKey: closeKey });
-    const folded = atCursor(host, cut).P.prompt.execution?.foldedContinuation;
-    const worker = folded == null ? undefined : executeField(folded, "worker");
-    expect(worker).toMatchObject({ reference: { key, runId: host.native.get(key)!.runId },
+    const execution = atCursor(host, cut).P.prompt.execution!;
+    expect(execution.worker).toMatchObject({ reference: { key, runId: host.native.get(key)!.runId },
       value: { status: "blocked", remaining: [reason] } });
+    expect(executeField(execution.foldedContinuation, "worker")).toEqual({
+      same: ["execution", "worker"], digest: canonicalDigest(execution.worker),
+    });
     expect(before.filter(row => row.kind === "receipt" && (row.body as { key: string }).key === closeKey)).toHaveLength(1);
     const reads = host.hostCalls.filter(key => key === "execute-settings").length;
     host.setFailSave();

@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { existsSync, rmSync, writeFileSync } from "node:fs";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { readBacklog } from "../skills/execute/loop.ts";
 import { digest } from "../extensions/spec-plans.ts";
 import { executeControllerFixture, executeField, executeString, type Result } from "./fixtures/execute-workflow.ts";
@@ -25,6 +26,7 @@ test.each(["admit", "reject", "gate-failure", "incomplete", "conflict", "stalled
   "one same-slot repair: %s", async outcome => {
     const host = fixture(); host.setLimit(1);
     let workers = 0, reviews = 0;
+    const repairKnowledge = { findings: [], handoff: "a2-incomplete-knowledge-sentinel" };
     host.setRespond((request, normal) => {
       const result = normal();
       if (request.agent === "pitako.worker") {
@@ -32,6 +34,7 @@ test.each(["admit", "reject", "gate-failure", "incomplete", "conflict", "stalled
         if (workers === 2 && outcome === "incomplete") {
           result.structuredOutput.status = "continue";
           result.structuredOutput.remaining = ["Still incomplete"];
+          result.structuredOutput.knowledge = repairKnowledge;
         }
       }
       if (pitakoAgentFamily(request.agent) === "loop-io" && JSON.parse(request.task).operation === "gate") {
@@ -78,6 +81,18 @@ test.each(["admit", "reject", "gate-failure", "incomplete", "conflict", "stalled
       expect(repair.task).toContain("Synthesis diagnosis");
       expect(repair.task).toContain("Repair the source-evidenced error path");
       expect(host.calls.some(call => call.key === "invoke-human-1.l1.t1.a2.baseline")).toBe(true);
+      if (outcome === "incomplete") {
+        expect(host.launches.some(call => call.key === `${repair.key}.gate`)).toBe(false);
+        const close = retained.records.find(row => row.kind === "receipt" &&
+          executeField(row.body, "key") === `${repair.key}.close`)!;
+        const execution = store.read(scope, { seq: close.seq, hash: close.digest }).P.prompt.execution!;
+        expect(execution.checkpoint).toMatchObject({ attempt: 3 });
+        expect(execution.worker).toBeNull();
+        const folded = execution.foldedContinuation;
+        expect(executeField(folded, "worker", "value", "knowledge")).toEqual(repairKnowledge);
+        expect(JSON.stringify(executeField(folded, "taskFrame"))).not.toContain(repairKnowledge.handoff);
+        expect(units.at(-1)!.body.frame.workerKnowledge[repair.key]).toEqual(repairKnowledge);
+      }
     }
     if (!admitted) {
       expect(host.history()[0].outcome).toBe("gaps");
@@ -180,7 +195,7 @@ test.each(["reviewer-intention", "synthesis-intention", "reviewer-receipt", "syn
   });
   expect((await execute(host)).reason).toContain("Essential persistence failed");
   const cursor = host.current();
-  expect(cursor.version).toBe(10);
+  expect(cursor.version).toBe(EXECUTE_STATE_VERSION);
   expect(cursor.action).toMatchObject({ kind: "launched", role: "reviewer", key: cutKey });
   if (cut.endsWith("-receipt") || preAdmission) expect(cursor.review.slots.at(-1).runId).toBeNull();
   if (preAdmission) {

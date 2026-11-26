@@ -929,6 +929,7 @@ describe("plan/execute packaged composition", () => {
           const fs = io;
           const { readExecuteIntentContext } = await import(input.intentModule);
           const { readExecuteAdmission } = await import(new URL("./execute-progress.ts", input.intentModule).href);
+          const { EXECUTE_STATE_VERSION } = await import(new URL("./execute-state.ts", input.intentModule).href);
           const storage=new Map<string, any>(),calls: string[]=[],hosts: string[]=[],originals=new Map<string, any>(),closings=new Map<number, any>();let checkout=input.checkout;
           if(input.mode==="legacy") storage.set("pitako-execute",{version:2,association:{...input.metadata,invocation:"human-1"},snapshot:{content:input.content},loops:[]});
           const options={script:input.script,state:{get:(key: string)=>structuredClone(storage.get(key)),set:(key: string,value: any)=>{storage.set(key,structuredClone(value));fs.writeFileSync(input.statePath,JSON.stringify(Object.fromEntries(storage)));}},
@@ -966,7 +967,7 @@ describe("plan/execute packaged composition", () => {
             second=await runWorkflowScript(options);
           }
           const cursor=storage.get("pitako-execute");
-          const saved=cursor?.version===10 ? readExecuteAdmission(input.root,cursor).admission : null;
+          const saved=cursor?.version===EXECUTE_STATE_VERSION ? readExecuteAdmission(input.root,cursor).admission : null;
           return {first:first.value,second:second?.value,calls,hosts,closings:[...closings.values()],saved};
       };
       const identity = checkoutEvidence(root);

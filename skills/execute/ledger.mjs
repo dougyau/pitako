@@ -5,6 +5,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { pathToFileURL } from "node:url";
 import { canonicalDigest, canonicalJSON, sha256 as digest } from "../../extensions/canonical.mjs";
 const { PitakoStore, StoreError } = await import("../../extensions/pitako-store.ts");
+const { readContinuation } = await import("../../extensions/execute-state.ts");
 
 import { safePath, validateExpected, readRequest } from "../../extensions/hash-ledger.mjs";
 
@@ -171,7 +172,7 @@ function projectionRows(rows) {
     if (["advance", "drain", "gate", "baseline"].includes(operation)) return false;
     if (operation === "close") {
       if (close) return false;
-      close = Boolean(row.body.continuation);
+      close = row.body.continuation != null;
     }
     if (operation === "selection") {
       if (selection) return false;
@@ -204,7 +205,7 @@ export function storedGateEvidence(records, request) {
   const predecessorReceipt = prefix.find(candidate => candidate.kind === "receipt" &&
     candidate.body.key === predecessor?.body.request.key);
   const steps = predecessorReceipt?.body.result.steps;
-  const view = predecessor?.body.operation === "baseline" ? predecessor.body.request.continuation?.view :
+  const view = predecessor?.body.operation === "baseline" ? readContinuation(predecessor.body.request.continuation)?.view :
     predecessor?.body.operation === "selection" ? steps?.find(step => step.operation === "apply")?.result.view :
       steps?.find(step => step.operation === "gate")?.result.receipt.view;
   if (!predecessor || canonicalDigest({ operation: predecessor.body.operation, ...predecessor.body.request }) !==
@@ -222,6 +223,12 @@ export function storedGateProjection(store, scope, prefix, request) {
 /** Full-fold oracle: keep independent selection evidence without a second reducer. */
 export function fullExecuteProjection(rows) {
   return foldExecuteProjection(rows, rows);
+}
+
+export function sameOutputCopy(source, same, target) {
+  if (source === undefined || target === undefined) return source;
+  const digest = canonicalDigest(source);
+  return digest === canonicalDigest(target) ? { same, digest } : source;
 }
 
 function foldExecuteProjection(rows, sources) {
@@ -271,7 +278,7 @@ function foldExecuteProjection(rows, sources) {
     if (startedAt !== undefined) prompt.loopOpen = { number, startedAt };
   }
   let admission = null, selection = null, selectionIntent = null, workerOriginal = null, workerCheckpoint = null;
-  let continuation = null, foldedContinuation = null, backlogPath = null, taskReviewRecovery = null;
+  let baselineRequest = null, closeReceipt = null, backlogPath = null, taskReviewRecovery = null;
   let demand = null;
   let tasks = [];
   function selectTask(id, reference) {
@@ -313,7 +320,7 @@ function foldExecuteProjection(rows, sources) {
         selection = row.body.request;
         selectionIntent = workerOriginal = workerCheckpoint = null;
       }
-      if (row.body.operation === "baseline") continuation = row.body.request.continuation;
+      if (row.body.operation === "baseline") baselineRequest = row.body.request;
       if (row.body.operation === "advance")
         control.operation.loop = row.body.request.prepare.loop;
       demand = row.body.request.demand ?? null;
@@ -363,44 +370,7 @@ function foldExecuteProjection(rows, sources) {
       const key = row.body.key.replace(/\.drain$/, "");
       control.finishDrain = { key, generation: Number(key.match(/\.v(\d+)$/)?.[1] ?? 0) };
     }
-    if (row.kind === "receipt" && row.body.continuation) {
-      const packet = row.body.continuation;
-      if (!Array.isArray(packet.ledgerRefs))
-        throw new StoreError("store-corrupt", "Missing close continuation ledger references");
-      const resolve = (ref, kind) => {
-        const source = sources.find(source => source.seq < row.seq && source.seq === ref?.seq &&
-          source.digest === ref.digest && source.kind === kind);
-        if (!source) throw new StoreError("store-corrupt", "Close continuation reference integrity mismatch");
-        return source.body;
-      };
-      const request = resolve(packet.input, "operation").request;
-      const gate = resolve(packet.gate, "marker");
-      const seal = resolve(packet.seal, "seal");
-      const intent = resolve(packet.attempt, "intent");
-      // A gate receipt may have been carried by a prior standalone admission.
-      // Fold its evidence, never the prior admission envelope and its projection.
-      const { P: priorProjection, head: priorHead, storeId: priorStore, ...receipt } = gate.result.receipt;
-      const resultReference = result => {
-        if (!result) throw new StoreError("store-corrupt", "Missing close continuation ledger result");
-        return Object.fromEntries(["taskId", "attempt", "sealed", "checkpoint", "ref"]
-          .filter(key => result[key] !== undefined).map(key => [key, result[key]]));
-      };
-      const drained = packet.ledgerRefs.flatMap(ref => resolve(ref, "ledger").entries)
-        .filter(entry => entry.kind === "unit").map(entry => ({
-          frame: Object.fromEntries(["reviewProjections", "workerKnowledge"]
-            .filter(key => entry.body.frame?.[key]).map(key => [key, entry.body.frame[key]])),
-          result: resultReference(entry.body.result), results: entry.body.results.map(resultReference),
-        }));
-      if (!request.continuation || request.gate.checkpoint.key !== request.continuation.attempt.key ||
-          intent.key !== (packet.next ? request.nextBaseline[seal.result.receipt.outcome]?.key :
-            request.gate.checkpoint.key) ||
-          gate.workerOriginal?.reference.key !== request.continuation.attempt.key)
-        throw new StoreError("store-corrupt", "Close continuation source integrity mismatch");
-      foldedContinuation = { ref: inputReference, intent: packet.attempt, checkpoint: intent,
-        ...request.continuation, requests: result.steps.find(step => step.operation === "nextRequests").result,
-        view: receipt.view, gate: { receipt, contextPeak: gate.result.contextPeak }, seal: seal.result.receipt,
-        worker: gate.workerOriginal, drained };
-    }
+    if (row.kind === "receipt" && row.body.continuation != null) closeReceipt = row;
     if (row.kind === "receipt" && result?.operation === "selection")
       backlogPath = result.steps.find(step => step.operation === "apply")?.result.path ?? backlogPath;
     if (!result || row.kind === "receipt") continue;
@@ -463,7 +433,17 @@ function foldExecuteProjection(rows, sources) {
     if (control.operation.operation === "selection") prompt.loopSummaries = summaries;
     control.ledger = { count: ledger.length, head: ledger.length ? ledgerDigest(ledger.at(-1)) : null };
     control.lastConfirmed = ledger.findLast(entry => entry.kind === "unit")?.body.checkpoint ?? null;
-    if (["selection", "close", "gate", "baseline"].includes(control.operation.operation) && selection?.plan && selectionIntent)
+    if (["selection", "close", "gate", "baseline"].includes(control.operation.operation) && selection?.plan && selectionIntent) {
+      const checkpoint = workerCheckpoint ?? selectionIntent;
+      const continuation = [checkpoint.key, selectionIntent.key].includes(baselineRequest?.intent?.key)
+        ? readContinuation(baselineRequest.continuation) : null;
+      // A close can supply the just-closed attempt or the baseline it captured.
+      // Use the surrounding receipt to select it before interpreting its packet.
+      const next = closeReceipt?.body.result.steps.find(step => step.operation === "nextBaseline")?.result;
+      const priorKey = checkpoint.key.replace(/\.a([2-9]|[1-9]\d+)$/, (_, attempt) => `.a${Number(attempt) - 1}`);
+      const foldedContinuation = closeReceipt && (closeReceipt.body.key === `${checkpoint.key}.close` ||
+        !continuation && next?.captured && priorKey !== checkpoint.key && closeReceipt.body.key === `${priorKey}.close`)
+        ? foldCloseContinuation(closeReceipt, sources) : null;
       prompt.execution = { plan: selection.plan, backlogPath, checkpoint: workerCheckpoint ?? selectionIntent, worker: workerOriginal,
         ...(control.operation.operation === "selection" && selection.recoveries ? { recoveries: selection.recoveries } : {}),
         ...(taskReviewRecovery?.gate.seq === control.operation.input.seq ? { taskReviewRecovery } : {}),
@@ -473,8 +453,7 @@ function foldExecuteProjection(rows, sources) {
           : continuation?.attempt.key === selectionIntent.key ? { continuation } :
             foldedContinuation?.checkpoint.key === (workerCheckpoint ?? selectionIntent).key
               ? { continuationRef: foldedContinuation.ref, foldedContinuation } : {}) };
-    if (prompt.execution) {
-      const checkpoint = prompt.execution.checkpoint;
+      const execution = prompt.execution;
       const prior = continuation?.attempt.key === checkpoint.key ? continuation :
         foldedContinuation?.checkpoint.key === checkpoint.key ? foldedContinuation : null;
       const usage = [...(prior?.usage ?? selection.usage ?? [])];
@@ -485,7 +464,17 @@ function foldExecuteProjection(rows, sources) {
             Number.isFinite(reported[field]) && reported[field] >= 0)
             ? ["input", "output", "cacheRead", "cacheWrite"].reduce((total, field) => total + reported[field], 0) : null });
       }
-      prompt.execution.usage = usage;
+      execution.usage = usage;
+      if (execution.foldedContinuation) {
+        // A captured next baseline changes the active checkpoint and clears its
+        // worker. Keep a closed original inline when the active copy differs.
+        execution.foldedContinuation = { ...foldedContinuation,
+          worker: sameOutputCopy(foldedContinuation.worker, ["execution", "worker"], execution.worker),
+          checkpoint: sameOutputCopy(foldedContinuation.checkpoint, ["execution", "checkpoint"], checkpoint),
+          attempt: { ...foldedContinuation.attempt,
+            checkpoint: sameOutputCopy(foldedContinuation.attempt.checkpoint, ["execution", "checkpoint"], checkpoint) },
+        };
+      }
     }
     if (control.operation.operation === "selection" && !prompt.execution && selection?.plan)
       prompt.execution = { plan: selection.plan, backlogPath, usage: selection.usage ?? [],
@@ -524,6 +513,48 @@ function foldExecuteProjection(rows, sources) {
   if (Buffer.byteLength(JSON.stringify(projection)) > 61440)
     throw new Error("Execute decision projection exceeds its transport budget");
   return projection;
+}
+
+function foldCloseContinuation(row, sources) {
+  const packet = readContinuation(row.body.continuation);
+  if (!Array.isArray(packet.ledgerRefs))
+    throw new StoreError("store-corrupt", "Missing close continuation ledger references");
+  const resolve = (ref, kind) => {
+    const source = sources.find(source => source.seq < row.seq && source.seq === ref?.seq &&
+      source.digest === ref.digest && source.kind === kind);
+    if (!source) throw new StoreError("store-corrupt", "Close continuation reference integrity mismatch");
+    return source.body;
+  };
+  const request = resolve(packet.input, "operation").request;
+  const continuation = readContinuation(request.continuation);
+  const gate = resolve(packet.gate, "marker");
+  const seal = resolve(packet.seal, "seal");
+  const intent = resolve(packet.attempt, "intent");
+  // A gate receipt may have been carried by a prior standalone admission.
+  // Fold its evidence, never the prior admission envelope and its projection.
+  const { P: priorProjection, head: priorHead, storeId: priorStore, view, gates, ...receipt } = gate.result.receipt;
+  const resultReference = result => {
+    if (!result) throw new StoreError("store-corrupt", "Missing close continuation ledger result");
+    return Object.fromEntries(["taskId", "attempt", "sealed", "checkpoint", "ref"]
+      .filter(key => result[key] !== undefined).map(key => [key, result[key]]));
+  };
+  const drained = packet.ledgerRefs.flatMap(ref => resolve(ref, "ledger").entries)
+    .filter(entry => entry.kind === "unit").map(entry => ({
+      frame: Object.fromEntries(["reviewProjections", "workerKnowledge"]
+        .filter(key => entry.body.frame?.[key]).map(key => [key, entry.body.frame[key]])),
+      result: resultReference(entry.body.result), results: entry.body.results.map(resultReference),
+    }));
+  if (!continuation || request.gate.checkpoint.key !== continuation.attempt.key ||
+      intent.key !== (packet.next ? request.nextBaseline[seal.result.receipt.outcome]?.key :
+        request.gate.checkpoint.key) ||
+      gate.workerOriginal?.reference.key !== continuation.attempt.key)
+    throw new StoreError("store-corrupt", "Close continuation source integrity mismatch");
+  return { ref: { seq: row.seq, digest: row.digest }, intent: packet.attempt, checkpoint: intent,
+    ...continuation, requests: row.body.result.steps.find(step => step.operation === "nextRequests").result,
+    // Repair diagnosis reads only these prefixes; the marker retains the original tails.
+    gate: { receipt: { ...receipt, gates: gates.map(gate => ({ ...gate, tail: gate.tail.slice(0, 128) })) },
+      contextPeak: gate.result.contextPeak }, seal: seal.result.receipt,
+    worker: gate.workerOriginal, drained };
 }
 
 export function executeStore(root, invocation, writer = false, epoch = invocationStore.getStore()?.epoch ?? 0) {

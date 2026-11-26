@@ -235,7 +235,7 @@ and defaults to four hours per implementation attempt and execute reviewer child
 The foreground coordinator can pass sticky `args.timeouts` overrides; existing
 intentions keep frozen deadlines. A barrier-free `timeout` halt requires a
 strictly greater value on relaunch of the same invocation (three generations
-maximum). These operational arguments cannot clear a terminal halt. See the [v10 coordinator contract](skills/execute/SKILL.md#coordinator-timeouts-v10)
+maximum). These operational arguments cannot clear a terminal halt. See the [coordinator contract](skills/execute/SKILL.md#coordinator-timeouts)
 for validation, reset, gate floors, derived totals and recovery limits.
 Version-8 execute state, including paused invocations, is rejected, not migrated.
 Material review/compliance gaps go to the next loop, not a hidden repair loop.

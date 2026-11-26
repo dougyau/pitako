@@ -488,7 +488,7 @@ remain separate. Replay reconstructs this block from verified committed data.
 Complete requires reasoned fulfillment/current mandatory checks/no material gaps;
 the admitted loops without it return partial. Standalone /review remains advisory.
 
-Execute v10 saves only `pitako-execute`: one validated cursor of at most
+Execute v11 saves only `pitako-execute`: one validated cursor of at most
 16384 UTF-8 bytes, measured as a pretty-printed single-key JSON object.
 It records the committed head, current action, loop position and bounded child
 references, with an embedded integrated-review cursor. A new invocation
@@ -556,7 +556,7 @@ text. Native terminal status does not prove subprocess quiescence; timeout/Stop
 races and tool deadlines remain limits. One-hour overhead is unmeasured and a
 floor increase need not fix overhead timeouts. No installed-copy hotfix changes,
 v8 migration, standalone review/pre-pr or director/inspector/non-close timeout
-changes are implied. See the [coordinator contract](../skills/execute/SKILL.md#coordinator-timeouts-v10)
+changes are implied. See the [coordinator contract](../skills/execute/SKILL.md#coordinator-timeouts)
 for executable input, validation and halt-specific actions.
 
 An integrated review cut before the first replacement launch-intention save

@@ -17,7 +17,7 @@ import { readExecuteIntentContext, verifyExecuteSealerIntents } from "../extensi
 import { readExecuteAdmission } from "../extensions/execute-progress.ts";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
-import { executionStatePath } from "../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath } from "../extensions/execute-state.ts";
 import type { ExecuteCursor } from "../extensions/execute-cursor.ts";
 import { processBudget, expectProcessBudget } from "./fixtures/process-budget.ts";
 import { gitFakeBootstrap } from "./fixtures/git-fake-env.ts";
@@ -56,7 +56,7 @@ function fixture(paths = ["owned"]) {
     if (saved.outcome !== "appended" || !saved.head) throw Error("Expected fixture intent append");
     const input = { seq: saved.head.seq, digest: saved.head.hash };
     const cursor: ExecuteCursor = {
-      version: 10, storeId: identity.storeId, root, invocation: "test", epoch: 0,
+      version: EXECUTE_STATE_VERSION, storeId: identity.storeId, root, invocation: "test", epoch: 0,
       associationDigest: canonicalDigest(current.association), admissionBinding: "b".repeat(64), head: saved.head,
       action: { kind: "launched", key: current.key, runId: null, role: "worker", input, gateTimeoutMs: 1000 },
       loop: { number: current.loop, phase: current.phase, cursor: current.cursor, taskId: current.taskId,
@@ -670,7 +670,7 @@ test("replay with a committed seal but a missing worker original admits nothing"
   expect((await host.execute()).status).toBe("partial");
   expect(host.current().loop).toMatchObject({ taskId: "change1", attempt: { stage: "launched" } });
   host.setFailSave();
-  // A v10 cursor carries no received body. Replay must verify the native original.
+  // The cursor carries no received body. Replay must verify the native original.
   const { admission } = readExecuteAdmission(host.root, host.current());
   const mission = JSON.parse(readFileSync(admission.association.missionPath, "utf8"));
   const worker = mission.workflowChildren.find((child: any) => child.key === "invoke-human-1.l1.t1.a1");

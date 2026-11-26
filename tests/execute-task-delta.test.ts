@@ -2,6 +2,7 @@ import { beforeAll, expect, test } from "bun:test";
 import { spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { PitakoStore } from "../extensions/pitako-store.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { beginHookEffect, captureBaseline, checkpointDirectory, checkpointTaskDelta, closeHookEffect, readCheckpointTaskBytes, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
@@ -135,7 +136,7 @@ test("repair-attempt baseline CLI takes its invocation from the checkpoint inten
   const { baseline: _, ...unbound } = first;
   const intent = { ...unbound, key: "invoke-delta.e2.l1.t1.a2", attempt: 2 };
   // The workflow's baselineIO request carries the invocation only inside the intent.
-  const request = { operation: "baseline", root: f.root, intent, continuation: { attempt: { number: 2 } } };
+  const request = { operation: "baseline", root: f.root, intent, continuation: { version: EXECUTE_STATE_VERSION, attempt: { number: 2 } } };
   const run = f.cli(request);
   expect(run.status, JSON.stringify(run.output)).toBe(0);
   expect(run.output.candidate).toEqual(captureBaseline({ intent }).candidate);

@@ -5,13 +5,18 @@ import type { CheckpointIntent } from "./execute-checkpoint.ts";
 import { PitakoStore, StoreError, type VerifiedStoreRecord } from "./pitako-store.ts";
 import { executeProjection, ledgerPath, storedGateEvidence } from "../skills/execute/ledger.mjs";
 import { existsSync, readFileSync } from "node:fs";
-import { executionStatePath } from "./execute-state.ts";
+import { EXECUTE_CONTINUATION_INCOMPATIBLE, EXECUTE_STATE_VERSION, executionStatePath, readContinuation } from "./execute-state.ts";
 
 function savedExecuteCursor(context: { missionPath: string; missionId: string; invocation: string }) {
   let value;
   try { value = JSON.parse(readFileSync(executionStatePath(context), "utf8"))[EXECUTE_CURSOR_KEY]; }
   catch (error) { if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined; throw error; }
-  return value?.invocation === context.invocation ? value : undefined;
+  if (value?.invocation !== context.invocation) return undefined;
+  // Preliminary capture must let the root report the retained cursor without dispatching.
+  if (value.version !== EXECUTE_STATE_VERSION)
+    throw new StoreError(EXECUTE_CONTINUATION_INCOMPATIBLE,
+      `${EXECUTE_CONTINUATION_INCOMPATIBLE}: Retained execute cursor v${value.version} is incompatible.`);
+  return value;
 }
 
 export function boundExecuteHostHalt(cwd: string, context: Parameters<typeof savedExecuteCursor>[0] & {
@@ -220,7 +225,7 @@ function timeoutEvidence(cursor: ExecuteCursor, action: NonNullable<ReturnType<t
         intent?.kind !== "intent" || intent.digest !== ref?.digest ||
         canonicalDigest(intent.body) !== canonicalDigest({ ...body.request.intent,
           baseline: (intent.body as CheckpointIntent).baseline }) ||
-        body.request.intent.key !== action.key || !body.request.continuation?.attempt?.restore)
+        body.request.intent.key !== action.key || !readContinuation(body.request.continuation)?.attempt?.restore)
       throw new StoreError("store-corrupt", "Restoring worker timeout differs from its committed baseline.");
     return { baseline: { intent: ref, replayOperation: "baseline" } };
   }

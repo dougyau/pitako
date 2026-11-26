@@ -4,6 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import { boundRetainedAnalyses, retainedAnalyses } from "../extensions/execute-retained.ts";
 import { type ExecuteCursor } from "../extensions/execute-cursor.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { canonicalDigest } from "../extensions/canonical.mjs";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
@@ -37,7 +38,7 @@ function setup(root: string) {
 	const head = commit("root-admission", { association, admissionBinding: "b".repeat(64), amendments: [] });
 	const input = { seq: head.seq, digest: head.hash };
 	const cursor: ExecuteCursor = {
-		version: 10, storeId: identity.storeId, root, invocation: "human-1", epoch: 0,
+		version: EXECUTE_STATE_VERSION, storeId: identity.storeId, root, invocation: "human-1", epoch: 0,
 		associationDigest: canonicalDigest(association), admissionBinding: "b".repeat(64), head,
 		action: { kind: "launched", key, runId, role: "reviewer", input },
 		loop: { number: 1, phase: "review", cursor: 0, taskId: null, outcome: null, attempt: null },
@@ -70,7 +71,7 @@ function setup(root: string) {
 	const bound = () => boundRetainedAnalyses(root, association.commonDir, "/spec.md", "e".repeat(64), "b".repeat(64), context);
 	return { root, native, file, mission, statePath, original, cursor, child, status, association, store, scope, commit, persist, select, load, bound, runId };
 }
-test("reads full originals from a saved v10 cursor without reader writes", () => fixture(f => {
+test("reads full originals from a saved execute cursor without reader writes", () => fixture(f => {
 	const state = readFileSync(f.statePath), database = readFileSync(f.store.file);
 	expect(f.load()).toEqual([{ key: f.child.key, runId: f.runId, agent: f.child.agent,
 		ok: true, state: "complete", structuredOutput: f.original }]);

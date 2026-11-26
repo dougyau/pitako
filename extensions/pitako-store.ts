@@ -21,7 +21,8 @@ export interface StoreRecord {
 }
 export type VerifiedStoreRecord = Readonly<Omit<StoreRecord, "body">> & { readonly body: unknown };
 export type StoreErrorCode = "store-busy" | "store-corrupt" | "store-unavailable" |
-  "store-replaced" | "cursor-ahead" | "wrong-cwd" | "superseded" | "missing-record";
+  "store-replaced" | "cursor-ahead" | "wrong-cwd" | "superseded" | "missing-record" |
+  "execute-continuation-incompatible";
 export class StoreError extends Error {
   readonly code: StoreErrorCode;
   recovery?: StoreIdentity & { quarantine?: string };

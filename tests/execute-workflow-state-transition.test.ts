@@ -20,6 +20,14 @@ function unitBodies(host: ReturnType<typeof fixture>) {
   return JSON.parse(JSON.stringify(host.records().filter((record: any) => record.kind === "unit")
     .map((record: any) => record.body)).replaceAll(host.root, "<root>"));
 }
+function foldedCloseView(prefix: ReturnType<ReturnType<typeof executeStore>["store"]["read"]>) {
+  const ref = executeField(prefix.P.prompt.execution!.foldedContinuation, "ref");
+  const close = prefix.records.find(row => row.kind === "receipt" &&
+    row.seq === executeField(ref, "seq") && row.digest === executeField(ref, "digest"));
+  const steps = executeField(close?.body, "result", "steps");
+  if (!Array.isArray(steps)) throw new Error("Expected committed close steps.");
+  return executeField(steps.find(step => executeField(step, "operation") === "gate"), "result", "receipt", "view");
+}
 const validators: [string, (key: string, value: unknown) => void][] = [
   ["host", validateExecuteCursor],
   ["sandbox", runInNewContext(`${executeCursorValidationScript()}\nvalidateExecuteCursor;`)],
@@ -228,7 +236,7 @@ test.each([
         if (!Array.isArray(steps)) throw new Error("Expected selection steps.");
         const launchView = attempt === 1
           ? executeField(steps.find(step => executeField(step, "operation") === "apply"), "result", "view")
-          : executeField(prefix.P.prompt.execution!.foldedContinuation, "view");
+          : foldedCloseView(prefix);
         const launchPosts = executeField(launchView, "posts");
         if (!Array.isArray(launchPosts)) throw new Error("Expected launch Board posts.");
         expect(launchPosts.map(post => executeField(post, "id"))).not.toContain(attempt);
@@ -421,7 +429,7 @@ test.each([2, 3])("terminal worker attempt %s reads its folded intent and replay
   expect(gateTask).toEqual(gateInput.task);
   const priorClose = JSON.parse(completed.native.get(`invoke-human-1.l1.t1.a${attempt - 1}.close`)!.output!);
   expect(receiptReference).toEqual({ path: priorClose.path, digest: priorClose.digest });
-  const posts = executeField(committed.P.prompt.execution!.foldedContinuation, "view", "posts");
+  const posts = executeField(foldedCloseView(committed), "posts");
   if (!Array.isArray(posts)) throw new Error("Expected continuation Board posts.");
   expect(boardPostIds).toEqual(posts.map(post => executeField(post, "id")));
   expect(executeField(gateRow.body, "request")).toEqual(gateInput);
@@ -637,7 +645,7 @@ test.each(["before-commit", "after-commit", "before-model-dispatch"])("initial a
 
 
 
-test.each(validators)("the closed v10 execute cursor fits 16384 bytes at its maximum (%s)", (_name, validate) => {
+test.each(validators)("the closed execute cursor fits 16384 bytes at its maximum (%s)", (_name, validate) => {
   const value = maximalCursor(executeCursorSchema);
   const diagnostic = { ...value, halt: maximalCursor(executeCursorSchema.properties.halt),
     action: { ...maximalCursor(executeCursorSchema.properties.action.anyOf[2]), runId: null },
@@ -752,7 +760,7 @@ test.each(validators)("a launched attempt requires an intent committed at or bef
   }
 });
 
-test("v10 persistence validates before state.set and writes only the frozen cursor", async () => {
+test("execute persistence validates before state.set and writes only the frozen cursor", async () => {
   const writes: { key: string; value: unknown }[] = [];
   // Exercise the production persistence boundary without starting the root's dispatch loop.
   const persistence = source.slice(source.indexOf("function deterministicSaveError("), source.indexOf("function maxCycles("));
@@ -760,7 +768,7 @@ test("v10 persistence validates before state.set and writes only the frozen curs
     let saveTail = Promise.resolve();
     ${persistence}
     persistState;`, {
-    config: { stateVersion: 10 }, clone: copy,
+    config: { stateVersion: EXECUTE_STATE_VERSION }, clone: copy,
     state: { set: async (key: string, value: unknown) => { writes.push({ key, value }); } },
   }) as (key: string, value: unknown) => Promise<void>;
   const cursor = maximalCursor(executeCursorSchema), frozen = copy(cursor);
@@ -1269,8 +1277,7 @@ test("final selection retains one acceptance history and delivers it to review a
   expect(Object.fromEntries(host.storage)).toEqual(before);
 });
 
-test("v10 admission leaves unrelated mission state unchanged", async () => {
-  expect(EXECUTE_STATE_VERSION).toBe(10);
+test("execute admission leaves unrelated mission state unchanged", async () => {
   const host = fixture();
   const unrelatedKey = "unrelated-state";
   host.storage.set(unrelatedKey, { preserved: "unchanged" });
@@ -1280,5 +1287,5 @@ test("v10 admission leaves unrelated mission state unchanged", async () => {
   expect(host.storage.get(unrelatedKey)).toEqual(before[unrelatedKey]);
   expect([...host.storage.keys()]).toEqual([unrelatedKey, EXECUTE_CURSOR_KEY]);
   expect(host.launches.length).toBeGreaterThan(0);
-  expect(host.current().version).toBe(10);
+  expect(host.current().version).toBe(EXECUTE_STATE_VERSION);
 });

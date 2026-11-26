@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { executeControllerFixture, cutAt, source } from "./fixtures/execute-workflow.ts";
 import { executeStore } from "../skills/execute/ledger.mjs";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { pitakoAgentFamily } from "../skills/agent-names.mjs";
 
 const { fixture } = executeControllerFixture();
@@ -99,7 +100,7 @@ describe("fused loop ledger publication", () => {
       expect(record.body).not.toHaveProperty("outcome");
       expect(record.body).not.toHaveProperty("endedAt");
       expect(record.body).not.toHaveProperty("observation.ledger");
-      expect(host.current()).toMatchObject({ version: 10, action: { kind: "terminal" } });
+      expect(host.current()).toMatchObject({ version: EXECUTE_STATE_VERSION, action: { kind: "terminal" } });
       expect(host.emits.some(item => ["blocked", "cancelled"].includes(item.status))).toBe(false);
       const calls = host.launches.filter(call => call.agent === "pitako.checkout-observer");
       expect(calls.map(call => call.key)).toEqual(failure === "state-save" ? [checkoutKey] : [checkoutKey, `${checkoutKey}.r1`]);

@@ -11,7 +11,7 @@ import { canonicalDigest, canonicalJSON, sha256 } from "../extensions/canonical.
 import { appendExecuteTodoRecords } from "../extensions/execute-todo-projection.ts";
 import { PitakoStore } from "../extensions/pitako-store.ts";
 import { openSqliteSync } from "../extensions/board/sqlite.ts";
-import { executionStatePath } from "../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executionStatePath } from "../extensions/execute-state.ts";
 import { validateExecuteCursor } from "../extensions/execute-cursor.ts";
 import { applyCheckpoint, beginHookEffect, captureCheckpoint, checkpointDirectory, recordContextPeak, restoreCheckpoint, type CheckpointIntent } from "../extensions/execute-checkpoint.ts";
 import { childResponse, realCheckoutCompositionFixture, nativeCheckpointFixture } from "./fixtures/plan-execute-composition.ts";
@@ -189,7 +189,7 @@ async function groupedFixture(operation: "advance" | "close", workerStatus = "co
   if (saved.outcome !== "appended" || !saved.head) throw new Error("Expected fixture intent append.");
   const input = { seq: saved.head.seq, digest: saved.head.hash };
   const cursor = {
-    version: 10, storeId: identity.storeId, root: f.root, invocation, epoch: 0,
+    version: EXECUTE_STATE_VERSION, storeId: identity.storeId, root: f.root, invocation, epoch: 0,
     associationDigest: canonicalDigest(intent.association), admissionBinding: "b".repeat(64), head: saved.head,
     action: { kind: "launched", key: intent.key, runId: null, role: "worker", input, gateTimeoutMs: 1000 },
     loop: { number: 1, phase: "implementation", cursor: 0, taskId: "one", outcome: null,
