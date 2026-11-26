@@ -1097,7 +1097,8 @@ describe("plan/execute packaged composition", () => {
     expect(call(nested, nested)).toMatchObject({ block: true });
   });
 
-  for (const mode of ["siblings", "long-path"]) describe(`inspector preview ${mode}`, () => {
+  // Each fixture path exceeds macOS's 1024-byte PATH_MAX, so these cases run only where paths may be longer.
+  for (const mode of ["siblings", "long-path"]) describe.skipIf(process.platform === "darwin")(`inspector preview ${mode}`, () => {
     let runPreview: () => Promise<void>;
     // Git worktrees and the native inspector's compilation cache belong to the fixture.
     beforeAll(() => { runPreview = preparePreview(mode); });

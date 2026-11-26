@@ -3,6 +3,7 @@
  * Node is loaded with createRequire so Pi's jiti loader can open it. Bun's module name
  * stays a runtime string so Node does not try to resolve it.
  */
+import { existsSync } from "node:fs";
 import { createRequire } from "node:module";
 
 const require = createRequire(import.meta.url);
@@ -44,7 +45,7 @@ export async function openSqlite(file: string, options: { readOnly?: boolean; se
 export function openSqliteSync(file: string, options: { readOnly?: boolean; setWal?: boolean } = {}): SqlDatabase {
   const readOnly = options.readOnly ?? false;
   const db: SyncDb = typeof Bun !== "undefined"
-    ? new (require("bun:" + "sqlite").Database)(file, { create: !readOnly, readonly: readOnly })
+    ? openBunDatabase(require("bun:" + "sqlite").Database, file, readOnly)
     : openNode(file, readOnly);
   try {
     db.exec("PRAGMA foreign_keys = ON");
@@ -69,10 +70,28 @@ function openNode(file: string, readOnly: boolean): SyncDb {
 
 async function openBun(file: string, readOnly: boolean): Promise<SyncDb> {
   const specifier = "bun:" + "sqlite";
-  const mod = (await import(specifier)) as {
-    Database: new (path: string, options?: { create?: boolean; readonly?: boolean }) => SyncDb;
-  };
-  return new mod.Database(file, { create: !readOnly, readonly: readOnly });
+  const mod = (await import(specifier)) as { Database: BunDatabase };
+  return openBunDatabase(mod.Database, file, readOnly);
+}
+
+type BunDatabase = new (path: string, options?: { create?: boolean; readonly?: boolean; readwrite?: boolean }) => SyncDb;
+
+// Bun on macOS uses Apple's system SQLite, which cannot read a closed WAL database through a
+// read-only connection (SQLITE_CANTOPEN on first read). Reopen that existing file read-write
+// without create and refuse writes with query_only.
+function openBunDatabase(Database: BunDatabase, file: string, readOnly: boolean): SyncDb {
+  const db = new Database(file, { create: !readOnly, readonly: readOnly });
+  if (!readOnly) return db;
+  try {
+    db.prepare("PRAGMA schema_version").get();
+    return db;
+  } catch (error) {
+    db.close();
+    if ((error as { code?: unknown }).code !== "SQLITE_CANTOPEN" || !existsSync(file)) throw error;
+  }
+  const fallback = new Database(file, { create: false, readwrite: true });
+  fallback.exec("PRAGMA query_only = ON");
+  return fallback;
 }
 
 function wrap(db: SyncDb): SqlDatabase {
