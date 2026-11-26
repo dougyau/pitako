@@ -432,7 +432,9 @@ test("gate classifies failures/errors, detects product mutation, ignores metadat
 
 test("a timed-out command kills its grandchild group and still produces a receipt; metric timeout stalls", async () => {
   const f = fixture(), t = task();
-  t.gates = [{ id: "timeout", command: "sleep 100 & child=$!; printf '%s\\n' \"$child\"; wait", cwd: ".", timeoutMs: 100 }];
+  t.gates = [{ id: "timeout", command: "sleep 100 & child=$!; printf '%s\\n' \"$child\"; wait", cwd: ".",
+    // macOS process startup can exceed 100 ms before the pid is printed.
+    timeoutMs: process.platform === "darwin" ? 1000 : 100 }];
   const receipt = await gate(attempt(f, { task: t })); expect(receipt.gates[0]!.status).toBe("timeout");
   expect(receipt.progress.nonImproving).toBe(1);
   const pid = Number(new PitakoStore(f.root).readBlob(receipt.gates[0]!.logRef).bytes.toString("utf8").trim()); expect(pid).toBeGreaterThan(0);
