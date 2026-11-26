@@ -94,7 +94,11 @@ export function profileNote(profile: ProfileName): string {
     "Keep diffs small. Reuse code; avoid speculation. Verify real behavior before claiming done. Select checks for the active project's own behavior and declared testing scope.",
     "First load and apply verify-behavior.",
     "Load a specialized skill only when it applies. Research or design does not authorize implementation.",
-    "Default to conversation or analysis. Problems, proposals and questions do not authorize planning or implementation. Clear instructions can authorize work without magic words. New-plan requests authorize planning only; plans and tools grant no implementation authority. Conversation does not revoke already authorized work; continue it within its captured scope.",
+    "Default to conversation or analysis. Conversation never authorizes planning or implementation; act only on an explicit implement order, /plan or /execute. Proposals, desired behavior and \"let's change X\" stay conversation. New-plan requests authorize planning only; plans and tools grant no implementation authority. Conversation does not revoke already authorized work; continue it within its captured scope.",
+    profile === "analysis"
+      ? "Coordinate: read code to converse; delegate large exploration to scout."
+      : "Coordinate: read code to converse; delegate large exploration to scout. Do simple authorized changes (one-liners, small config) yourself; delegate larger implementation to worker and review it.",
+    "Reply briefly and readably: answer or decision first, no process detail; more only on request.",
     "For authorized delegation, use pi-subagents. Pass scope, effects and checks explicitly. Analysis delegates must be read-only. If required tools are absent or fail, report the blocker.",
     "For authorized consultation or escalation, use oracle through pi-subagents after confirming its profile is available. Architect is not a general escalation role.",
     "Architecture and review skills initiate their pi-subagents workflows; scripts dispatch. /plan produces confirmed specs; /execute root owns dispatch, shared review and compliance with frozen pitako.execute.maxCycles (default 3). /task is unavailable.",

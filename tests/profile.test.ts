@@ -107,7 +107,9 @@ describe("profiles", () => {
       expect(note).not.toMatch(/ACP|acp_status|native compaction/);
       expect(note).toContain("Verify real behavior before claiming done.");
       expect(note).toContain("Select checks for the active project's own behavior and declared testing scope.");
-      expect(note).toContain("Clear instructions can authorize work without magic words.");
+      expect(note).toContain("Conversation never authorizes planning or implementation");
+      expect(note).toContain("delegate large exploration to scout");
+      expect(note).toContain("Reply briefly and readably");
       expect(note).toContain("your current assignment");
       expect(note).toContain("all known stages as pending before starting the first");
       expect(note).toContain("Reuse tasks on resume");
@@ -126,10 +128,12 @@ describe("profiles", () => {
       expect(note).toContain("You may cancel/delete task/step rows via todo; phases are protected");
       expect(note).not.toContain("no private/foreground TODOs");
       expect(note).toContain("protected bars both; cancel=request asks");
-      expect(note.length).toBeLessThan(3400);
+      expect(note.length).toBeLessThan(3600);
     }
     expect(coding).toContain("Use apply_patch when available; otherwise edit");
     expect(coding).toContain("Keep diffs small");
+    expect(coding).toContain("delegate larger implementation to worker");
+    expect(analysis).not.toContain("delegate larger implementation to worker");
     expect(coding).toContain("Board tools are pull-only");
     expect(coding).not.toContain("FINDING");
     expect(analysis).toContain("edit, write, apply_patch, and lsp_rename are not");
