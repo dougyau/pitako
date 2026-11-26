@@ -131,14 +131,14 @@ test("renewal deadlines retain per-gate inputs rather than the old aggregate", a
 });
 
 test("ordinary tasks continue after repairs and timeout generations", async () => {
-  const taskCount = 9;
+  const taskCount = 3, repairLoops = [1, taskCount];
   const host = fixture(undefined, { taskCount, retainSnapshots: false });
   host.setLimit(12);
   host.storage.set("unrelated", { text: "Independent mission state" });
   host.setStatus(ref => ({ ...structuredClone(host.native.get(ref)!), state: "complete" }));
   host.setRespond((request, normal) => {
     const result = normal();
-    const repairLoop = /\.l(?:1|9)\./.test(request.key);
+    const repairLoop = repairLoops.some(loop => request.key.includes(`.l${loop}.`));
     if (repairLoop && request.agent === "pitako.worker" && request.key.endsWith(".a1"))
       Object.assign(result.structuredOutput, { status: "continue", remaining: ["Finish scoped implementation"],
         knowledge: { findings: ["The implementation is partly complete"], handoff: "Finish the remaining scoped branch" } });
@@ -167,6 +167,7 @@ test("ordinary tasks continue after repairs and timeout generations", async () =
   }
   expect(output.status, output.reason).toBe("complete");
   expect(generations).toBe(expectedGenerations);
+  expect(readBacklog(host.root, "spec").backlog!.tasks.map(task => task.status)).toEqual(["done", "done", "done"]);
   const attempts = taskCount + 4;
   expect(host.launches.filter(request => request.agent === "pitako.worker")).toHaveLength(attempts);
   expect(host.current().action.kind).toBe("terminal");
@@ -174,7 +175,7 @@ test("ordinary tasks continue after repairs and timeout generations", async () =
   expect(host.storage.size).toBe(2);
   expect(host.records().filter((record: any) => record.kind === "unit")).toHaveLength(attempts);
   expect(host.launches.filter(call => /\.recover/.test(call.key))).toHaveLength(0);
-  for (const number of [1, 9]) for (const stage of ["task-reviewer", "task-synthesis"]) {
+  for (const number of repairLoops) for (const stage of ["task-reviewer", "task-synthesis"]) {
     const base = `invoke-human-1.l${number}.t1.a2`;
     const calls = host.launches.filter(call =>
       [1, 2, 3].some(generation => call.key === `${base}${generation === 1 ? "" : `.g${generation}`}.${stage}`));

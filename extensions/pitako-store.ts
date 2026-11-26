@@ -483,9 +483,9 @@ export class PitakoStore<P = readonly StoreRecord[]> {
         const dataVersion = Number(db.prepare("PRAGMA data_version").get()?.data_version);
         db.exec(writer ? "BEGIN IMMEDIATE" : "BEGIN");
         observedVersion = Number(db.prepare("PRAGMA user_version").get()?.user_version);
-        // Another creator may have opened the file; initialize only under the write lock.
-        if (writer && observedVersion === 0 &&
-            db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().length === 0) {
+        // An open file can be visible before its creator commits the schema.
+        if (observedVersion === 0 && !db.prepare("SELECT 1 FROM sqlite_master WHERE type='table' LIMIT 1").get()) {
+          if (!writer) throw new StoreError("store-unavailable", "Store schema is not initialized.");
           db.exec(schema);
           db.prepare("INSERT INTO meta VALUES ('storeId',?), ('rootRealpath',?)").run(randomUUID(), this.root);
           db.exec(`PRAGMA user_version=${STORE_VERSION}`);
@@ -555,7 +555,9 @@ export class PitakoStore<P = readonly StoreRecord[]> {
           if (writer && attempt + 1 < (this.busyPolicy.attempts ?? 3)) continue;
           throw new StoreError("store-busy", "Store remained busy.");
         }
-        if (this.session) this.session.failed = true;
+        // An unbound invocation can proceed to writer admission after a genesis read misses.
+        if (this.session && !(error instanceof StoreError && error.code === "store-unavailable" &&
+            !this.cursor && !this.session.storeId)) this.session.failed = true;
         if (error instanceof StoreError && (quarantine || (error.code === "store-replaced" && !error.recovery))) {
           const fresh = new PitakoStore(this.root, undefined, undefined, this.busyPolicy);
           // Resolve the current store only after closing the displaced connection.

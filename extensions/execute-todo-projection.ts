@@ -1,5 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
-import { existsSync, readFileSync, realpathSync, statSync, watch, type FSWatcher } from "node:fs";
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs";
 import path from "node:path";
 import { SessionManager, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { PROJECTION_ACTOR, replayFromBranch, type CommitOperation, type TodoCommit } from "../vendor/rpiv-todo/index.ts";
@@ -216,7 +216,6 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   const latest = new Map<string,ExecuteTodoSnapshot>();
   const invocationRoots = new Map<string,string>();
   const workerSnapshots = new Map<string,{loop:number; workers:Map<string,WorkerTodoSnapshot>}>();
-  const watchers = new Map<string,FSWatcher>();
   // Rows last committed per owner. A repeat of the same rows is a no-op sync, so it is skipped
   // instead of paying a full-state commit for every owner on every refresh.
   const synced = new Map<string,string>();
@@ -224,7 +223,8 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   const settled = new Set<string>();
   // Append-only worker sessions: an unchanged size means an unchanged replay.
   const replays = new Map<string,{key:string; tasks:readonly Task[]}>();
-  let watchTimer: ReturnType<typeof setTimeout> | undefined;
+  let watchedFiles = new Map<string,string | undefined>();
+  let watchTimer: ReturnType<typeof setInterval> | undefined;
   // The "pitako" status line: live runs, plus endings this session watched happen.
   let published: string | undefined;
   const progressing = new Set<string>(), ended = new Map<string,string>();
@@ -236,6 +236,24 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   const unsubscribe: (()=>void)[] = [];
   const pending = new Set<()=>void>();
   const warn = (error: unknown) => context?.ui.notify(`Execute todo: ${String(error)}`,"warning");
+  function watchWorkerFiles(files: Map<string,string | undefined>) {
+    watchedFiles = files;
+    if (!files.size) { clearInterval(watchTimer); watchTimer = undefined; }
+    // Compare against the replayed version: macOS can miss appends even just after fs.watch returns.
+    else watchTimer ??= setInterval(() => {
+      let changed = false;
+      for (const [file,previous] of watchedFiles) {
+        try {
+          const current = workerSessionKey(file);
+          if (current === previous) continue;
+          watchedFiles.set(file,current);
+          changed = true;
+        } catch (error) { warn(error); watchedFiles.delete(file); }
+      }
+      if (!watchedFiles.size) watchWorkerFiles(watchedFiles);
+      if (changed) void refresh();
+    },250);
+  }
   function rpc(method: "status"|"steer", params: Record<string,unknown> = {}): Promise<any> {
     const requestId = randomUUID();
     return new Promise((resolve,reject) => {
@@ -346,7 +364,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
         if (object(error) && error.code === "no_active_session") return;
         if (known.size) warn(error);
       }
-      const files = new Set<string>();
+      const files = new Map<string,string | undefined>();
       const runs = new Map<string,{run:any; prior:ExecuteTodoSnapshot|undefined}>();
       const workflows: any[] = [];
       const predecessors = new Map<string,string[]>();
@@ -498,14 +516,15 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
               try { child = await status(step.runId); } catch (error) { warn(error); continue; }
               if (!child || !lineage(runId).includes(child.parentWorkflowRunId) || child.workflowKey !== binding.workflowKey) continue;
               const file = child.steps?.[0]?.sessionFile;
-              if (typeof file !== "string" || !existsSync(file)) continue;
+              if (typeof file !== "string") continue;
+              const key = workerSessionKey(file);
+              if (key === undefined) continue;
               const owner = workerOwner(runId,binding.taskId,binding.attempt);
               childIds.set(owner,step.runId);
-              const stat = statSync(file), key = `${stat.ino}:${stat.size}`;
               let replay = replays.get(file);
               if (replay?.key !== key) { replay = {key,tasks:replayFromBranch({sessionManager:SessionManager.open(file)}).tasks}; replays.set(file,replay); }
               cache.workers.set(owner,{taskId:binding.taskId,attempt:binding.attempt,tasks:replay.tasks});
-              if (snapshot.active?.workflowKey === binding.workflowKey && !terminalRun(child.state)) files.add(file);
+              if (snapshot.active?.workflowKey === binding.workflowKey && !terminalRun(child.state)) files.set(file,key);
             }
           }
           const workers = [...cache.workers.values()];
@@ -552,16 +571,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
           stagedSettled.push(runId);
         } catch (error) { warn(error); return; }
       }
-      if (epoch !== generation) return;
-      for (const [file,watcher] of watchers) if (!files.has(file)) { watcher.close(); watchers.delete(file); }
-      for (const file of files) if (!watchers.has(file)) {
-        // Worker sessions write in bursts; one trailing refresh covers a burst.
-        const watcher = watch(file,() => {
-          if (watchTimer) return;
-          watchTimer = setTimeout(() => { watchTimer = undefined; void refresh(); },250);
-        });
-        watcher.on("error",warn); watchers.set(file,watcher);
-      }
+      if (epoch === generation) watchWorkerFiles(files);
     }
   }
   function refresh(): Promise<void> {
@@ -581,8 +591,7 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
     if (context?.hasUI && published !== undefined) context.ui.setStatus("pitako",undefined);
     published = undefined; progressing.clear(); ended.clear();
     context = undefined; generation++; dirty = false;
-    clearTimeout(watchTimer); watchTimer = undefined;
-    for (const watcher of watchers.values()) watcher.close(); watchers.clear();
+    watchWorkerFiles(new Map());
     for (const cancel of pending) cancel();
     await running; known.clear(); absent.clear(); inert.clear(); latest.clear(); workerSnapshots.clear(); invocationRoots.clear();
     synced.clear(); settled.clear(); replays.clear();
@@ -609,5 +618,9 @@ export function registerExecuteTodoProjection(pi: ExtensionAPI, commit: TodoComm
   for (const event of ["subagent:child-status","subagent:jobs-changed","subagent:async-started","subagent:async-complete","subagents:rpc:v1:ready"]) {
     unsubscribe.push(pi.events.on(event,payload => { remember(payload,true); void refresh(); }));
   }
+}
+function workerSessionKey(file: string) {
+  const stat = statSync(file,{throwIfNoEntry:false});
+  return stat && `${stat.ino}:${stat.size}`;
 }
 function terminalRun(state: string) { return ["complete","completed","failed","stopped"].includes(state); }

@@ -286,7 +286,7 @@ test("readers never create or quarantine; replacement and wrong cwd remain disti
   });
 });
 
-test.each(["body", "noncanonical", "chain", "meta", "version", "notadb", "ahead"] as const)(
+test.each(["body", "noncanonical", "chain", "meta", "version", "zero-version", "notadb", "ahead"] as const)(
   "writers recover %s while readers preserve evidence", defect => {
     const dir = root(), store = new PitakoStore(dir);
     let identity = { storeId: "missing", root: dir };
@@ -317,6 +317,7 @@ test.each(["body", "noncanonical", "chain", "meta", "version", "notadb", "ahead"
           chain: "UPDATE records SET digest='broken'",
           meta: "DELETE FROM meta WHERE key='storeId'",
           version: "PRAGMA user_version=2",
+          "zero-version": "PRAGMA user_version=0",
         }[defect]);
       } finally { db.close(); }
     }
@@ -339,7 +340,7 @@ test.each(["body", "noncanonical", "chain", "meta", "version", "notadb", "ahead"
     const error = failure(() => append(writer, expected, "second", 2), code);
     expect(error.recovery?.storeId).not.toBe(identity.storeId);
     const quarantine = error.recovery!.quarantine!;
-    expect(quarantine).toContain(`pitako.db.v${defect === "version" ? 2 : defect === "notadb" ? 0 : 1}.`);
+    expect(quarantine).toContain(`pitako.db.v${defect === "version" ? 2 : defect === "notadb" || defect === "zero-version" ? 0 : 1}.`);
     expect(readFileSync(quarantine)).toEqual(bytes);
     expect(statSync(quarantine).ino).toBe(inode);
     expect(store.read(scope).records).toEqual([]);

@@ -318,15 +318,20 @@ test("worktree setup respects setup's single-segment graph directory selection",
   try {
     database(f.principal, "custom", ".codegraph-custom");
     expectInvocation(f.run({ CODEGRAPH_DIR: "  .codegraph-custom  ", EXPECTED_GRAPH_DIR: ".codegraph-custom" }), f.target, "sync");
-    database(f.target, "default");
-    for (const invalid of [".", "..", "../outside", "nested/index", "nested\\index", "/absolute", "a..b", "   "]) {
-      expectInvocation(f.run({ CODEGRAPH_DIR: invalid }), f.target, "sync");
-    }
-    expect(existsSync(path.join(f.target, "nested"))).toBe(false);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
 
-test("worktree setup propagates setup, init, sync and corrupt database failures", () => {
+test.each([".", "..", "../outside", "nested/index", "nested\\index", "/absolute", "a..b", "   "])(
+  "worktree setup uses the default graph for invalid directory override %j", invalid => {
+    const f = fixture();
+    try {
+      database(f.target, "default");
+      expectInvocation(f.run({ CODEGRAPH_DIR: invalid }), f.target, "sync");
+      expect(existsSync(path.join(f.target, "nested"))).toBe(false);
+    } finally { rmSync(f.root, { recursive: true, force: true }); }
+  });
+
+test("worktree setup propagates setup failure without copying the database", () => {
   const f = fixture();
   try {
     database(f.principal, "must not copy after failed setup");
@@ -335,12 +340,23 @@ test("worktree setup propagates setup, init, sync and corrupt database failures"
     expect(setup.calls).toHaveLength(1);
     expect(setup.stdout).not.toContain("Worktree setup complete");
     expect(existsSync(path.join(f.target, ".codegraph"))).toBe(false);
-    rmSync(path.join(f.principal, ".codegraph"), { recursive: true });
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("worktree setup propagates CodeGraph init failure", () => {
+  const f = fixture();
+  try {
     const init = f.run({ CODEGRAPH_EXIT: "32" });
     expect(init.status).not.toBe(0);
     expect(init.calls[1]?.args).toEqual(["init", f.target, "--yes"]);
     expect(init.stdout).not.toContain("Worktree setup complete");
-    const source = database(f.principal, "source");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("worktree setup propagates sync failure and preserves the snapshot on retry", () => {
+  const f = fixture();
+  try {
+    database(f.principal, "source");
     const sync = f.run({ CODEGRAPH_EXIT: "33" });
     expect(sync.status).not.toBe(0);
     expect(sync.calls[1]?.args).toEqual(["sync", f.target]);
@@ -351,17 +367,33 @@ test("worktree setup propagates setup, init, sync and corrupt database failures"
     const snapshot = readFileSync(destination);
     expectInvocation(f.run(), f.target, "sync");
     expect(readFileSync(destination)).toEqual(snapshot);
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("worktree setup rejects a corrupt destination database without replacing it", () => {
+  const f = fixture();
+  try {
+    database(f.principal, "source");
+    mkdirSync(path.join(f.target, ".codegraph"));
+    const destination = path.join(f.target, ".codegraph/codegraph.db");
     writeFileSync(destination, "corrupt destination");
     const corruptDestination = f.run();
     expect(corruptDestination.status).not.toBe(0);
     expect(corruptDestination.calls).toHaveLength(1);
     expect(readFileSync(destination, "utf8")).toBe("corrupt destination");
-    rmSync(destination);
-    writeFileSync(source, "corrupt source");
+  } finally { rmSync(f.root, { recursive: true, force: true }); }
+});
+
+test("worktree setup rejects a corrupt source database without publishing a snapshot", () => {
+  const f = fixture();
+  try {
+    mkdirSync(path.join(f.principal, ".codegraph"));
+    writeFileSync(path.join(f.principal, ".codegraph/codegraph.db"), "corrupt source");
+    mkdirSync(path.join(f.target, ".codegraph"));
     const corruptSource = f.run();
     expect(corruptSource.status).not.toBe(0);
     expect(corruptSource.calls).toHaveLength(1);
-    expect(existsSync(destination)).toBe(false);
+    expect(existsSync(path.join(f.target, ".codegraph/codegraph.db"))).toBe(false);
     expect(readdirSync(f.target).filter(name => name.startsWith(".codegraph-stage-"))).toEqual([]);
   } finally { rmSync(f.root, { recursive: true, force: true }); }
 });
