@@ -53,7 +53,7 @@ function fixture() {
   const persist = () => {
     const { cursor, persist: save } = committedCursor({ root, intent, record,
       bindingKey: (loop.attempt as any).bindingKey, statePath: state.path });
-    cursor.version = record.version as 10;
+    cursor.version = record.version as typeof EXECUTE_STATE_VERSION;
     cursor.associationDigest = canonicalDigest(record.association);
     cursor.budget.consumedLoops = record.consumedLoops;
     cursor.loop!.number = loop.number;
@@ -118,7 +118,7 @@ test.each(["current", "admission-at-tip", "ahead", "binding", "missing-store"])(
   });
 
 test.each(["current", "resumed", "ahead", "association", "missing-store", "other-invocation"])(
-  "v10 inspector observes checkpoint originals only at cursor.head (%s)", async mode => {
+  "inspector observes checkpoint originals only at cursor.head (%s)", async mode => {
     const f = fixture();
     const content = `---\npitako-spec: 1\nid: fixture\nstatus: complete\n---\n` +
       SPEC_SECTIONS.map(section => `## ${section}\nCheckpoint observation fixture.\n`).join("");
@@ -170,7 +170,7 @@ test.each(["current", "resumed", "ahead", "association", "missing-store", "other
     expect(fs.readdirSync(path.dirname(store.file)).some(name => name.startsWith("pitako.db.v"))).toBe(false);
   });
 
-test("v10 checkpoint_create reads committed intent/progress at cursor.head, not the newer store tip", async () => {
+test("checkpoint_create reads committed intent/progress at cursor.head, not the newer store tip", async () => {
   const f = fixture(), { store, scope, cursor } = committedCursor(f);
   // The next baseline is already committed but its cursor save was lost.
   const later = structuredClone(f.intent);
@@ -187,7 +187,7 @@ test("v10 checkpoint_create reads committed intent/progress at cursor.head, not 
   expect(store.read(scope).head!.seq).toBe(cursor.head.seq + 1);
 });
 
-test("v10 resumed hooks use the committed binding key while an in-flight worker waits", async () => {
+test("resumed hooks use the committed binding key while an in-flight worker waits", async () => {
   const f = fixture(), { store, scope, cursor, persist } = committedCursor(f);
   const resumed = structuredClone(f.intent);
   resumed.key = "invoke-fixture.l1.t1.a2"; resumed.attempt = 2;
@@ -196,7 +196,7 @@ test("v10 resumed hooks use the committed binding key while an in-flight worker 
   if (committed.outcome !== "appended" || !committed.head) throw new Error("Expected committed intent");
   const baseline = store.commit(scope, committed.head, "resumed-baseline", canonicalDigest({ resumed, binding: f.intent.key }),
     () => ({ kind: "operation", body: { operation: "baseline", request: { intent: resumed,
-      continuation: { attempt: { bindingKey: f.intent.key } } } } }));
+      continuation: { version: EXECUTE_STATE_VERSION, attempt: { bindingKey: f.intent.key } } } } }));
   if (baseline.outcome !== "appended" || !baseline.head) throw new Error("Expected committed baseline");
   cursor.head = baseline.head;
   cursor.loop!.attempt!.number = 2;
@@ -214,7 +214,7 @@ test("v10 resumed hooks use the committed binding key while an in-flight worker 
 });
 
 test.each(["valid", "committed-source", "changed-intent", "uncommitted-source", "ahead", "invalid", "missing-store"])(
-  "v10 sealer requires cursor-head committed originals (%s)", mode => {
+  "sealer requires cursor-head committed originals (%s)", mode => {
     const f = fixture(), { store, scope, cursor, persist } = committedCursor(f);
     captureCheckpoint(f.intent, paths);
     applyCheckpoint(f.intent, [{ path: "modified", image: { bytes: Buffer.from("completed").toString("base64"), mode: 0o644 } }]);
@@ -275,7 +275,7 @@ test.each(["valid", "committed-source", "changed-intent", "uncommitted-source", 
   });
 
 test.each(["ahead", "digest", "stopped", "outcome", "launch", "association", "invalid", "missing-store"])(
-  "v10 checkpoint_create rejects %s without publishing or repairing the store", async mode => {
+  "checkpoint_create rejects %s without publishing or repairing the store", async mode => {
     const f = fixture(), { store, cursor, persist } = committedCursor(f);
     if (mode === "ahead") {
       cursor.head = { seq: 2, hash: "d".repeat(64) };

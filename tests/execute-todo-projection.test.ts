@@ -12,6 +12,7 @@ import { getState, getSyncSequences, evictSession, replaceState } from "../vendo
 import { createMockPi, createMockCtx } from "../vendor/rpiv-todo/test-utils.ts";
 import type { Task } from "../vendor/rpiv-todo/tool/types.ts";
 import { readTodoRecords, type TodoRecordKind } from "../extensions/pitako-store.ts";
+import { EXECUTE_STATE_VERSION } from "../extensions/execute-state.ts";
 import { executeProgress, progressStatusLine, workflowProgress } from "../extensions/progress-status.ts";
 import { gitFakeFixture } from "./fixtures/git-fake-fixture.ts";
 
@@ -303,7 +304,7 @@ describe("execute todo registration and reconciliation",()=>{
       const statePath=path.join(f.root,"missions","mission","state.json");
       const database=path.join(f.root,".pi","pitako","pitako.db");
       mkdirSync(path.dirname(statePath),{recursive:true});
-      const missionState=JSON.stringify({"invoke-invocation":{version:9},"pitako-execute":{version:10,head:{seq:999,hash:"0".repeat(64)}}});
+      const missionState=JSON.stringify({"invoke-invocation":{version:9},"pitako-execute":{version:EXECUTE_STATE_VERSION,head:{seq:999,hash:"0".repeat(64)}}});
       writeFileSync(statePath,missionState);
       const statusPath=path.join(f.root,"main","status.json");
       const run=JSON.parse(readFileSync(statusPath,"utf8"));

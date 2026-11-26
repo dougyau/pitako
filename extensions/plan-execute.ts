@@ -7,7 +7,7 @@ import { designatedWorkspace, executionAmendments, preliminarySpec, validatePlan
 import { boundRetainedAnalyses } from "./execute-retained.ts";
 import { boundEpochAdvanceReplay, boundExecuteHostHalt, boundExecuteTimeoutProjection } from "./execute-progress.ts";
 import { PitakoStore, StoreError } from "./pitako-store.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath } from "./execute-state.ts";
+import { EXECUTE_STATE_VERSION, executeContinuationScript, executionStatePath } from "./execute-state.ts";
 import { executeCursorValidationScript } from "./execute-cursor.ts";
 import { isExecuteReviewModel } from "./execute-settings.ts";
 import { reviewModels } from "./review-settings.ts";
@@ -67,6 +67,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
   // Trusted complete sources are loaded at setup, never discovered in resolve.
   const rootScript = readFileSync(path.join(packageRoot(), "skills/execute/workflow.js"), "utf8");
   const cursorValidationScript = executeCursorValidationScript();
+  const continuationScript = executeContinuationScript();
   const canonicalScript = readFileSync(path.join(packageRoot(), "skills/workflow-canonical.js"), "utf8");
   const reviewScript = readFileSync(path.join(packageRoot(), "skills/review/workflow.js"), "utf8");
   const inspectorEntry = path.join(packageRoot(), "skills/execute/inspect.mjs");
@@ -120,7 +121,7 @@ export function executionResource(platform: NodeJS.Platform = process.platform) 
       originalProblem: validateSpec(preliminary.content, args.id),
       checkpointHelper: path.join(packageRoot(), "skills/execute/checkpoint.mjs"), stateVersion: EXECUTE_STATE_VERSION,
       ...(args.timeouts !== undefined ? { timeouts: args.timeouts } : {}), };
-    return { script: `${closingCompliance.toString()}\n${closingArchive.toString()}\n${readTaskGateWire.toString()}\n${planConflictReason.toString()}\n${checkpointMismatchReason.toString()}\n${settledBarrier.toString()}\n${inspectorConflictReason.toString()}\n${viewOverflowReason.toString()}\n${checkpointWitnessIssue.toString()}\n${nativeReference.toString()}\n${canonicalScript}\n${cursorValidationScript}\n${reviewSynthesisScript}const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
+    return { script: `${closingCompliance.toString()}\n${closingArchive.toString()}\n${readTaskGateWire.toString()}\n${planConflictReason.toString()}\n${checkpointMismatchReason.toString()}\n${settledBarrier.toString()}\n${inspectorConflictReason.toString()}\n${viewOverflowReason.toString()}\n${checkpointWitnessIssue.toString()}\n${nativeReference.toString()}\n${canonicalScript}\n${cursorValidationScript}\n${continuationScript}\n${reviewSynthesisScript}const config = ${JSON.stringify(config)};\nconst pitakoReviewLibraryMode = true;\n${reviewScript}\n${rootScript}`,
       hostCommands: inspections };
   } };
 }

@@ -10,6 +10,7 @@ import { digest, SPEC_SECTIONS } from "../../extensions/spec-plans.ts";
 import { planExecute, missionFiles, childResponse, registeredCheckpoint, type CompositionFixture, type NativeCheckpointFixture } from "./plan-execute-composition.ts";
 
 import { EXECUTE_CURSOR_KEY, type ExecuteCursor } from "../../extensions/execute-cursor.ts";
+import { EXECUTE_STATE_VERSION } from "../../extensions/execute-state.ts";
 import { type CheckpointIntent } from "../../extensions/execute-checkpoint.ts";
 import { PitakoStore } from "../../extensions/pitako-store.ts";
 import { canonicalDigest } from "../../extensions/canonical.mjs";
@@ -20,7 +21,7 @@ export function committedCursor(f: { root: string; intent: CheckpointIntent; sta
   let head = store.read(scope).head;
   if (f.record?.lastConfirmed || f.bindingKey) {
     const body = { operation: "baseline", request: { intent: f.intent, continuation: {
-      lastConfirmed: f.record?.lastConfirmed ?? null, attempt: { bindingKey: f.bindingKey ?? f.intent.key } } } };
+      version: EXECUTE_STATE_VERSION, lastConfirmed: f.record?.lastConfirmed ?? null, attempt: { bindingKey: f.bindingKey ?? f.intent.key } } } };
     const saved = store.commit(scope, head, `baseline:${head?.seq ?? 0}`, canonicalDigest(body),
       () => ({ kind: "operation", body }));
     if (saved.outcome !== "appended") throw new Error("Expected committed baseline");
@@ -31,7 +32,7 @@ export function committedCursor(f: { root: string; intent: CheckpointIntent; sta
   if (committed.outcome !== "appended" || !committed.head) throw new Error("Expected committed intent");
   const intentRef = { seq: committed.head.seq, digest: committed.head.hash };
   const cursor: ExecuteCursor = {
-    version: 10, storeId: identity.storeId, root: f.root, invocation: f.intent.association.invocation, epoch: 0,
+    version: EXECUTE_STATE_VERSION, storeId: identity.storeId, root: f.root, invocation: f.intent.association.invocation, epoch: 0,
     associationDigest: canonicalDigest(f.intent.association), admissionBinding: "b".repeat(64),
     head: committed.head,
     action: { kind: "launched", key: f.intent.key, runId: "11111111-1111-4111-8111-111111111111",
@@ -848,7 +849,7 @@ export function checkpointScenarioFixture({ repository, disposers, workflowSettl
           expect(actual.points).toHaveLength(1);
         }
         if (["seal-cut", "admission-cut", "missing-receipt", "wrong-progress"].includes(mode)) expect(actual.points).toHaveLength(2);
-        // v10 publishes the admitted head and next cursor together in one save.
+        // The workflow publishes the admitted head and next cursor together in one save.
         if (mode === "cursor-cut") expect(loop.cursor).toBe(1);
         if (mode === "pause") expect(loop.results[1].status).toBe("blocked");
       }

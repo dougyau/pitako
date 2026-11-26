@@ -170,7 +170,7 @@ are four hours; the gate floor defaults to zero, leaving the per-command
 30-minute default and director overrides intact. Omitted fields keep saved
 values across relaunches; `{}` resets defaults. Effective values and their
 loop/attempt `since` appear in reports; existing intentions keep frozen values.
-See the [executable example and halt actions](../skills/execute/SKILL.md#coordinator-timeouts-v10)
+See the [executable example and halt actions](../skills/execute/SKILL.md#coordinator-timeouts)
 for derived gate/close totals and strictly-greater timeout renewal. These arguments never supply human resolution or bypass native barriers.
 Standalone `/review` and `pre-pr` timeouts are unchanged.
 

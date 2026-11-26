@@ -1,3 +1,5 @@
+import { EXECUTE_STATE_VERSION } from "./execute-state.ts";
+
 export const EXECUTE_CURSOR_KEY = "pitako-execute";
 export const EXECUTE_CURSOR_MAX_BYTES = 16384;
 export const EXECUTE_TASK_GATES_MAX = 16;
@@ -48,7 +50,7 @@ const reviewSlot = closed({
 
 /** Only control and references belong here; prompts and decision inputs belong to the head-bound store projection. */
 export const executeCursorSchema = closed({
-  version: literal(10),
+  version: literal(EXECUTE_STATE_VERSION),
   storeId: uuid,
   root: string(1, 1024, "^[^\\u0000-\\u001f\\u007f]+(?![\\s\\S])"),
   invocation: string(1, 128, "^(?!.*\\.\\.)[A-Za-z0-9][A-Za-z0-9._-]*(?![\\s\\S])"),

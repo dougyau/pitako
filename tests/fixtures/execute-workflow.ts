@@ -10,12 +10,12 @@ import { gitFakeFixture } from "./git-fake-fixture.ts";
 import { childResponse } from "./plan-execute-composition.ts";
 const { admitExecuteRoot, appendLedger, verifyLedger, loopSummaries, ledgerProjection, summarizeLoops, committedIntent, commitExecute, executeEpoch, executeScope, executeStore, withExecuteStore } =
   await import(path.resolve("skills/execute/ledger.mjs"));
-const { resolveStoredGroupedInput, recoverStoredWorker, receiptTransport, receiptData, commitStoredGate, commitFinalGate, publishFinalReview, commitTaskReviewContext, recordBaselineInput, closeContinuation, recordFinalDrainInput, retainSelectionRejection, replaySelectionRejection } = await import("../../skills/execute/loop-io.mjs");
+const { resolveStoredGroupedInput, recoverStoredWorker, receiptTransport, receiptData, transportOutput, commitStoredGate, commitFinalGate, publishFinalReview, commitTaskReviewContext, recordBaselineInput, closeContinuation, recordFinalDrainInput, retainSelectionRejection, replaySelectionRejection } = await import("../../skills/execute/loop-io.mjs");
 import { canonicalDigest, canonicalJSON as canonicalViewJSON } from "../../extensions/canonical.mjs";
 import { captureBaseline, captureCheckpoint } from "../../extensions/execute-checkpoint.ts";
 import { readExecuteIntentContext } from "../../extensions/execute-intent.ts";
 import { boundEpochAdvanceReplay, boundExecuteHostHalt, readExecuteAdmission, readExecuteSelectionReplay, readExecuteTimeoutProjection, readInitialAdvanceReplay } from "../../extensions/execute-progress.ts";
-import { StoreError } from "../../extensions/pitako-store.ts";
+import { StoreError, type VerifiedStoreRecord } from "../../extensions/pitako-store.ts";
 import { boundRetainedAnalyses, earlyAnalysisReplayGap, retainedExecuteHalt } from "../../extensions/execute-retained.ts";
 import { checkoutEvidence, digest, inspectionSnapshot, specBinding, specChunks } from "../../extensions/spec-plans.ts";
 import { updateProgress, apply, reviewOriginals, readReviewOriginal, readWorkerOriginal, cancelledScope, readBacklog, readTaskGateWire } from "../../skills/execute/loop.ts";
@@ -23,7 +23,7 @@ import { closingCompliance, closingArchive, resolveClosingPublication } from "..
 import { reviewSynthesisScript } from "../../skills/review/synthesis.mjs";
 import { planConflictReason, checkpointMismatchReason, settledBarrier, inspectorConflictReason, viewOverflowReason, checkpointWitnessIssue, nativeReference } from "../../skills/execute/halt-evidence.mjs";
 import { reviewModels } from "../../extensions/review-settings.ts";
-import { EXECUTE_STATE_VERSION, executionStatePath } from "../../extensions/execute-state.ts";
+import { EXECUTE_STATE_VERSION, executeContinuationScript, executionStatePath } from "../../extensions/execute-state.ts";
 import { executeCursorValidationScript } from "../../extensions/execute-cursor.ts";
 import { DEFAULT_TASK_REVIEWER, DEFAULT_TASK_SYNTHESIS } from "../../extensions/execute-settings.ts";
 import { verifyGate } from "../../extensions/access-receipts.mjs";
@@ -38,7 +38,7 @@ const reviewSource = readFileSync(new URL("../../skills/workflow-canonical.js", 
 // Shared by tests/execute-workflow-*.test.ts. Mutable state lives in the per-file
 // factory below: each test file owns its roots and settlements, even when Bun
 // loads several files in one process.
-export const source = `${closingCompliance.toString()}\n${closingArchive.toString()}\n${readTaskGateWire.toString()}\n${planConflictReason.toString()}\n${checkpointMismatchReason.toString()}\n${settledBarrier.toString()}\n${inspectorConflictReason.toString()}\n${viewOverflowReason.toString()}\n${checkpointWitnessIssue.toString()}\n${nativeReference.toString()}\n${executeCursorValidationScript()}\nconst pitakoReviewLibraryMode = true;\n${reviewSource}\n${executeSource}`;
+export const source = `${closingCompliance.toString()}\n${closingArchive.toString()}\n${readTaskGateWire.toString()}\n${planConflictReason.toString()}\n${checkpointMismatchReason.toString()}\n${settledBarrier.toString()}\n${inspectorConflictReason.toString()}\n${viewOverflowReason.toString()}\n${checkpointWitnessIssue.toString()}\n${nativeReference.toString()}\n${executeCursorValidationScript()}\n${executeContinuationScript()}\nconst pitakoReviewLibraryMode = true;\n${reviewSource}\n${executeSource}`;
 const globalConfig = {
   root: "/owned/designated", id: "spec", invocation: "human-1", missionId: "native.mission-1", missionPath: "/native/exact-mission",
   inspections: ["initial", "loop-1", "loop-2", "loop-3", "loop-4", "initial.r1", "initial.r2"].map(phase => ({ key: `inspect-${phase}`, command: "READ" })),
@@ -112,7 +112,8 @@ const task = (id: string, kind = "implementation") => ({ id, kind, goal: `Goal $
   dependsOn: [] as { taskId: string; reason: string }[],
   checks: [{ id: `${id}-check`, requirement: "spec:criterion-1", command: `bun test ${id}`, cwd: config.root }] });
 type FixtureOptions = { humanPosts?: any[]; metadataPadding?: number; taskCount?: number; findings?: boolean; readOnly?: boolean;
-  realCheckout?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean };
+  realCheckout?: boolean; retainSnapshots?: boolean; rawWorkerReceipts?: boolean;
+  gateTail?: (key: string, id: string) => string | undefined };
 type OwnedResources = { roots: string[]; settlements: Promise<unknown>[]; disposers: (() => void)[]; controlledProcesses: (() => Processes)[] };
 export function executeControllerFixture(fake?: ReturnType<typeof createGitFake>) {
   const owned: OwnedResources = { roots: [], settlements: [], disposers: [], controlledProcesses: [] };
@@ -154,6 +155,12 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
     if (!options.realCheckout) return copy(checkout);
     const { head, fingerprint } = checkoutEvidence(root); return { head, fingerprint };
   };
+  function controlledGate(key: string, id: string, pass: boolean, defaultTail: string) {
+    const tail = options.gateTail?.(key, id);
+    const logRef = tail === undefined ? `/native/gates/${key}/${id}.log`
+      : executeStore(root, config.invocation).store.writeGateLog(Buffer.from(tail), Buffer.byteLength(tail));
+    return { id, status: pass ? "pass" : "fail", exit: pass ? 0 : 1, ms: 1, tail: tail ?? defaultTail, logRef };
+  }
   let checkout = candidate(), clock = 1000;
   if (options.realCheckout) checkout = observedCandidate();
   if (!options.realCheckout) controlledProcesses.push(budget.processes);
@@ -372,7 +379,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         const before = observedCandidate();
         const reused = input.reuse && input.reuse.candidate.head === before.head && input.reuse.candidate.fingerprint === before.fingerprint;
         const gates = reused ? copy(input.reuse.results) : input.task.gates.map((gate: any) => {
-          if (!options.realCheckout) return { id: gate.id, status: "pass", exit: 0, ms: 1, tail: "Controlled gate passed", logRef: `/native/gates/${request.key}/${gate.id}.log` };
+          if (!options.realCheckout) return controlledGate(request.key, gate.id, true, "Controlled gate passed");
           const start = Date.now();
           budget.counts.gates++;
           const command = spawnSync("sh", ["-c", gate.command], { cwd: path.resolve(root, gate.cwd), env: process.env,
@@ -396,8 +403,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       const shouldRun = input.workerStatus === "complete" || !input.task.metric;
       const gates = shouldRun ? input.task.gates.map((gate: { id: string }) => {
         const pass = taskGatePass?.(request.key, gate.id) ?? true;
-        return { id: gate.id, status: pass ? "pass" : "fail", exit: pass ? 0 : 1, ms: 1,
-          tail: pass ? "Focused gate passed" : "Focused gate failed", logRef: `/native/gates/${request.key}/${gate.id}.log` };
+        return controlledGate(request.key, gate.id, pass, pass ? "Focused gate passed" : "Focused gate failed");
       }) : [];
       const passed = gates.filter((gate: { status: string }) => gate.status === "pass").length;
       const progress = updateProgress(previous, { value: input.task.metric?.target ?? null,
@@ -547,16 +553,6 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       if (step.operation === "apply" && projection.operation !== "selection") delete step.result.view;
       if (step.operation === "apply" && (projection.operation !== "selection" || step.result.selected !== null))
         delete step.result.completedTasks;
-      if (step.operation === "gate") {
-        for (const gate of step.result.receipt.gates) gate.tail = "";
-        projection.view = step.result.receipt.view;
-        delete step.result.receipt.view;
-      }
-      if (projection.operation === "close" && step.operation === "requests" &&
-          projection.steps.some((step: any) => step.operation === "nextRequests")) {
-        const { requests, ...page } = step.result;
-        step.result = { ...page, count: requests.length };
-      }
     }
     const saved = commitExecute(root, config.invocation, `loop-io:loop-io/receipts/${digest(key)}/000000.json`,
       marker.requestDigest ?? canonicalDigest(value), "receipt", marker);
@@ -587,9 +583,8 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
   }
   async function compound(request: Request): Promise<Result> {
     let input = JSON.parse(request.task);
-    const referenced = !!input.refs;
     const selectionReplay = input.refs?.director ? input : null;
-    const drainReplay = referenced && input.operation === "drain" ? input : null;
+    const drainReplay = input.refs && input.operation === "drain" ? input : null;
     let key = request.key.replace(/\.r\d+$/, "");
     const steps: any[] = [];
     async function step(name: string, call: Request) {
@@ -612,7 +607,13 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         if (name === "gate") {
           const gateInput = JSON.parse(call.task);
           const { P, head, storeId, ...gateReceipt } = result;
-          result = gateReceipt;
+          // A packed standalone response is just the wire. Reuse the full marker for a close.
+          if (typeof gateReceipt.gates === "string") {
+            const { store, scope } = executeStore(root, config.invocation);
+            result = store.readRecords(scope, head).records.find((row: VerifiedStoreRecord) =>
+              row.kind === "marker" && row.opKey === `worker-gate:${gateInput.key}`)!.body;
+            result = executeField(result, "result");
+          } else result = gateReceipt;
           commitExecute(root, config.invocation, `loop-io:loop-io/steps/${digest(id)}/000000.json`, canonicalDigest(gateInput), "marker", {
             key: id, operation: name, request: gateInput,
             result: { receipt: result, contextPeak: result.contextPeak ?? null }, workerOriginal: readWorkerOriginal(gateInput),
@@ -630,7 +631,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         input = { ...resolveStoredGroupedInput(operation, stored), operation };
         if (input.replay) {
           calls.push(copy(request));
-          return { ...normalExternal(request), output: JSON.stringify(receiptTransport(input.replay)) };
+          return { ...normalExternal(request), output: transportOutput(operation, input.replay) };
         }
         key = input.key;
       }
@@ -759,9 +760,9 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
         invocation: input.invocation, operation: input.operation, steps,
         ...(input.operation === "close" ? { contextPeak } : {}),
       }, input.operation === "close" ? closeContinuation(input, steps) : undefined);
-      if (!referenced)
-        delete receipt.P.prompt.execution?.foldedContinuation;
-      return { ...normalExternal(request), output: JSON.stringify(receipt) };
+      const { projection, ...reference } = receipt;
+      return { ...normalExternal(request), output: input.operation === "close"
+        ? transportOutput("close", reference) : JSON.stringify(receipt) };
     } catch (error) {
       const failed = error as Result;
       return { ...normalExternal(request), ok: false, ...(failed.stopped ? { stopped: true } : {}),
@@ -778,7 +779,8 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
   // Controlled admission boundary mirrors separate inert data and native digest;
   // the registered Node recovery cases independently exercise the real producer.
   function admissionValue(key = "inspect-initial") {
-    const cursor = storage.get("pitako-execute");
+    const saved = storage.get("pitako-execute");
+    const cursor = saved?.invocation === config.invocation ? saved : undefined;
     const sealerHalt = cursor?.action?.kind === "launched" && cursor.action.role === "reviewer" &&
       /\.task-(reviewer|synthesis)$/.test(cursor.action.key) &&
       ["checkpoint-integrity", "native-barrier"].includes(cursor.halt?.stage);
@@ -822,7 +824,7 @@ function ownedFixture({ roots, settlements, disposers, controlledProcesses }: Ow
       ...(selectionRecovery ? { selectionRecovery } : {}),
       ...(initialAdvance ? { initialAdvance } : {}),
       ...(retained ? { retainedAnalyses: retained.originals, retainedReferences: retained.references } : {}),
-      ...(!storeFailure && !initialAdvance && cursor?.invocation !== config.invocation ? { admission: { maxCycles: admittedLimit,
+      ...(!storeFailure && !initialAdvance && !cursor ? { admission: { maxCycles: admittedLimit,
         reviewModels: reviewModels(root, path.join(root, "private-agent")),
         taskReviewer: DEFAULT_TASK_REVIEWER, taskSynthesis: DEFAULT_TASK_SYNTHESIS } } : {}) };
     const value = hostResponse ? hostResponse(key, base) : base;

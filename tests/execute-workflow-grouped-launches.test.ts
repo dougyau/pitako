@@ -178,9 +178,19 @@ async function groupedScenario(continuation: boolean, uninterrupted?: { root: st
       expect(transport.digest).toBe(original.digest);
       expect(transport.head).toEqual(original.head);
       const committed = retained.store.read(retained.scope, original.head);
-      expect(canonicalJSON(transport.P)).toBe(canonicalJSON(committed.P));
-      expect(canonicalDigest(transport.P.prompt.execution.foldedContinuation))
-        .toBe(canonicalDigest(committed.P.prompt.execution!.foldedContinuation));
+      const decoded = structuredClone(transport.P);
+      const folded = decoded.prompt.execution.foldedContinuation;
+      if (folded) {
+        const step = (operation: string) => transport.projection.steps.find((value: any) => value.operation === operation).result;
+        for (const [field, fact, same] of [
+          ["requests", step("nextRequests"), ["projection", "steps", "nextRequests", "result"]],
+          ["seal", step("seal").receipt, ["projection", "steps", "seal", "result", "receipt"]],
+        ] as const) {
+          expect(folded[field]).toEqual({ same, digest: canonicalDigest(fact) });
+          folded[field] = fact;
+        }
+      }
+      expect(canonicalJSON(decoded)).toBe(canonicalJSON(committed.P));
       expect(checkoutEvidence(host.root)).toEqual(before!.checkout);
       expect(canonicalJSON(host.records())).toBe(before!.ledger);
       expect(retained.store.readRecords(retained.scope).head).toEqual(before!.head);

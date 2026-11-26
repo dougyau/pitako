@@ -1,3 +1,5 @@
+export function runOperation(operation: string, input: Record<string, unknown>, grouped?: boolean): Promise<Record<string, unknown>>;
+
 export function resolveStoredGroupedInput(
   operation: string,
   input: Record<string, unknown>,
@@ -10,6 +12,7 @@ export function publishFinalReview(input: Record<string, unknown>, observe?: (ro
 export function commitTaskReviewContext(input: Record<string, unknown>, delta: Record<string, unknown>): Record<string, unknown>;
 
 export function receiptTransport(reference: Record<string, unknown>, outer?: boolean): Record<string, unknown>;
+export function transportOutput(operation: string, receipt: Record<string, unknown>): string;
 export function receiptData(value: Record<string, unknown>): Record<string, unknown>;
 export function recordBaselineInput(input: Record<string, unknown>): void;
 export function closeContinuation(input: Record<string, unknown>, steps: Record<string, unknown>[]): Record<string, unknown> | null;

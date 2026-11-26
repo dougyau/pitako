@@ -24,9 +24,10 @@ function admittedInvocation({ root, id, part }: Inspection, context: any): Execu
   try { mission = JSON.parse(readFileSync(executionStatePath(context), "utf8")); }
   catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
   const value = mission?.[EXECUTE_CURSOR_KEY];
-  if (value === undefined) return false;
+  // Only a cursor identified as belonging to another invocation may be replaced.
+  if (value === undefined || typeof value?.invocation === "string" &&
+      value.invocation && value.invocation !== context.invocation) return false;
   validateExecuteCursor(EXECUTE_CURSOR_KEY, value);
-  if (value.invocation !== context.invocation) return false;
   let retained;
   try {
     retained = readExecuteAdmission(root, value);

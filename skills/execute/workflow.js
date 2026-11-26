@@ -86,6 +86,95 @@ function same(a, b) {
   const keys = Object.keys(a);
   return keys.length === Object.keys(b).length && keys.every(k => Object.prototype.hasOwnProperty.call(b, k) && same(a[k], b[k]));
 }
+// Pointer paths name only these protocol copy sites, not arbitrary lookups.
+function visitContinuationCopies(packet, worker, copy) {
+  const frame = packet.taskFrame;
+  const attempt = packet.attempt;
+  const workerKey = attempt?.key;
+  const knowledge = worker && worker.reference?.key === workerKey &&
+    text(worker.reference?.runId) && worker.reference.runId === attempt?.launch?.runId
+    ? worker.value?.knowledge : undefined;
+  const copyKnowledge = source => {
+    for (const key of Object.keys(source?.workerKnowledge ?? {}))
+      source.workerKnowledge[key] = copy(source.workerKnowledge[key], ["worker", "value", "knowledge"],
+        key === workerKey ? knowledge : undefined);
+  };
+  for (const intention of packet.intentions ?? []) {
+    const record = intention.operation === "ledger" && intention.input.record;
+    if (record?.kind !== "unit") continue;
+    const body = record.body;
+    if (body.frame?.intents !== undefined)
+      body.frame.intents = copy(body.frame.intents, ["taskFrame", "intents"], frame?.intents);
+    if (body.result !== undefined)
+      body.result = copy(body.result, ["taskState", "last"], packet.taskState?.last);
+    if (body.checkpoint !== undefined)
+      body.checkpoint = copy(body.checkpoint, ["lastConfirmed"], packet.lastConfirmed);
+    copyKnowledge(body.frame);
+  }
+  const pause = attempt?.pauseSource;
+  if (pause?.checkpoint !== undefined) {
+    // The confirmation binds the source key even when the checkpoint is a pointer.
+    const ref = pause.confirmation?.checkpointRef;
+    const sourceKey = typeof ref === "string" ? ref.split("/").at(-2) : undefined;
+    const source = sourceKey && Object.hasOwn(frame?.intents ?? {}, sourceKey) ? frame.intents[sourceKey] : undefined;
+    pause.checkpoint = copy(pause.checkpoint, ["taskFrame", "intents", sourceKey],
+      source?.key === sourceKey ? source : undefined);
+  }
+  copyKnowledge(frame);
+  return packet;
+}
+function encodeContinuation(packet, worker) {
+  return visitContinuationCopies({ ...packet, version: config.stateVersion }, worker, (source, path, target) => {
+    if (target === undefined || !same(source, target)) return source;
+    const digest = canonicalDigest(target);
+    return canonicalDigest(source) === digest ? { same: path, digest } : source;
+  });
+}
+function decodeLoopIOOutput(receipt) {
+  const wire = receipt?.P?.prompt?.execution;
+  const baselinePacket = readContinuation(wire?.continuation);
+  const closePacket = readContinuation(wire?.foldedContinuation);
+  if (baselinePacket == null && closePacket == null) return receipt;
+  // Host timeout evidence can be checked again against its original wire digest.
+  const P = clone(receipt.P);
+  const execution = P.prompt.execution;
+  const expand = (source, path, target) => {
+    if (!source || typeof source !== "object" || Array.isArray(source)) return source;
+    const keys = Object.keys(source);
+    const hasSame = Object.hasOwn(source, "same");
+    const hasDigest = Object.hasOwn(source, "digest");
+    const pointer = keys.length === 2 && hasSame && hasDigest && same(source.same, path) &&
+      typeof source.digest === "string" && source.digest.length === 64 && /^[a-f0-9]{64}$/.test(source.digest);
+    if (!(hasSame || (hasDigest && keys.length === 1))) return source;
+    if (!pointer || target === undefined || target && Object.hasOwn(target, "same") ||
+        canonicalDigest(target) !== source.digest)
+      throw Object.assign(new Error(`Execute continuation pointer integrity mismatch: ${path.join(".")}.`),
+        { code: "execute-continuation-integrity" });
+    return clone(target);
+  };
+  const folded = execution.foldedContinuation;
+  if (folded) {
+    const step = operation => {
+      const matches = Array.isArray(receipt.projection?.steps)
+        ? receipt.projection.steps.filter(step => step?.operation === operation) : [];
+      return matches.length === 1 ? matches[0].result : undefined;
+    };
+    for (const field of ["worker", "checkpoint"])
+      if (folded[field] !== undefined)
+        folded[field] = expand(folded[field], ["execution", field], execution[field]);
+    if (folded.attempt?.checkpoint !== undefined)
+      folded.attempt.checkpoint = expand(folded.attempt.checkpoint, ["execution", "checkpoint"], execution.checkpoint);
+    if (folded.requests !== undefined)
+      folded.requests = expand(folded.requests, ["projection", "steps", "nextRequests", "result"], step("nextRequests"));
+    if (folded.seal !== undefined)
+      folded.seal = expand(folded.seal, ["projection", "steps", "seal", "result", "receipt"], step("seal")?.receipt);
+  }
+  for (const packet of [execution?.continuation, execution?.foldedContinuation]) {
+    if (!packet) continue;
+    visitContinuationCopies(packet, packet.worker ?? execution.worker, expand);
+  }
+  return { ...receipt, P };
+}
 // Pure policy: a retained worker is useful only on this exact, unhalted continuation.
 function decideRevival(prev, cfg, peak) {
   const fresh = code => ({ decision: "fresh", code });
@@ -468,7 +557,8 @@ function capture(current, proof = refreshedTimeoutAdmission ?? config) {
   return { metadata: { root: preliminary.root, commonDir: preliminary.commonDir,
     selected: { source: preliminary.source, digest: preliminary.digest }, checkout: current.checkout,
     retainedAnalyses: recoveredEpochCursor ? [] : proof.recovery?.originals ?? [],
-    ...(!recoveredEpochCursor && proof.timeoutRecovery ? { timeoutProjection: proof.timeoutRecovery.packet } : {}),
+    ...(!recoveredEpochCursor && proof.timeoutRecovery
+      ? { timeoutProjection: decodeLoopIOOutput(proof.timeoutRecovery.packet) } : {}),
     ...(witness ? { checkpointObservation: witness } : {}) }, content: preliminary.content };
 }
 const checkpointWitnessRefs = new WeakMap();
@@ -572,7 +662,7 @@ function executeCursor() {
       : ["capacity", "native-dispatch", "task-review-model"].includes(loop.halt.code) ? loop.halt.code : null
     : null;
   return {
-    version: 10, storeId: invocation.storeId, root: invocation.association.root,
+    version: config.stateVersion, storeId: invocation.storeId, root: invocation.association.root,
     invocation: config.invocation, epoch: invocation.epoch ?? 0,
     associationDigest: canonicalDigest(invocation.association), admissionBinding: invocation.admissionBinding,
     head: clone(invocation.head), action,
@@ -1717,6 +1807,7 @@ function loopIO(slot, input, owner = loop) {
         if (pending.retry >= 2) throw new Error(`loop-io ${slot} has no terminal receipt: ${result.error ?? childKey}`);
         pending.retry++; delete pending.ref; return save().then(run);
       }
+      receipt = decodeLoopIOOutput(receipt);
       if (receipt.P !== undefined) {
         // P is a head-bound decision input, never part of a retained operation receipt.
         const firstAdmission = !invocation.storeId;
@@ -2710,6 +2801,14 @@ function verifyAttempt(descriptor, task, value, reuse) {
       if (receipt?.error === "loop-io" && receipt.code)
         throw Object.assign(new Error(receipt.reason), { code: receipt.code, recovery: receipt.recovery });
       loopIOViewOverflow(receipt, pending.ref);
+      const failures = [result, ...(result?.results ?? [])].filter(Boolean);
+      const terminal = result?.ok && pitakoAgentFamily(result.agent) === "loop-io" && text(result.runId) &&
+        (result.key === undefined || result.key === gateKey) && !result.state && !result.terminalOutcome &&
+        Array.isArray(result.results) && result.results.length === 1 && result.results[0].exitCode === 0 &&
+        failures.every(item => !item.error && !item.outputSaveError && !item.metadataSaveError && !item.transcriptError &&
+          !item.outputPartial && !item.truncation && !item.timedOut && !item.processSignal &&
+          (item.exitCode === undefined || item.exitCode === 0));
+      if (terminal) receipt = decodeLoopIOOutput(receipt);
       if (descriptor === loop.finalAttempt && receipt?.selectionHead) {
         const { receipt: value, finalGate, receiptDigest, storeId, selectionHead, selectionInput } = receipt;
         if (!same(selectionHead, invocation.head) || !same(selectionInput, storeProjection.P.control.operation.input) ||
@@ -2717,7 +2816,6 @@ function verifyAttempt(descriptor, task, value, reuse) {
           throw new Error("Final acceptance retry selection integrity mismatch.");
         receipt = { ...value, finalGate, receiptDigest, storeId };
       }
-      const failures = [result, ...(result?.results ?? [])].filter(Boolean);
       const committedGate = receipt?.P ? { head: receipt.head, P: receipt.P, storeId: receipt.storeId } : null;
       if (receipt?.P) {
         const { head, P, storeId, ...gateReceipt } = receipt;
@@ -2727,12 +2825,6 @@ function verifyAttempt(descriptor, task, value, reuse) {
       if (finalGate) receipt = finalReceipt;
       if (descriptor !== loop.finalAttempt)
         receipt = readTaskGateWire(receipt, gateTask.gates, committedGate?.P.prompt.execution?.worker?.reference);
-      const terminal = result?.ok && pitakoAgentFamily(result.agent) === "loop-io" && text(result.runId) &&
-        (result.key === undefined || result.key === gateKey) && !result.state && !result.terminalOutcome &&
-        Array.isArray(result.results) && result.results.length === 1 && result.results[0].exitCode === 0 &&
-        failures.every(item => !item.error && !item.outputSaveError && !item.metadataSaveError && !item.transcriptError &&
-          !item.outputPartial && !item.truncation && !item.timedOut && !item.processSignal &&
-          (item.exitCode === undefined || item.exitCode === 0));
       if (!terminal || !validGateReceipt(receipt, gateTask, value.status)) {
         // Native permission/Stop/activity is never a transport retry.
         if (result?.nativeFailure || pending.retry >= 2) return save().then(() => {
@@ -2861,6 +2953,9 @@ function closeAttemptInput(descriptor, task, value) {
       if (!source) throw new Error("Missing authenticated restoration source intent.");
       return source;
     }) } : {}) };
+  // Compare to the committed original, not the possibly normalized received result.
+  // A close without a prior gate needs no fallback: its frame hasn't admitted this worker's knowledge yet.
+  const workerOriginal = storeProjection?.P.prompt?.execution?.worker;
   return { operation: "close", taskFrame: clone(invocation.taskFrame),
     gate: { root: config.root, specId: config.id, invocation: config.invocation,
       loop: loop.number, attempt: descriptor.number, key: gateKey, task: gateTask,
@@ -2868,14 +2963,14 @@ function closeAttemptInput(descriptor, task, value) {
       ...(descriptor.revival ? { revival: { decision: descriptor.revival.decision } } : {}),
       worker: { key: descriptor.key, runId: descriptor.launch.runId } },
     seal: { unit: seal, pause: seal }, nextBaseline: nextBaselines,
-    continuation: { attempt: { ...Object.fromEntries(["taskId", "index", "number", "key", "timeoutMs",
+    continuation: encodeContinuation({ attempt: { ...Object.fromEntries(["taskId", "index", "number", "key", "timeoutMs",
       "checkpoint", "intent", "baseline", "bindingKey", "revival", "resume", "resumeAfter", "boardPostIds",
       "taskReview", "restore", "pauseSource"].filter(field => descriptor[field] !== undefined)
       .map(field => [field, clone(descriptor[field])])), launch: { key: descriptor.key, runId: descriptor.launch.runId } },
       taskState: clone(invocation.tasks[task.id]), taskFrame: clone(invocation.taskFrame),
       results: clone(loop.results), recoveries: clone(loop.recoveries),
       usage: clone(loop.usage),
-      metricSeries: clone(loop.metricSeries ?? task.progress), lastConfirmed: clone(invocation.lastConfirmed ?? null) } };
+      metricSeries: clone(loop.metricSeries ?? task.progress), lastConfirmed: clone(invocation.lastConfirmed ?? null) }, workerOriginal) };
 }
 function storedWorkerCloseInput(position, worker, input, operation = "close") {
   return { operation, root: position.root, invocation: position.invocation,
@@ -3873,7 +3968,7 @@ function checkoutTerminalObservation(observed, childKey, association, number, co
   // Retain only the validated candidate/workspace projection, not potentially large Git status text.
   observation = { version: 1, ok: true, root: observation.root, commonDir: observation.commonDir,
     checkout: candidate(observation.checkout), ledger: observation.ledger, summaries: observation.summaries,
-    store: observation.store };
+    store: decodeLoopIOOutput(observation.store) };
   return observation;
 }
 function validateClosingProjection(published, context) {
@@ -4061,7 +4156,7 @@ function restoreClosingCursor(cursor, receipt, checkoutKey, observed) {
   inFlight.clear();
   dispatchedAction = undefined;
   return {
-    version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+    version: config.stateVersion, association: admission.association, admissionBinding: admission.admissionBinding,
     amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
     taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
     reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot =>
@@ -4238,6 +4333,7 @@ function replayGateTimeout(cursor) {
         }
         if (!terminalLoopIOResult(result, childKey, "gate") || !receipt?.P)
           throw new Error(receipt?.reason ?? "Gate renewal has no terminal projection.");
+        receipt = decodeLoopIOOutput(receipt);
         return replayCursorAdmission({ ...cursor, halt: null, head: receipt.head,
           action: { kind: "pending", op: "gate", opKey: nextKey,
             input: receipt.P.control.operation.input } }, receipt).then(restored => {
@@ -4513,7 +4609,7 @@ function replayLoopIO(childKey, input, timeoutMs, maxRetries = 2) {
         rejectedDrain: receipt.rejectedDrain });
       if (!receipt || !terminalLoopIOResult(result, currentKey, request.operation))
         throw new Error(result.error ?? `Execute replay has no terminal receipt. ${excerpt(result.output ?? "")}`);
-      return { receipt, result, childKey: currentKey };
+      return { receipt: decodeLoopIOOutput(receipt), result, childKey: currentKey };
     });
   }
   return issue(0);
@@ -4583,6 +4679,9 @@ function replayDirectorSelection(cursor, inspection, observedDirector) {
     return inspection?.observation ?? host(config.inspections[0]);
   }).then(observation => {
     if (!observation.storeFailure && !config.preliminaryStoreFailure) return observation;
+    const failure = observation.storeFailure ?? config.preliminaryStoreFailure;
+    if (failure.code === EXECUTE_CONTINUATION_INCOMPATIBLE)
+      throw new StoreError(failure.code, failure.reason);
     if (observation.storeFailure?.code === "superseded")
       throw Object.assign(new Error(observation.storeFailure.reason), { code: "superseded" });
     const opKey = `${action.key}.store-check`;
@@ -4821,7 +4920,7 @@ function restoreFinalAcceptance(cursor, saved, gateRef, admissionObservation, ac
       replayAdmissionObservation = same(candidate(receipt.after), candidate(admissionObservation.checkout))
         ? { ...admissionObservation, checkout: receipt.after } : admissionObservation;
       return {
-        version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+        version: config.stateVersion, association: admission.association, admissionBinding: admission.admissionBinding,
         replayedFinalGate: true,
         amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
         taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
@@ -5003,7 +5102,7 @@ function replayFinalReview(cursor) {
     storeProjection = { head, P };
     dispatchedAction = clone(cursor.action);
     return {
-      version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+      version: config.stateVersion, association: admission.association, admissionBinding: admission.admissionBinding,
       amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
       taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
       reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [slot, admission.models[slot]])),
@@ -6056,7 +6155,7 @@ function replayCursorAdmission(cursor, committedAdvance, observedGrouped = false
       }
     }
     const restored = {
-      version: 10, association: admission.association, admissionBinding: admission.admissionBinding,
+      version: config.stateVersion, association: admission.association, admissionBinding: admission.admissionBinding,
       amendments: admission.amendments, revivalContextPeak: admission.revivalContextPeak,
       taskReviewer: cursor.models.taskReviewer, taskSynthesis: cursor.models.taskSynthesis,
       reviewModels: Object.fromEntries(["r1", "r2", "synthesis"].map(slot => [
@@ -6169,8 +6268,10 @@ try {
     return finish("blocked", "Existing native missionId and actually returned missionPath are required.");
   retainedCursor = recoveredEpochCursor ? null : await state.get(stateKey);
   if (retainedCursor?.invocation === config.invocation) {
-    if (retainedCursor.version !== config.stateVersion)
-      return cursorDisposition(retainedCursor, "blocked", `Retained execution created by an incompatible Pitako contract v${retainedCursor.version}. No migration or replay is supported; retained unchanged.`);
+    if (retainedCursor.version !== config.stateVersion) {
+      const reason = `${EXECUTE_CONTINUATION_INCOMPATIBLE}: Retained execution created by an incompatible Pitako contract v${retainedCursor.version}. No migration or replay is supported; retained unchanged.`;
+      return { ...cursorDisposition(retainedCursor, "blocked", reason), code: EXECUTE_CONTINUATION_INCOMPATIBLE };
+    }
     validateExecuteCursor(stateKey, retainedCursor);
     if (retainedCursor.root !== config.root)
       return cursorDisposition(retainedCursor, "blocked", "Execute cursor belongs to the wrong cwd.");
@@ -6194,7 +6295,8 @@ try {
         if (observed.admission || observed.initialAdvance)
           throw new Error("Terminal execute cursor unavailable to native admission.");
       } catch (error) {
-        return cursorDisposition(retainedCursor, "blocked", String(error.message ?? error));
+        const disposition = cursorDisposition(retainedCursor, "blocked", String(error.message ?? error));
+        return error.code === EXECUTE_CONTINUATION_INCOMPATIBLE ? { ...disposition, code: error.code } : disposition;
       }
       return cursorDisposition(retainedCursor, retainedCursor.loop.outcome === "complete" ? "complete" : "partial",
         "Retained terminal execute disposition; no replay or dispatch.");
@@ -6253,11 +6355,12 @@ try {
         return { ...cursorDisposition(held, halt.status, halt.reason), loopReport: { halt } };
       }
       if (!await recoverStoreEpoch(error, retainedCursor)) {
-        return cursorDisposition(retainedCursor,
+        const disposition = cursorDisposition(retainedCursor,
           error.code === "superseded" ? "partial" :
             ["stopped", "interrupted"].includes(error.nativeBarrier) ||
               error.nativeBarrier && /\.task-(reviewer|synthesis)$/.test(error.nativeReference?.key ?? "") ? "cancelled" : "blocked",
           String(error.message ?? error));
+        return error.code === EXECUTE_CONTINUATION_INCOMPATIBLE ? { ...disposition, code: error.code } : disposition;
       }
     }
   }
@@ -6302,7 +6405,8 @@ try {
   // Incompatible retained state fails before any resume or dispatch.
   if (!Number.isSafeInteger(config.stateVersion)) return finish("blocked", "Missing resolved execute state contract version.");
   if (invocation && invocation.version !== config.stateVersion)
-    return finish("blocked", `Retained execution created by an incompatible Pitako contract v${invocation.version}. No migration or replay is supported; retained unchanged.`);
+    return { ...finish("blocked", `${EXECUTE_CONTINUATION_INCOMPATIBLE}: Retained execution created by an incompatible Pitako contract v${invocation.version}. No migration or replay is supported; retained unchanged.`, true),
+      code: EXECUTE_CONTINUATION_INCOMPATIBLE };
   activePlan = invocation?.activePlan;
   loop = invocation?.loop;
   if (invocation?.transitionReplay) {
@@ -6826,15 +6930,16 @@ Publish one selection with the native output binding then END. Native permission
           await save();
         }
         const folded = loop.attempt.foldedBaseline ?? (loop.attempt.number === 1 ? loop.initialCheckpoint : null);
+        const { checkpoint, ...attempt } = loop.attempt;
         const baseline = folded ? { candidate: folded.checkpoint.baseline } : await loopIO("baselineIO", { operation: "baseline", root: config.root,
-          intent: clone(loop.attempt.checkpoint),
-          continuation: { attempt: clone(loop.attempt), taskState: clone(invocation.tasks[task.id]),
+          intent: clone(checkpoint),
+          continuation: encodeContinuation({ attempt: clone(attempt), taskState: clone(invocation.tasks[task.id]),
             taskFrame: clone(invocation.taskFrame), results: clone(loop.results), recoveries: clone(loop.recoveries),
             usage: clone(loop.usage),
             metricSeries: clone(loop.metricSeries ?? task.progress), view: clone(invocation.currentView),
             requests: clone(invocation.lastRequestPage),
             receiptReference: clone(invocation.receiptReference ?? null),
-            intentions: clone(invocation.intentions ?? []), lastConfirmed: clone(invocation.lastConfirmed ?? null) } }, loop.attempt);
+            intentions: clone(invocation.intentions ?? []), lastConfirmed: clone(invocation.lastConfirmed ?? null) }) }, loop.attempt);
         const admitted = folded ?? admitBaseline(loop.attempt.checkpoint, { ...baseline, captured: true }, baseline.head);
         loop.attempt.checkpoint = clone(admitted.checkpoint);
         loop.attempt.intent = clone(admitted.intent);
@@ -7422,6 +7527,8 @@ no unresolved material gaps and this SAME candidate. Otherwise gaps or blocked. 
   }
 } catch (error) {
   let reason = String(error?.message ?? error);
+  if (error?.code === EXECUTE_CONTINUATION_INCOMPATIBLE)
+    return { ...finish("blocked", reason, true), code: error.code };
   if (invocation?.head && error?.recovery) {
     const cursor = executeCursor();
     try {

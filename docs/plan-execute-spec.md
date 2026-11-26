@@ -338,7 +338,7 @@ earlier. No automatic invocation/mission, publication, commits or slot renewal.
 
 ## Recovery uses native missions and Git
 
-Native state retains only the `pitako-execute` v10 cursor: store identity, saved
+Native state retains only the `pitako-execute` v11 cursor: store identity, saved
 head, recorded action, bounded loop/task/attempt and producer references, loop
 budget, and an integrated-review sub-cursor. Each save validates the closed
 schema and the 16384-byte UTF-8 single-key envelope. Git preserves code and WIP,

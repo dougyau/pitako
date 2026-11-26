@@ -233,7 +233,7 @@ human decisions and Stop, then present native progress and the full result
 (read its exact native artifact if preview truncates). No extra model or final
 validation turn is required.
 
-## Coordinator timeouts (v10)
+## Coordinator timeouts
 
 The coordinator is the foreground session launching/relaunching `pitako.execute`,
 not the per-loop director. Execute-owned analysis dispatch defaults to
@@ -926,11 +926,11 @@ Native replay is not stack restoration, exactly-once or a read-only reattachment
 API. Preserve exact producer/run, outputReference, outputArtifactPath,
 outputPathMapping, artifactPaths and optional results[].structuredOutputPath.
 Distinguish binding JSON, optional native value and debug artifacts. Consume the
-original full structuredOutput, not previews. Execute v10 saves only the
+original full structuredOutput, not previews. Execute saves only the
 validated `pitako-execute` cursor (16384 UTF-8 bytes including its key and
 pretty-printing). It holds no plan cache, result bodies or closed-loop history.
 The cwd-local `.pi/pitako/pitako.db` holds the admission, checkpoint intents,
-receipts and hash-chained ledger. The execute contract version (v10) has no
+receipts and hash-chained ledger. The execute contract version (v11) has no
 migration of legacy state.
 The deterministic child commits before the cursor save and returns the
 in-memory projection; receipt lines are limited to 61440 bytes. On relaunch,

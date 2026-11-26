@@ -3,6 +3,7 @@ import { canonicalDigest } from "./canonical.mjs";
 import { previousUnitMatches, type CheckpointIntent, type ConfirmedUnit, type SealerRequest } from "./execute-checkpoint.ts";
 import { StoreError } from "./pitako-store.ts";
 import { readExecuteProgress } from "./execute-progress.ts";
+import { readContinuation } from "./execute-state.ts";
 
 export type CheckpointBinding = { association: CheckpointIntent["association"]; key: string };
 
@@ -37,29 +38,38 @@ export function readExecuteIntentContext(cwd: string, value: unknown, associatio
     throw new Error("Checkpoint intention/progress differs from durable execution context.");
   // Baselines carry the prior confirmation; a later admitted ledger unit replaces it.
   let confirmed: ConfirmedUnit | { kind: "pause" } | null | undefined;
+  let baselineConfirmation: NonNullable<BaselineOperation["request"]>["continuation"];
   for (const record of records) {
     if (record.kind === "operation") {
       const continuation = (record.body as BaselineOperation).request?.continuation;
-      if (continuation && Object.hasOwn(continuation, "lastConfirmed")) confirmed = continuation.lastConfirmed;
+      if (continuation && Object.hasOwn(continuation, "lastConfirmed")) baselineConfirmation = continuation;
     }
     if (record.kind === "ledger") {
       for (const entry of (record.body as { entries: { kind: string; body: { checkpoint?: ConfirmedUnit | { kind: "pause" } } }[] }).entries)
-        if (entry.kind === "unit" && entry.body.checkpoint) confirmed = entry.body.checkpoint;
+        if (entry.kind === "unit" && entry.body.checkpoint) {
+          confirmed = entry.body.checkpoint;
+          baselineConfirmation = undefined;
+        }
     }
     if (record.kind === "receipt") {
-      const packet = (record.body as { continuation?: {
+      const candidate = (record.body as { continuation?: {
         next: boolean; attempt: { seq: number; digest: string }; seal: { seq: number; digest: string };
       } }).continuation;
-      if (packet?.next && packet.attempt.seq === row.seq && packet.attempt.digest === row.digest) {
+      if (candidate?.next && candidate.attempt?.seq === row.seq && candidate.attempt.digest === row.digest) {
+        const packet = readContinuation(candidate);
         const seal = records[packet.seal.seq - 1];
         const result = seal?.body as { result?: { kind: string; receipt: { outcome: string } } };
         if (!seal || seal.kind !== "seal" || seal.digest !== packet.seal.digest ||
             result.result?.kind !== "pause" || !["sealed", "observed"].includes(result.result.receipt.outcome))
           throw new StoreError("store-corrupt", "Folded checkpoint pause provenance differs.");
-        if (result.result.receipt.outcome === "sealed") confirmed = { kind: "pause" };
+        if (result.result.receipt.outcome === "sealed") {
+          confirmed = { kind: "pause" };
+          baselineConfirmation = undefined;
+        }
       }
     }
   }
+  if (baselineConfirmation) confirmed = readContinuation(baselineConfirmation).lastConfirmed;
   if (confirmed?.kind === "unit" && !previousUnitMatches(intent, confirmed))
     throw new Error("Confirmed unit lacks admitted pending-position provenance.");
   return { cursor, loop, attempt, intent, records, confirmed };
@@ -76,7 +86,7 @@ export function readExecuteIntent(cwd: string, value: unknown, binding: Checkpoi
     return row.kind === "operation" && body?.operation === "baseline" &&
       body.request?.intent?.key === intent.key;
   })?.body as BaselineOperation | undefined;
-  const bindingKey = baseline?.request?.continuation?.attempt?.bindingKey ?? intent.key;
+  const bindingKey = readContinuation(baseline?.request?.continuation)?.attempt?.bindingKey ?? intent.key;
   if ((hook ? bindingKey : intent.key) !== binding.key)
     throw new Error("Checkpoint intention/progress differs from durable execution context.");
   if (attempt.stage === "launched" &&

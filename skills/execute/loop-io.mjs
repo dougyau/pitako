@@ -1,9 +1,9 @@
 import "./loader.mjs";
-import { lstatSync, readFileSync } from "node:fs";
+import { existsSync, lstatSync, readFileSync } from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { structuredPatch } from "diff";
-import { admitExecuteRoot, appendLedger, committedIntent, commitExecute, executeEpoch, executeScope, executeStore, withExecuteStore, isLedgerIntegrityError, verifyExecuteStoreForWrite, ledgerPath, loopSummaries, summarizeLoops, readRequest, storedGateProjection, verifyLedger } from "./ledger.mjs";
+import { admitExecuteRoot, appendLedger, committedIntent, commitExecute, executeEpoch, executeScope, executeStore, withExecuteStore, isLedgerIntegrityError, verifyExecuteStoreForWrite, ledgerPath, loopSummaries, summarizeLoops, readRequest, sameOutputCopy, storedGateProjection, verifyLedger } from "./ledger.mjs";
 import { safePath } from "../../extensions/hash-ledger.mjs";
 import { nativeReference, settledBarrier } from "./halt-evidence.mjs";
 import { canonicalDigest, canonicalJSON, sha256 } from "../../extensions/canonical.mjs";
@@ -13,6 +13,7 @@ import { reviewAnalysisConforms, reviewSynthesisContract } from "../review/synth
 import { pitakoAgentFamily } from "../agent-names.mjs";
 const { viewBudget } = await import("../../extensions/board/store.ts");
 const { PitakoStore, StoreError } = await import("../../extensions/pitako-store.ts");
+const { EXECUTE_STATE_VERSION, readContinuation } = await import("../../extensions/execute-state.ts");
 const { captureBaseline, checkpointTaskDelta, readCheckpointTaskBytes, sealCheckpointRequest, observeTaskReviewSeal } = await import("../../extensions/execute-checkpoint.ts");
 const { checkoutEvidence } = await import("../../extensions/spec-plans.ts");
 const { prepare, apply, gate, taskGateWire, currentHumanPostIds, readBacklog, reviewOriginals, readReviewOriginal, readWorkerOriginal, readNativeOriginal } = await import("./loop.ts");
@@ -109,12 +110,7 @@ export function receiptTransport(reference, outer = true, readProjection = readR
           .filter(key => restored[key] !== undefined).map(key => [key, restored[key]]));
     }
   }
-  const { P: storedProjection, reconstruct, ...location } = reference;
-  let P = storedProjection;
-  if (!reconstruct && P?.prompt.execution?.foldedContinuation) {
-    const { foldedContinuation, ...execution } = P.prompt.execution;
-    P = { ...P, prompt: { ...P.prompt, execution } };
-  }
+  const { P, ...location } = reference;
   const output = { ...location, ...(outer ? { P } : {}), projection: compact };
   const wireBytes = () => Buffer.byteLength(JSON.stringify(output));
   if (wireBytes() > 61440) {
@@ -140,7 +136,7 @@ export function receiptTransport(reference, outer = true, readProjection = readR
         page.requests.pop();
         page.next = cursor + page.requests.length;
         for (const field of ["continuation", "foldedContinuation"]) {
-          const packet = output.P?.prompt.execution?.[field];
+          const packet = readContinuation(output.P?.prompt.execution?.[field]);
           if (packet?.requests && canonicalJSON(packet.requests) === original) {
             output.P = { ...output.P, prompt: { ...output.P.prompt, execution: {
               ...output.P.prompt.execution, [field]: { ...packet, requests: page },
@@ -149,6 +145,19 @@ export function receiptTransport(reference, outer = true, readProjection = readR
         }
       }
     }
+  }
+  const execution = output.P?.prompt.execution;
+  const folded = readContinuation(execution?.foldedContinuation);
+  if (folded && compact.operation === "close") {
+    // Bind the actual wire page, not the unpaged result committed in the store.
+    const page = compact.steps.find(step => step.operation === "nextRequests")?.result;
+    const seal = compact.steps.find(step => step.operation === "seal")?.result.receipt;
+    const foldedContinuation = {
+      ...folded,
+      requests: sameOutputCopy(folded.requests, ["projection", "steps", "nextRequests", "result"], page),
+      seal: sameOutputCopy(folded.seal, ["projection", "steps", "seal", "result", "receipt"], seal),
+    };
+    output.P = { ...output.P, prompt: { ...output.P.prompt, execution: { ...execution, foldedContinuation } } };
   }
   if (wireBytes() > 61440) throw new Error("loop-io admission projection exceeds 61440 bytes");
   return output;
@@ -858,6 +867,11 @@ export async function runOperation(operation, input, grouped = false) {
     return resolveStoredGroupedInput("gate", envelope).replay;
   }
   if (operation === "baseline") recordBaselineInput(input);
+  if (operation === "gate" && input.worker && !grouped) {
+    // A standalone worker gate also consumes the current projection when it commits.
+    const { store, scope } = executeStore(input.root, input.invocation);
+    if (existsSync(store.file)) store.read(scope);
+  }
   const operations = { prepare, apply, gate, reviewOriginals, baseline: captureBaseline, taskDelta };
   if (!Object.hasOwn(operations, operation)) throw new Error("Expected loop-io prepare, apply, gate, reviewOriginals, baseline, taskDelta or drain");
   if (operation === "apply") input.currentHumanIds = await currentHumanPostIds(input);
@@ -1333,7 +1347,7 @@ export function publishFinalReview({ observedSynthesisAgent, ...input }, observe
 }
 
 export function recordBaselineInput(input) {
-  if (!input.continuation) return;
+  if (readContinuation(input.continuation) == null) return;
   const { root, invocation } = input.intent.association;
   const request = { ...input, root, invocation, key: `${input.intent.key}.baseline` };
   commitExecute(root, invocation, `operation:${request.key}`, canonicalDigest({ operation: "baseline", ...request }),
@@ -1390,12 +1404,14 @@ export function resolveStoredGroupedInput(operation, input) {
       if (nextKey === source.key) return;
       const records = store.readRecords(scope).records;
       const operation = records.find(candidate => candidate.seq > row.seq && candidate.opKey === `operation:${nextKey}.baseline`);
-      const request = operation?.body.request;
-      const restore = request?.continuation?.attempt?.restore;
-      if (!restore) return;
+      if (!operation) return;
       const intent = records.find(candidate => candidate.seq > operation.seq &&
         candidate.kind === "intent" && candidate.body.key === nextKey);
       if (!intent) return;
+      const request = operation.body.request;
+      const continuation = readContinuation(request?.continuation);
+      const restore = continuation?.attempt?.restore;
+      if (!restore) return;
       if (operation.kind !== "operation" || operation.body.operation !== "baseline" ||
           request.root !== input.root || request.invocation !== input.invocation ||
           request.key !== `${nextKey}.baseline` ||
@@ -1405,7 +1421,7 @@ export function resolveStoredGroupedInput(operation, input) {
           intent.body.cursor !== source.cursor || intent.body.attempt !== source.attempt + 1 ||
           canonicalDigest(intent.body.association) !== canonicalDigest(source.association) ||
           restore.producer?.key !== source.key || (restore.producer.runId ?? null) !== (worker.runId ?? null) ||
-          canonicalDigest(request.continuation.taskFrame?.intents?.[source.key]) !== canonicalDigest(source))
+          canonicalDigest(continuation.taskFrame?.intents?.[source.key]) !== canonicalDigest(source))
         throw new Error("Committed restoration baseline differs from its source attempt.");
       const saved = store.read(scope, { seq: intent.seq, hash: intent.digest });
       return { replay: { candidate: intent.body.baseline, intent: { seq: intent.seq, digest: intent.digest },
@@ -1514,6 +1530,7 @@ export function resolveStoredGroupedInput(operation, input) {
             entry.input.record.body.attempt === row.body.request.gate.attempt &&
             entry.input.record.body.taskId === row.body.request.gate.task.id)))
         throw new Error("Pause drain differs from its committed close.");
+      if (pause) readContinuation(row.body.request.continuation);
       if (!drain) {
         if (receipt) throw new Error("Final drain receipt has no intention marker.");
         recordFinalDrainInput(request);
@@ -1623,7 +1640,7 @@ export function resolveStoredGroupedInput(operation, input) {
           agent: original.agent, body: original.value };
       });
       const execution = prefix.P.prompt.execution;
-      const continuation = [execution?.continuation, execution?.foldedContinuation]
+      const continuation = [readContinuation(execution?.continuation), readContinuation(execution?.foldedContinuation)]
         .find(packet => packet?.attempt.key === request.checkpoint.key);
       const seal = originals.length === 2 ? observeTaskReviewSeal(request.checkpoint, true,
         continuation?.attempt.restore?.sourceKeys.map(key => {
@@ -1662,7 +1679,7 @@ export function resolveStoredGroupedInput(operation, input) {
           path: path.join(ledgerPath(input.root, input.invocation), "loop-io", "receipts",
             sha256(advance.body.request.key), "000000.json"),
           digest: sha256(canonicalJSON(receipt.body)), head, P: saved.P,
-          storeId: saved.identity.storeId, reconstruct: true,
+          storeId: saved.identity.storeId,
         }) } };
       }
       const requestPages = store.readRecords(scope).records.filter(candidate => candidate.kind === "observation" &&
@@ -1675,7 +1692,7 @@ export function resolveStoredGroupedInput(operation, input) {
       if (!context) throw new StoreError("store-corrupt", "Missing task review context");
       const previousReceipt = prefix.records.findLast(candidate => candidate.kind === "receipt" &&
         ["selection", "close", "drain"].includes(candidate.body.result?.operation));
-      const receiptReference = prefix.P.prompt.execution?.continuation?.receiptReference ??
+      const receiptReference = readContinuation(execution?.continuation)?.receiptReference ??
         (previousReceipt ? { path: path.join(ledgerPath(input.root, input.invocation), "loop-io", "receipts",
           sha256(previousReceipt.body.key), "000000.json"), digest: sha256(canonicalJSON(previousReceipt.body)) } : null);
       const saved = commitExecute(input.root, input.invocation, `task-review-recovery:${input.key}`,
@@ -1703,7 +1720,7 @@ export function resolveStoredGroupedInput(operation, input) {
       return { replay: { path: path.join(ledgerPath(input.root, input.invocation), "loop-io", "receipts",
         sha256(source.body.request.key), "000000.json"), digest: sha256(canonicalJSON(receipt.body)),
         storeId: saved.identity.storeId, head: operation === "drain" ? prefix.head : head,
-        P: operation === "drain" ? prefix.P : saved.P, reconstruct: true } };
+        P: operation === "drain" ? prefix.P : saved.P } };
     }
     if (Object.keys(input.refs).join(",") === "input,intent,worker") {
       const intent = prefix.records.find(candidate => candidate.kind === "intent" &&
@@ -1730,7 +1747,7 @@ export function resolveStoredGroupedInput(operation, input) {
       const saved = store.read(scope, head);
       return { replay: { path: path.join(ledgerPath(input.root, input.invocation), "loop-io", "receipts",
         sha256(request.key), "000000.json"), digest: sha256(canonicalJSON(receipt.body)),
-        storeId: saved.identity.storeId, head, P: saved.P, recoveredWorker, reconstruct: true } };
+        storeId: saved.identity.storeId, head, P: saved.P, recoveredWorker } };
     }
     if (operation === "close" && input.refs.worker && row?.kind === "operation" &&
         ["selection", "close", "baseline", "gate"].includes(row.body.operation)) {
@@ -1752,6 +1769,7 @@ export function resolveStoredGroupedInput(operation, input) {
             canonicalDigest(request.gate.checkpoint) !== canonicalDigest(intent.body) ||
             canonicalDigest({ operation, ...request }) !== committed.requestDigest)
           throw new Error("loop-io committed close replay integrity mismatch");
+        readContinuation(request.continuation);
         return input.refs.committed ? committedReplay(committed) : request;
       }
       if (input.refs.committed) throw new StoreError("store-corrupt", "Missing committed close input");
@@ -1766,7 +1784,10 @@ export function resolveStoredGroupedInput(operation, input) {
       if (source && (source.body.request.root !== input.root || source.body.request.invocation !== input.invocation ||
           canonicalDigest({ operation, ...source.body.request }) !== source.requestDigest))
         throw new Error("loop-io stored close digest mismatch");
-      if (source) return input.refs.committed ? committedReplay(source) : source.body.request;
+      if (source) {
+        readContinuation(source.body.request.continuation);
+        return input.refs.committed ? committedReplay(source) : source.body.request;
+      }
     }
     if (input.refs.committed && operation === "close")
       throw new StoreError("store-corrupt", "Missing committed close input");
@@ -1858,7 +1879,7 @@ export function resolveStoredGroupedInput(operation, input) {
         const restoration = committedRestoration(checkpoint, worker);
         if (restoration) return restoration;
         if (row.body.operation === "baseline") {
-          const continuation = predecessor.continuation;
+          const continuation = readContinuation(predecessor.continuation);
           if (continuation?.attempt.key !== checkpoint.key || !continuation.view || !continuation.requests)
             throw new Error("loop-io baseline recovery lacks its task continuation");
           return { root: input.root, invocation: input.invocation, key: input.key,
@@ -1889,7 +1910,7 @@ export function resolveStoredGroupedInput(operation, input) {
             throw new Error("Committed gate input integrity mismatch");
           return replayGate(snapshot, request, true);
         }
-        const progress = prefix.P.prompt.execution?.continuation?.metricSeries ??
+        const progress = readContinuation(prefix.P.prompt.execution?.continuation)?.metricSeries ??
           prefix.records.findLast(candidate => candidate.body.operation === "gate" &&
             candidate.body.request?.task.id === selected.id &&
             candidate.body.request.checkpoint?.loop === checkpoint.loop &&
@@ -1926,7 +1947,7 @@ export function resolveStoredGroupedInput(operation, input) {
             metric: selected.metric ?? null, progress: selected.progress ?? { nonImproving: 0, last5: [] } },
           workerStatus: value.status, writerSettled: true, checkpoint, worker },
         seal: { unit: seal, pause: seal }, nextBaseline: { sealed, observed: next },
-        continuation: { attempt: { taskId: checkpoint.taskId, index: checkpoint.cursor, number: 1,
+        continuation: { version: EXECUTE_STATE_VERSION, attempt: { taskId: checkpoint.taskId, index: checkpoint.cursor, number: 1,
           key: checkpoint.key, checkpoint, intent: intentRef,
           baseline: checkpoint.baseline, launch: worker, bindingKey: worker.key,
           boardPostIds: receiptRow.body.result.steps.find(step => step.operation === "apply").result.view.posts.map(post => post.id) },
@@ -1971,6 +1992,7 @@ export function resolveStoredGroupedInput(operation, input) {
     if (canonicalDigest({ operation, ...request }) !== row.requestDigest)
       throw new Error("loop-io stored operation digest mismatch");
     if (operation === "baseline") {
+      readContinuation(request.continuation);
       const intent = prefix.records.findLast(candidate => candidate.kind === "intent" &&
         candidate.body.key === request.intent.key);
       if (!intent || canonicalDigest(intent.body) !==
@@ -2057,14 +2079,15 @@ export function recoverStoredWorker(input) {
   if (!view || !requests) throw new Error("Worker recovery lacks its committed predecessor receipt");
   const result = { invocation, operation: "close", view,
     steps: [{ key: `${key}.nextRequests`, operation: "nextRequests", result: requests }] };
-  return { ...publishResult(path.join(ledgerPath(root, invocation), "loop-io", "receipts", sha256(key)),
-    { key, requestDigest, resultDigest: canonicalDigest(result), result }), reconstruct: true };
+  return publishResult(path.join(ledgerPath(root, invocation), "loop-io", "receipts", sha256(key)),
+    { key, requestDigest, resultDigest: canonicalDigest(result), result });
 }
 
 // The receipt COMMIT owns the continuation; evidence stays in already committed rows.
 export function closeContinuation(input, steps) {
+  const continuation = readContinuation(input.continuation);
   const baseline = steps.find(step => step.operation === "nextBaseline")?.result;
-  if (!input.continuation) return null;
+  if (continuation == null) return null;
   const { store, scope } = executeStore(input.root, input.invocation);
   const rows = store.readRecords(scope).records;
   const operation = rows.find(row => row.kind === "operation" && row.body.request.key === input.key);
@@ -2075,7 +2098,7 @@ export function closeContinuation(input, steps) {
     return { seq: row.seq, digest: row.digest };
   };
   if (!operation) throw new StoreError("store-corrupt", "Missing close continuation input");
-  const intent = baseline?.captured ? baseline.intent : input.continuation.attempt.intent;
+  const intent = baseline?.captured ? baseline.intent : continuation.attempt.intent;
   if (!intent) throw new StoreError("store-corrupt", "Missing close continuation intent");
   const ledgerRefs = (input.intentions ?? []).filter(intention =>
     intention.operation === "ledger" && intention.input.record.kind === "unit").map(intention => {
@@ -2084,7 +2107,7 @@ export function closeContinuation(input, steps) {
     if (!row) throw new StoreError("store-corrupt", "Missing close continuation ledger admission");
     return { seq: row.seq, digest: row.digest };
   });
-  return { attempt: intent, next: baseline?.captured === true,
+  return { version: EXECUTE_STATE_VERSION, attempt: intent, next: baseline?.captured === true,
     input: { seq: operation.seq, digest: operation.digest },
     gate: reference("gate"), seal: reference("seal"), ledgerRefs };
 }
@@ -2092,11 +2115,11 @@ export function closeContinuation(input, steps) {
 export async function grouped(operation, input, hooks = {}) {
   if (!["advance", "selection", "close"].includes(operation)) throw new Error("Expected advance, selection or close");
   if (input.root !== process.cwd()) throw new Error("loop-io root must be its actual cwd");
-  const referenced = !!input.refs;
   const replayRequest = input.refs?.director ? input : null;
   input = resolveStoredGroupedInput(operation, input);
   if (input.replay) return input.replay;
   if (input.recovery) return recoverStoredWorker(input);
+  if (operation === "close") readContinuation(input.continuation);
   const { root, invocation } = input;
   for (const reference of input.receipts ?? []) readReceipt(reference);
   const key = stepKey(input.key).replace(/\.r\d+$/, "");
@@ -2259,9 +2282,15 @@ export async function grouped(operation, input, hooks = {}) {
     }
   }
   const result = { invocation, operation, steps, ...(operation === "close" ? { contextPeak } : {}) };
-  return { ...publishResult(receiptDirectory, { key, requestDigest, resultDigest: canonicalDigest(result), result,
-    ...(operation === "close" ? { continuation: closeContinuation({ ...input, key }, steps) } : {}) }),
-    reconstruct: referenced };
+  return publishResult(receiptDirectory, { key, requestDigest, resultDigest: canonicalDigest(result), result,
+    ...(operation === "close" ? { continuation: closeContinuation({ ...input, key }, steps) } : {}) });
+}
+
+export function transportOutput(operation, receipt) {
+  const output = JSON.stringify(["drain", "advance", "selection", "close"].includes(operation) ? receiptTransport(receipt) :
+    operation === "gate" && Array.isArray(receipt.gates) && !receipt.finalGate ? taskGateWire(receipt) : receipt);
+  if (Buffer.byteLength(output) > 61440) throw new Error("loop-io admission projection exceeds 61440 bytes");
+  return output;
 }
 
 if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.argv[1])).href) {
@@ -2278,10 +2307,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(path.resolve(process.ar
     const receipt = await withExecuteStore(input.root, invocation, () => operation === "drain" ? drain(input) :
       ["advance", "selection", "close"].includes(operation) ? grouped(operation, input) : runOperation(operation, input), epoch,
       input.storeId ? { storeId: input.storeId, expectedHead: input.expectedHead } : undefined);
-    const output = JSON.stringify(["drain", "advance", "selection", "close"].includes(operation) ? receiptTransport(receipt) :
-      operation === "gate" && Array.isArray(receipt.gates) && !receipt.finalGate ? taskGateWire(receipt) : receipt);
-    if (Buffer.byteLength(output) > 61440) throw new Error("loop-io admission projection exceeds 61440 bytes");
-    process.stdout.write(output + "\n");
+    process.stdout.write(transportOutput(operation, receipt) + "\n");
   } catch (error) {
     const ledgerIntegrity = error?.ledgerIntegrity === true || isLedgerIntegrityError(error);
     // Read-side preflights never quarantine. This deterministic writer owns recovery

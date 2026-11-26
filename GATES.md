@@ -54,7 +54,7 @@ They inspect retained bytes, exercise no-clobber replay and missing/corrupt
 records, and settle a foreground todo writer in another process while
 loop-io owns the execute session. They do not change the full gate.
 
-Execute v10 focused checks cover the single `pitako-execute` key (including
+Execute v11 focused checks cover the single `pitako-execute` key (including
 integrated review), the 16384-byte cursor and 61440-byte receipt limits, exact
 relaunch admissions and checkpoint intents at the saved head. The 30-loop
 constant-state test keeps its 20-second deadline. Use
